@@ -1,0 +1,1337 @@
+//! GPUI adapter for persistent read-only AI conversations.
+
+use std::{
+    collections::HashSet,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+
+use anyhow::{Context as _, Result, bail};
+use gpui::{Context, Entity, Task};
+use moye_epub_editor::{
+    agent::{AgentAnswerSourceStatus, AgentCitation, SelectionSnapshot},
+    agent_chat::{AgentConversation, ConversationQuestion},
+    agent_runtime::{AgentCancellation, AgentRunEvent},
+    ai::ChatRole,
+    chat::{ChatCitation, ChatSession, ChatThread, ChatWindowKind},
+    document::{BookDocument, SourceLocator},
+    services::AppServices,
+};
+
+use super::ai_sidebar::{
+    AiQuestionRequest, AiReferenceHint, AiRestoredMessage, AiRestoredRole, AiSidebar, AiSourceLink,
+    AiThreadOption, MAX_SELECTED_REFERENCES,
+};
+
+const MAX_REFERENCE_TOTAL_BYTES: usize = 96 * 1024;
+
+enum UiAgentMessage {
+    Delta(String),
+    Reset,
+    Committed,
+    Sessions {
+        active_thread_id: Option<String>,
+        threads: Vec<AiThreadOption>,
+    },
+    Completed(Box<std::result::Result<UiConversationAnswer, String>>),
+}
+
+struct UiConversationAnswer {
+    answer: moye_epub_editor::agent_chat::ConversationAnswer,
+    sources: Vec<AiSourceLink>,
+    source_status: AgentAnswerSourceStatus,
+}
+
+struct UiSessionState {
+    active_thread_id: Option<String>,
+    threads: Vec<AiThreadOption>,
+    messages: Vec<AiRestoredMessage>,
+}
+
+pub(super) struct AiSidebarController {
+    services: Arc<AppServices>,
+    conversation: AgentConversation,
+    answer_task: Option<Task<()>>,
+    session_task: Option<Task<()>>,
+    session_generation: Arc<AtomicU64>,
+}
+
+impl AiSidebarController {
+    pub(super) fn new(
+        services: Arc<AppServices>,
+        window_kind: ChatWindowKind,
+        primary_book_id: Option<String>,
+    ) -> Result<Self> {
+        let conversation =
+            AgentConversation::new(Arc::clone(&services), window_kind, primary_book_id)?;
+        Ok(Self {
+            services,
+            conversation,
+            answer_task: None,
+            session_task: None,
+            session_generation: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    pub(super) fn restore<Owner: 'static>(
+        &mut self,
+        sidebar: Entity<AiSidebar>,
+        cx: &mut Context<Owner>,
+    ) {
+        if !sidebar.update(cx, |sidebar, cx| sidebar.begin_session_operation(cx)) {
+            return;
+        }
+        let generation = self.session_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let current_generation = Arc::clone(&self.session_generation);
+        let conversation = self.conversation.clone();
+        let services = Arc::clone(&self.services);
+        let allowed_book_ids = sidebar.read(cx).authorized_book_ids();
+        let join = self.services.runtime().spawn(async move {
+            let session = conversation
+                .restore(&allowed_book_ids)
+                .await
+                .map_err(|error| format!("{error:#}"))?;
+            Ok::<_, String>(
+                load_ui_session_state(services, &conversation, session, &allowed_book_ids).await,
+            )
+        });
+        self.session_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = match join.await {
+                Ok(outcome) => outcome,
+                Err(error) => Err(format!("AI 会话恢复任务已停止：{error}")),
+            };
+            if current_generation.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            let _ = sidebar.update(cx, |sidebar, cx| match outcome {
+                Ok(session) => {
+                    sidebar.apply_session(
+                        session.active_thread_id,
+                        session.threads,
+                        session.messages,
+                        cx,
+                    );
+                }
+                Err(error) => {
+                    sidebar.fail_session_operation(format!("无法恢复 AI 会话：{error}"), cx)
+                }
+            });
+        }));
+    }
+
+    pub(super) fn new_session<Owner: 'static>(
+        &mut self,
+        sidebar: Entity<AiSidebar>,
+        cx: &mut Context<Owner>,
+    ) {
+        let generation = self.session_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let current_generation = Arc::clone(&self.session_generation);
+        let conversation = self.conversation.clone();
+        let services = Arc::clone(&self.services);
+        let allowed_book_ids = sidebar.read(cx).authorized_book_ids();
+        let join = self.services.runtime().spawn(async move {
+            conversation
+                .start_new_session()
+                .await
+                .map_err(|error| format!("{error:#}"))?;
+            Ok::<_, String>(
+                load_ui_session_state(services, &conversation, None, &allowed_book_ids).await,
+            )
+        });
+        self.session_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = match join.await {
+                Ok(outcome) => outcome,
+                Err(error) => Err(format!("新建 AI 会话任务已停止：{error}")),
+            };
+            if current_generation.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            let _ = sidebar.update(cx, |sidebar, cx| match outcome {
+                Ok(session) => {
+                    sidebar.apply_session(None, session.threads, session.messages, cx);
+                }
+                Err(error) => {
+                    sidebar.fail_session_operation(format!("无法新建 AI 会话：{error}"), cx)
+                }
+            });
+        }));
+    }
+
+    pub(super) fn switch_session<Owner: 'static>(
+        &mut self,
+        thread_id: String,
+        sidebar: Entity<AiSidebar>,
+        cx: &mut Context<Owner>,
+    ) {
+        let generation = self.session_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let current_generation = Arc::clone(&self.session_generation);
+        let conversation = self.conversation.clone();
+        let services = Arc::clone(&self.services);
+        let allowed_book_ids = sidebar.read(cx).authorized_book_ids();
+        let join = self.services.runtime().spawn(async move {
+            let session = conversation
+                .select_session(&thread_id, &allowed_book_ids)
+                .await
+                .map_err(|error| format!("{error:#}"))?;
+            Ok::<_, String>(
+                load_ui_session_state(services, &conversation, Some(session), &allowed_book_ids)
+                    .await,
+            )
+        });
+        self.session_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = match join.await {
+                Ok(outcome) => outcome,
+                Err(error) => Err(format!("切换 AI 会话任务已停止：{error}")),
+            };
+            if current_generation.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            let _ = sidebar.update(cx, |sidebar, cx| match outcome {
+                Ok(session) => {
+                    sidebar.apply_session(
+                        session.active_thread_id,
+                        session.threads,
+                        session.messages,
+                        cx,
+                    );
+                }
+                Err(error) => {
+                    sidebar.fail_session_operation(format!("无法切换 AI 会话：{error}"), cx)
+                }
+            });
+        }));
+    }
+
+    pub(super) fn delete_session<Owner: 'static>(
+        &mut self,
+        thread_id: String,
+        sidebar: Entity<AiSidebar>,
+        cx: &mut Context<Owner>,
+    ) {
+        let generation = self.session_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let current_generation = Arc::clone(&self.session_generation);
+        let conversation = self.conversation.clone();
+        let services = Arc::clone(&self.services);
+        let allowed_book_ids = sidebar.read(cx).authorized_book_ids();
+        let join = self.services.runtime().spawn(async move {
+            let session = conversation
+                .delete_session(&thread_id, &allowed_book_ids)
+                .await
+                .map_err(|error| format!("{error:#}"))?;
+            Ok::<_, String>(
+                load_ui_session_state(services, &conversation, session, &allowed_book_ids).await,
+            )
+        });
+        self.session_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = match join.await {
+                Ok(outcome) => outcome,
+                Err(error) => Err(format!("删除 AI 会话任务已停止：{error}")),
+            };
+            if current_generation.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            let _ = sidebar.update(cx, |sidebar, cx| match outcome {
+                Ok(session) => {
+                    sidebar.apply_session(
+                        session.active_thread_id,
+                        session.threads,
+                        session.messages,
+                        cx,
+                    );
+                }
+                Err(error) => {
+                    sidebar.fail_session_operation(format!("无法删除 AI 会话：{error}"), cx)
+                }
+            });
+        }));
+    }
+
+    pub(super) fn reconcile_scope<Owner: 'static>(
+        &mut self,
+        allowed_book_ids: Vec<String>,
+        sidebar: Entity<AiSidebar>,
+        cx: &mut Context<Owner>,
+    ) {
+        let generation = self.session_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let current_generation = Arc::clone(&self.session_generation);
+        let conversation = self.conversation.clone();
+        let join = self.services.runtime().spawn(async move {
+            let reset = conversation
+                .reconcile_scope(&allowed_book_ids)
+                .await
+                .map_err(|error| format!("{error:#}"))?;
+            let active_thread_id = conversation.selected_thread_id().await;
+            let threads = conversation
+                .list_sessions(&allowed_book_ids)
+                .await
+                .map(thread_options)
+                .map_err(|error| format!("{error:#}"));
+            Ok::<_, String>((reset, active_thread_id, threads))
+        });
+        self.session_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = match join.await {
+                Ok(outcome) => outcome,
+                Err(error) => Err(format!("AI 会话范围同步任务已停止：{error}")),
+            };
+            if current_generation.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            let _ = sidebar.update(cx, |sidebar, cx| match outcome {
+                Ok((reset, active_thread_id, Ok(threads))) => {
+                    if reset {
+                        sidebar.apply_session(None, threads, Vec::new(), cx);
+                    } else {
+                        sidebar.refresh_sessions(active_thread_id, threads, cx);
+                    }
+                }
+                Ok((true, _, Err(error))) => {
+                    tracing::warn!(%error, "cannot list sessions after resetting AI scope");
+                    sidebar.apply_session(None, Vec::new(), Vec::new(), cx);
+                }
+                Ok((false, _, Err(error))) => sidebar
+                    .fail_session_operation(format!("无法刷新当前范围的 AI 会话：{error}"), cx),
+                Err(error) => {
+                    sidebar.fail_session_operation(format!("无法同步 AI 会话范围：{error}"), cx)
+                }
+            });
+        }));
+    }
+
+    pub(super) fn submit<Owner: 'static>(
+        &mut self,
+        request: AiQuestionRequest,
+        sidebar: Entity<AiSidebar>,
+        cx: &mut Context<Owner>,
+    ) {
+        let AiQuestionRequest {
+            request_id,
+            question,
+            book_ids,
+            reference_hints,
+            reference,
+        } = request;
+        let reference_hints = merge_editor_reference(reference_hints, reference);
+        let services = Arc::clone(&self.services);
+        let conversation = self.conversation.clone();
+        let prepared = match conversation.prepare_request(request_id) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let error = friendly_agent_error(&format!("{error:#}"));
+                sidebar.update(cx, |sidebar, cx| {
+                    sidebar.fail_answer(request_id, error, cx);
+                });
+                return;
+            }
+        };
+        let cancellation = prepared.cancellation();
+        let runtime = services.runtime();
+        let live_scope = book_ids.clone();
+        let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (ui_tx, ui_rx) = async_channel::unbounded();
+
+        runtime.spawn(async move {
+            let snapshots = match freeze_references(
+                Arc::clone(&services),
+                reference_hints,
+                &book_ids,
+                cancellation,
+            )
+            .await
+            {
+                Ok(snapshots) => snapshots,
+                Err(error) => {
+                    drop(prepared);
+                    let _ = ui_tx
+                        .send(UiAgentMessage::Completed(Box::new(Err(format!(
+                            "{error:#}"
+                        )))))
+                        .await;
+                    return;
+                }
+            };
+            let cancel_conversation = conversation.clone();
+            let session_conversation = conversation.clone();
+            let mut answer = Box::pin(conversation.ask_prepared(
+                ConversationQuestion {
+                    request_id,
+                    question,
+                    allowed_book_ids: book_ids,
+                    snapshots,
+                },
+                Some(agent_tx),
+                prepared,
+            ));
+            let mut agent_events_open = true;
+            let result = loop {
+                tokio::select! {
+                    biased;
+                    event = agent_rx.recv(), if agent_events_open => {
+                        let message = match event {
+                            Some(AgentRunEvent::AnswerDelta(delta)) => Some(UiAgentMessage::Delta(delta)),
+                            Some(AgentRunEvent::AnswerReset) => Some(UiAgentMessage::Reset),
+                            Some(AgentRunEvent::AnswerCommitted) => Some(UiAgentMessage::Committed),
+                            Some(AgentRunEvent::ToolStarted { .. } | AgentRunEvent::ToolFinished { .. }) => None,
+                            None => {
+                                agent_events_open = false;
+                                None
+                            }
+                        };
+                        if let Some(message) = message
+                            && ui_tx.send(message).await.is_err()
+                        {
+                                cancel_conversation.cancel(request_id);
+                                return;
+                        }
+                    }
+                    result = &mut answer => {
+                        break result;
+                    }
+                }
+            };
+            // The completed future still owns PreparedAgentRequest. Drop it
+            // before notifying the UI so a pending scope reconciliation never
+            // observes a request that has already finished or been cancelled.
+            drop(answer);
+            let result = match result {
+                Ok(answer) => {
+                    // Preserve AgentRuntime's explicit verified-source result before any UI
+                    // source conversion or current-document validation can discard a link.
+                    let source_status = answer.answer.source_status;
+                    let sources = answer
+                        .answer
+                        .citations
+                        .iter()
+                        .cloned()
+                        .filter_map(source_link_from_agent_citation)
+                        .collect();
+                    let sources = match validate_live_sources(
+                        Arc::clone(&services),
+                        live_scope.clone(),
+                        sources,
+                    )
+                    .await
+                    {
+                        Ok(sources) => sources,
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                "cannot decorate the already-persisted AI answer with live sources"
+                            );
+                            Vec::new()
+                        }
+                    };
+                    Ok(UiConversationAnswer {
+                        answer,
+                        sources,
+                        source_status,
+                    })
+                }
+                Err(error) => Err(format!("{error:#}")),
+            };
+            let active_thread_id = session_conversation.selected_thread_id().await;
+            match session_conversation.list_sessions(&live_scope).await {
+                Ok(threads) => {
+                    let _ = ui_tx
+                        .send(UiAgentMessage::Sessions {
+                            active_thread_id,
+                            threads: thread_options(threads),
+                        })
+                        .await;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "cannot refresh AI conversation list");
+                }
+            }
+            let _ = ui_tx
+                .send(UiAgentMessage::Completed(Box::new(result)))
+                .await;
+        });
+
+        self.answer_task = Some(cx.spawn(async move |_, cx| {
+            let mut received_delta = false;
+            let mut answer_committed = false;
+            while let Ok(message) = ui_rx.recv().await {
+                match message {
+                    UiAgentMessage::Delta(delta) => {
+                        received_delta = true;
+                        let _ = sidebar.update(cx, |sidebar, cx| {
+                            sidebar.append_answer_delta(request_id, &delta, cx);
+                        });
+                    }
+                    UiAgentMessage::Reset => {
+                        received_delta = false;
+                        answer_committed = false;
+                        let _ = sidebar.update(cx, |sidebar, cx| {
+                            sidebar.reset_answer(request_id, cx);
+                        });
+                    }
+                    UiAgentMessage::Committed => {
+                        answer_committed = true;
+                    }
+                    UiAgentMessage::Sessions {
+                        active_thread_id,
+                        threads,
+                    } => {
+                        let _ = sidebar.update(cx, |sidebar, cx| {
+                            sidebar.refresh_sessions(active_thread_id, threads, cx);
+                        });
+                    }
+                    UiAgentMessage::Completed(result) => {
+                        let _ = sidebar.update(cx, |sidebar, cx| match *result {
+                            Ok(answer) => {
+                                if !answer_committed {
+                                    sidebar.reset_answer(request_id, cx);
+                                    received_delta = false;
+                                }
+                                if !received_delta {
+                                    sidebar.append_answer_delta(
+                                        request_id,
+                                        &answer.answer.answer.markdown,
+                                        cx,
+                                    );
+                                }
+                                sidebar.finish_answer(
+                                    request_id,
+                                    answer.sources,
+                                    answer.source_status,
+                                    cx,
+                                );
+                            }
+                            Err(error) => {
+                                sidebar.fail_answer(request_id, friendly_agent_error(&error), cx);
+                            }
+                        });
+                        return;
+                    }
+                }
+            }
+        }));
+    }
+
+    pub(super) fn cancel(&mut self, request_id: u64) {
+        self.conversation.cancel(request_id);
+    }
+
+    pub(super) fn close(&mut self) {
+        self.conversation.cancel_all();
+        self.session_generation.fetch_add(1, Ordering::SeqCst);
+        self.answer_task.take();
+        self.session_task.take();
+    }
+}
+
+fn merge_editor_reference(
+    mut references: Vec<AiReferenceHint>,
+    editor_reference: Option<AiReferenceHint>,
+) -> Vec<AiReferenceHint> {
+    let Some(editor_reference) = editor_reference else {
+        return references;
+    };
+    if let Some(reference) = references.iter_mut().find(|reference| {
+        reference.book_id == editor_reference.book_id
+            && reference.unit_id == editor_reference.unit_id
+    }) {
+        *reference = editor_reference;
+    }
+    references
+}
+
+fn validate_reference_request(
+    references: &[AiReferenceHint],
+    allowed_book_ids: &[String],
+) -> Result<()> {
+    if references.len() > MAX_SELECTED_REFERENCES {
+        bail!("一次最多引用 {MAX_SELECTED_REFERENCES} 个章节或页面");
+    }
+    let allowed = allowed_book_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    let mut frozen_bytes = 0usize;
+    for reference in references {
+        if !allowed.contains(reference.book_id.as_str()) {
+            bail!("引用的图书已不在当前窗口授权范围内");
+        }
+        validate_reference_locator(reference)?;
+        let locator_json = reference
+            .locator
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .context("无法序列化引用定位信息")?;
+        if !seen.insert((
+            reference.book_id.as_str(),
+            reference.unit_id.as_str(),
+            locator_json,
+        )) {
+            bail!("引用列表包含重复的章节或页面");
+        }
+        if let Some(text) = reference.frozen_text.as_ref() {
+            frozen_bytes = checked_reference_bytes(frozen_bytes, text.len())?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_reference_locator(reference: &AiReferenceHint) -> Result<()> {
+    let Some(locator) = reference.locator.as_ref() else {
+        return Ok(());
+    };
+    locator.validate().context("引用定位信息无效")?;
+    if locator.book_id != reference.book_id || locator.unit_id != reference.unit_id {
+        bail!("引用定位与图书或内容单元不一致");
+    }
+    if matches!(
+        locator.source.as_ref(),
+        Some(SourceLocator::OfficeRenderedPage { .. })
+    ) {
+        bail!("Office 增强预览页是可重建派生数据，不能作为 AI 引用定位");
+    }
+    Ok(())
+}
+
+fn checked_reference_bytes(current: usize, additional: usize) -> Result<usize> {
+    let total = current
+        .checked_add(additional)
+        .context("引用内容大小溢出")?;
+    if total > MAX_REFERENCE_TOTAL_BYTES {
+        bail!(
+            "所选引用内容总大小超过 {} KiB",
+            MAX_REFERENCE_TOTAL_BYTES / 1024
+        );
+    }
+    Ok(total)
+}
+
+fn capture_frozen_reference(reference: &AiReferenceHint) -> Result<Option<SelectionSnapshot>> {
+    let Some(text) = reference.frozen_text.as_ref() else {
+        return Ok(None);
+    };
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    let snapshot = SelectionSnapshot::capture(
+        reference.book_id.clone(),
+        reference.unit_id.clone(),
+        reference.revision.unwrap_or(0),
+        text.clone(),
+    )
+    .map_err(anyhow::Error::new)?;
+    let snapshot = match reference.locator.clone() {
+        Some(locator) => snapshot.with_locator(locator).map_err(anyhow::Error::new)?,
+        None => snapshot,
+    };
+    Ok(Some(snapshot))
+}
+
+fn validate_snapshot_payload(snapshots: &[SelectionSnapshot]) -> Result<()> {
+    if snapshots.len() > MAX_SELECTED_REFERENCES {
+        bail!("一次最多引用 {MAX_SELECTED_REFERENCES} 个章节或页面");
+    }
+    let mut text_bytes = 0usize;
+    for snapshot in snapshots {
+        text_bytes = checked_reference_bytes(text_bytes, snapshot.text.len())?;
+    }
+    let encoded_bytes = serde_json::to_vec(snapshots)
+        .context("无法计算引用快照大小")?
+        .len();
+    if encoded_bytes > MAX_REFERENCE_TOTAL_BYTES {
+        bail!(
+            "所选引用快照总大小超过 {} KiB",
+            MAX_REFERENCE_TOTAL_BYTES / 1024
+        );
+    }
+    Ok(())
+}
+
+async fn freeze_references(
+    services: Arc<AppServices>,
+    references: Vec<AiReferenceHint>,
+    allowed_book_ids: &[String],
+    cancellation: AgentCancellation,
+) -> Result<Vec<SelectionSnapshot>> {
+    ensure_reference_freeze_active(&cancellation)?;
+    validate_reference_request(&references, allowed_book_ids)?;
+    if references.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut slots = vec![None; references.len()];
+    let mut persisted = Vec::new();
+    let mut frozen_bytes = 0usize;
+    for (index, reference) in references.into_iter().enumerate() {
+        ensure_reference_freeze_active(&cancellation)?;
+        if reference.frozen_text.is_some() {
+            if let Some(snapshot) = capture_frozen_reference(&reference)? {
+                frozen_bytes = checked_reference_bytes(frozen_bytes, snapshot.text.len())?;
+                slots[index] = Some(snapshot);
+            }
+        } else {
+            persisted.push((index, reference));
+        }
+    }
+
+    if !persisted.is_empty() {
+        ensure_reference_freeze_active(&cancellation)?;
+        let read_cancellation = cancellation.clone();
+        let resolved = services
+            .spawn_library_read(move |library| {
+                ensure_reference_freeze_active(&read_cancellation)?;
+                let mut resolved = Vec::with_capacity(persisted.len());
+                let mut total_bytes = frozen_bytes;
+                for (index, reference) in persisted {
+                    ensure_reference_freeze_active(&read_cancellation)?;
+                    let document = library.document(&reference.book_id)?;
+                    let unit = document
+                        .units
+                        .iter()
+                        .find(|unit| unit.id == reference.unit_id)
+                        .context("引用的章节或页面已不存在")?;
+                    if let Some(unit_index) = reference.unit_index {
+                        let indexed = document
+                            .units
+                            .get(unit_index)
+                            .context("引用的内容单元序号已失效")?;
+                        if indexed.id != unit.id {
+                            bail!("引用的内容单元 ID 与序号不一致");
+                        }
+                    }
+                    validate_persisted_reference(&document, unit, &reference)?;
+                    let text = unit.plain_text();
+                    total_bytes = checked_reference_bytes(total_bytes, text.len())?;
+                    let snapshot = SelectionSnapshot::capture(
+                        reference.book_id,
+                        unit.id.clone(),
+                        unit.revision.get(),
+                        text,
+                    )
+                    .map_err(anyhow::Error::new)?;
+                    let snapshot = match reference.locator {
+                        Some(locator) => {
+                            snapshot.with_locator(locator).map_err(anyhow::Error::new)?
+                        }
+                        None => snapshot,
+                    };
+                    resolved.push((index, snapshot));
+                }
+                ensure_reference_freeze_active(&read_cancellation)?;
+                Ok(resolved)
+            })
+            .await
+            .context("引用快照任务已停止")??;
+        ensure_reference_freeze_active(&cancellation)?;
+        for (index, snapshot) in resolved {
+            slots[index] = Some(snapshot);
+        }
+    }
+
+    ensure_reference_freeze_active(&cancellation)?;
+    let snapshots = slots.into_iter().flatten().collect::<Vec<_>>();
+    validate_snapshot_payload(&snapshots)?;
+    ensure_reference_freeze_active(&cancellation)?;
+    Ok(snapshots)
+}
+
+fn ensure_reference_freeze_active(cancellation: &AgentCancellation) -> Result<()> {
+    if cancellation.is_cancelled() {
+        bail!("AI request was cancelled");
+    }
+    Ok(())
+}
+
+fn validate_persisted_reference(
+    document: &BookDocument,
+    unit: &moye_epub_editor::document::ContentUnit,
+    reference: &AiReferenceHint,
+) -> Result<()> {
+    if let Some(revision) = reference.revision
+        && revision != unit.revision.get()
+    {
+        bail!("引用的内容单元版本已失效");
+    }
+    if let Some(locator) = reference.locator.as_ref() {
+        document
+            .validate_locator(locator)
+            .context("引用定位已失效或超出内容范围")?;
+        if let Some(source) = locator.source.as_ref()
+            && unit.source_locator.as_ref() != Some(source)
+        {
+            bail!("引用的原始来源位置与当前内容单元不匹配");
+        }
+    }
+    Ok(())
+}
+
+fn thread_options(threads: Vec<ChatThread>) -> Vec<AiThreadOption> {
+    threads
+        .into_iter()
+        .map(|thread| AiThreadOption::new(thread.id, thread.title, thread.scope.book_ids))
+        .collect()
+}
+
+async fn load_ui_session_state(
+    services: Arc<AppServices>,
+    conversation: &AgentConversation,
+    session: Option<ChatSession>,
+    allowed_book_ids: &[String],
+) -> UiSessionState {
+    let active_thread_id = session
+        .as_ref()
+        .map(|session| session.thread.id.clone())
+        .or(conversation.selected_thread_id().await);
+    let fallback_thread = session.as_ref().map(|session| session.thread.clone());
+    let messages = match session {
+        Some(session) => match validated_restored_messages(services, session.clone()).await {
+            Ok(messages) => messages,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "cannot validate restored AI citations; restoring message text without sources"
+                );
+                let mut messages = restored_messages(session);
+                for message in &mut messages {
+                    message.sources.clear();
+                }
+                messages
+            }
+        },
+        None => Vec::new(),
+    };
+    let threads = match conversation.list_sessions(allowed_book_ids).await {
+        Ok(threads) => thread_options(threads),
+        Err(error) => {
+            tracing::warn!(%error, "cannot list AI sessions after selecting a session");
+            fallback_thread
+                .into_iter()
+                .map(|thread| AiThreadOption::new(thread.id, thread.title, thread.scope.book_ids))
+                .collect()
+        }
+    };
+    UiSessionState {
+        active_thread_id,
+        threads,
+        messages,
+    }
+}
+
+fn restored_messages(session: ChatSession) -> Vec<AiRestoredMessage> {
+    session
+        .messages
+        .into_iter()
+        .filter_map(|message| {
+            let role = match message.role {
+                ChatRole::User => AiRestoredRole::User,
+                ChatRole::Assistant => AiRestoredRole::Assistant,
+                ChatRole::System | ChatRole::Tool => return None,
+            };
+            // Persisted citation-row presence is the durable grounding fact. Record it
+            // before malformed, stale, or unauthorized links are filtered for display.
+            let source_status = match role {
+                AiRestoredRole::User => None,
+                AiRestoredRole::Assistant => Some(if message.citations.is_empty() {
+                    AgentAnswerSourceStatus::NoVerifiedSources
+                } else {
+                    AgentAnswerSourceStatus::VerifiedKnowledgeBaseSources
+                }),
+            };
+            Some(AiRestoredMessage {
+                role,
+                content: message.content,
+                sources: message
+                    .citations
+                    .into_iter()
+                    .filter_map(source_link_from_chat_citation)
+                    .collect(),
+                source_status,
+            })
+        })
+        .collect()
+}
+
+async fn validated_restored_messages(
+    services: Arc<AppServices>,
+    session: ChatSession,
+) -> Result<Vec<AiRestoredMessage>> {
+    let allowed_book_ids = session.thread.scope.book_ids.clone();
+    let messages = restored_messages(session);
+    services
+        .spawn_library_read(move |library| {
+            let allowed = allowed_book_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>();
+            let mut messages = messages;
+            for message in &mut messages {
+                message.sources.retain_mut(|source| {
+                    if !allowed.contains(source.book_id.as_str()) {
+                        return false;
+                    }
+                    let document = library.document(&source.book_id).ok();
+                    source.mark_restored_status(document.as_ref());
+                    true
+                });
+            }
+            Ok(messages)
+        })
+        .await
+        .context("恢复引用状态的任务已停止")?
+}
+
+async fn validate_live_sources(
+    services: Arc<AppServices>,
+    allowed_book_ids: Vec<String>,
+    sources: Vec<AiSourceLink>,
+) -> Result<Vec<AiSourceLink>> {
+    services
+        .spawn_library_read(move |library| {
+            let allowed = allowed_book_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>();
+            let mut validated = Vec::with_capacity(sources.len());
+            for mut source in sources {
+                if !allowed.contains(source.book_id.as_str()) {
+                    continue;
+                }
+                let document = library.document(&source.book_id).ok();
+                source.mark_current_status(document.as_ref());
+                validated.push(source);
+            }
+            Ok(validated)
+        })
+        .await
+        .context("校验引用状态的任务已停止")?
+}
+
+fn source_link_from_agent_citation(citation: AgentCitation) -> Option<AiSourceLink> {
+    if citation.locator.book_id != citation.book_id
+        || citation.locator.unit_id != citation.unit_id
+        || citation.locator.validate().is_err()
+        || matches!(
+            citation.locator.source.as_ref(),
+            Some(SourceLocator::OfficeRenderedPage { .. })
+        )
+    {
+        tracing::warn!(
+            citation_id = %citation.citation_id,
+            "discarding AI citation with an invalid or mismatched locator"
+        );
+        return None;
+    }
+    let selection_snapshot = citation.citation_id.starts_with("selection:");
+    Some(AiSourceLink {
+        citation_id: citation.citation_id,
+        book_id: citation.book_id,
+        unit_id: citation.unit_id,
+        unit_index: None,
+        document_revision: citation.document_revision,
+        unit_revision: citation.unit_revision,
+        locator: Some(citation.locator),
+        label: format!("{} · {}", citation.book_title, citation.unit_title),
+        quote: Some(citation.quote),
+        selection_snapshot,
+        stale: false,
+    })
+}
+
+fn source_link_from_chat_citation(citation: ChatCitation) -> Option<AiSourceLink> {
+    if citation.locator.validate().is_err()
+        || matches!(
+            citation.locator.source.as_ref(),
+            Some(SourceLocator::OfficeRenderedPage { .. })
+        )
+        || citation
+            .content_unit_id
+            .as_deref()
+            .is_some_and(|unit_id| unit_id != citation.locator.unit_id)
+    {
+        tracing::warn!(
+            citation_id = %citation.id,
+            "discarding persisted AI citation with an invalid or mismatched locator"
+        );
+        return None;
+    }
+    let selection_snapshot = citation.search_chunk_id.is_none();
+    Some(AiSourceLink {
+        citation_id: citation.id,
+        book_id: citation.locator.book_id.clone(),
+        unit_id: citation.locator.unit_id.clone(),
+        unit_index: None,
+        document_revision: citation.document_revision,
+        unit_revision: citation.unit_revision,
+        locator: Some(citation.locator),
+        label: "已保存的来源".to_string(),
+        quote: Some(citation.quote),
+        selection_snapshot,
+        stale: false,
+    })
+}
+
+fn friendly_agent_error(error: &str) -> String {
+    if error.contains("connection refused") || error.contains("failed to connect") {
+        "无法连接本地 Ollama。请确认 Ollama 已启动，并在 AI 设置中检查端点和模型；本应用不会代为启动服务。".to_string()
+    } else if error.contains("cancelled") {
+        "本次回答已取消。".to_string()
+    } else {
+        format!("AI 回答失败：{error}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use moye_epub_editor::document::{
+        Block, BlockDocument, BookDocument, ContentUnit, ContentUnitKind, DocumentLocator,
+        Revision, SourceKind,
+    };
+    use moye_epub_editor::{
+        chat::{ChatScope, ChatThread, StoredChatMessage},
+        library::LibraryStore,
+    };
+
+    fn reference(book_id: &str, unit_id: &str, index: usize) -> AiReferenceHint {
+        AiReferenceHint::chapter(book_id, unit_id, index, format!("Unit {index}"))
+    }
+
+    #[test]
+    fn explains_local_ollama_connection_failure() {
+        assert!(friendly_agent_error("connection refused").contains("Ollama"));
+    }
+
+    #[test]
+    fn editor_frozen_text_replaces_only_the_matching_selected_reference() {
+        let first = reference("book-a", "unit-1", 0);
+        let second = reference("book-a", "unit-2", 1);
+        let mut frozen = first.clone();
+        frozen.revision = Some(27);
+        frozen.frozen_text = Some("未保存的正文\nexact bytes".to_string());
+
+        let merged = merge_editor_reference(vec![first, second.clone()], Some(frozen.clone()));
+
+        assert_eq!(merged, vec![frozen.clone(), second]);
+        let snapshot = capture_frozen_reference(&merged[0]).unwrap().unwrap();
+        assert_eq!(snapshot.text, "未保存的正文\nexact bytes");
+        assert_eq!(snapshot.revision, 27);
+        assert!(snapshot.validate().is_ok());
+
+        let outside = reference("book-secret", "unit-x", 0);
+        assert_eq!(
+            merge_editor_reference(merged.clone(), Some(outside)),
+            merged
+        );
+    }
+
+    #[test]
+    fn controller_rejects_out_of_scope_duplicate_and_too_many_references() {
+        let allowed = vec!["book-a".to_string()];
+        assert!(validate_reference_request(&[reference("book-a", "unit-1", 0)], &allowed).is_ok());
+        assert!(
+            validate_reference_request(&[reference("book-secret", "unit-1", 0)], &allowed)
+                .unwrap_err()
+                .to_string()
+                .contains("授权范围")
+        );
+        let duplicate = reference("book-a", "unit-1", 0);
+        assert!(
+            validate_reference_request(&[duplicate.clone(), duplicate], &allowed)
+                .unwrap_err()
+                .to_string()
+                .contains("重复")
+        );
+
+        let too_many = (0..=MAX_SELECTED_REFERENCES)
+            .map(|index| reference("book-a", &format!("unit-{index}"), index))
+            .collect::<Vec<_>>();
+        assert!(
+            validate_reference_request(&too_many, &allowed)
+                .unwrap_err()
+                .to_string()
+                .contains("最多引用")
+        );
+    }
+
+    #[test]
+    fn controller_rejects_preview_only_and_mismatched_locators() {
+        let allowed = vec!["book-a".to_string()];
+        let mut preview_only = reference("book-a", "unit-1", 0);
+        preview_only.locator = Some(
+            DocumentLocator::unit("book-a", "unit-1")
+                .with_source(SourceLocator::office_rendered_page(1)),
+        );
+        assert!(
+            validate_reference_request(&[preview_only], &allowed)
+                .unwrap_err()
+                .to_string()
+                .contains("派生数据")
+        );
+
+        let mut source_locator = reference("book-a", "unit-1", 0);
+        source_locator.locator =
+            Some(DocumentLocator::unit("book-a", "unit-1").with_source(SourceLocator::pdf_page(1)));
+        assert!(validate_reference_request(&[source_locator], &allowed).is_ok());
+
+        let mut mismatched = reference("book-a", "unit-1", 0);
+        mismatched.locator = Some(DocumentLocator::unit("book-a", "unit-2"));
+        assert!(
+            validate_reference_request(&[mismatched], &allowed)
+                .unwrap_err()
+                .to_string()
+                .contains("不一致")
+        );
+    }
+
+    #[test]
+    fn live_and_persisted_citations_keep_only_valid_exact_locators() {
+        let locator =
+            DocumentLocator::unit("book-a", "unit-1").with_source(SourceLocator::pdf_page(2));
+        let live = source_link_from_agent_citation(AgentCitation {
+            citation_id: "passage:p-1".to_string(),
+            book_id: "book-a".to_string(),
+            book_title: "Book".to_string(),
+            unit_id: "unit-1".to_string(),
+            unit_title: "Unit".to_string(),
+            document_revision: Revision::new(1),
+            unit_revision: Revision::new(1),
+            quote: "evidence".to_string(),
+            locator: locator.clone(),
+        })
+        .expect("valid live citation");
+        assert_eq!(live.locator.as_ref(), Some(&locator));
+        assert!(!live.selection_snapshot);
+
+        let live_selection = source_link_from_agent_citation(AgentCitation {
+            citation_id: "selection:host-issued".to_string(),
+            book_id: "book-a".to_string(),
+            book_title: "Book".to_string(),
+            unit_id: "unit-1".to_string(),
+            unit_title: "Unit".to_string(),
+            document_revision: Revision::new(1),
+            unit_revision: Revision::new(1),
+            quote: "unsaved selection".to_string(),
+            locator: locator.clone(),
+        })
+        .expect("valid live selection citation");
+        assert!(live_selection.selection_snapshot);
+
+        let restored = source_link_from_chat_citation(ChatCitation {
+            id: "citation-1".to_string(),
+            content_unit_id: Some("unit-1".to_string()),
+            search_chunk_id: Some("p-1".to_string()),
+            document_revision: Revision::new(1),
+            unit_revision: Revision::new(1),
+            quote: "evidence".to_string(),
+            locator: locator.clone(),
+            created_at: 1,
+        })
+        .expect("valid persisted citation");
+        assert_eq!(restored.locator.as_ref(), Some(&locator));
+        assert!(!restored.selection_snapshot);
+
+        assert!(
+            source_link_from_agent_citation(AgentCitation {
+                citation_id: "passage:forged".to_string(),
+                book_id: "book-a".to_string(),
+                book_title: "Book".to_string(),
+                unit_id: "unit-2".to_string(),
+                unit_title: "Other".to_string(),
+                document_revision: Revision::new(1),
+                unit_revision: Revision::new(1),
+                quote: "forged".to_string(),
+                locator,
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn restored_source_status_uses_rows_before_ui_source_filtering() {
+        let thread_id = "thread-source-status".to_string();
+        let cited = StoredChatMessage {
+            id: "assistant-cited".to_string(),
+            thread_id: thread_id.clone(),
+            parent_id: None,
+            ordinal: 0,
+            role: ChatRole::Assistant,
+            content: "grounded answer".to_string(),
+            model: Some("mock".to_string()),
+            created_at: 1,
+            citations: vec![ChatCitation {
+                id: "citation-invalid-for-ui".to_string(),
+                content_unit_id: Some("unit-a".to_string()),
+                search_chunk_id: Some("chunk-a".to_string()),
+                document_revision: Revision::new(1),
+                unit_revision: Revision::new(1),
+                quote: "evidence".to_string(),
+                locator: DocumentLocator::unit("book-a", "different-unit"),
+                created_at: 1,
+            }],
+        };
+        let uncited = StoredChatMessage {
+            id: "assistant-uncited".to_string(),
+            thread_id: thread_id.clone(),
+            parent_id: Some(cited.id.clone()),
+            ordinal: 1,
+            role: ChatRole::Assistant,
+            content: "general answer".to_string(),
+            model: Some("mock".to_string()),
+            created_at: 2,
+            citations: Vec::new(),
+        };
+        let restored = restored_messages(ChatSession {
+            thread: ChatThread {
+                id: thread_id,
+                primary_book_id: None,
+                title: "Question".to_string(),
+                scope: ChatScope::default(),
+                window_kind: ChatWindowKind::Library,
+                created_at: 1,
+                updated_at: 2,
+            },
+            messages: vec![cited, uncited],
+        });
+
+        assert!(restored[0].sources.is_empty());
+        assert_eq!(
+            restored[0].source_status,
+            Some(AgentAnswerSourceStatus::VerifiedKnowledgeBaseSources),
+            "a persisted citation row must keep the answer grounded even when its UI link is rejected"
+        );
+        assert_eq!(
+            restored[1].source_status,
+            Some(AgentAnswerSourceStatus::NoVerifiedSources)
+        );
+    }
+
+    #[test]
+    fn persisted_reference_checks_current_revision_and_text_bounds() {
+        let unit = ContentUnit::new(
+            "unit-1",
+            ContentUnitKind::Chapter,
+            "One",
+            SourceKind::Markdown,
+            "body",
+            BlockDocument::new(vec![Block::paragraph("block-1", "body")]),
+        );
+        let mut document = BookDocument::created("book-a", "Book");
+        document.units.push(unit);
+        let unit = &document.units[0];
+
+        let mut reference = reference("book-a", "unit-1", 0);
+        reference.revision = Some(unit.revision.get());
+        reference.locator = Some(DocumentLocator::text("book-a", "unit-1", "block-1", 0, 4));
+        assert!(validate_persisted_reference(&document, unit, &reference).is_ok());
+
+        reference.revision = Some(unit.revision.get() + 1);
+        assert!(validate_persisted_reference(&document, unit, &reference).is_err());
+        reference.revision = Some(unit.revision.get());
+        reference.locator = Some(DocumentLocator::text("book-a", "unit-1", "block-1", 0, 99));
+        assert!(validate_persisted_reference(&document, unit, &reference).is_err());
+
+        reference.locator =
+            Some(DocumentLocator::unit("book-a", "unit-1").with_source(SourceLocator::pdf_page(1)));
+        assert!(
+            validate_persisted_reference(&document, unit, &reference)
+                .unwrap_err()
+                .to_string()
+                .contains("原始来源位置")
+        );
+    }
+
+    #[test]
+    fn combined_snapshot_payload_has_a_hard_total_byte_limit() {
+        let within = vec![
+            SelectionSnapshot::capture("book-a", "unit-1", 1, "a".repeat(1024)).unwrap(),
+            SelectionSnapshot::capture("book-a", "unit-2", 2, "b".repeat(1024)).unwrap(),
+        ];
+        assert!(validate_snapshot_payload(&within).is_ok());
+
+        let oversized = vec![
+            SelectionSnapshot::capture(
+                "book-a",
+                "unit-large",
+                3,
+                "x".repeat(MAX_REFERENCE_TOTAL_BYTES + 1),
+            )
+            .unwrap(),
+        ];
+        assert!(
+            validate_snapshot_payload(&oversized)
+                .unwrap_err()
+                .to_string()
+                .contains("总大小")
+        );
+    }
+
+    #[test]
+    fn reference_freeze_stops_when_the_prepared_request_is_cancelled() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let services = Arc::new(AppServices::open(temp.path()).expect("open services"));
+        let runtime = services.runtime();
+        let cancellation = AgentCancellation::default();
+        cancellation.cancel();
+
+        let error = runtime
+            .block_on(freeze_references(services, Vec::new(), &[], cancellation))
+            .expect_err("cancelled freeze must stop before reading the library");
+        assert!(error.to_string().contains("cancelled"));
+    }
+
+    #[test]
+    fn restored_unsaved_selection_is_stale_when_current_ast_cannot_prove_it() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut library = LibraryStore::load_from(temp.path().to_path_buf()).expect("open library");
+        let record = library
+            .create_book("Selection restore", "Author")
+            .expect("create book");
+        let document = library.document(&record.id).expect("load document");
+        let unit = document.units.first().expect("default chapter");
+        let locator = match unit.source_locator.clone() {
+            Some(source) => DocumentLocator::unit(&document.id, &unit.id).with_source(source),
+            None => DocumentLocator::unit(&document.id, &unit.id),
+        };
+        let session = ChatSession {
+            thread: ChatThread {
+                id: "thread-selection".to_string(),
+                primary_book_id: None,
+                title: "Question".to_string(),
+                scope: ChatScope::new([document.id.clone()]).unwrap(),
+                window_kind: ChatWindowKind::Library,
+                created_at: 1,
+                updated_at: 1,
+            },
+            messages: vec![StoredChatMessage {
+                id: "assistant-selection".to_string(),
+                thread_id: "thread-selection".to_string(),
+                parent_id: None,
+                ordinal: 0,
+                role: ChatRole::Assistant,
+                content: "Answer".to_string(),
+                model: Some("mock".to_string()),
+                created_at: 1,
+                citations: vec![ChatCitation {
+                    id: "stored-selection".to_string(),
+                    content_unit_id: Some(unit.id.clone()),
+                    search_chunk_id: None,
+                    document_revision: document.revision,
+                    unit_revision: unit.revision,
+                    quote: "unsaved text absent from the current AST".to_string(),
+                    locator,
+                    created_at: 1,
+                }],
+            }],
+        };
+        drop(library);
+        let services = Arc::new(AppServices::open(temp.path()).expect("open services"));
+        let runtime = services.runtime();
+
+        let restored = runtime
+            .block_on(validated_restored_messages(services, session))
+            .expect("restore messages");
+        let source = &restored[0].sources[0];
+        assert!(source.selection_snapshot);
+        assert!(source.stale);
+    }
+}

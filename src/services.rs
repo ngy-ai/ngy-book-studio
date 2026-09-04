@@ -1,0 +1,2930 @@
+//! Process-level service composition.
+//!
+//! `AppServices` owns the durable store, parsers, model provider, search,
+//! conversations and background workers. UI code receives cloneable handles
+//! and schedules blocking library operations through [`AppServices::spawn_library`].
+
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use anyhow::{Context as _, Result, ensure};
+use serde::{Deserialize, Serialize};
+
+#[cfg(target_os = "windows")]
+use crate::office_visual::{OFFICE_ENHANCED_RENDERER_NAME, OfficeEnhancedRenderer};
+#[cfg(target_os = "windows")]
+use crate::windows_pdf_renderer::WindowsPdfRenderer;
+use crate::{
+    ai::{
+        DEFAULT_AI_REQUEST_TIMEOUT_SECS, DEFAULT_OLLAMA_OPENAI_BASE_URL, ModelInfo,
+        OpenAiCompatibleProvider, OpenAiHttpProvider, ProviderConfig, normalize_provider_base_url,
+    },
+    chat::ChatRepository,
+    credentials::{CredentialStore, SystemCredentialStore},
+    db,
+    formats::FormatRegistry,
+    indexing::{IndexingCoordinator, IndexingJobStatus, IndexingModelConfig},
+    library::{LibraryStore, reclaim_unreferenced_blobs},
+    office_com::{OfficeComWorker, OfficeEnhancer},
+    preview::{
+        PreviewFuture, RenderProfile, RenderedVisualPage, RendererDescriptor, SqliteVisualJobStore,
+        StructuralPngRenderer, VisualAssetPayload, VisualDocumentSource, VisualJobCoordinator,
+        VisualJobState, VisualPageSink, VisualRenderer, VisualSourcePayload,
+        office_preview_unit_id,
+    },
+    runtime::IoRuntime,
+    search::SearchService,
+    storage::{BlobKey, BlobPublicationLock, BlobStore, LocalBlobStore},
+};
+
+const OBJECT_DIRECTORY: &str = "objects";
+const PROVIDER_SETTINGS_KEY: &str = "ai.openai_compatible.provider.v1";
+const MAX_MODEL_NAME_CHARS: usize = 256;
+#[cfg(target_os = "windows")]
+const MAX_LOADED_OFFICE_PAGES: usize = 20_000;
+#[cfg(target_os = "windows")]
+const MAX_LOADED_OFFICE_PAGE_BYTES: u64 = 512 * 1024 * 1024;
+
+pub const DEFAULT_CHAT_MODEL: &str = "qwen3.5:0.8b";
+pub const DEFAULT_EMBEDDING_MODEL: &str = "qwen3-embedding:0.6b";
+pub const DEFAULT_VISION_MODEL: &str = "qwen3.5:0.8b";
+
+/// Persisted provider choices. Secrets intentionally cannot be represented by
+/// this type; API keys live behind [`CredentialStore`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderSettings {
+    pub base_url: String,
+    pub chat_model: String,
+    pub embedding_model: String,
+    pub vision_model: String,
+    pub remote_content_confirmed: bool,
+    pub allow_insecure_remote_http: bool,
+    /// Canonical endpoint for which the content and transport acknowledgements
+    /// were made. Changing the endpoint invalidates both booleans.
+    pub confirmed_remote_endpoint: String,
+    pub request_timeout_secs: u64,
+}
+
+impl Default for ProviderSettings {
+    fn default() -> Self {
+        Self {
+            base_url: DEFAULT_OLLAMA_OPENAI_BASE_URL.to_string(),
+            chat_model: DEFAULT_CHAT_MODEL.to_string(),
+            embedding_model: DEFAULT_EMBEDDING_MODEL.to_string(),
+            vision_model: DEFAULT_VISION_MODEL.to_string(),
+            remote_content_confirmed: false,
+            allow_insecure_remote_http: false,
+            confirmed_remote_endpoint: String::new(),
+            request_timeout_secs: DEFAULT_AI_REQUEST_TIMEOUT_SECS,
+        }
+    }
+}
+
+impl ProviderSettings {
+    pub fn validate(&self) -> Result<()> {
+        validate_model_name("chat", &self.chat_model)?;
+        validate_model_name("embedding", &self.embedding_model)?;
+        validate_model_name("vision", &self.vision_model)?;
+        self.provider_config(None).validated_base_url()?;
+        Ok(())
+    }
+
+    fn provider_config(&self, api_key: Option<String>) -> ProviderConfig {
+        let confirmation_matches = normalize_provider_base_url(&self.base_url)
+            .ok()
+            .is_some_and(|url| self.confirmed_remote_endpoint == url.as_str());
+        ProviderConfig {
+            base_url: self.base_url.clone(),
+            api_key,
+            remote_content_confirmed: self.remote_content_confirmed && confirmation_matches,
+            allow_insecure_remote_http: self.allow_insecure_remote_http && confirmation_matches,
+            request_timeout_secs: self.request_timeout_secs,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ApiKeyUpdate {
+    Keep,
+    Set(String),
+    Delete,
+}
+
+/// Stable, UI-facing state for all persisted derivative work. Keeping this
+/// type in the service layer prevents GPUI code from depending on database
+/// rows or renderer-specific cursor JSON.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackgroundJobStatus {
+    Queued,
+    Running,
+    Paused,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackgroundJobAction {
+    Pause,
+    Resume,
+    Retry,
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BackgroundJobProgress {
+    pub completed: usize,
+    pub total: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackgroundJobSnapshot {
+    pub id: String,
+    pub book_id: String,
+    /// Foreign key into `book_sources`. `None` for legacy tasks created before
+    /// sources became first-class. The details UI uses this to look up the
+    /// owning source kind without exposing raw identifiers beyond the service
+    /// layer.
+    pub source_id: Option<String>,
+    pub kind: String,
+    pub status: BackgroundJobStatus,
+    pub pause_requested: bool,
+    pub cancel_requested: bool,
+    pub attempts: u32,
+    pub progress: BackgroundJobProgress,
+    pub error: Option<String>,
+    /// Unix seconds (UTC) — populated by the service layer so the UI can
+    /// render a stable local timestamp without re-querying the database.
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub started_at: Option<u64>,
+    pub finished_at: Option<u64>,
+    /// Raw renderer/provider cursor JSON. Only kept for `Failed` jobs and
+    /// for `visual_render` jobs so users can see which renderer profile and
+    /// units were used; otherwise the cursor can be very large and noisy.
+    pub cursor_json: Option<String>,
+}
+
+/// A verified Office-enhanced page loaded from the managed object store.
+///
+/// Object keys and filesystem paths deliberately stay private to the service
+/// layer; callers receive only stable document coordinates and owned bytes.
+#[cfg(target_os = "windows")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OfficeEnhancedPage {
+    pub file_name: String,
+    pub media_type: String,
+    pub bytes: Vec<u8>,
+    pub content_unit_id: Option<String>,
+    pub locator: crate::document::DocumentLocator,
+}
+
+struct AiServices {
+    settings: ProviderSettings,
+    provider: Arc<dyn OpenAiCompatibleProvider>,
+    search: Arc<SearchService>,
+}
+
+impl std::fmt::Debug for AiServices {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AiServices")
+            .field("settings", &self.settings)
+            .field("search", &self.search)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Result of a shared library mutation together with the exact in-memory
+/// projection published by that mutation.
+#[derive(Debug)]
+pub struct LibraryMutation<T> {
+    pub value: T,
+    pub snapshot: LibraryStore,
+    pub generation: u64,
+}
+
+/// FIFO admission for every mutation of the process-level library snapshot.
+///
+/// `spawn_blocking` does not promise that jobs begin in submission order. A
+/// plain mutex therefore lets a later UI request commit before an earlier one
+/// and then be overwritten by it. Tickets are assigned and queued
+/// synchronously at the API boundary. A single asynchronous dispatcher grants
+/// exactly one turn at a time, so requests waiting for their turn consume
+/// neither Tokio core threads nor blocking-pool threads.
+#[derive(Debug)]
+struct LibraryMutationQueue {
+    next_ticket: AtomicU64,
+    requests: tokio::sync::mpsc::UnboundedSender<LibraryMutationRequest>,
+}
+
+impl LibraryMutationQueue {
+    fn new(runtime: &tokio::runtime::Handle) -> Self {
+        let (requests, receiver) = tokio::sync::mpsc::unbounded_channel();
+        runtime.spawn(run_library_mutation_turnstile(receiver));
+        Self {
+            next_ticket: AtomicU64::new(0),
+            requests,
+        }
+    }
+
+    fn reserve(&self) -> LibraryMutationReservation {
+        let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
+        let (ready, turn) = tokio::sync::oneshot::channel();
+        if let Err(stopped) = self.requests.send(LibraryMutationRequest { ticket, ready }) {
+            // Closing the returned sender makes `enter` report a useful error
+            // instead of leaving an unresolvable reservation behind.
+            drop(stopped.0.ready);
+        }
+        LibraryMutationReservation { ticket, turn }
+    }
+}
+
+#[derive(Debug)]
+struct LibraryMutationRequest {
+    ticket: u64,
+    ready: tokio::sync::oneshot::Sender<LibraryMutationTurn>,
+}
+
+#[derive(Debug)]
+struct LibraryMutationReservation {
+    ticket: u64,
+    turn: tokio::sync::oneshot::Receiver<LibraryMutationTurn>,
+}
+
+impl LibraryMutationReservation {
+    async fn enter(self) -> Result<LibraryMutationTurn> {
+        self.turn.await.with_context(|| {
+            format!(
+                "library mutation turnstile stopped before ticket {} was admitted",
+                self.ticket
+            )
+        })
+    }
+}
+
+#[derive(Debug)]
+struct LibraryMutationTurn {
+    completed: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Drop for LibraryMutationTurn {
+    fn drop(&mut self) {
+        if let Some(completed) = self.completed.take() {
+            let _ = completed.send(());
+        }
+    }
+}
+
+async fn run_library_mutation_turnstile(
+    mut requests: tokio::sync::mpsc::UnboundedReceiver<LibraryMutationRequest>,
+) {
+    let mut next_ticket = 0_u64;
+    let mut pending = BTreeMap::new();
+
+    while let Some(request) = requests.recv().await {
+        let replaced = pending.insert(request.ticket, request.ready);
+        debug_assert!(replaced.is_none(), "library mutation ticket was reused");
+
+        while let Some(ready) = pending.remove(&next_ticket) {
+            next_ticket = next_ticket.wrapping_add(1);
+            let (completed, completion) = tokio::sync::oneshot::channel();
+            let turn = LibraryMutationTurn {
+                completed: Some(completed),
+            };
+
+            // A request may be explicitly aborted while queued. In that case
+            // sending the turn returns it to us; dropping it releases the
+            // dispatcher immediately and does not leave a ticket-sized hole.
+            if ready.send(turn).is_ok() {
+                let _ = completion.await;
+            }
+        }
+    }
+}
+
+/// Shared application services. Construct once and pass an `Arc<AppServices>`
+/// to windows. No method that performs SQLite or document work runs it on the
+/// calling (GPUI) thread.
+pub struct AppServices {
+    data_dir: PathBuf,
+    db_path: PathBuf,
+    library: Arc<Mutex<LibraryStore>>,
+    library_generation: Arc<AtomicU64>,
+    library_mutations: Arc<LibraryMutationQueue>,
+    blobs: Arc<LocalBlobStore>,
+    blob_publication: BlobPublicationLock,
+    formats: Arc<FormatRegistry>,
+    chat: ChatRepository,
+    credentials: Arc<dyn CredentialStore>,
+    ai: RwLock<AiServices>,
+    office: Arc<dyn OfficeEnhancer>,
+    indexing: Arc<IndexingCoordinator>,
+    visual_jobs: RwLock<Option<Arc<VisualJobCoordinator>>>,
+    visual_renderer_descriptors: RwLock<Vec<RendererDescriptor>>,
+    runtime: IoRuntime,
+}
+
+impl std::fmt::Debug for AppServices {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AppServices")
+            .field("data_dir", &self.data_dir)
+            .field("db_path", &self.db_path)
+            .field("formats", &self.formats)
+            .field("ai", &self.ai)
+            .field("indexing", &self.indexing)
+            .field("has_visual_jobs", &self.visual_jobs().is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl AppServices {
+    pub fn open(data_dir: impl Into<PathBuf>) -> Result<Self> {
+        Self::open_with_credentials(data_dir, Arc::new(SystemCredentialStore))
+    }
+
+    pub fn open_with_credentials(
+        data_dir: impl Into<PathBuf>,
+        credentials: Arc<dyn CredentialStore>,
+    ) -> Result<Self> {
+        let requested_data_dir = data_dir.into();
+        let runtime = IoRuntime::default();
+        let library =
+            LibraryStore::load_from_with_runtime(requested_data_dir.clone(), runtime.clone())?;
+        let data_dir = fs::canonicalize(&requested_data_dir).with_context(|| {
+            format!(
+                "failed to resolve application data directory {}",
+                requested_data_dir.display()
+            )
+        })?;
+        let db_path = data_dir.join(db::DATABASE_FILE);
+        let blobs = Arc::new(LocalBlobStore::new(data_dir.join(OBJECT_DIRECTORY))?);
+        let formats = Arc::new(FormatRegistry::with_builtin_importers());
+        let blob_publication = library.blob_publication_lock();
+        let library = Arc::new(Mutex::new(library));
+        let library_generation = Arc::new(AtomicU64::new(0));
+        let library_mutations = Arc::new(LibraryMutationQueue::new(&runtime.handle()));
+        let chat = ChatRepository::new(db_path.clone(), runtime.clone());
+        let settings = load_provider_settings(&db_path)?;
+        let api_key = credentials.api_key(&settings.base_url)?;
+        let ai = build_ai_services(&db_path, settings, api_key)?;
+        let office: Arc<dyn OfficeEnhancer> = Arc::new(OfficeComWorker::start()?);
+        let mut visual_renderers: Vec<Arc<dyn VisualRenderer>> =
+            vec![Arc::new(StructuralPngRenderer)];
+        #[cfg(target_os = "windows")]
+        visual_renderers.push(Arc::new(WindowsPdfRenderer));
+        #[cfg(target_os = "windows")]
+        visual_renderers.push(Arc::new(OfficeEnhancedRenderer::new(Arc::clone(&office))));
+        let visual_job_store = Arc::new(SqliteVisualJobStore::new(&db_path));
+        let renderer_descriptors = visual_renderers
+            .iter()
+            .map(|renderer| renderer.descriptor())
+            .collect::<Vec<_>>();
+        // Reconcile before starting the model worker so stale SVG pages can
+        // never race a requeued vision job during startup. The same gate used
+        // by every object publisher spans the reference-removal transaction;
+        // stale page bytes are then rechecked and reclaimed before any worker
+        // can publish or consume a replacement.
+        let reconciliation = {
+            let publication_guard = runtime.block_on(blob_publication.acquire());
+            let reconciliation = visual_job_store
+                .reconcile_registered_renderers(&renderer_descriptors, unix_timestamp()?)?;
+            drop(publication_guard);
+            reconciliation
+        };
+        if reconciliation.changed_sources != 0 {
+            tracing::info!(
+                changed_sources = reconciliation.changed_sources,
+                "已按当前 renderer/profile 重建视觉派生任务"
+            );
+        }
+        runtime.block_on(reclaim_unreferenced_blobs(
+            &db_path,
+            &blobs,
+            &blob_publication,
+            reconciliation.unreferenced_blobs,
+            "过期视觉页面对象",
+        ));
+        let indexing_blobs: Arc<dyn BlobStore> = blobs.clone();
+        let indexing_models = indexing_model_config(&ai.settings)?;
+        let indexing = IndexingCoordinator::start(
+            runtime.handle(),
+            &db_path,
+            indexing_blobs,
+            Arc::clone(&ai.provider),
+            indexing_models,
+        )?;
+
+        let source: Arc<dyn VisualDocumentSource> = Arc::new(LibraryVisualDocumentSource {
+            library: Arc::clone(&library),
+        });
+        let sink: Arc<dyn VisualPageSink> = Arc::new(LocalVisualPageSink {
+            db_path: db_path.clone(),
+            blobs: Arc::clone(&blobs),
+            blob_publication: blob_publication.clone(),
+            indexing: Arc::clone(&indexing),
+        });
+        let visual_jobs = VisualJobCoordinator::new(
+            runtime.handle(),
+            visual_job_store,
+            source,
+            sink,
+            visual_renderers,
+        )?;
+
+        Ok(Self {
+            data_dir,
+            db_path,
+            library,
+            library_generation,
+            library_mutations,
+            blobs,
+            blob_publication,
+            formats,
+            chat,
+            credentials,
+            ai: RwLock::new(ai),
+            office,
+            indexing,
+            visual_jobs: RwLock::new(Some(Arc::new(visual_jobs))),
+            visual_renderer_descriptors: RwLock::new(renderer_descriptors),
+            runtime,
+        })
+    }
+
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    pub fn database_path(&self) -> &Path {
+        &self.db_path
+    }
+
+    pub fn runtime(&self) -> IoRuntime {
+        self.runtime.clone()
+    }
+
+    pub fn blob_store(&self) -> Arc<LocalBlobStore> {
+        Arc::clone(&self.blobs)
+    }
+
+    pub fn format_registry(&self) -> Arc<FormatRegistry> {
+        Arc::clone(&self.formats)
+    }
+
+    pub fn chat(&self) -> ChatRepository {
+        self.chat.clone()
+    }
+
+    /// Returns a current library snapshot for constructing a window. Window
+    /// code should still use the service methods for long-running mutations;
+    /// this clone is only the existing UI's initial, local view model.
+    pub fn library_snapshot(&self) -> Result<LibraryStore> {
+        self.library
+            .lock()
+            .map_err(|_| anyhow::anyhow!("library service lock is poisoned"))
+            .map(|library| library.clone())
+    }
+
+    /// Monotonic sequence assigned to successful mutations of the shared
+    /// in-memory library projection. It lets windows discard a delayed older
+    /// completion without ever taking the library mutex on the GPUI thread.
+    pub fn library_generation(&self) -> u64 {
+        self.library_generation.load(Ordering::Acquire)
+    }
+
+    pub fn provider_settings(&self) -> Result<ProviderSettings> {
+        Ok(self
+            .ai
+            .read()
+            .map_err(|_| anyhow::anyhow!("AI service lock is poisoned"))?
+            .settings
+            .clone())
+    }
+
+    pub fn provider(&self) -> Result<Arc<dyn OpenAiCompatibleProvider>> {
+        Ok(Arc::clone(
+            &self
+                .ai
+                .read()
+                .map_err(|_| anyhow::anyhow!("AI service lock is poisoned"))?
+                .provider,
+        ))
+    }
+
+    pub fn search(&self) -> Result<Arc<SearchService>> {
+        Ok(Arc::clone(
+            &self
+                .ai
+                .read()
+                .map_err(|_| anyhow::anyhow!("AI service lock is poisoned"))?
+                .search,
+        ))
+    }
+
+    pub fn office_enhancer(&self) -> Arc<dyn OfficeEnhancer> {
+        Arc::clone(&self.office)
+    }
+
+    pub fn indexing(&self) -> Arc<IndexingCoordinator> {
+        Arc::clone(&self.indexing)
+    }
+
+    pub fn visual_jobs(&self) -> Option<Arc<VisualJobCoordinator>> {
+        self.visual_jobs
+            .read()
+            .ok()
+            .and_then(|coordinator| coordinator.as_ref().map(Arc::clone))
+    }
+
+    /// Runs synchronous LibraryStore work away from GPUI and Tokio core
+    /// workers. The returned handle belongs to the dedicated application
+    /// runtime and may be awaited from a GPUI task.
+    pub fn spawn_library<T, F>(&self, operation: F) -> tokio::task::JoinHandle<Result<T>>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut LibraryStore) -> Result<T> + Send + 'static,
+    {
+        let library = Arc::clone(&self.library);
+        let library_generation = Arc::clone(&self.library_generation);
+        let mutation_turn = self.library_mutations.reserve();
+        let indexing = Arc::clone(&self.indexing);
+        self.runtime.handle().spawn(async move {
+            let turn = mutation_turn.enter().await?;
+            tokio::task::spawn_blocking(move || {
+                let _turn = turn;
+                let mut library = library
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("library service lock is poisoned"))?;
+                let result = operation(&mut library);
+                if result.is_ok() {
+                    library_generation.fetch_add(1, Ordering::AcqRel);
+                    indexing.wake();
+                }
+                result
+            })
+            .await
+            .context("library mutation worker stopped")?
+        })
+    }
+
+    /// Runs a mutation and captures the resulting projection while the same
+    /// mutex guard is still held. The generation reflects commit order, so a
+    /// UI can merge only monotonically newer completions even when async tasks
+    /// finish their GPUI callbacks out of order.
+    pub fn spawn_library_projected<T, F>(
+        &self,
+        operation: F,
+    ) -> tokio::task::JoinHandle<Result<LibraryMutation<T>>>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut LibraryStore) -> Result<T> + Send + 'static,
+    {
+        let library = Arc::clone(&self.library);
+        let library_generation = Arc::clone(&self.library_generation);
+        let mutation_turn = self.library_mutations.reserve();
+        let indexing = Arc::clone(&self.indexing);
+        self.runtime.handle().spawn(async move {
+            let turn = mutation_turn.enter().await?;
+            tokio::task::spawn_blocking(move || {
+                let _turn = turn;
+                let mut library = library
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("library service lock is poisoned"))?;
+                let value = operation(&mut library)?;
+                let generation = library_generation.fetch_add(1, Ordering::AcqRel) + 1;
+                let snapshot = library.clone();
+                drop(library);
+                indexing.wake();
+                Ok(LibraryMutation {
+                    value,
+                    snapshot,
+                    generation,
+                })
+            })
+            .await
+            .context("projected library mutation worker stopped")?
+        })
+    }
+
+    /// Runs a read-only LibraryStore operation away from GPUI and Tokio core
+    /// workers. The in-memory projection is cloned before the operation so a
+    /// long media read cannot hold the mutation lock. Unlike
+    /// [`Self::spawn_library`], successful reads do not wake the indexing
+    /// coordinator; WebView range requests therefore cannot turn playback
+    /// into an indexing wake storm.
+    pub fn spawn_library_read<T, F>(&self, operation: F) -> tokio::task::JoinHandle<Result<T>>
+    where
+        T: Send + 'static,
+        F: FnOnce(&LibraryStore) -> Result<T> + Send + 'static,
+    {
+        let library = Arc::clone(&self.library);
+        self.runtime.handle().spawn_blocking(move || {
+            let library = library
+                .lock()
+                .map_err(|_| anyhow::anyhow!("library service lock is poisoned"))?
+                .clone();
+            operation(&library)
+        })
+    }
+
+    /// Persists non-secret model settings and updates the API key in the
+    /// credential backend. Both storage calls run on the I/O runtime.
+    pub async fn configure_provider(
+        &self,
+        settings: ProviderSettings,
+        api_key: ApiKeyUpdate,
+    ) -> Result<()> {
+        settings.validate()?;
+        let indexing_models = indexing_model_config(&settings)?;
+        let previous_settings = self.provider_settings()?;
+        let db_path = self.db_path.clone();
+        let credentials = Arc::clone(&self.credentials);
+        let settings_for_worker = settings.clone();
+        let (next, previous_key) = self
+            .runtime
+            .handle()
+            .spawn_blocking(move || {
+                let settings = settings_for_worker;
+                let previous_key = credentials.api_key(&settings.base_url)?;
+                let next_key = match &api_key {
+                    ApiKeyUpdate::Keep => previous_key.clone(),
+                    ApiKeyUpdate::Set(value) => {
+                        ensure!(!value.is_empty(), "API key cannot be empty");
+                        Some(value.clone())
+                    }
+                    ApiKeyUpdate::Delete => None,
+                };
+                let services = build_ai_services(&db_path, settings.clone(), next_key)?;
+
+                match &api_key {
+                    ApiKeyUpdate::Keep => {}
+                    ApiKeyUpdate::Set(value) => {
+                        credentials.set_api_key(&settings.base_url, value)?;
+                    }
+                    ApiKeyUpdate::Delete => {
+                        credentials.delete_api_key(&settings.base_url)?;
+                    }
+                }
+                if let Err(error) = save_provider_settings(&db_path, &settings) {
+                    let rollback = match previous_key {
+                        Some(previous) => credentials.set_api_key(&settings.base_url, &previous),
+                        None => credentials.delete_api_key(&settings.base_url),
+                    };
+                    if let Err(rollback_error) = rollback {
+                        return Err(error.context(format!(
+                            "credential rollback also failed: {rollback_error:#}"
+                        )));
+                    }
+                    return Err(error);
+                }
+                Ok((services, previous_key))
+            })
+            .await
+            .context("AI settings worker stopped")??;
+        let provider = Arc::clone(&next.provider);
+        if let Err(error) = self
+            .indexing
+            .reconfigure(provider, indexing_models)
+            .await
+            .context("failed to reconfigure derived indexing")
+        {
+            let rollback_db_path = self.db_path.clone();
+            let rollback_credentials = Arc::clone(&self.credentials);
+            let rollback_endpoint = settings.base_url.clone();
+            let rollback = self
+                .runtime
+                .handle()
+                .spawn_blocking(move || {
+                    let settings_result =
+                        save_provider_settings(&rollback_db_path, &previous_settings);
+                    let credential_result = match previous_key {
+                        Some(previous) => {
+                            rollback_credentials.set_api_key(&rollback_endpoint, &previous)
+                        }
+                        None => rollback_credentials.delete_api_key(&rollback_endpoint),
+                    };
+                    match (settings_result, credential_result) {
+                        (Ok(()), Ok(())) => Ok(()),
+                        (Err(settings_error), Ok(())) => Err(settings_error),
+                        (Ok(()), Err(credential_error)) => Err(credential_error),
+                        (Err(settings_error), Err(credential_error)) => Err(settings_error
+                            .context(format!(
+                                "credential rollback also failed: {credential_error:#}"
+                            ))),
+                    }
+                })
+                .await
+                .context("AI settings rollback worker stopped")?;
+            if let Err(rollback_error) = rollback {
+                return Err(error.context(format!(
+                    "persisted AI settings rollback also failed: {rollback_error:#}"
+                )));
+            }
+            return Err(error);
+        }
+
+        // The persisted settings and all derived job contracts now agree.
+        // Recovering a poisoned whole-value lock avoids reporting a failure
+        // after those durable commit points have already succeeded.
+        let mut ai = self.ai.write().unwrap_or_else(|error| error.into_inner());
+        *ai = next;
+        drop(ai);
+        self.ai.clear_poison();
+        Ok(())
+    }
+
+    /// Queries `/v1/models` using the settings currently entered in the UI
+    /// without persisting them or replacing the active provider. Credential
+    /// lookup and provider construction stay off the GPUI thread, while the
+    /// HTTP request always runs on the application's Tokio runtime.
+    pub async fn probe_provider_models(
+        &self,
+        settings: ProviderSettings,
+        api_key: ApiKeyUpdate,
+    ) -> Result<Vec<ModelInfo>> {
+        let credentials = Arc::clone(&self.credentials);
+        let provider = self
+            .runtime
+            .handle()
+            .spawn_blocking(move || {
+                settings.validate()?;
+                let api_key = match api_key {
+                    ApiKeyUpdate::Keep => credentials.api_key(&settings.base_url)?,
+                    ApiKeyUpdate::Set(value) => {
+                        ensure!(!value.is_empty(), "API key cannot be empty");
+                        Some(value)
+                    }
+                    ApiKeyUpdate::Delete => None,
+                };
+                OpenAiHttpProvider::new(settings.provider_config(api_key))
+            })
+            .await
+            .context("AI provider probe setup worker stopped")??;
+
+        let provider: Arc<dyn OpenAiCompatibleProvider> = Arc::new(provider);
+        self.runtime
+            .spawn(async move { provider.models().await })
+            .await
+            .context("AI model probe worker stopped")?
+    }
+
+    /// Replaces the structural renderer coordinator with an explicitly
+    /// supplied renderer set (for example a PDF.js or Office-enhanced worker).
+    /// Existing in-flight jobs must be allowed to finish or be cancelled first.
+    pub fn replace_visual_renderers(
+        &self,
+        source: Arc<dyn VisualDocumentSource>,
+        sink: Arc<dyn VisualPageSink>,
+        renderers: Vec<Arc<dyn VisualRenderer>>,
+    ) -> Result<Arc<VisualJobCoordinator>> {
+        let descriptors = renderers
+            .iter()
+            .map(|renderer| renderer.descriptor())
+            .collect::<Vec<_>>();
+        let coordinator = Arc::new(VisualJobCoordinator::new(
+            self.runtime.handle(),
+            Arc::new(SqliteVisualJobStore::new(&self.db_path)),
+            source,
+            sink,
+            renderers,
+        )?);
+        let mut current = self
+            .visual_jobs
+            .write()
+            .map_err(|_| anyhow::anyhow!("visual job service lock is poisoned"))?;
+        if let Some(existing) = current.as_ref() {
+            ensure!(
+                Arc::strong_count(existing) == 1,
+                "visual coordinator is in use; cancel or release its jobs before replacing it"
+            );
+        }
+        *current = Some(Arc::clone(&coordinator));
+        *self
+            .visual_renderer_descriptors
+            .write()
+            .map_err(|_| anyhow::anyhow!("visual renderer descriptor lock is poisoned"))? =
+            descriptors;
+        Ok(coordinator)
+    }
+}
+
+impl AppServices {
+    /// Returns the durable per-book opt-in. Absence is deliberately equivalent
+    /// to disabled so importing an Office document never starts COM silently.
+    #[cfg(target_os = "windows")]
+    pub async fn office_enhancement_enabled(&self, book_id: String) -> Result<bool> {
+        ensure!(!book_id.trim().is_empty(), "图书 ID 不能为空");
+        let db_path = self.db_path.clone();
+        self.runtime
+            .handle()
+            .spawn_blocking(move || {
+                db::office_enhancements::is_enabled(&db::open_conn(&db_path)?, &book_id)
+            })
+            .await
+            .context("Office 增强预览设置查询线程异常退出")?
+    }
+
+    /// Enables or disables Office COM enhancement for the current source,
+    /// replacing only visual-derived pages/chunks/jobs. Canonical content,
+    /// full-text chunks and the byte-exact original remain untouched.
+    #[cfg(target_os = "windows")]
+    pub async fn set_office_enhancement_enabled(
+        &self,
+        book_id: String,
+        enabled: bool,
+    ) -> Result<String> {
+        ensure!(!book_id.trim().is_empty(), "图书 ID 不能为空");
+        // Serialize the setting and source lookup with canonical document
+        // mutations. Otherwise an edit could publish a normalized source
+        // between preflight and the derived-job replacement.
+        let _mutation_turn = self.library_mutations.reserve().enter().await?;
+        let db_path = self.db_path.clone();
+        let lookup_book_id = book_id.clone();
+        let source_id = self
+            .runtime
+            .handle()
+            .spawn_blocking(move || {
+                let conn = db::open_conn(&db_path)?;
+                let book = db::books::get(&conn, &lookup_book_id)?.context("图书不存在")?;
+                let source = db::book_sources::get_revision(&conn, &lookup_book_id, book.revision)?
+                    .context("当前图书来源不存在")?;
+                if enabled {
+                    ensure!(
+                        source.source_kind == "original"
+                            && matches!(source.format.as_str(), "doc" | "docx" | "pptx" | "xlsx"),
+                        "只有尚未规范化编辑的 Office 原件可以启用增强预览"
+                    );
+                }
+                Ok(source.id)
+            })
+            .await
+            .context("Office 增强预览来源查询线程异常退出")??;
+
+        let coordinator = self.visual_jobs().context("视觉任务协调器不可用")?;
+        let job_id = format!("visual-render:{source_id}");
+        stop_visual_job_before_replacement(&coordinator, &job_id).await?;
+        stop_indexing_jobs_before_visual_replacement(&self.indexing, &book_id, &source_id).await?;
+
+        let descriptors = self
+            .visual_renderer_descriptors
+            .read()
+            .map_err(|_| anyhow::anyhow!("visual renderer descriptor lock is poisoned"))?
+            .clone();
+        let profile = RenderProfile::default();
+        let db_path = self.db_path.clone();
+        let publication_guard = self.blob_publication.acquire().await;
+        let (committed_source_id, reconciliation) = self
+            .runtime
+            .handle()
+            .spawn_blocking(move || {
+                db::transactions::set_office_enhancement(
+                    &mut db::open_conn(&db_path)?,
+                    &book_id,
+                    enabled,
+                    &descriptors,
+                    &profile,
+                    unix_timestamp()?,
+                )
+            })
+            .await
+            .context("Office 增强预览设置线程异常退出")??;
+        ensure!(
+            committed_source_id == source_id,
+            "图书来源在 Office 增强预览设置期间发生变化"
+        );
+        drop(publication_guard);
+        reclaim_unreferenced_blobs(
+            &self.db_path,
+            &self.blobs,
+            &self.blob_publication,
+            reconciliation.unreferenced_blobs,
+            "Office 增强替换的视觉页面对象",
+        )
+        .await;
+        ensure!(
+            coordinator.recover(&job_id).await?,
+            "Office 增强视觉任务未进入待执行队列"
+        );
+        self.indexing.wake();
+        Ok(job_id)
+    }
+
+    /// Loads the complete, successfully published Office-enhanced page set
+    /// for the book's current source revision.
+    ///
+    /// The database graph is validated while the object publication gate is
+    /// held, then every object is rechecked against its stored length, BLAKE3
+    /// digest and image media type before bytes leave the service layer.
+    #[cfg(target_os = "windows")]
+    pub async fn load_office_enhanced_pages(
+        &self,
+        book_id: String,
+    ) -> Result<Vec<OfficeEnhancedPage>> {
+        ensure!(!book_id.trim().is_empty(), "图书 ID 不能为空");
+        // Canonical edits and Office enable/disable operations use this same
+        // turnstile. Holding the turn until object reads finish ensures the
+        // result still belongs to the current source when it is returned.
+        let _mutation_turn = self.library_mutations.reserve().enter().await?;
+        let publication_guard = self.blob_publication.acquire().await;
+        let db_path = self.db_path.clone();
+        let rows = self
+            .runtime
+            .handle()
+            .spawn_blocking(move || load_office_enhanced_page_rows(&db_path, &book_id))
+            .await
+            .context("Office 增强页面查询线程异常退出")??;
+
+        let mut pages = Vec::with_capacity(rows.len());
+        let mut total_bytes = 0_u64;
+        for (page_index, row) in rows.into_iter().enumerate() {
+            let key = BlobKey::parse(&row.object_key).context("Office 增强页面对象键无效")?;
+            let bytes = self
+                .blobs
+                .get(&key)
+                .await
+                .context("无法读取 Office 增强页面对象")?;
+            ensure!(
+                bytes.len() as u64 == row.byte_len,
+                "Office 增强页面对象长度与数据库元数据不一致"
+            );
+            total_bytes = total_bytes
+                .checked_add(row.byte_len)
+                .context("Office 增强页面总大小溢出")?;
+            ensure!(
+                total_bytes <= MAX_LOADED_OFFICE_PAGE_BYTES,
+                "Office 增强页面总大小超过支持上限"
+            );
+            let digest = blake3::hash(&bytes).to_hex().to_string();
+            ensure!(
+                digest == row.hash && BlobKey::from_bytes(&bytes) == key,
+                "Office 增强页面对象摘要与数据库元数据不一致"
+            );
+            let expected_format = office_enhanced_image_format(&row.media_type)?;
+            ensure!(
+                image::guess_format(&bytes).context("无法识别 Office 增强页面图片格式")?
+                    == expected_format,
+                "Office 增强页面图片格式与媒体类型不一致"
+            );
+            pages.push(OfficeEnhancedPage {
+                file_name: office_enhanced_page_file_name(page_index, &row.media_type)?,
+                media_type: row.media_type,
+                bytes,
+                content_unit_id: row.content_unit_id,
+                locator: row.locator,
+            });
+        }
+        drop(publication_guard);
+        Ok(pages)
+    }
+
+    /// Loads the complete persisted task history for the requested books on
+    /// the application runtime. The scope is explicit and an empty scope never
+    /// turns into an unbounded query.
+    pub async fn background_jobs_for_books(
+        &self,
+        mut book_ids: Vec<String>,
+    ) -> Result<Vec<BackgroundJobSnapshot>> {
+        book_ids.retain(|book_id| !book_id.trim().is_empty());
+        book_ids.sort();
+        book_ids.dedup();
+        if book_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let db_path = self.db_path.clone();
+        self.runtime
+            .handle()
+            .spawn_blocking(move || {
+                let conn = db::open_conn(&db_path)?;
+                let mut snapshots = Vec::new();
+                for book_id in &book_ids {
+                    for job in db::index_jobs::list_for_book(&conn, book_id)? {
+                        snapshots.push(background_job_snapshot(&conn, job)?);
+                    }
+                }
+                snapshots.sort_by(|left, right| {
+                    left.book_id
+                        .cmp(&right.book_id)
+                        .then_with(|| {
+                            background_kind_order(&left.kind)
+                                .cmp(&background_kind_order(&right.kind))
+                        })
+                        .then_with(|| left.id.cmp(&right.id))
+                });
+                Ok(snapshots)
+            })
+            .await
+            .context("后台任务查询线程异常退出")?
+    }
+
+    /// Applies one state transition using the coordinator that owns the job
+    /// kind. In particular, a running visual renderer must receive its in-memory
+    /// control signal in addition to the durable SQLite flag.
+    pub async fn control_background_job(
+        &self,
+        job_id: String,
+        action: BackgroundJobAction,
+    ) -> Result<bool> {
+        ensure!(!job_id.trim().is_empty(), "后台任务 ID 不能为空");
+        let indexing = Arc::clone(&self.indexing);
+        let visual_jobs = self.visual_jobs();
+        self.runtime
+            .spawn(async move {
+                let job = indexing
+                    .job(&job_id)
+                    .await?
+                    .with_context(|| format!("后台任务已不存在：{job_id}"))?;
+                match job.kind.as_str() {
+                    "visual_render" => {
+                        let coordinator = visual_jobs.context("视觉任务协调器不可用")?;
+                        match action {
+                            BackgroundJobAction::Pause => coordinator.pause(&job_id).await,
+                            BackgroundJobAction::Resume => coordinator.resume(&job_id).await,
+                            BackgroundJobAction::Retry => coordinator.retry(&job_id).await,
+                            BackgroundJobAction::Cancel => coordinator.cancel(&job_id).await,
+                        }
+                    }
+                    "embedding" | "vision" => match action {
+                        BackgroundJobAction::Pause => indexing.pause(&job_id).await,
+                        BackgroundJobAction::Resume => indexing.resume(&job_id).await,
+                        BackgroundJobAction::Retry => indexing.retry(&job_id).await,
+                        BackgroundJobAction::Cancel => indexing.cancel(&job_id).await,
+                    },
+                    other => anyhow::bail!("不支持控制后台任务类型：{other}"),
+                }
+            })
+            .await
+            .context("后台任务控制线程异常退出")?
+    }
+}
+
+impl Drop for AppServices {
+    fn drop(&mut self) {
+        if let Ok(slot) = self.visual_jobs.get_mut() {
+            slot.take();
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+struct OfficeEnhancedPageRow {
+    object_key: String,
+    media_type: String,
+    byte_len: u64,
+    hash: String,
+    content_unit_id: Option<String>,
+    locator: crate::document::DocumentLocator,
+}
+
+#[cfg(target_os = "windows")]
+fn load_office_enhanced_page_rows(
+    db_path: &Path,
+    book_id: &str,
+) -> Result<Vec<OfficeEnhancedPageRow>> {
+    let conn = db::open_conn(db_path)?;
+    let book = db::books::get(&conn, book_id)?.context("图书不存在")?;
+    let source = db::book_sources::get_revision(&conn, book_id, book.revision)?
+        .context("当前图书来源不存在")?;
+    ensure!(
+        db::office_enhancements::is_enabled(&conn, book_id)?,
+        "当前图书尚未启用 Office 增强预览"
+    );
+    ensure!(
+        source.source_kind == "original"
+            && matches!(source.format.as_str(), "doc" | "docx" | "pptx" | "xlsx"),
+        "当前图书来源不再是可增强的 Office 原件"
+    );
+
+    let job_id = format!("visual-render:{}", source.id);
+    let job = db::index_jobs::get(&conn, &job_id)?.context("Office 增强视觉任务不存在")?;
+    ensure!(
+        job.book_id == book.id
+            && job.source_id.as_deref() == Some(source.id.as_str())
+            && job.kind == "visual_render",
+        "Office 增强视觉任务不属于当前图书来源"
+    );
+    ensure!(
+        job.status == db::index_jobs::IndexJobStatus::Succeeded,
+        "Office 增强视觉任务尚未成功完成"
+    );
+    let (spec, completed_pages) = crate::preview::decode_persisted_visual_job(&job.cursor_json)
+        .context("Office 增强视觉任务游标无效")?;
+    ensure!(
+        spec.id == job_id
+            && spec.book_id == book.id
+            && spec.source_id == source.id
+            && spec.document_revision.get() == book.revision
+            && spec.renderer == OFFICE_ENHANCED_RENDERER_NAME
+            && spec.fidelity == crate::preview::RenderFidelity::OfficeEnhanced,
+        "Office 增强视觉任务不是当前图书版本的增强产物"
+    );
+    let units = db::content_units::list_for_source(&conn, &source.id)?
+        .into_iter()
+        .map(|unit| (unit.id, unit.revision))
+        .collect::<BTreeMap<_, _>>();
+    ensure!(!units.is_empty(), "当前 Office 来源没有内容单元");
+    ensure!(
+        spec.unit_ids.is_empty()
+            || (spec.unit_ids.len() == units.len()
+                && spec
+                    .unit_ids
+                    .iter()
+                    .all(|unit_id| units.contains_key(unit_id))),
+        "Office 增强视觉任务只包含部分内容单元"
+    );
+    let pages = db::visual_pages::list_for_source(&conn, &source.id)?;
+    ensure!(
+        !pages.is_empty() && pages.len() <= MAX_LOADED_OFFICE_PAGES,
+        "Office 增强页面数量无效或超过支持上限"
+    );
+    ensure!(
+        completed_pages == pages.len(),
+        "Office 增强视觉任务完成进度与已发布页面不一致"
+    );
+
+    let profile_id = spec.profile.stable_id();
+    let mut total_bytes = 0_u64;
+    let mut rows = Vec::with_capacity(pages.len());
+    for (expected_index, page) in pages.into_iter().enumerate() {
+        ensure!(
+            page.page_index == expected_index,
+            "Office 增强页面序号不连续"
+        );
+        ensure!(
+            page.book_id == book.id
+                && page.source_id == source.id
+                && page.document_revision == book.revision
+                && page.renderer == spec.renderer
+                && page.renderer_version == spec.renderer_version
+                && page.profile_id == profile_id
+                && page.render_scale == spec.profile.scale()
+                && page.fidelity == "office_enhanced",
+            "Office 增强页面元数据与当前视觉任务不一致"
+        );
+        ensure!(
+            page.width > 0 && page.height > 0 && page.render_scale.is_finite(),
+            "Office 增强页面尺寸或缩放无效"
+        );
+        let locator = serde_json::from_str::<crate::document::DocumentLocator>(&page.locator_json)
+            .context("Office 增强页面定位信息无效")?;
+        locator
+            .validate()
+            .context("Office 增强页面定位信息不符合统一模型约束")?;
+        ensure!(
+            locator.book_id == book.id,
+            "Office 增强页面定位不属于当前图书"
+        );
+        match locator.source.as_ref() {
+            Some(crate::document::SourceLocator::Slide { .. }) => {
+                let content_unit_id = page
+                    .content_unit_id
+                    .as_deref()
+                    .context("PowerPoint 增强页面缺少内容单元 ID")?;
+                let current_unit_revision = units.get(content_unit_id).with_context(|| {
+                    format!("Office 增强页面引用了不存在的内容单元：{content_unit_id}")
+                })?;
+                ensure!(
+                    locator.unit_id == content_unit_id
+                        && page.unit_revision == *current_unit_revision,
+                    "PowerPoint 增强页面内容单元映射或版本已过期"
+                );
+            }
+            Some(crate::document::SourceLocator::OfficeRenderedPage { page: source_page }) => {
+                let expected_page = u32::try_from(expected_index)
+                    .ok()
+                    .and_then(|index| index.checked_add(1));
+                ensure!(
+                    page.content_unit_id.is_none()
+                        && matches!(source.format.as_str(), "doc" | "docx" | "xlsx")
+                        && page.unit_revision == crate::document::Revision::INITIAL.get()
+                        && locator.unit_id == office_preview_unit_id(&book.id, &source.id)
+                        && locator.block_id.is_none()
+                        && locator.text_range.is_none()
+                        && locator.region.is_none()
+                        && expected_page == Some(*source_page),
+                    "Word/Excel 增强页面错误关联了内容单元或页面定位无效"
+                );
+            }
+            _ => anyhow::bail!("Office 增强页面缺少可验证的幻灯片或预览页定位"),
+        }
+        let blob =
+            db::blobs::get(&conn, &page.object_key)?.context("Office 增强页面对象元数据不存在")?;
+        office_enhanced_image_format(&blob.media_type)?;
+        BlobKey::parse(&blob.object_key).context("Office 增强页面对象键无效")?;
+        total_bytes = total_bytes
+            .checked_add(blob.byte_len)
+            .context("Office 增强页面总大小溢出")?;
+        ensure!(
+            total_bytes <= MAX_LOADED_OFFICE_PAGE_BYTES,
+            "Office 增强页面总大小超过支持上限"
+        );
+        rows.push(OfficeEnhancedPageRow {
+            object_key: blob.object_key,
+            media_type: blob.media_type,
+            byte_len: blob.byte_len,
+            hash: blob.hash,
+            content_unit_id: page.content_unit_id,
+            locator,
+        });
+    }
+    Ok(rows)
+}
+
+#[cfg(target_os = "windows")]
+fn office_enhanced_image_format(media_type: &str) -> Result<image::ImageFormat> {
+    match media_type {
+        "image/png" => Ok(image::ImageFormat::Png),
+        "image/jpeg" => Ok(image::ImageFormat::Jpeg),
+        _ => anyhow::bail!("Office 增强页面使用了不支持的图片媒体类型：{media_type}"),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn office_enhanced_page_file_name(page_index: usize, media_type: &str) -> Result<String> {
+    let extension = match office_enhanced_image_format(media_type)? {
+        image::ImageFormat::Png => "png",
+        image::ImageFormat::Jpeg => "jpg",
+        _ => unreachable!("Office enhanced media types are exhaustively checked"),
+    };
+    Ok(format!("Page{:05}.{extension}", page_index + 1))
+}
+
+fn background_job_snapshot(
+    conn: &rusqlite::Connection,
+    job: db::index_jobs::IndexJob,
+) -> Result<BackgroundJobSnapshot> {
+    let cursor = serde_json::from_str::<serde_json::Value>(&job.cursor_json).ok();
+    let completed = match job.kind.as_str() {
+        "visual_render" => cursor
+            .as_ref()
+            .and_then(|value| json_usize(value.get("completed_pages")))
+            .unwrap_or_default(),
+        "embedding" | "vision" => cursor
+            .as_ref()
+            .and_then(|value| json_usize(value.get("next_ordinal")))
+            .unwrap_or_default(),
+        _ => 0,
+    };
+    let total = match (job.kind.as_str(), job.source_id.as_deref()) {
+        ("embedding", Some(source_id)) => {
+            Some(db::search_chunks::count_for_source(conn, source_id)?)
+        }
+        ("vision", Some(source_id)) => Some(db::visual_pages::count_for_source(conn, source_id)?),
+        ("visual_render", Some(source_id)) => match cursor
+            .as_ref()
+            .and_then(|value| value.get("spec"))
+            .and_then(|spec| spec.get("unit_ids"))
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len)
+        {
+            Some(total) if total != 0 => Some(total),
+            _ => Some(db::content_units::count_for_source(conn, source_id)?),
+        },
+        _ => None,
+    };
+    let kept_cursor = snapshot_cursor_json(&job.kind, job.status, &job.cursor_json);
+    Ok(BackgroundJobSnapshot {
+        id: job.id,
+        book_id: job.book_id,
+        source_id: job.source_id,
+        kind: job.kind,
+        status: match job.status {
+            db::index_jobs::IndexJobStatus::Queued => BackgroundJobStatus::Queued,
+            db::index_jobs::IndexJobStatus::Running => BackgroundJobStatus::Running,
+            db::index_jobs::IndexJobStatus::Paused => BackgroundJobStatus::Paused,
+            db::index_jobs::IndexJobStatus::Succeeded => BackgroundJobStatus::Succeeded,
+            db::index_jobs::IndexJobStatus::Failed => BackgroundJobStatus::Failed,
+            db::index_jobs::IndexJobStatus::Cancelled => BackgroundJobStatus::Cancelled,
+        },
+        pause_requested: job.pause_requested,
+        cancel_requested: job.cancel_requested,
+        attempts: job.attempts,
+        progress: BackgroundJobProgress { completed, total },
+        error: job.error,
+        created_at: job.created_at,
+        updated_at: job.updated_at,
+        started_at: job.started_at,
+        finished_at: job.finished_at,
+        cursor_json: kept_cursor,
+    })
+}
+
+/// Decide whether to expose the raw cursor JSON to the UI. Visual render jobs
+/// keep their cursor so users can inspect the renderer profile and unit list;
+/// failed jobs of any kind keep theirs because the cursor often contains the
+/// last successful provider response or page index. Other jobs return `None`
+/// because the cursor is just an internal offset.
+fn snapshot_cursor_json(
+    kind: &str,
+    status: db::index_jobs::IndexJobStatus,
+    cursor: &str,
+) -> Option<String> {
+    let keep = kind == "visual_render" || matches!(status, db::index_jobs::IndexJobStatus::Failed);
+    if keep && !cursor.is_empty() {
+        Some(cursor.to_string())
+    } else {
+        None
+    }
+}
+
+fn json_usize(value: Option<&serde_json::Value>) -> Option<usize> {
+    value
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+}
+
+fn background_kind_order(kind: &str) -> u8 {
+    match kind {
+        "visual_render" => 0,
+        "vision" => 1,
+        "embedding" => 2,
+        _ => 3,
+    }
+}
+
+fn build_ai_services(
+    db_path: &Path,
+    settings: ProviderSettings,
+    api_key: Option<String>,
+) -> Result<AiServices> {
+    settings.validate()?;
+    let provider = Arc::new(OpenAiHttpProvider::new(settings.provider_config(api_key))?);
+    let provider_contract: Arc<dyn OpenAiCompatibleProvider> = provider;
+    let search = Arc::new(SearchService::new(
+        db_path,
+        Arc::clone(&provider_contract),
+        &settings.embedding_model,
+    )?);
+    Ok(AiServices {
+        settings,
+        provider: provider_contract,
+        search,
+    })
+}
+
+fn indexing_model_config(settings: &ProviderSettings) -> Result<IndexingModelConfig> {
+    IndexingModelConfig::new(
+        &settings.embedding_model,
+        embedding_execution_identity(settings)?,
+        &settings.vision_model,
+        vision_execution_identity(settings)?,
+    )
+}
+
+fn vision_execution_identity(settings: &ProviderSettings) -> Result<String> {
+    let endpoint = normalize_provider_base_url(&settings.base_url)?;
+    Ok(format!(
+        "vision-v1:{}",
+        blake3::hash(format!("{}\0{}", endpoint.as_str(), settings.vision_model).as_bytes())
+            .to_hex()
+    ))
+}
+
+/// Non-secret identity for deciding whether persisted vector work is stale.
+/// Deliberately excludes chat/vision choices, request policy and credentials.
+fn embedding_execution_identity(settings: &ProviderSettings) -> Result<String> {
+    let endpoint = normalize_provider_base_url(&settings.base_url)?;
+    Ok(format!(
+        "embedding-v1:{}",
+        blake3::hash(format!("{}\0{}", endpoint.as_str(), settings.embedding_model).as_bytes())
+            .to_hex()
+    ))
+}
+
+fn load_provider_settings(db_path: &Path) -> Result<ProviderSettings> {
+    let conn = db::open_conn(db_path)?;
+    let settings = match db::settings::get(&conn, PROVIDER_SETTINGS_KEY)? {
+        Some(row) => serde_json::from_str::<ProviderSettings>(&row.value_json)
+            .context("stored AI provider settings are invalid")?,
+        None => ProviderSettings::default(),
+    };
+    settings.validate()?;
+    Ok(settings)
+}
+
+fn save_provider_settings(db_path: &Path, settings: &ProviderSettings) -> Result<()> {
+    settings.validate()?;
+    let value_json = serde_json::to_string(settings).context("failed to serialize AI settings")?;
+    // A structural assertion guards future accidental additions to the
+    // persisted type as well as today's explicit absence of an API-key field.
+    let object = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&value_json)
+        .context("AI settings did not serialize to an object")?;
+    ensure!(
+        !object.keys().any(|key| {
+            let key = key.to_ascii_lowercase();
+            key.contains("api_key") || key.contains("password") || key.contains("secret")
+        }),
+        "refusing to persist a secret-bearing AI setting"
+    );
+    let setting = db::settings::Setting {
+        key: PROVIDER_SETTINGS_KEY.to_string(),
+        value_json,
+        updated_at: unix_timestamp()?,
+    };
+    ensure!(
+        db::settings::upsert(&db::open_conn(db_path)?, &setting)? == 1,
+        "AI provider settings were not stored"
+    );
+    Ok(())
+}
+
+fn validate_model_name(kind: &str, model: &str) -> Result<()> {
+    ensure!(
+        !model.trim().is_empty()
+            && model.trim() == model
+            && model.chars().count() <= MAX_MODEL_NAME_CHARS
+            && !model.chars().any(char::is_control),
+        "{kind} model is invalid"
+    );
+    Ok(())
+}
+
+fn unix_timestamp() -> Result<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")
+        .map(|duration| duration.as_secs())
+}
+
+#[cfg(target_os = "windows")]
+async fn stop_visual_job_before_replacement(
+    coordinator: &VisualJobCoordinator,
+    job_id: &str,
+) -> Result<()> {
+    let Some(record) = coordinator.status(job_id).await? else {
+        return Ok(());
+    };
+    if matches!(
+        record.state,
+        VisualJobState::Queued | VisualJobState::Running | VisualJobState::Paused
+    ) {
+        let _ = coordinator.cancel(job_id).await?;
+    } else {
+        return Ok(());
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(125);
+    loop {
+        let Some(record) = coordinator.status(job_id).await? else {
+            return Ok(());
+        };
+        if matches!(
+            record.state,
+            VisualJobState::Succeeded | VisualJobState::Failed | VisualJobState::Cancelled
+        ) {
+            return Ok(());
+        }
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "等待现有视觉任务停止超时"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[cfg(target_os = "windows")]
+async fn stop_indexing_jobs_before_visual_replacement(
+    indexing: &IndexingCoordinator,
+    book_id: &str,
+    source_id: &str,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let active = indexing
+            .jobs_for_book(book_id)
+            .await?
+            .into_iter()
+            .filter(|job| {
+                job.source_id.as_deref() == Some(source_id)
+                    && matches!(job.kind.as_str(), "embedding" | "vision")
+                    && matches!(
+                        job.status,
+                        IndexingJobStatus::Queued
+                            | IndexingJobStatus::Running
+                            | IndexingJobStatus::Paused
+                    )
+            })
+            .collect::<Vec<_>>();
+        if active.is_empty() {
+            return Ok(());
+        }
+        for job in active {
+            if job.status == IndexingJobStatus::Paused {
+                // Paused jobs are not scanned by the worker. Put them back in
+                // the queue before setting cancellation so they can publish a
+                // durable terminal state.
+                let _ = indexing.resume(&job.id).await?;
+            }
+            let _ = indexing.cancel(&job.id).await?;
+        }
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "等待旧视觉理解或向量任务停止超时"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[derive(Clone)]
+struct LibraryVisualDocumentSource {
+    library: Arc<Mutex<LibraryStore>>,
+}
+
+impl VisualDocumentSource for LibraryVisualDocumentSource {
+    fn load_document(
+        &self,
+        book_id: String,
+        revision: crate::document::Revision,
+    ) -> PreviewFuture<'_, crate::document::BookDocument> {
+        let library = Arc::clone(&self.library);
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let document = library
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("library service lock is poisoned"))?
+                    .document(&book_id)?;
+                ensure!(
+                    document.revision == revision,
+                    "visual request revision is no longer current"
+                );
+                Ok(document)
+            })
+            .await
+            .context("visual document loader stopped")?
+        })
+    }
+
+    fn load_asset(
+        &self,
+        book_id: String,
+        asset_id: String,
+    ) -> PreviewFuture<'_, VisualAssetPayload> {
+        let library = Arc::clone(&self.library);
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let library = library
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("library service lock is poisoned"))?;
+                let (media_type, expected_len) = library.asset_metadata(&book_id, &asset_id)?;
+                ensure!(
+                    media_type.starts_with("image/"),
+                    "视觉任务只能读取图书所属图片"
+                );
+                let bytes = library.asset_bytes(&book_id, &asset_id)?;
+                ensure!(
+                    bytes.len() as u64 == expected_len,
+                    "视觉图片对象长度与数据库元数据不一致"
+                );
+                Ok(VisualAssetPayload { media_type, bytes })
+            })
+            .await
+            .context("visual asset loader stopped")?
+        })
+    }
+
+    fn load_source(
+        &self,
+        book_id: String,
+        source_id: String,
+        revision: crate::document::Revision,
+    ) -> PreviewFuture<'_, VisualSourcePayload> {
+        let library = Arc::clone(&self.library);
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let library = library
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("library service lock is poisoned"))?;
+                let (format, source_kind, media_type, bytes) =
+                    library.visual_source_bytes(&book_id, &source_id, revision)?;
+                Ok(VisualSourcePayload {
+                    format,
+                    source_kind,
+                    media_type,
+                    bytes,
+                })
+            })
+            .await
+            .context("visual source loader stopped")?
+        })
+    }
+}
+
+#[derive(Clone)]
+struct LocalVisualPageSink {
+    db_path: PathBuf,
+    blobs: Arc<LocalBlobStore>,
+    blob_publication: BlobPublicationLock,
+    indexing: Arc<IndexingCoordinator>,
+}
+
+impl VisualPageSink for LocalVisualPageSink {
+    fn reset_staging(&self, spec: crate::preview::VisualJobSpec) -> PreviewFuture<'_, ()> {
+        let db_path = self.db_path.clone();
+        let blobs = Arc::clone(&self.blobs);
+        let blob_publication = self.blob_publication.clone();
+        Box::pin(async move {
+            let publication_guard = blob_publication.acquire().await;
+            let reset_db_path = db_path.clone();
+            let unreferenced = tokio::task::spawn_blocking(move || {
+                db::transactions::clear_visual_page_staging(
+                    &mut db::open_conn(&reset_db_path)?,
+                    &spec,
+                )
+            })
+            .await
+            .context("visual page staging reset worker stopped")??;
+            drop(publication_guard);
+            reclaim_unreferenced_blobs(
+                &db_path,
+                &blobs,
+                &blob_publication,
+                unreferenced,
+                "视觉页面断点对象",
+            )
+            .await;
+            Ok(())
+        })
+    }
+
+    fn checkpoint_page(
+        &self,
+        spec: crate::preview::VisualJobSpec,
+        page: RenderedVisualPage,
+        completed_pages: usize,
+    ) -> PreviewFuture<'_, ()> {
+        let db_path = self.db_path.clone();
+        let blobs = Arc::clone(&self.blobs);
+        let blob_publication = self.blob_publication.clone();
+        Box::pin(async move {
+            let publication_guard = blob_publication.acquire().await;
+            let now = unix_timestamp()?;
+            let key = blobs.put(&page.bytes).await?;
+            ensure!(
+                key == crate::storage::BlobKey::from_bytes(&page.bytes),
+                "object store returned a non-content-addressed key"
+            );
+            let blob_row = db::blobs::BlobRecord {
+                object_key: key.to_string(),
+                media_type: page.media_type.clone(),
+                byte_len: page.bytes.len() as u64,
+                hash: blake3::hash(&page.bytes).to_hex().to_string(),
+                created_at: now,
+            };
+            let page_row = visual_page_row(&spec, page, key.to_string(), now)?;
+            let commit_db_path = db_path.clone();
+            tokio::task::spawn_blocking(move || {
+                db::transactions::checkpoint_visual_page(
+                    &mut db::open_conn(&commit_db_path)?,
+                    &spec,
+                    &blob_row,
+                    &page_row,
+                    completed_pages,
+                    now,
+                )
+            })
+            .await
+            .context("visual page checkpoint worker stopped")??;
+            drop(publication_guard);
+            Ok(())
+        })
+    }
+
+    fn commit_pages(
+        &self,
+        spec: crate::preview::VisualJobSpec,
+        total_pages: usize,
+    ) -> PreviewFuture<'_, ()> {
+        let db_path = self.db_path.clone();
+        let blobs = Arc::clone(&self.blobs);
+        let blob_publication = self.blob_publication.clone();
+        let indexing = Arc::clone(&self.indexing);
+        Box::pin(async move {
+            let publication_guard = blob_publication.acquire().await;
+            let source_id = spec.source_id.clone();
+            let commit_db_path = db_path.clone();
+            let now = unix_timestamp()?;
+            let unreferenced = tokio::task::spawn_blocking(move || {
+                db::transactions::publish_staged_visual_pages(
+                    &mut db::open_conn(&commit_db_path)?,
+                    &spec,
+                    total_pages,
+                    now,
+                )
+            })
+            .await
+            .context("visual page publication worker stopped")??;
+            drop(publication_guard);
+            reclaim_unreferenced_blobs(
+                &db_path,
+                &blobs,
+                &blob_publication,
+                unreferenced,
+                "已替换视觉页面对象",
+            )
+            .await;
+            if let Err(error) = indexing.visual_pages_ready(&source_id).await {
+                // Final pages and the Succeeded job state were already
+                // committed atomically. Vision jobs are durable and will be
+                // discovered by the background scanner, so a wake-up failure
+                // must not rewrite the completed render as Failed.
+                tracing::warn!(source_id, %error, "视觉页面已发布，但视觉索引即时唤醒失败");
+            }
+            Ok(())
+        })
+    }
+}
+
+fn visual_page_row(
+    spec: &crate::preview::VisualJobSpec,
+    page: RenderedVisualPage,
+    object_key: String,
+    created_at: u64,
+) -> Result<db::visual_pages::VisualPage> {
+    let fidelity = match page.metadata.fidelity {
+        crate::preview::RenderFidelity::Normalized => "normalized",
+        crate::preview::RenderFidelity::Structural => "structural",
+        crate::preview::RenderFidelity::OfficeEnhanced => "office_enhanced",
+    }
+    .to_string();
+    Ok(db::visual_pages::VisualPage {
+        id: page.id,
+        book_id: spec.book_id.clone(),
+        source_id: spec.source_id.clone(),
+        content_unit_id: page.content_unit_id,
+        page_index: page.page_index,
+        object_key,
+        width: page.width,
+        height: page.height,
+        render_scale: spec.profile.scale(),
+        renderer: page.metadata.renderer,
+        renderer_version: page.metadata.renderer_version,
+        document_revision: page.metadata.document_revision.get(),
+        unit_revision: page.metadata.unit_revision.get(),
+        profile_id: page.metadata.profile_id,
+        fidelity,
+        locator_json: serde_json::to_string(&page.locator)
+            .context("failed to serialize visual page locator")?,
+        created_at,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        ai::DEFAULT_OLLAMA_OPENAI_BASE_URL, credentials::MemoryCredentialStore,
+        library::ImportOutcome, preview::VisualJobState,
+    };
+    #[cfg(target_os = "windows")]
+    use crate::{
+        office_com::{
+            OfficeEnhanceOutput, OfficeEnhanceRequest, OfficeEnhancementKind, OfficeFuture,
+        },
+        office_visual::OfficeEnhancedRenderer,
+    };
+    #[cfg(target_os = "windows")]
+    use lopdf::{
+        Document, Object, Stream,
+        content::{Content, Operation},
+        dictionary,
+    };
+    use std::{
+        future::Future,
+        io::Cursor,
+        sync::{
+            Mutex as StdMutex,
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        },
+        task::{Context as TaskContext, Poll, Wake, Waker},
+        thread,
+        time::Duration,
+    };
+
+    struct ThreadWake(thread::Thread);
+
+    impl Wake for ThreadWake {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    /// Polls a future on this ordinary test thread without entering any Tokio
+    /// runtime. This mirrors GPUI's foreground executor closely enough to catch
+    /// service methods that accidentally depend on an ambient Tokio handle.
+    fn block_on_without_tokio<F: Future>(future: F) -> F::Output {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let waker = Waker::from(Arc::new(ThreadWake(thread::current())));
+        let mut context = TaskContext::from_waker(&waker);
+        let mut future = Box::pin(future);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(output) => return output,
+                Poll::Pending => thread::park(),
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[derive(Clone, Copy)]
+    struct FakeOfficeSlides;
+
+    #[cfg(target_os = "windows")]
+    impl OfficeEnhancer for FakeOfficeSlides {
+        fn enhance<'a>(&'a self, request: OfficeEnhanceRequest) -> OfficeFuture<'a> {
+            Box::pin(async move {
+                ensure!(
+                    request.kind == OfficeEnhancementKind::PowerPointImages,
+                    "test expected PowerPoint enhancement"
+                );
+                let mut paths = Vec::new();
+                for index in 1..=2 {
+                    let path = request.target.join(format!("Slide{index}.png"));
+                    std::fs::write(&path, tiny_office_slide_png(index as u8))?;
+                    paths.push(path);
+                }
+                Ok(OfficeEnhanceOutput::Images(paths))
+            })
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn tiny_office_slide_png(channel: u8) -> Vec<u8> {
+        let image = image::RgbaImage::from_pixel(4, 3, image::Rgba([channel, 2, 3, 255]));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn async_library_mutation_turnstile_is_fifo_without_blocking_pool_starvation() {
+        const REQUESTS: usize = 128;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let queue = LibraryMutationQueue::new(runtime.handle());
+        let reservations = (0..REQUESTS).map(|_| queue.reserve()).collect::<Vec<_>>();
+        let order = Arc::new(StdMutex::new(Vec::with_capacity(REQUESTS)));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+
+        runtime.block_on(async move {
+            let mut handles = Vec::with_capacity(REQUESTS);
+            // Polling the consumers in reverse order must not affect the API
+            // boundary ticket order established above.
+            for reservation in reservations.into_iter().rev() {
+                let ticket = reservation.ticket;
+                let order = Arc::clone(&order);
+                let active = Arc::clone(&active);
+                let max_active = Arc::clone(&max_active);
+                handles.push(tokio::spawn(async move {
+                    let turn = reservation.enter().await.unwrap();
+                    tokio::task::spawn_blocking(move || {
+                        let now_active = active.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                        max_active.fetch_max(now_active, AtomicOrdering::SeqCst);
+                        order.lock().unwrap().push(ticket);
+                        std::thread::yield_now();
+                        active.fetch_sub(1, AtomicOrdering::SeqCst);
+                        drop(turn);
+                    })
+                    .await
+                    .unwrap();
+                }));
+            }
+
+            tokio::time::timeout(Duration::from_secs(5), async {
+                for handle in handles {
+                    handle.await.unwrap();
+                }
+            })
+            .await
+            .expect("queued mutations starved a one-thread blocking pool");
+
+            assert_eq!(max_active.load(AtomicOrdering::SeqCst), 1);
+            assert_eq!(
+                *order.lock().unwrap(),
+                (0..REQUESTS as u64).collect::<Vec<_>>()
+            );
+        });
+    }
+
+    #[test]
+    fn composes_default_local_services_in_an_isolated_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = Arc::new(MemoryCredentialStore::default());
+        let services = AppServices::open_with_credentials(temp.path(), credentials).unwrap();
+
+        let provider_settings = services.provider_settings().unwrap();
+        assert_eq!(provider_settings.base_url, DEFAULT_OLLAMA_OPENAI_BASE_URL);
+        assert_eq!(provider_settings.chat_model, "qwen3.5:0.8b");
+        assert_eq!(provider_settings.embedding_model, "qwen3-embedding:0.6b");
+        assert_eq!(provider_settings.vision_model, "qwen3.5:0.8b");
+        assert_eq!(
+            services.search().unwrap().embedding_model(),
+            DEFAULT_EMBEDDING_MODEL
+        );
+        assert!(services.blob_store().root().starts_with(temp.path()));
+        assert!(services.visual_jobs().is_some());
+
+        let title = services
+            .runtime()
+            .block_on(async {
+                services
+                    .spawn_library(|library| {
+                        Ok(library.create_book("Service book", "Author")?.title)
+                    })
+                    .await
+                    .context("library test worker stopped")?
+            })
+            .unwrap();
+        assert_eq!(title, "Service book");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn office_opt_in_replaces_persisted_visual_pages_through_app_services() {
+        use office_oxide::{DocumentFormat, create::create_from_markdown_to_writer};
+
+        let temp = tempfile::tempdir().unwrap();
+        let services = AppServices::open_with_credentials(
+            temp.path(),
+            Arc::new(MemoryCredentialStore::default()),
+        )
+        .unwrap();
+        let source: Arc<dyn VisualDocumentSource> = Arc::new(LibraryVisualDocumentSource {
+            library: Arc::clone(&services.library),
+        });
+        let sink: Arc<dyn VisualPageSink> = Arc::new(LocalVisualPageSink {
+            db_path: services.db_path.clone(),
+            blobs: Arc::clone(&services.blobs),
+            blob_publication: services.blob_publication.clone(),
+            indexing: Arc::clone(&services.indexing),
+        });
+        services
+            .replace_visual_renderers(
+                source,
+                sink,
+                vec![
+                    Arc::new(StructuralPngRenderer),
+                    Arc::new(OfficeEnhancedRenderer::new(Arc::new(FakeOfficeSlides))),
+                ],
+            )
+            .unwrap();
+
+        let mut pptx = Cursor::new(Vec::new());
+        create_from_markdown_to_writer(
+            "# First\n\nOfficeEnhancedOne\n\n---\n\n# Second\n\nOfficeEnhancedTwo",
+            DocumentFormat::Pptx,
+            &mut pptx,
+        )
+        .unwrap();
+        let source_path = temp.path().join("enhanced.pptx");
+        std::fs::write(&source_path, pptx.into_inner()).unwrap();
+        let runtime = services.runtime();
+        let record = runtime
+            .block_on(async {
+                services
+                    .spawn_library(move |library| match library.import(&source_path)? {
+                        ImportOutcome::Added(record) | ImportOutcome::AlreadyExists(record) => {
+                            Ok(record)
+                        }
+                    })
+                    .await
+                    .context("Office test import worker stopped")?
+            })
+            .unwrap();
+        let source_id = db::book_sources::get_revision(
+            &db::open_conn(&services.db_path).unwrap(),
+            &record.id,
+            record.revision,
+        )
+        .unwrap()
+        .unwrap()
+        .id;
+        let job_id = format!("visual-render:{source_id}");
+
+        let submitted_job_id = runtime
+            .block_on(services.set_office_enhancement_enabled(record.id.clone(), true))
+            .unwrap();
+        assert_eq!(submitted_job_id, job_id);
+        assert!(
+            runtime
+                .block_on(services.office_enhancement_enabled(record.id.clone()))
+                .unwrap()
+        );
+        runtime
+            .block_on(services.visual_jobs().unwrap().wait_for_state(
+                &job_id,
+                VisualJobState::Succeeded,
+                Duration::from_secs(5),
+            ))
+            .unwrap();
+        let pages = db::visual_pages::list_for_source(
+            &db::open_conn(&services.db_path).unwrap(),
+            &source_id,
+        )
+        .unwrap();
+        assert_eq!(pages.len(), 2);
+        assert!(pages.iter().all(|page| {
+            page.renderer == "moye-office-com-enhanced"
+                && page.fidelity == "office_enhanced"
+                && serde_json::from_str::<crate::document::DocumentLocator>(&page.locator_json)
+                    .unwrap()
+                    .source
+                    .is_some()
+        }));
+        let loaded_pages = runtime
+            .block_on(services.load_office_enhanced_pages(record.id.clone()))
+            .unwrap();
+        assert_eq!(loaded_pages.len(), 2);
+        assert_eq!(loaded_pages[0].file_name, "Page00001.png");
+        assert_eq!(loaded_pages[1].file_name, "Page00002.png");
+        assert!(loaded_pages.iter().all(|page| {
+            page.media_type == "image/png"
+                && !page.bytes.is_empty()
+                && page
+                    .content_unit_id
+                    .as_deref()
+                    .is_some_and(|id| !id.is_empty())
+                && page.locator.source.is_some()
+        }));
+
+        let submitted_job_id = runtime
+            .block_on(services.set_office_enhancement_enabled(record.id.clone(), false))
+            .unwrap();
+        assert_eq!(submitted_job_id, job_id);
+        assert!(
+            !runtime
+                .block_on(services.office_enhancement_enabled(record.id.clone()))
+                .unwrap()
+        );
+        runtime
+            .block_on(services.visual_jobs().unwrap().wait_for_state(
+                &job_id,
+                VisualJobState::Succeeded,
+                Duration::from_secs(5),
+            ))
+            .unwrap();
+        let pages = db::visual_pages::list_for_source(
+            &db::open_conn(&services.db_path).unwrap(),
+            &source_id,
+        )
+        .unwrap();
+        assert!(!pages.is_empty());
+        assert!(pages.iter().all(|page| page.fidelity == "structural"));
+        assert!(
+            runtime
+                .block_on(services.load_office_enhanced_pages(record.id))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn projected_mutations_follow_commit_order_and_reads_do_not_advance_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let services = AppServices::open_with_credentials(
+            temp.path(),
+            Arc::new(MemoryCredentialStore::default()),
+        )
+        .unwrap();
+        let runtime = services.runtime();
+        assert_eq!(services.library_generation(), 0);
+
+        let initial_count = runtime
+            .block_on(async {
+                services
+                    .spawn_library_read(|library| Ok(library.books().len()))
+                    .await
+                    .context("library read worker stopped")?
+            })
+            .unwrap();
+        assert_eq!(initial_count, 0);
+        assert_eq!(services.library_generation(), 0);
+
+        let first = runtime
+            .block_on(async {
+                services
+                    .spawn_library_projected(|library| {
+                        library.create_book("Projected one", "Author")
+                    })
+                    .await
+                    .context("first projected mutation stopped")?
+            })
+            .unwrap();
+        assert_eq!(first.generation, 1);
+        assert_eq!(first.snapshot.books().len(), 1);
+        assert_eq!(services.library_generation(), 1);
+
+        let error = runtime
+            .block_on(async {
+                services
+                    .spawn_library_projected::<(), _>(|_| anyhow::bail!("expected failure"))
+                    .await
+                    .context("failed projected mutation stopped")?
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("expected failure"));
+        assert_eq!(services.library_generation(), 1);
+
+        let second = runtime
+            .block_on(async {
+                services
+                    .spawn_library_projected(|library| {
+                        library.create_book("Projected two", "Author")
+                    })
+                    .await
+                    .context("second projected mutation stopped")?
+            })
+            .unwrap();
+        assert_eq!(second.generation, 2);
+        assert_eq!(second.snapshot.books().len(), 2);
+        assert_eq!(services.library_generation(), 2);
+    }
+
+    #[test]
+    fn provider_settings_survive_restart_without_persisting_the_api_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = Arc::new(MemoryCredentialStore::default());
+        let services =
+            AppServices::open_with_credentials(temp.path(), credentials.clone()).unwrap();
+        let settings = ProviderSettings {
+            base_url: "https://models.example.test/v1".to_string(),
+            chat_model: "chat-test".to_string(),
+            embedding_model: "embed-test".to_string(),
+            vision_model: "vision-test".to_string(),
+            remote_content_confirmed: true,
+            allow_insecure_remote_http: false,
+            confirmed_remote_endpoint: "https://models.example.test/v1/".to_string(),
+            request_timeout_secs: 30,
+        };
+        block_on_without_tokio(services.configure_provider(
+            settings.clone(),
+            ApiKeyUpdate::Set("credential-only-secret".to_string()),
+        ))
+        .unwrap();
+        assert_eq!(
+            credentials.api_key(&settings.base_url).unwrap().as_deref(),
+            Some("credential-only-secret")
+        );
+
+        let row = db::settings::get(
+            &db::open_conn(services.database_path()).unwrap(),
+            PROVIDER_SETTINGS_KEY,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!row.value_json.contains("credential-only-secret"));
+        assert!(!row.value_json.to_ascii_lowercase().contains("api_key"));
+        drop(services);
+
+        let reopened = AppServices::open_with_credentials(temp.path(), credentials).unwrap();
+        assert_eq!(reopened.provider_settings().unwrap(), settings);
+        assert_eq!(reopened.search().unwrap().embedding_model(), "embed-test");
+    }
+
+    #[test]
+    fn embedding_identity_uses_only_canonical_endpoint_and_embedding_model() {
+        let base = ProviderSettings::default();
+        let expected = embedding_execution_identity(&base).unwrap();
+        let mut unrelated = base.clone();
+        unrelated.base_url = format!("{}/", unrelated.base_url.trim_end_matches('/'));
+        unrelated.chat_model = "chat-other".to_string();
+        unrelated.vision_model = "vision-other".to_string();
+        unrelated.request_timeout_secs = 1;
+        unrelated.remote_content_confirmed = true;
+        unrelated.allow_insecure_remote_http = true;
+        unrelated.confirmed_remote_endpoint = "ignored-for-identity".to_string();
+        assert_eq!(embedding_execution_identity(&unrelated).unwrap(), expected);
+
+        let mut different_model = base.clone();
+        different_model.embedding_model = "embed-other".to_string();
+        assert_ne!(
+            embedding_execution_identity(&different_model).unwrap(),
+            expected
+        );
+        let mut different_endpoint = base;
+        different_endpoint.base_url = "http://127.0.0.1:11435/v1".to_string();
+        assert_ne!(
+            embedding_execution_identity(&different_endpoint).unwrap(),
+            expected
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn chat_timeout_and_key_changes_do_not_requeue_embedding_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = Arc::new(MemoryCredentialStore::default());
+        let services =
+            AppServices::open_with_credentials(temp.path(), credentials.clone()).unwrap();
+        let book = block_on_without_tokio(async {
+            services
+                .spawn_library(|library| library.create_book("Embedding identity", "Author"))
+                .await
+                .context("library test worker stopped")?
+        })
+        .unwrap();
+        let conn = db::open_conn(services.database_path()).unwrap();
+        let source = db::book_sources::get_revision(&conn, &book.id, book.revision)
+            .unwrap()
+            .unwrap();
+        drop(conn);
+        services
+            .runtime()
+            .block_on(stop_indexing_jobs_before_visual_replacement(
+                &services.indexing,
+                &book.id,
+                &source.id,
+            ))
+            .unwrap();
+        let before = db::index_jobs::list_for_source_kind(
+            &db::open_conn(services.database_path()).unwrap(),
+            &source.id,
+            "embedding",
+        )
+        .unwrap();
+        assert!(!before.is_empty());
+
+        let mut next = services.provider_settings().unwrap();
+        next.chat_model = "chat-only-change".to_string();
+        next.request_timeout_secs = (next.request_timeout_secs + 1).min(600);
+        block_on_without_tokio(
+            services.configure_provider(next, ApiKeyUpdate::Set("key-only-change".to_string())),
+        )
+        .unwrap();
+
+        let after = db::index_jobs::list_for_source_kind(
+            &db::open_conn(services.database_path()).unwrap(),
+            &source.id,
+            "embedding",
+        )
+        .unwrap();
+        assert_eq!(after, before);
+        assert_eq!(
+            credentials
+                .api_key(DEFAULT_OLLAMA_OPENAI_BASE_URL)
+                .unwrap()
+                .as_deref(),
+            Some("key-only-change")
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn provider_configuration_rolls_back_when_index_reconfigure_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = Arc::new(MemoryCredentialStore::default());
+        let services =
+            AppServices::open_with_credentials(temp.path(), credentials.clone()).unwrap();
+        let book = block_on_without_tokio(async {
+            services
+                .spawn_library(|library| library.create_book("Provider rollback", "Author"))
+                .await
+                .context("library test worker stopped")?
+        })
+        .unwrap();
+        let conn = db::open_conn(services.database_path()).unwrap();
+        let source = db::book_sources::get_revision(&conn, &book.id, book.revision)
+            .unwrap()
+            .unwrap();
+        services
+            .runtime()
+            .block_on(stop_indexing_jobs_before_visual_replacement(
+                &services.indexing,
+                &book.id,
+                &source.id,
+            ))
+            .unwrap();
+        let vision_id = format!("vision:{}", source.id);
+        let before_job = db::index_jobs::get(&conn, &vision_id).unwrap().unwrap();
+        let previous = services.provider_settings().unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER test_provider_reconfigure_failure
+             BEFORE INSERT ON index_jobs
+             WHEN NEW.kind = 'embedding'
+              AND instr(NEW.cursor_json, '\"model\":\"embed-rollback-test\"') > 0
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected provider reconfigure failure');
+             END;",
+        )
+        .unwrap();
+
+        let mut next = previous.clone();
+        next.chat_model = "chat-rollback-test".to_string();
+        next.embedding_model = "embed-rollback-test".to_string();
+        next.vision_model = "vision-rollback-test".to_string();
+        let result = block_on_without_tokio(services.configure_provider(
+            next,
+            ApiKeyUpdate::Set("temporary-rollback-secret".to_string()),
+        ));
+        assert!(result.is_err());
+        assert_eq!(services.provider_settings().unwrap(), previous);
+        let persisted = load_provider_settings(services.database_path()).unwrap();
+        assert_eq!(persisted, previous);
+        assert!(credentials.api_key(&previous.base_url).unwrap().is_none());
+        assert_eq!(
+            db::index_jobs::get(&conn, &vision_id).unwrap().unwrap(),
+            before_job
+        );
+
+        conn.execute_batch("DROP TRIGGER test_provider_reconfigure_failure")
+            .unwrap();
+    }
+
+    #[test]
+    fn remote_confirmation_is_bound_to_the_exact_canonical_endpoint() {
+        let mut settings = ProviderSettings {
+            base_url: "https://models-a.example.test/v1".to_string(),
+            chat_model: "chat-test".to_string(),
+            embedding_model: "embed-test".to_string(),
+            vision_model: "vision-test".to_string(),
+            remote_content_confirmed: true,
+            allow_insecure_remote_http: false,
+            confirmed_remote_endpoint: "https://models-a.example.test/v1/".to_string(),
+            request_timeout_secs: 30,
+        };
+        settings.validate().unwrap();
+
+        settings.base_url = "https://models-b.example.test/v1".to_string();
+        assert!(settings.validate().is_err());
+
+        settings.confirmed_remote_endpoint = "https://models-b.example.test/v1/".to_string();
+        settings.validate().unwrap();
+    }
+
+    #[test]
+    fn persisted_provider_contract_does_not_accept_legacy_unbound_confirmation() {
+        let legacy = serde_json::json!({
+            "base_url": "https://legacy-remote.example.test/v1",
+            "chat_model": "chat-test",
+            "embedding_model": "embed-test",
+            "vision_model": "vision-test",
+            "remote_content_confirmed": true,
+            "allow_insecure_remote_http": false,
+            "request_timeout_secs": 30
+        });
+        assert!(serde_json::from_value::<ProviderSettings>(legacy).is_err());
+    }
+
+    #[test]
+    fn background_job_snapshots_are_scoped_deduplicated_and_include_progress() {
+        let temp = tempfile::tempdir().unwrap();
+        let services = AppServices::open_with_credentials(
+            temp.path(),
+            Arc::new(MemoryCredentialStore::default()),
+        )
+        .unwrap();
+        let runtime = services.runtime();
+        let book = runtime
+            .block_on(async {
+                services
+                    .spawn_library(|library| library.create_book("Tasks", "Author"))
+                    .await
+                    .context("library test worker stopped")?
+            })
+            .unwrap();
+
+        let jobs = runtime
+            .block_on(services.background_jobs_for_books(vec![book.id.clone(), book.id.clone()]))
+            .unwrap();
+        assert_eq!(jobs.len(), 3);
+        assert_eq!(
+            jobs.iter().map(|job| job.kind.as_str()).collect::<Vec<_>>(),
+            vec!["visual_render", "vision", "embedding"]
+        );
+        let visual = jobs.iter().find(|job| job.kind == "visual_render").unwrap();
+        assert_eq!(visual.progress.total, Some(1));
+        assert!(
+            runtime
+                .block_on(services.background_jobs_for_books(Vec::new()))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn structural_visual_jobs_use_the_shared_library_and_object_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let services = AppServices::open_with_credentials(
+            temp.path(),
+            Arc::new(MemoryCredentialStore::default()),
+        )
+        .unwrap();
+        // This deliberately bypasses AppServices::spawn_library, matching the
+        // existing UI clones. The durable visual queue must still be noticed.
+        let (book, document) = {
+            let mut library = services.library_snapshot().unwrap();
+            let book = library.create_book("Visual", "Author").unwrap();
+            let document = library.document(&book.id).unwrap();
+            (book, document)
+        };
+        let source = db::book_sources::get_revision(
+            &db::open_conn(services.database_path()).unwrap(),
+            &book.id,
+            book.revision,
+        )
+        .unwrap()
+        .unwrap();
+        let visual_job_id = format!("visual-render:{}", source.id);
+        let coordinator = services.visual_jobs().unwrap();
+        let completed = services.runtime().block_on(coordinator.wait_for_state(
+            &visual_job_id,
+            VisualJobState::Succeeded,
+            std::time::Duration::from_secs(5),
+        ));
+        assert_eq!(completed.unwrap().completed_pages, document.units.len());
+        let pages = db::visual_pages::list_for_source(
+            &db::open_conn(services.database_path()).unwrap(),
+            &source.id,
+        )
+        .unwrap();
+        assert_eq!(pages.len(), document.units.len());
+        assert!(pages.iter().all(|page| {
+            page.renderer == "moye-structural-png"
+                && page.document_revision == book.revision
+                && page.unit_revision == book.revision
+                && page.profile_id.starts_with("render-profile-")
+                && page.fidelity == "structural"
+        }));
+        for page in &pages {
+            let blob = db::blobs::get(
+                &db::open_conn(services.database_path()).unwrap(),
+                &page.object_key,
+            )
+            .unwrap()
+            .expect("persisted structural page blob");
+            assert_eq!(blob.media_type, "image/png");
+            let key = BlobKey::parse(&page.object_key).unwrap();
+            let bytes = services
+                .runtime()
+                .block_on(services.blob_store().get(&key))
+                .unwrap();
+            assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        }
+    }
+
+    #[test]
+    fn startup_requeues_legacy_renderer_and_reclaims_its_visual_object() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut library = LibraryStore::load_from(temp.path().to_path_buf()).unwrap();
+        let book = library.create_book("Legacy visual", "Author").unwrap();
+        let document = library.document(&book.id).unwrap();
+        let unit = document.units.first().unwrap();
+        let db_path = temp.path().join(db::DATABASE_FILE);
+        let source = db::book_sources::get_revision(
+            &db::open_conn(&db_path).unwrap(),
+            &book.id,
+            book.revision,
+        )
+        .unwrap()
+        .unwrap();
+        let runtime = library.io_runtime();
+        let store = LocalBlobStore::new(temp.path().join(OBJECT_DIRECTORY)).unwrap();
+        let legacy_bytes = b"<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8'/>";
+        let legacy_key = runtime.block_on(store.put(legacy_bytes)).unwrap();
+        let legacy_blob = db::blobs::BlobRecord {
+            object_key: legacy_key.to_string(),
+            media_type: "image/svg+xml".to_string(),
+            byte_len: legacy_bytes.len() as u64,
+            hash: blake3::hash(legacy_bytes).to_hex().to_string(),
+            created_at: unix_timestamp().unwrap(),
+        };
+        let legacy_page = db::visual_pages::VisualPage {
+            id: "legacy-svg-page".to_string(),
+            book_id: book.id.clone(),
+            source_id: source.id.clone(),
+            content_unit_id: Some(unit.id.clone()),
+            page_index: 0,
+            object_key: legacy_key.to_string(),
+            width: 8,
+            height: 8,
+            render_scale: 1.0,
+            renderer: "moye-structural-svg".to_string(),
+            renderer_version: "0.0.1".to_string(),
+            document_revision: book.revision,
+            unit_revision: unit.revision.get(),
+            profile_id: crate::preview::RenderProfile::default().stable_id(),
+            fidelity: "structural".to_string(),
+            locator_json: serde_json::to_string(&crate::document::DocumentLocator::unit(
+                &book.id, &unit.id,
+            ))
+            .unwrap(),
+            created_at: unix_timestamp().unwrap(),
+        };
+        db::transactions::replace_visual_pages(
+            &mut db::open_conn(&db_path).unwrap(),
+            &book.id,
+            &source.id,
+            book.revision,
+            &[legacy_blob],
+            &[legacy_page],
+        )
+        .unwrap();
+        let job_id = format!("visual-render:{}", source.id);
+        let legacy_spec = crate::preview::VisualJobSpec {
+            id: job_id.clone(),
+            book_id: book.id.clone(),
+            source_id: source.id.clone(),
+            document_revision: crate::document::Revision::new(book.revision),
+            renderer: "moye-structural-svg".to_string(),
+            renderer_version: "0.0.1".to_string(),
+            fidelity: crate::preview::RenderFidelity::Structural,
+            unit_ids: document.units.iter().map(|unit| unit.id.clone()).collect(),
+            profile: crate::preview::RenderProfile::default(),
+        };
+        db::index_jobs::update_state(
+            &db::open_conn(&db_path).unwrap(),
+            &job_id,
+            db::index_jobs::IndexJobStatus::Succeeded,
+            &crate::preview::encode_persisted_visual_job(legacy_spec, 1).unwrap(),
+            None,
+            unix_timestamp().unwrap(),
+            Some(unix_timestamp().unwrap()),
+            Some(unix_timestamp().unwrap()),
+        )
+        .unwrap();
+        drop(library);
+
+        let services = AppServices::open_with_credentials(
+            temp.path(),
+            Arc::new(MemoryCredentialStore::default()),
+        )
+        .unwrap();
+        assert!(!runtime.block_on(store.exists(&legacy_key)).unwrap());
+        assert!(
+            db::blobs::get(&db::open_conn(&db_path).unwrap(), legacy_key.as_str())
+                .unwrap()
+                .is_none()
+        );
+        let completed = runtime
+            .block_on(services.visual_jobs().unwrap().wait_for_state(
+                &job_id,
+                VisualJobState::Succeeded,
+                std::time::Duration::from_secs(5),
+            ))
+            .unwrap();
+        assert_eq!(completed.spec.renderer, "moye-structural-png");
+        let pages =
+            db::visual_pages::list_for_source(&db::open_conn(&db_path).unwrap(), &source.id)
+                .unwrap();
+        assert!(!pages.is_empty());
+        assert!(
+            pages
+                .iter()
+                .all(|page| page.renderer == "moye-structural-png")
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn imported_pdf_visual_job_persists_native_png_pages() {
+        let temp = tempfile::tempdir().unwrap();
+        let services = AppServices::open_with_credentials(
+            temp.path(),
+            Arc::new(MemoryCredentialStore::default()),
+        )
+        .unwrap();
+        let source_path = temp.path().join("native-visual.pdf");
+        fs::write(&source_path, native_pdf_fixture()).unwrap();
+        let mut library = services.library_snapshot().unwrap();
+        let book = match library.import(&source_path).unwrap() {
+            ImportOutcome::Added(book) => book,
+            ImportOutcome::AlreadyExists(_) => panic!("new PDF unexpectedly deduplicated"),
+        };
+        let source = db::book_sources::get_revision(
+            &db::open_conn(services.database_path()).unwrap(),
+            &book.id,
+            book.revision,
+        )
+        .unwrap()
+        .unwrap();
+        let job_id = format!("visual-render:{}", source.id);
+        let completed = services
+            .runtime()
+            .block_on(services.visual_jobs().unwrap().wait_for_state(
+                &job_id,
+                VisualJobState::Succeeded,
+                std::time::Duration::from_secs(10),
+            ))
+            .unwrap();
+        assert_eq!(completed.completed_pages, 1);
+        let pages = db::visual_pages::list_for_source(
+            &db::open_conn(services.database_path()).unwrap(),
+            &source.id,
+        )
+        .unwrap();
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].renderer, "moye-windows-pdf-png");
+        let key = BlobKey::parse(&pages[0].object_key).unwrap();
+        let png = services
+            .runtime()
+            .block_on(services.blob_store().get(&key))
+            .unwrap();
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+
+        let unit_id = library.document(&book.id).unwrap().units[0].id.clone();
+        let updated = library
+            .update_content_unit_source(
+                &book.id,
+                &unit_id,
+                crate::document::SourceKind::Markdown,
+                "# Normalized\n\nEdited PDF content",
+            )
+            .unwrap();
+        let normalized_source = db::book_sources::get_revision(
+            &db::open_conn(services.database_path()).unwrap(),
+            &book.id,
+            updated.revision,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(normalized_source.source_kind, "normalized");
+        assert_eq!(normalized_source.format, "epub");
+        let normalized_job_id = format!("visual-render:{}", normalized_source.id);
+        services
+            .runtime()
+            .block_on(services.visual_jobs().unwrap().wait_for_state(
+                &normalized_job_id,
+                VisualJobState::Succeeded,
+                std::time::Duration::from_secs(10),
+            ))
+            .unwrap();
+        let normalized_pages = db::visual_pages::list_for_source(
+            &db::open_conn(services.database_path()).unwrap(),
+            &normalized_source.id,
+        )
+        .unwrap();
+        assert!(!normalized_pages.is_empty());
+        assert!(
+            normalized_pages
+                .iter()
+                .all(|page| page.renderer == "moye-structural-png")
+        );
+    }
+
+    #[test]
+    fn structural_visual_queue_recovers_a_running_job_after_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut library = LibraryStore::load_from(temp.path().to_path_buf()).unwrap();
+        let book = library.create_book("Restart visual", "Author").unwrap();
+        let db_path = temp.path().join(db::DATABASE_FILE);
+        let source = db::book_sources::get_revision(
+            &db::open_conn(&db_path).unwrap(),
+            &book.id,
+            book.revision,
+        )
+        .unwrap()
+        .unwrap();
+        let job_id = format!("visual-render:{}", source.id);
+        let conn = db::open_conn(&db_path).unwrap();
+        let job = db::index_jobs::get(&conn, &job_id).unwrap().unwrap();
+        db::index_jobs::update_state(
+            &conn,
+            &job_id,
+            db::index_jobs::IndexJobStatus::Running,
+            &job.cursor_json,
+            None,
+            unix_timestamp().unwrap(),
+            Some(unix_timestamp().unwrap()),
+            None,
+        )
+        .unwrap();
+        drop(conn);
+        drop(library);
+
+        let services = AppServices::open_with_credentials(
+            temp.path(),
+            Arc::new(MemoryCredentialStore::default()),
+        )
+        .unwrap();
+        let completed =
+            services
+                .runtime()
+                .block_on(services.visual_jobs().unwrap().wait_for_state(
+                    &job_id,
+                    VisualJobState::Succeeded,
+                    std::time::Duration::from_secs(5),
+                ));
+        assert!(completed.unwrap().attempts >= 2);
+    }
+
+    #[test]
+    fn replacing_visual_pages_reclaims_only_superseded_objects() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut library = LibraryStore::load_from(temp.path().to_path_buf()).unwrap();
+        let book = library.create_book("Visual replacement", "Author").unwrap();
+        let document = library.document(&book.id).unwrap();
+        let unit = document.units.first().unwrap();
+        let db_path = temp.path().join(db::DATABASE_FILE);
+        let source = db::book_sources::get_revision(
+            &db::open_conn(&db_path).unwrap(),
+            &book.id,
+            book.revision,
+        )
+        .unwrap()
+        .unwrap();
+        drop(library);
+
+        let runtime = IoRuntime::default();
+        let store = LocalBlobStore::new(temp.path().join(OBJECT_DIRECTORY)).unwrap();
+        let old_bytes = b"old visual page";
+        let reused_bytes = b"reused visual page";
+        let shared_bytes = b"shared visual page";
+        let replacement_bytes = b"replacement visual page";
+        let old_key = runtime.block_on(store.put(old_bytes)).unwrap();
+        let reused_key = runtime.block_on(store.put(reused_bytes)).unwrap();
+        let shared_key = runtime.block_on(store.put(shared_bytes)).unwrap();
+        let replacement_key = runtime.block_on(store.put(replacement_bytes)).unwrap();
+        let now = unix_timestamp().unwrap();
+        let blob = |key: &BlobKey, bytes: &[u8]| db::blobs::BlobRecord {
+            object_key: key.to_string(),
+            media_type: "image/png".to_string(),
+            byte_len: bytes.len() as u64,
+            hash: blake3::hash(bytes).to_hex().to_string(),
+            created_at: now,
+        };
+        let old_blob = blob(&old_key, old_bytes);
+        let reused_blob = blob(&reused_key, reused_bytes);
+        let shared_blob = blob(&shared_key, shared_bytes);
+        let replacement_blob = blob(&replacement_key, replacement_bytes);
+        let page = |id: &str, index: usize, key: &BlobKey| db::visual_pages::VisualPage {
+            id: id.to_string(),
+            book_id: book.id.clone(),
+            source_id: source.id.clone(),
+            content_unit_id: Some(unit.id.clone()),
+            page_index: index,
+            object_key: key.to_string(),
+            width: 800,
+            height: 1_200,
+            render_scale: 1.0,
+            renderer: "test-png".to_string(),
+            renderer_version: "1".to_string(),
+            document_revision: book.revision,
+            unit_revision: unit.revision.get(),
+            profile_id: "test-profile".to_string(),
+            fidelity: "structural".to_string(),
+            locator_json: serde_json::to_string(&crate::document::DocumentLocator::unit(
+                &book.id, &unit.id,
+            ))
+            .unwrap(),
+            created_at: now,
+        };
+
+        let initially_unreferenced = db::transactions::replace_visual_pages(
+            &mut db::open_conn(&db_path).unwrap(),
+            &book.id,
+            &source.id,
+            book.revision,
+            &[old_blob.clone(), reused_blob.clone(), shared_blob.clone()],
+            &[
+                page("old-page", 0, &old_key),
+                page("reused-page-old", 1, &reused_key),
+                page("shared-page-old", 2, &shared_key),
+            ],
+        )
+        .unwrap();
+        assert!(initially_unreferenced.is_empty());
+
+        let superseded = db::transactions::replace_visual_pages(
+            &mut db::open_conn(&db_path).unwrap(),
+            &book.id,
+            &source.id,
+            book.revision,
+            &[shared_blob.clone(), replacement_blob.clone()],
+            &[
+                page("shared-page-current", 0, &shared_key),
+                page("replacement-page", 1, &replacement_key),
+            ],
+        )
+        .unwrap();
+        assert_eq!(superseded.len(), 2);
+        assert!(superseded.contains(&old_blob));
+        assert!(superseded.contains(&reused_blob));
+
+        // Republish one of the stale candidates before its delayed collector
+        // runs. A content-addressed key can be reused by another page without
+        // writing different bytes, so the collector must consult current DB
+        // references instead of trusting `superseded`.
+        let no_longer_unreferenced = db::transactions::replace_visual_pages(
+            &mut db::open_conn(&db_path).unwrap(),
+            &book.id,
+            &source.id,
+            book.revision,
+            &[
+                shared_blob.clone(),
+                replacement_blob.clone(),
+                reused_blob.clone(),
+            ],
+            &[
+                page("shared-page-current", 0, &shared_key),
+                page("replacement-page", 1, &replacement_key),
+                page("reused-page-current", 2, &reused_key),
+            ],
+        )
+        .unwrap();
+        assert!(no_longer_unreferenced.is_empty());
+
+        let blob_publication = BlobPublicationLock::for_store(&store).unwrap();
+        runtime.block_on(reclaim_unreferenced_blobs(
+            &db_path,
+            &store,
+            &blob_publication,
+            superseded,
+            "视觉页面对象",
+        ));
+
+        assert!(!runtime.block_on(store.exists(&old_key)).unwrap());
+        assert!(runtime.block_on(store.exists(&reused_key)).unwrap());
+        assert!(runtime.block_on(store.exists(&shared_key)).unwrap());
+        assert!(runtime.block_on(store.exists(&replacement_key)).unwrap());
+        let conn = db::open_conn(&db_path).unwrap();
+        assert!(db::blobs::get(&conn, old_key.as_str()).unwrap().is_none());
+        assert!(
+            db::blobs::get(&conn, reused_key.as_str())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            db::blobs::get(&conn, shared_key.as_str())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            db::blobs::get(&conn, replacement_key.as_str())
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    fn native_pdf_fixture() -> Vec<u8> {
+        let mut document = Document::with_version("1.7");
+        let pages_id = document.new_object_id();
+        let font_id = document.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Courier",
+        });
+        let resources_id = document.add_object(dictionary! {
+            "Font" => dictionary! { "F1" => font_id },
+        });
+        let content = Content {
+            operations: vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F1".into(), 18.into()]),
+                Operation::new("Td", vec![72.into(), 720.into()]),
+                Operation::new("Tj", vec![Object::string_literal("Native PDF visual")]),
+                Operation::new("ET", vec![]),
+            ],
+        };
+        let content_id =
+            document.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
+        let page_id = document.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+        });
+        document.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_id.into()],
+                "Count" => 1,
+                "Resources" => resources_id,
+                "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+            }),
+        );
+        let catalog = document.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        document.trailer.set("Root", catalog);
+        let mut bytes = Vec::new();
+        document.save_to(&mut bytes).unwrap();
+        bytes
+    }
+}

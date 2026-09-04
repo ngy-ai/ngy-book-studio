@@ -1,0 +1,20 @@
+/target/
+/node_modules/
+**/node_modules/
+/.idea/
+/.vscode/
+*.pdb
+*.log
+
+# Development-only application data.  Real LocalAppData lives outside the
+# repository, but these narrow rules prevent an isolated GUI smoke directory
+# from becoming part of the first commit.
+/library.db
+/library.db-wal
+/library.db-shm
+/library.db-journal
+/objects/
+/webview-data/
+/WebView2/
+/gui-smoke-*/
+/exports/
