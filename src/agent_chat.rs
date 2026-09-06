@@ -210,6 +210,7 @@ pub struct ConversationQuestion {
     pub request_id: u64,
     pub question: String,
     pub allowed_book_ids: Vec<String>,
+    pub book_titles: Vec<(String, String)>,
     pub snapshots: Vec<SelectionSnapshot>,
 }
 
@@ -741,11 +742,13 @@ impl AgentConversation {
         let provider = self.services.provider()?;
         let search = self.services.search()?;
         let search_backend: Arc<dyn SearchBackend> = search;
+        let web_search = self.services.web_search_backend()?;
         let runtime = AgentRuntime::for_database(
             provider,
             search_backend,
             self.services.database_path(),
             settings.chat_model.clone(),
+            web_search,
         )?;
         ensure_request_not_cancelled(&cancellation)?;
         let answer = runtime
@@ -753,6 +756,7 @@ impl AgentConversation {
                 AgentQuestion {
                     question: request.question,
                     allowed_book_ids: scope.book_ids,
+                    book_titles: request.book_titles,
                     history: history_messages(&previous),
                     snapshots,
                 },
@@ -766,7 +770,11 @@ impl AgentConversation {
             .citations
             .iter()
             .map(|citation| NewChatCitation {
-                content_unit_id: Some(citation.unit_id.clone()),
+                content_unit_id: if citation.is_web() {
+                    None
+                } else {
+                    Some(citation.unit_id.clone())
+                },
                 search_chunk_id: citation
                     .citation_id
                     .strip_prefix("passage:")
@@ -775,6 +783,9 @@ impl AgentConversation {
                 unit_revision: citation.unit_revision,
                 quote: citation.quote.clone(),
                 locator: citation.locator.clone(),
+                source_kind: citation.source_kind,
+                url: citation.url.clone(),
+                source_title: citation.source_title.clone(),
             })
             .collect();
         let stored_message = repository
@@ -1883,6 +1894,7 @@ mod tests {
                     request_id: 41,
                     question: "must never be persisted or sent".to_string(),
                     allowed_book_ids: Vec::new(),
+                    book_titles: Vec::new(),
                     snapshots: Vec::new(),
                 },
                 None,

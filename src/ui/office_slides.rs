@@ -746,6 +746,7 @@ mod tests {
             quote: None,
             selection_snapshot: false,
             stale: false,
+            url: None,
         };
         assert_eq!(
             office_page_index_for_source(&pages, 1, &exact_source),
@@ -870,6 +871,7 @@ mod tests {
             quote: None,
             selection_snapshot: false,
             stale: false,
+            url: None,
         };
         assert_eq!(
             office_page_index_for_source(&pages, 1, &guessed_source),

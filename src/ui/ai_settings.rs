@@ -133,6 +133,19 @@ pub(super) struct AiSettingsWindow {
     allow_insecure_remote_http: bool,
     confirmed_remote_endpoint: String,
     delete_api_key: bool,
+    // --- Host web-search fallback (opt-in) ---
+    web_search_enabled: bool,
+    web_search_url_input: Entity<InputState>,
+    web_search_method_input: Entity<InputState>,
+    web_search_body_input: Entity<InputState>,
+    web_search_key_header_input: Entity<InputState>,
+    web_search_api_key_input: Entity<InputState>,
+    web_search_timeout_input: Entity<InputState>,
+    web_search_max_results_input: Entity<InputState>,
+    web_search_remote_confirmed: bool,
+    web_search_allow_insecure_http: bool,
+    web_search_confirmed_remote_endpoint: String,
+    delete_web_search_api_key: bool,
     operation: PendingOperation,
     detected_models: Vec<String>,
     missing_models: Vec<String>,
@@ -178,6 +191,46 @@ impl AiSettingsWindow {
                 .masked(true)
                 .placeholder("留空则保持现有密钥")
         });
+        let web_search_url_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(settings.web_search_url_template)
+                .placeholder("http://127.0.0.1:8080/search?q={query}&format=json")
+        });
+        let web_search_method_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(settings.web_search_method)
+                .placeholder("GET")
+                .validate(|value, _| matches!(value.to_ascii_uppercase().as_str(), "GET" | "POST"))
+        });
+        let web_search_body_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(settings.web_search_body_template.unwrap_or_default())
+                .placeholder(r#"{"query":"{query}"}"#)
+        });
+        let web_search_key_header_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(settings.web_search_key_header.unwrap_or_default())
+                .placeholder("Authorization")
+        });
+        let web_search_api_key_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .masked(true)
+                .placeholder("留空则保持现有密钥")
+        });
+        let web_search_timeout_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(settings.web_search_timeout_secs.to_string())
+                .placeholder(
+                    moye_epub_editor::web_search::DEFAULT_WEB_SEARCH_TIMEOUT_SECS.to_string(),
+                )
+                .validate(|value, _| value.chars().all(|character| character.is_ascii_digit()))
+        });
+        let web_search_max_results_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(settings.web_search_max_results.to_string())
+                .placeholder(moye_epub_editor::web_search::MAX_WEB_SEARCH_RESULTS.to_string())
+                .validate(|value, _| value.chars().all(|character| character.is_ascii_digit()))
+        });
         let subscriptions =
             vec![cx.subscribe_in(&base_url_input, window, Self::on_base_url_input_event)];
 
@@ -195,6 +248,18 @@ impl AiSettingsWindow {
             allow_insecure_remote_http: settings.allow_insecure_remote_http,
             confirmed_remote_endpoint: settings.confirmed_remote_endpoint,
             delete_api_key: false,
+            web_search_enabled: settings.web_search_enabled,
+            web_search_url_input,
+            web_search_method_input,
+            web_search_body_input,
+            web_search_key_header_input,
+            web_search_api_key_input,
+            web_search_timeout_input,
+            web_search_max_results_input,
+            web_search_remote_confirmed: settings.web_search_remote_confirmed,
+            web_search_allow_insecure_http: settings.web_search_allow_insecure_http,
+            web_search_confirmed_remote_endpoint: settings.web_search_confirmed_remote_endpoint,
+            delete_web_search_api_key: false,
             operation: PendingOperation::Idle,
             detected_models: Vec::new(),
             missing_models: Vec::new(),
@@ -206,6 +271,29 @@ impl AiSettingsWindow {
     fn entered_settings(&self, cx: &App) -> Result<ProviderSettings> {
         let request_timeout_secs =
             parse_request_timeout_secs(self.request_timeout_input.read(cx).value().as_ref())?;
+        let web_search_timeout_secs =
+            parse_web_search_timeout_secs(self.web_search_timeout_input.read(cx).value().as_ref())?;
+        let web_search_max_results = parse_web_search_max_results(
+            self.web_search_max_results_input.read(cx).value().as_ref(),
+        )?;
+        let body_template = {
+            let raw = self.web_search_body_input.read(cx).value();
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        };
+        let key_header = {
+            let raw = self.web_search_key_header_input.read(cx).value();
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        };
         let settings = ProviderSettings {
             base_url: self.base_url_input.read(cx).value().trim().to_string(),
             chat_model: self.chat_model_input.read(cx).value().trim().to_string(),
@@ -220,6 +308,26 @@ impl AiSettingsWindow {
             allow_insecure_remote_http: self.allow_insecure_remote_http,
             confirmed_remote_endpoint: self.confirmed_remote_endpoint.clone(),
             request_timeout_secs,
+            web_search_enabled: self.web_search_enabled,
+            web_search_url_template: self
+                .web_search_url_input
+                .read(cx)
+                .value()
+                .trim()
+                .to_string(),
+            web_search_method: self
+                .web_search_method_input
+                .read(cx)
+                .value()
+                .trim()
+                .to_ascii_uppercase(),
+            web_search_body_template: body_template,
+            web_search_key_header: key_header,
+            web_search_remote_confirmed: self.web_search_remote_confirmed,
+            web_search_allow_insecure_http: self.web_search_allow_insecure_http,
+            web_search_confirmed_remote_endpoint: self.web_search_confirmed_remote_endpoint.clone(),
+            web_search_timeout_secs,
+            web_search_max_results,
         };
         settings.validate()?;
         Ok(settings)
@@ -256,6 +364,18 @@ impl AiSettingsWindow {
 
     fn clear_entered_api_key(&self, window: &mut Window, cx: &mut Context<Self>) {
         let input = self.api_key_input.clone();
+        input.update(cx, |input, cx| input.set_value("", window, cx));
+    }
+
+    fn web_api_key_update(&self, cx: &App) -> ApiKeyUpdate {
+        api_key_update_for_input(
+            self.web_search_api_key_input.read(cx).value().as_ref(),
+            self.delete_web_search_api_key,
+        )
+    }
+
+    fn clear_entered_web_api_key(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let input = self.web_search_api_key_input.clone();
         input.update(cx, |input, cx| input.set_value("", window, cx));
     }
 
@@ -357,7 +477,9 @@ impl AiSettingsWindow {
             }
         };
         let key_update = self.api_key_update(cx);
+        let web_key_update = self.web_api_key_update(cx);
         self.clear_entered_api_key(window, cx);
+        self.clear_entered_web_api_key(window, cx);
         self.operation = PendingOperation::Saving;
         self.notice = Some(SettingsNotice {
             text: "正在安全保存 Provider 设置…".to_string(),
@@ -370,6 +492,12 @@ impl AiSettingsWindow {
             // AppServices moves credential and SQLite work to its dedicated
             // runtime; this UI future only awaits and applies the result.
             let outcome = services.configure_provider(settings, key_update).await;
+            let web_outcome = match &web_key_update {
+                ApiKeyUpdate::Keep => Ok(()),
+                ApiKeyUpdate::Set(value) => services.set_web_search_api_key(value),
+                ApiKeyUpdate::Delete => services.delete_web_search_api_key(),
+            };
+            let outcome = outcome.and(web_outcome);
             let _ = view.update(cx, |this, cx| {
                 this.operation = PendingOperation::Idle;
                 match outcome {
@@ -509,6 +637,11 @@ impl Render for AiSettingsWindow {
         let delete_view = view.clone();
         let detect_view = view.clone();
         let save_view = view.clone();
+        let web_enable_view = view.clone();
+        let web_confirm_view = view.clone();
+        let web_insecure_view = view.clone();
+        let web_delete_view = view.clone();
+        let web_url_input = self.web_search_url_input.clone();
         let busy = self.operation.busy();
         let endpoint_for_confirmation = self.base_url_input.clone();
 
@@ -727,6 +860,165 @@ impl Render for AiSettingsWindow {
                                             }),
                                     ),
                             )
+                            .child(
+                                div()
+                                    .v_flex()
+                                    .gap_3()
+                                    .p_4()
+                                    .rounded(px(12.))
+                                    .border_1()
+                                    .border_color(rgb(BORDER))
+                                    .bg(rgb(SURFACE))
+                                    .child(
+                                        div()
+                                            .h_flex()
+                                            .justify_between()
+                                            .child(
+                                                div()
+                                                    .v_flex()
+                                                    .gap_0p5()
+                                                    .child(
+                                                        div()
+                                                            .text_sm()
+                                                            .font_semibold()
+                                                            .text_color(rgb(INK))
+                                                            .child("联网搜索（可选）"),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(rgb(MUTED))
+                                                            .child("书中检索不到时，宿主补充一次联网搜索作为回答依据；关闭则不联网。"),
+                                                    ),
+                                            )
+                                            .child(
+                                                Checkbox::new("ai-web-search-enabled")
+                                                    .checked(self.web_search_enabled)
+                                                    .disabled(busy)
+                                                    .label("启用")
+                                                    .on_click(move |checked, _, cx| {
+                                                        let checked = *checked;
+                                                        web_enable_view.update(cx, |this, cx| {
+                                                            this.web_search_enabled = checked;
+                                                            cx.notify();
+                                                        });
+                                                    }),
+                                            ),
+                                    )
+                                    .child(self.render_input_field(
+                                        "请求模板（URL）",
+                                        "必须包含 {query}；可配置 SearxNG、Brave、Tavily 等端点。",
+                                        &self.web_search_url_input,
+                                    ))
+                                    .child(self.render_input_field(
+                                        "方法",
+                                        "GET 或 POST；POST 端点需填写下方的请求体模板。",
+                                        &self.web_search_method_input,
+                                    ))
+                                    .child(self.render_input_field(
+                                        "请求体模板（可选）",
+                                        "POST 时使用，需包含 {query}；留空则用 GET。",
+                                        &self.web_search_body_input,
+                                    ))
+                                    .child(self.render_input_field(
+                                        "API key 头（可选）",
+                                        "自定义携带密钥的请求头名；留空则用 Authorization: Bearer。",
+                                        &self.web_search_key_header_input,
+                                    ))
+                                    .child(
+                                        Input::new(&self.web_search_api_key_input)
+                                            .mask_toggle()
+                                            .disabled(
+                                                busy
+                                                    || self.delete_web_search_api_key
+                                                    || !self.web_search_enabled,
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(MUTED))
+                                            .child("联网搜索 API key 只存入 Windows Credential Manager；留空保持、输入替换。"),
+                                    )
+                                    .child(
+                                        Checkbox::new("ai-web-confirm-remote")
+                                            .checked(self.web_search_remote_confirmed)
+                                            .disabled(busy || !self.web_search_enabled)
+                                            .label("确认允许把检索词发送到远程搜索端点")
+                                            .on_click(move |checked, _, cx| {
+                                                let checked = *checked;
+                                                web_confirm_view.update(cx, |this, cx| {
+                                                    if checked {
+                                                        let entered = web_url_input.read(cx).value();
+                                                        match moye_epub_editor::web_search::normalize_web_endpoint(
+                                                            entered.trim(),
+                                                        ) {
+                                                            Some(url) => {
+                                                                this.web_search_remote_confirmed = true;
+                                                                this.web_search_confirmed_remote_endpoint = url;
+                                                            }
+                                                            None => {
+                                                                this.web_search_remote_confirmed = false;
+                                                                this.web_search_confirmed_remote_endpoint.clear();
+                                                                this.notice = Some(SettingsNotice {
+                                                                    text: "联网搜索端点无效，无法确认。".to_string(),
+                                                                    error: true,
+                                                                });
+                                                            }
+                                                        }
+                                                    } else {
+                                                        this.web_search_remote_confirmed = false;
+                                                        this.web_search_allow_insecure_http = false;
+                                                        this.web_search_confirmed_remote_endpoint.clear();
+                                                    }
+                                                    cx.notify();
+                                                });
+                                            }),
+                                    )
+                                    .child(
+                                        Checkbox::new("ai-web-allow-insecure-http")
+                                            .checked(self.web_search_allow_insecure_http)
+                                            .disabled(
+                                                busy
+                                                    || !self.web_search_enabled
+                                                    || !self.web_search_remote_confirmed,
+                                            )
+                                            .label("额外允许非 HTTPS 的搜索端点（内容可能被窃听）")
+                                            .on_click(move |checked, _, cx| {
+                                                let checked = *checked;
+                                                web_insecure_view.update(cx, |this, cx| {
+                                                    this.web_search_allow_insecure_http = checked;
+                                                    cx.notify();
+                                                });
+                                            }),
+                                    )
+                                    .child(self.render_input_field(
+                                        "超时（秒）",
+                                        "单次联网搜索请求的总超时。",
+                                        &self.web_search_timeout_input,
+                                    ))
+                                    .child(self.render_input_field(
+                                        "结果条数",
+                                        "返回给模型的最大搜索结果数量。",
+                                        &self.web_search_max_results_input,
+                                    ))
+                                    .child(
+                                        Checkbox::new("ai-web-delete-api-key")
+                                            .checked(self.delete_web_search_api_key)
+                                            .disabled(busy || !self.web_search_enabled)
+                                            .label("删除已保存的联网搜索 API key")
+                                            .on_click(move |checked, window, cx| {
+                                                let checked = *checked;
+                                                web_delete_view.update(cx, |this, cx| {
+                                                    this.delete_web_search_api_key = checked;
+                                                    if checked {
+                                                        this.clear_entered_web_api_key(window, cx);
+                                                    }
+                                                    cx.notify();
+                                                });
+                                            }),
+                                    ),
+                            )
                             .when_some(self.render_notice(), |this, notice| this.child(notice)),
                     ),
             )
@@ -878,6 +1170,34 @@ fn parse_request_timeout_secs(value: &str) -> Result<u64> {
         "请求超时必须是 {MIN_AI_REQUEST_TIMEOUT_SECS} 到 {MAX_AI_REQUEST_TIMEOUT_SECS} 之间的整数秒数"
     );
     Ok(timeout)
+}
+
+fn parse_web_search_timeout_secs(value: &str) -> Result<u64> {
+    use moye_epub_editor::web_search::{MAX_WEB_SEARCH_TIMEOUT_SECS, MIN_WEB_SEARCH_TIMEOUT_SECS};
+    let value = value.trim();
+    let timeout = value.parse::<u64>().map_err(|_| {
+        anyhow::anyhow!(
+            "联网搜索超时必须是 {MIN_WEB_SEARCH_TIMEOUT_SECS} 到 {MAX_WEB_SEARCH_TIMEOUT_SECS} 之间的整数秒数"
+        )
+    })?;
+    anyhow::ensure!(
+        (MIN_WEB_SEARCH_TIMEOUT_SECS..=MAX_WEB_SEARCH_TIMEOUT_SECS).contains(&timeout),
+        "联网搜索超时必须是 {MIN_WEB_SEARCH_TIMEOUT_SECS} 到 {MAX_WEB_SEARCH_TIMEOUT_SECS} 之间的整数秒数"
+    );
+    Ok(timeout)
+}
+
+fn parse_web_search_max_results(value: &str) -> Result<usize> {
+    use moye_epub_editor::web_search::MAX_WEB_SEARCH_RESULTS;
+    let value = value.trim();
+    let count = value.parse::<usize>().map_err(|_| {
+        anyhow::anyhow!("联网搜索结果数必须是 1 到 {MAX_WEB_SEARCH_RESULTS} 之间的整数")
+    })?;
+    anyhow::ensure!(
+        (1..=MAX_WEB_SEARCH_RESULTS).contains(&count),
+        "联网搜索结果数必须是 1 到 {MAX_WEB_SEARCH_RESULTS} 之间的整数"
+    );
+    Ok(count)
 }
 
 fn configured_models(settings: &ProviderSettings) -> [&str; 3] {

@@ -23,6 +23,7 @@ use crate::office_visual::{OFFICE_ENHANCED_RENDERER_NAME, OfficeEnhancedRenderer
 #[cfg(target_os = "windows")]
 use crate::windows_pdf_renderer::WindowsPdfRenderer;
 use crate::{
+    agent::WebSearchBackend,
     ai::{
         DEFAULT_AI_REQUEST_TIMEOUT_SECS, DEFAULT_OLLAMA_OPENAI_BASE_URL, ModelInfo,
         OpenAiCompatibleProvider, OpenAiHttpProvider, ProviderConfig, normalize_provider_base_url,
@@ -43,10 +44,12 @@ use crate::{
     runtime::IoRuntime,
     search::SearchService,
     storage::{BlobKey, BlobPublicationLock, BlobStore, LocalBlobStore},
+    web_search::{HttpWebSearch, WebSearchConfig, normalize_web_endpoint},
 };
 
 const OBJECT_DIRECTORY: &str = "objects";
 const PROVIDER_SETTINGS_KEY: &str = "ai.openai_compatible.provider.v1";
+const WEB_SEARCH_CREDENTIAL_TARGET: &str = "ai.openai_compatible.web_search.v1";
 const MAX_MODEL_NAME_CHARS: usize = 256;
 #[cfg(target_os = "windows")]
 const MAX_LOADED_OFFICE_PAGES: usize = 20_000;
@@ -72,6 +75,46 @@ pub struct ProviderSettings {
     /// were made. Changing the endpoint invalidates both booleans.
     pub confirmed_remote_endpoint: String,
     pub request_timeout_secs: u64,
+    // --- Host-performed web search (off by default) ---
+    /// Opt-in internet fallback used only when the authorized books cannot
+    /// ground an answer. Disabled by default, so no request is ever issued
+    /// unless the user enables and configures one.
+    #[serde(default)]
+    pub web_search_enabled: bool,
+    #[serde(default)]
+    pub web_search_url_template: String,
+    #[serde(default = "default_web_search_method")]
+    pub web_search_method: String,
+    /// Optional JSON body template containing `{query}` for POST endpoints
+    /// such as Tavily.
+    #[serde(default)]
+    pub web_search_body_template: Option<String>,
+    /// Header name for the web-search key. `None` sends `Authorization: Bearer <key>`.
+    #[serde(default)]
+    pub web_search_key_header: Option<String>,
+    #[serde(default)]
+    pub web_search_remote_confirmed: bool,
+    #[serde(default)]
+    pub web_search_allow_insecure_http: bool,
+    /// Canonical web endpoint for which the confirmations above were made.
+    #[serde(default)]
+    pub web_search_confirmed_remote_endpoint: String,
+    #[serde(default = "default_web_search_timeout_secs")]
+    pub web_search_timeout_secs: u64,
+    #[serde(default = "default_web_search_max_results")]
+    pub web_search_max_results: usize,
+}
+
+fn default_web_search_method() -> String {
+    "GET".to_string()
+}
+
+fn default_web_search_timeout_secs() -> u64 {
+    crate::web_search::DEFAULT_WEB_SEARCH_TIMEOUT_SECS
+}
+
+fn default_web_search_max_results() -> usize {
+    crate::web_search::MAX_WEB_SEARCH_RESULTS
 }
 
 impl Default for ProviderSettings {
@@ -85,6 +128,16 @@ impl Default for ProviderSettings {
             allow_insecure_remote_http: false,
             confirmed_remote_endpoint: String::new(),
             request_timeout_secs: DEFAULT_AI_REQUEST_TIMEOUT_SECS,
+            web_search_enabled: false,
+            web_search_url_template: String::new(),
+            web_search_method: default_web_search_method(),
+            web_search_body_template: None,
+            web_search_key_header: None,
+            web_search_remote_confirmed: false,
+            web_search_allow_insecure_http: false,
+            web_search_confirmed_remote_endpoint: String::new(),
+            web_search_timeout_secs: crate::web_search::DEFAULT_WEB_SEARCH_TIMEOUT_SECS,
+            web_search_max_results: crate::web_search::MAX_WEB_SEARCH_RESULTS,
         }
     }
 }
@@ -95,6 +148,9 @@ impl ProviderSettings {
         validate_model_name("embedding", &self.embedding_model)?;
         validate_model_name("vision", &self.vision_model)?;
         self.provider_config(None).validated_base_url()?;
+        // Validate the web endpoint eagerly so a malformed configuration is
+        // caught at save time instead of silently disabling the fallback.
+        self.web_search_config(None)?;
         Ok(())
     }
 
@@ -109,6 +165,33 @@ impl ProviderSettings {
             allow_insecure_remote_http: self.allow_insecure_remote_http && confirmation_matches,
             request_timeout_secs: self.request_timeout_secs,
         }
+    }
+
+    /// Builds the validated web-search configuration, or `None` when the
+    /// fallback is disabled. The API key is supplied by the caller (it lives in
+    /// the credential store, never in persisted JSON).
+    pub fn web_search_config(&self, api_key: Option<String>) -> Result<Option<WebSearchConfig>> {
+        if !self.web_search_enabled {
+            return Ok(None);
+        }
+        let confirmation_matches = normalize_web_endpoint(&self.web_search_url_template)
+            .is_some_and(|url| self.web_search_confirmed_remote_endpoint == url);
+        let config = WebSearchConfig {
+            enabled: true,
+            url_template: self.web_search_url_template.clone(),
+            method: self.web_search_method.clone(),
+            body_template: self.web_search_body_template.clone(),
+            api_key,
+            api_key_header: self.web_search_key_header.clone(),
+            remote_confirmed: self.web_search_remote_confirmed && confirmation_matches,
+            allow_insecure_remote_http: self.web_search_allow_insecure_http && confirmation_matches,
+            timeout_secs: self.web_search_timeout_secs,
+            max_results: self.web_search_max_results,
+        };
+        config
+            .validated_endpoint()
+            .context("联网搜索端点配置无效")?;
+        Ok(Some(config))
     }
 }
 
@@ -520,6 +603,36 @@ impl AppServices {
                 .map_err(|_| anyhow::anyhow!("AI service lock is poisoned"))?
                 .provider,
         ))
+    }
+
+    /// Builds the host web-search backend from the persisted configuration, or
+    /// `None` when the fallback is disabled. The API key is read from the
+    /// credential store, never from persisted JSON.
+    pub fn web_search_backend(&self) -> Result<Option<Arc<dyn WebSearchBackend>>> {
+        let settings = self.provider_settings()?;
+        let api_key = if settings.web_search_enabled {
+            self.credentials.api_key(WEB_SEARCH_CREDENTIAL_TARGET)?
+        } else {
+            None
+        };
+        match settings.web_search_config(api_key)? {
+            Some(config) => Ok(Some(Arc::new(HttpWebSearch::new(config)?))),
+            None => Ok(None),
+        }
+    }
+
+    pub fn web_search_api_key(&self) -> Result<Option<String>> {
+        self.credentials.api_key(WEB_SEARCH_CREDENTIAL_TARGET)
+    }
+
+    pub fn set_web_search_api_key(&self, key: &str) -> Result<()> {
+        self.credentials
+            .set_api_key(WEB_SEARCH_CREDENTIAL_TARGET, key)
+    }
+
+    pub fn delete_web_search_api_key(&self) -> Result<()> {
+        self.credentials
+            .delete_api_key(WEB_SEARCH_CREDENTIAL_TARGET)
     }
 
     pub fn search(&self) -> Result<Arc<SearchService>> {
@@ -2180,6 +2293,7 @@ mod tests {
             allow_insecure_remote_http: false,
             confirmed_remote_endpoint: "https://models.example.test/v1/".to_string(),
             request_timeout_secs: 30,
+            ..Default::default()
         };
         block_on_without_tokio(services.configure_provider(
             settings.clone(),
@@ -2356,6 +2470,39 @@ mod tests {
     }
 
     #[test]
+    fn web_search_stays_off_until_enabled_and_confirmed() {
+        let mut settings = ProviderSettings::default();
+        assert!(settings.web_search_config(None).unwrap().is_none());
+
+        // A loopback endpoint needs no acknowledgement.
+        settings.web_search_enabled = true;
+        settings.web_search_url_template =
+            "http://127.0.0.1:8080/search?q={query}&format=json".to_string();
+        assert!(settings.validate().is_ok());
+
+        // The key comes from the caller (credential store) and is not persisted.
+        let config = settings
+            .web_search_config(Some("credential-only".to_string()))
+            .unwrap()
+            .expect("loopback web search config");
+        assert_eq!(config.api_key.as_deref(), Some("credential-only"));
+
+        // A remote endpoint is rejected until it is explicitly confirmed.
+        settings.web_search_url_template = "https://api.example.test/search?q={query}".to_string();
+        assert!(settings.validate().is_err());
+
+        settings.web_search_confirmed_remote_endpoint =
+            normalize_web_endpoint(&settings.web_search_url_template).unwrap();
+        settings.web_search_remote_confirmed = true;
+        assert!(settings.validate().is_ok());
+
+        // Changing the endpoint invalidates the acknowledgement again.
+        settings.web_search_url_template =
+            "https://other.example.test/search?q={query}".to_string();
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
     fn remote_confirmation_is_bound_to_the_exact_canonical_endpoint() {
         let mut settings = ProviderSettings {
             base_url: "https://models-a.example.test/v1".to_string(),
@@ -2366,6 +2513,7 @@ mod tests {
             allow_insecure_remote_http: false,
             confirmed_remote_endpoint: "https://models-a.example.test/v1/".to_string(),
             request_timeout_secs: 30,
+            ..Default::default()
         };
         settings.validate().unwrap();
 

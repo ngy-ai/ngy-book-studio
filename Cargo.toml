@@ -64,6 +64,16 @@ windows = { version = "0.61.3", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+# Debug info is dominated by third-party crates (aws-lc-sys, ring, rav1e,
+# resvg, gpui...), which produced a ~640 MB PDB and a 21 GB target dir. Keep
+# full debug info for this crate only; dependencies are rarely stepped into
+# and rebuilding them with debuginfo costs disk and link time.
+[profile.dev]
+debug = 2
+
+[profile.dev.package."*"]
+debug = 0
+
 [profile.release]
 lto = "thin"
 strip = true

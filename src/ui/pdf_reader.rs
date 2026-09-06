@@ -1581,6 +1581,7 @@ mod tests {
             quote: None,
             selection_snapshot: false,
             stale: false,
+            url: None,
         };
         assert_eq!(pdf_page_for_source(&pages, &source), Some(3));
 

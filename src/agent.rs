@@ -275,6 +275,45 @@ pub trait SearchBackend: Send + Sync {
     fn search(&self, request: SearchRequest) -> BoxFuture<'_, AnyResult<Vec<PassageRecord>>>;
 }
 
+/// One internet result served to the model as a citable source.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebSearchResult {
+    pub title: String,
+    /// Absolute http(s) URL. Non-http(s) schemes are rejected by the client.
+    pub url: String,
+    pub snippet: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WebSearchRequest {
+    pub query: String,
+    pub limit: usize,
+}
+
+/// Internet retrieval performed by the host, never by the model.
+///
+/// Web search is deliberately *not* exposed as a tool: the host decides when
+/// the authorized books cannot answer and runs the fallback itself, so the
+/// read-only agent keeps exactly three model-facing tools.
+pub trait WebSearchBackend: Send + Sync {
+    fn web_search(
+        &self,
+        request: WebSearchRequest,
+    ) -> BoxFuture<'_, AnyResult<Vec<WebSearchResult>>>;
+}
+
+impl<T> WebSearchBackend for Arc<T>
+where
+    T: WebSearchBackend + ?Sized,
+{
+    fn web_search(
+        &self,
+        request: WebSearchRequest,
+    ) -> BoxFuture<'_, AnyResult<Vec<WebSearchResult>>> {
+        (**self).web_search(request)
+    }
+}
+
 impl<T> SearchBackend for Arc<T>
 where
     T: SearchBackend + ?Sized,
@@ -464,6 +503,9 @@ impl SelectionSnapshot {
                 .locator
                 .clone()
                 .expect("validated host citation locator"),
+            source_kind: AgentCitationSourceKind::Book,
+            url: None,
+            source_title: None,
         })
     }
 
@@ -568,9 +610,30 @@ fn selection_marker_nonce() -> AgentResult<String> {
     Ok(encoded)
 }
 
+/// Where a served source came from.
+///
+/// Book sources carry a verifiable [`DocumentLocator`] plus document/unit
+/// revisions, so a persisted citation can be re-resolved and marked stale.
+/// Web sources carry only a URL and a title: they have no locator, no unit and
+/// no revision, so they are never treated as a book passage.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCitationSourceKind {
+    #[default]
+    Book,
+    Web,
+}
+
+impl AgentCitationSourceKind {
+    pub fn is_web(self) -> bool {
+        matches!(self, Self::Web)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentCitation {
     pub citation_id: String,
+    /// Empty for web sources; web identity lives in [`Self::url`].
     pub book_id: String,
     pub book_title: String,
     pub unit_id: String,
@@ -579,18 +642,70 @@ pub struct AgentCitation {
     pub unit_revision: Revision,
     pub quote: String,
     pub locator: DocumentLocator,
+    #[serde(default)]
+    pub source_kind: AgentCitationSourceKind,
+    /// Absolute http(s) URL, populated only for web sources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Human-readable origin (result title or site name) for web sources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_title: Option<String>,
+}
+
+impl AgentCitation {
+    /// Builds a web source. Web results have no book/unit/locator identity, so
+    /// those fields stay empty and must never be resolved as a passage.
+    pub fn web(citation_id: String, title: String, url: String, snippet: String) -> Self {
+        Self {
+            citation_id,
+            book_id: String::new(),
+            book_title: title.clone(),
+            unit_id: String::new(),
+            unit_title: String::new(),
+            document_revision: Revision::new(0),
+            unit_revision: Revision::new(0),
+            quote: snippet,
+            // Web results have no book/unit coordinate. The locator is an
+            // intentionally empty struct so it can never be resolved to a
+            // passage; identity comes from `url` alone.
+            locator: DocumentLocator::unit("", ""),
+            source_kind: AgentCitationSourceKind::Web,
+            url: Some(url),
+            source_title: Some(title),
+        }
+    }
+
+    pub fn is_web(&self) -> bool {
+        self.source_kind.is_web()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentAnswerSourceStatus {
-    /// Every returned citation was issued by the host for this question and
-    /// retained explicitly by the model in its final answer.
+    /// Every retained citation was issued by the host for this question and
+    /// points at the authorized knowledge base.
     VerifiedKnowledgeBaseSources,
+    /// Every retained citation came from a host-performed web search.
+    VerifiedWebSources,
+    /// The answer retained both book and web citations.
+    VerifiedMixedSources,
     /// The final answer retained no host-verified citation. It may still be a
     /// useful general-model answer, but callers must not present it as grounded
-    /// in the authorized knowledge base.
+    /// in the authorized knowledge base or in retrieved web pages.
     NoVerifiedSources,
+}
+
+impl AgentAnswerSourceStatus {
+    /// Short, user-facing description of what the answer is grounded in.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::VerifiedKnowledgeBaseSources => "基于当前图书内容回答",
+            Self::VerifiedWebSources => "基于联网搜索结果回答",
+            Self::VerifiedMixedSources => "基于当前图书与联网搜索结果回答",
+            Self::NoVerifiedSources => "基于模型自身知识回答（未在图书或联网结果中找到依据）",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -657,10 +772,20 @@ impl CitationRegistry {
                 .ok_or_else(|| AgentError::UnknownCitation(id.clone()))?;
             citations.push(citation.clone());
         }
+        let mut web = 0usize;
+        for citation in &citations {
+            if citation.is_web() {
+                web += 1;
+            }
+        }
         let source_status = if citations.is_empty() {
             AgentAnswerSourceStatus::NoVerifiedSources
-        } else {
+        } else if web == 0 {
             AgentAnswerSourceStatus::VerifiedKnowledgeBaseSources
+        } else if web == citations.len() {
+            AgentAnswerSourceStatus::VerifiedWebSources
+        } else {
+            AgentAnswerSourceStatus::VerifiedMixedSources
         };
         Ok(AgentAnswer {
             markdown: markdown.into(),
@@ -791,7 +916,11 @@ where
     /// Builds messages without interpreting selection text. JSON escaping plus
     /// the system policy makes the trust boundary explicit; authorization is
     /// still enforced independently for every subsequent tool call.
-    pub fn question_messages(&self, question: &str) -> AgentResult<Vec<ChatMessage>> {
+    pub fn question_messages(
+        &self,
+        question: &str,
+        book_titles: &[(String, String)],
+    ) -> AgentResult<Vec<ChatMessage>> {
         let question = question.trim();
         if question.is_empty() {
             return Err(AgentError::InvalidArguments(
@@ -830,6 +959,18 @@ where
             policy.push_str(
                 "\nThe host authorized no books and supplied no frozen selections for this question. No source citation marker is valid. Do not call a book tool and do not output any [[moye-source:...]] marker. Answer using general knowledge without implying that it came from a book or knowledge base.",
             );
+        } else if !book_titles.is_empty() {
+            // Only titles are listed. Internal book identifiers are never
+            // shown because a model that sees one tends to copy it into
+            // `[[moye-source:...]]`, and the host must reject that.
+            let titles = book_titles
+                .iter()
+                .map(|(_, title)| format!("• {title}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            policy.push_str(&format!(
+                "\nHost-authorized books:\n{titles}\nThe user's question may be answerable from these books. Search them first before relying on general knowledge, unless the question is completely unrelated to the listed book titles and topics (e.g., current weather, stock prices, or real-time events). Book identifiers are not exposed to you: use the `citation_id` field returned by search_books or read_passages verbatim inside [[moye-source:...]], and never place a book title, unit title, or any other value there."
+            ));
         }
         let prompt = if self.snapshots.is_empty() {
             question.to_string()
@@ -1070,14 +1211,24 @@ fn effective_limit(requested: Option<usize>, maximum: usize) -> AgentResult<usiz
 #[derive(Clone, Debug, PartialEq, Serialize)]
 struct ServedPassage {
     citation_id: String,
+    /// Needed by the model as the `read_passages` argument.
     passage_id: String,
+    /// Host-internal identifier. It is deliberately kept out of the tool
+    /// payload: an identifier that looks citable but is not a registered
+    /// source marker makes the model emit it inside `[[moye-source:...]]`,
+    /// which the host must then reject.
+    #[serde(skip_serializing)]
     book_id: String,
     book_title: String,
+    #[serde(skip_serializing)]
     unit_id: String,
     unit_title: String,
+    #[serde(skip_serializing)]
     document_revision: Revision,
+    #[serde(skip_serializing)]
     unit_revision: Revision,
     text: String,
+    #[serde(skip_serializing)]
     locator: DocumentLocator,
     #[serde(skip_serializing_if = "Option::is_none")]
     relevance: Option<f64>,
@@ -1095,6 +1246,9 @@ impl ServedPassage {
             unit_revision: self.unit_revision,
             quote: self.text.clone(),
             locator: self.locator.clone(),
+            source_kind: AgentCitationSourceKind::Book,
+            url: None,
+            source_title: None,
         }
     }
 }
@@ -1262,6 +1416,39 @@ fn sanitize_outline_nodes(
     output
 }
 
+/// Model-facing outline node. Locators are dropped: an outline is orientation
+/// only, the host registers no citation for it, and exposing coordinates
+/// invites the model to emit them as source markers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct ServedOutlineNode {
+    title: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    children: Vec<ServedOutlineNode>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct ServedOutlineBook {
+    book_title: String,
+    nodes: Vec<ServedOutlineNode>,
+}
+
+fn served_outline(records: &[BookOutlineRecord]) -> Vec<ServedOutlineBook> {
+    records
+        .iter()
+        .map(|record| ServedOutlineBook {
+            book_title: record.book_title.clone(),
+            nodes: record.nodes.iter().map(served_outline_node).collect(),
+        })
+        .collect()
+}
+
+fn served_outline_node(node: &OutlineNodeRecord) -> ServedOutlineNode {
+    ServedOutlineNode {
+        title: node.title.clone(),
+        children: node.children.iter().map(served_outline_node).collect(),
+    }
+}
+
 fn fit_outline_output(
     mut records: Vec<BookOutlineRecord>,
     mut truncated: bool,
@@ -1270,7 +1457,7 @@ fn fit_outline_output(
     loop {
         let content = serde_json::to_string(&json!({
             "tool": GET_OUTLINE_TOOL,
-            "books": records,
+            "books": served_outline(&records),
             "truncated": truncated,
         }))
         .map_err(|error| AgentError::Backend(error.to_string()))?;
@@ -1681,6 +1868,98 @@ mod tests {
         }));
     }
 
+    fn clean_passage() -> PassageRecord {
+        PassageRecord {
+            passage_id: "p-1".to_string(),
+            book_id: "book-a".to_string(),
+            book_title: "Alpha".to_string(),
+            unit_id: "unit-1".to_string(),
+            unit_title: "Chapter 1".to_string(),
+            document_revision: Revision::new(1),
+            unit_revision: Revision::new(1),
+            text: "visible text".to_string(),
+            locator: DocumentLocator::unit("book-a", "unit-1"),
+            relevance: Some(0.5),
+        }
+    }
+
+    #[tokio::test]
+    async fn passage_results_never_expose_book_or_unit_identifiers() {
+        // A model that sees `book-a` copies it into [[moye-source:...]], which
+        // the host must reject, failing the whole answer.
+        let search = MockSearch {
+            results: Arc::new(vec![clean_passage()]),
+            ..Default::default()
+        };
+        let mut agent = ReadOnlyAgent::new(
+            search,
+            MockBooks::default(),
+            scope(),
+            AgentLimits::default(),
+        )
+        .unwrap();
+        let result = agent
+            .execute_tool(&tool_call(SEARCH_BOOKS_TOOL, json!({"query": "visible"})))
+            .await
+            .unwrap();
+        assert!(result.content.contains("passage:p-1"));
+        assert!(result.content.contains("visible text"));
+        assert!(!result.content.contains("book-a"), "{}", result.content);
+        assert!(!result.content.contains("unit-1"), "{}", result.content);
+        assert_eq!(result.citations[0].book_id, "book-a");
+    }
+
+    #[tokio::test]
+    async fn outline_results_never_expose_book_or_unit_identifiers() {
+        let books = MockBooks {
+            outlines: Arc::new(vec![BookOutlineRecord {
+                book_id: "book-a".to_string(),
+                book_title: "Alpha".to_string(),
+                nodes: vec![OutlineNodeRecord {
+                    title: "Chapter 1".to_string(),
+                    locator: DocumentLocator::unit("book-a", "unit-1"),
+                    children: Vec::new(),
+                }],
+            }]),
+            ..Default::default()
+        };
+        let mut agent = ReadOnlyAgent::new(
+            MockSearch::default(),
+            books,
+            scope(),
+            AgentLimits::default(),
+        )
+        .unwrap();
+        let result = agent
+            .execute_tool(&tool_call(GET_OUTLINE_TOOL, json!({})))
+            .await
+            .unwrap();
+        assert!(result.content.contains("Alpha"));
+        assert!(result.content.contains("Chapter 1"));
+        assert!(!result.content.contains("book-a"), "{}", result.content);
+        assert!(!result.content.contains("unit-1"), "{}", result.content);
+    }
+
+    #[test]
+    fn authorized_book_listing_never_exposes_internal_book_ids() {
+        let agent = ReadOnlyAgent::new(
+            MockSearch::default(),
+            MockBooks::default(),
+            scope(),
+            AgentLimits::default(),
+        )
+        .unwrap();
+        let messages = agent
+            .question_messages("question", &[("book-a".to_string(), "Alpha".to_string())])
+            .unwrap();
+        let serialized = serde_json::to_string(&messages[0]).unwrap();
+        assert!(serialized.contains("Alpha"));
+        assert!(
+            !serialized.contains("book-a"),
+            "system prompt must not leak internal book ids: {serialized}"
+        );
+    }
+
     #[tokio::test]
     async fn model_book_ids_can_narrow_but_cannot_expand_host_scope() {
         let search = MockSearch::default();
@@ -1798,7 +2077,9 @@ mod tests {
         );
         let snapshot = SelectionSnapshot::capture("book-a", "unit-1", 9, injection).unwrap();
         agent.attach_snapshot(snapshot).unwrap();
-        let messages = agent.question_messages("Summarize my selection").unwrap();
+        let messages = agent
+            .question_messages("Summarize my selection", &[])
+            .unwrap();
         assert!(format!("{:?}", messages[1]).contains("book-secret"));
 
         let error = agent
@@ -2184,7 +2465,7 @@ mod tests {
         let short_marker = agent.selection_model_marker(0);
         let marker = format!("[[moye-source:{short_marker}]]");
 
-        let messages = agent.question_messages("Use the selection").unwrap();
+        let messages = agent.question_messages("Use the selection", &[]).unwrap();
         let policy = messages[0]
             .content
             .as_ref()
@@ -2232,7 +2513,7 @@ mod tests {
         )
         .unwrap();
 
-        let messages = agent.question_messages("Explain this idea").unwrap();
+        let messages = agent.question_messages("Explain this idea", &[]).unwrap();
         let policy = messages[0]
             .content
             .as_ref()

@@ -169,6 +169,7 @@ async fn http_stream_drives_a_scoped_tool_round_and_validated_citation() {
             AgentQuestion {
                 question: "给出依据".to_string(),
                 allowed_book_ids: vec!["book-1".to_string()],
+                book_titles: Vec::new(),
                 history: Vec::new(),
                 snapshots: Vec::new(),
             },
@@ -248,6 +249,7 @@ async fn http_stream_accepts_markerless_final_answer_without_verified_sources() 
             AgentQuestion {
                 question: "没有知识库来源时也请回答".to_string(),
                 allowed_book_ids: vec!["book-1".to_string()],
+                book_titles: Vec::new(),
                 history: Vec::new(),
                 snapshots: Vec::new(),
             },
@@ -312,6 +314,7 @@ async fn http_tool_call_cannot_expand_the_host_book_scope() {
             AgentQuestion {
                 question: "读取秘密".to_string(),
                 allowed_book_ids: vec!["book-1".to_string()],
+                book_titles: Vec::new(),
                 history: Vec::new(),
                 snapshots: Vec::new(),
             },

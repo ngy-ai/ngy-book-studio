@@ -16,7 +16,7 @@ use moye_epub_editor::{
     agent_runtime::{AgentCancellation, AgentRunEvent},
     ai::ChatRole,
     chat::{ChatCitation, ChatSession, ChatThread, ChatWindowKind},
-    document::{BookDocument, SourceLocator},
+    document::{BookDocument, Revision, SourceLocator},
     services::AppServices,
 };
 
@@ -309,6 +309,7 @@ impl AiSidebarController {
             request_id,
             question,
             book_ids,
+            book_titles,
             reference_hints,
             reference,
         } = request;
@@ -358,6 +359,7 @@ impl AiSidebarController {
                     request_id,
                     question,
                     allowed_book_ids: book_ids,
+                    book_titles,
                     snapshots,
                 },
                 Some(agent_tx),
@@ -907,6 +909,25 @@ async fn validate_live_sources(
 }
 
 fn source_link_from_agent_citation(citation: AgentCitation) -> Option<AiSourceLink> {
+    if citation.is_web() {
+        return Some(AiSourceLink {
+            citation_id: citation.citation_id,
+            book_id: String::new(),
+            unit_id: String::new(),
+            unit_index: None,
+            document_revision: Revision::new(0),
+            unit_revision: Revision::new(0),
+            locator: None,
+            label: citation
+                .source_title
+                .clone()
+                .unwrap_or_else(|| citation.url.clone().unwrap_or_default()),
+            quote: Some(citation.quote),
+            selection_snapshot: false,
+            stale: false,
+            url: citation.url.clone(),
+        });
+    }
     if citation.locator.book_id != citation.book_id
         || citation.locator.unit_id != citation.unit_id
         || citation.locator.validate().is_err()
@@ -934,10 +955,30 @@ fn source_link_from_agent_citation(citation: AgentCitation) -> Option<AiSourceLi
         quote: Some(citation.quote),
         selection_snapshot,
         stale: false,
+        url: None,
     })
 }
 
 fn source_link_from_chat_citation(citation: ChatCitation) -> Option<AiSourceLink> {
+    if citation.source_kind.is_web() {
+        return Some(AiSourceLink {
+            citation_id: citation.id,
+            book_id: String::new(),
+            unit_id: String::new(),
+            unit_index: None,
+            document_revision: Revision::new(0),
+            unit_revision: Revision::new(0),
+            locator: None,
+            label: citation
+                .source_title
+                .clone()
+                .unwrap_or_else(|| citation.url.clone().unwrap_or_default()),
+            quote: Some(citation.quote),
+            selection_snapshot: false,
+            stale: false,
+            url: citation.url.clone(),
+        });
+    }
     if citation.locator.validate().is_err()
         || matches!(
             citation.locator.source.as_ref(),
@@ -967,6 +1008,7 @@ fn source_link_from_chat_citation(citation: ChatCitation) -> Option<AiSourceLink
         quote: Some(citation.quote),
         selection_snapshot,
         stale: false,
+        url: None,
     })
 }
 
@@ -975,6 +1017,8 @@ fn friendly_agent_error(error: &str) -> String {
         "无法连接本地 Ollama。请确认 Ollama 已启动，并在 AI 设置中检查端点和模型；本应用不会代为启动服务。".to_string()
     } else if error.contains("cancelled") {
         "本次回答已取消。".to_string()
+    } else if error.contains("unknown or unserved citation") {
+        "模型引用了一个本次检索并未提供的来源，因此该回答未被采用。请重新提问；小模型更容易出现这种情况，可在 AI 设置中换用更强的对话模型。".to_string()
     } else {
         format!("AI 回答失败：{error}")
     }
@@ -988,6 +1032,7 @@ mod tests {
         Revision, SourceKind,
     };
     use moye_epub_editor::{
+        agent::AgentCitationSourceKind,
         chat::{ChatScope, ChatThread, StoredChatMessage},
         library::LibraryStore,
     };
@@ -1097,6 +1142,9 @@ mod tests {
             unit_revision: Revision::new(1),
             quote: "evidence".to_string(),
             locator: locator.clone(),
+            source_kind: AgentCitationSourceKind::Book,
+            url: None,
+            source_title: None,
         })
         .expect("valid live citation");
         assert_eq!(live.locator.as_ref(), Some(&locator));
@@ -1112,6 +1160,9 @@ mod tests {
             unit_revision: Revision::new(1),
             quote: "unsaved selection".to_string(),
             locator: locator.clone(),
+            source_kind: AgentCitationSourceKind::Book,
+            url: None,
+            source_title: None,
         })
         .expect("valid live selection citation");
         assert!(live_selection.selection_snapshot);
@@ -1124,6 +1175,9 @@ mod tests {
             unit_revision: Revision::new(1),
             quote: "evidence".to_string(),
             locator: locator.clone(),
+            source_kind: AgentCitationSourceKind::Book,
+            url: None,
+            source_title: None,
             created_at: 1,
         })
         .expect("valid persisted citation");
@@ -1141,9 +1195,34 @@ mod tests {
                 unit_revision: Revision::new(1),
                 quote: "forged".to_string(),
                 locator,
+                source_kind: AgentCitationSourceKind::Book,
+                url: None,
+                source_title: None,
             })
             .is_none()
         );
+    }
+
+    #[test]
+    fn web_citations_keep_a_url_instead_of_a_book_locator() {
+        let link = source_link_from_chat_citation(ChatCitation {
+            id: "web-citation".to_string(),
+            content_unit_id: None,
+            search_chunk_id: None,
+            document_revision: Revision::new(0),
+            unit_revision: Revision::new(0),
+            quote: "verified snippet".to_string(),
+            locator: DocumentLocator::unit("", ""),
+            created_at: 1,
+            source_kind: AgentCitationSourceKind::Web,
+            url: Some("https://example.test/docs".to_string()),
+            source_title: Some("Docs".to_string()),
+        })
+        .expect("web citation must survive restoration");
+        assert_eq!(link.url.as_deref(), Some("https://example.test/docs"));
+        assert_eq!(link.label, "Docs");
+        assert!(link.locator.is_none());
+        assert!(link.book_id.is_empty());
     }
 
     #[test]
@@ -1167,6 +1246,9 @@ mod tests {
                 quote: "evidence".to_string(),
                 locator: DocumentLocator::unit("book-a", "different-unit"),
                 created_at: 1,
+                source_kind: AgentCitationSourceKind::Book,
+                url: None,
+                source_title: None,
             }],
         };
         let uncited = StoredChatMessage {
@@ -1320,6 +1402,9 @@ mod tests {
                     quote: "unsaved text absent from the current AST".to_string(),
                     locator,
                     created_at: 1,
+                    source_kind: AgentCitationSourceKind::Book,
+                    url: None,
+                    source_title: None,
                 }],
             }],
         };

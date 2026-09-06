@@ -346,6 +346,9 @@ pub(super) struct AiSourceLink {
     /// current canonical document. Stale links remain visible for auditability
     /// but every window must refuse to navigate them.
     pub stale: bool,
+    /// For web-sourced citations, the absolute http(s) URL to open. Book
+    /// citations leave this `None` and navigate by locator instead.
+    pub url: Option<String>,
 }
 
 /// A version-checked citation target that is safe for a host window to open.
@@ -706,6 +709,7 @@ pub(super) struct AiQuestionRequest {
     pub request_id: u64,
     pub question: String,
     pub book_ids: Vec<String>,
+    pub book_titles: Vec<(String, String)>,
     pub reference_hints: Vec<AiReferenceHint>,
     /// Compatibility bridge for the Editor's exact WebView snapshot barrier.
     /// The controller only lets this replace the matching item in
@@ -1078,6 +1082,12 @@ impl ConversationState {
             request_id,
             question: question.to_string(),
             book_ids: self.scope.book_ids(),
+            book_titles: self
+                .scope
+                .selected_books()
+                .into_iter()
+                .map(|book| (book.id, book.title))
+                .collect(),
             // Editor currently freezes its one selected chapter through this
             // field after its exact href/revision/request-id acknowledgement.
             reference: reference_hints.first().cloned(),
@@ -1247,6 +1257,11 @@ fn valid_reference_hint_locator(reference: &AiReferenceHint) -> bool {
 }
 
 fn allowed_source_link(allowed: &HashSet<String>, source: &AiSourceLink) -> bool {
+    // Web citations have no book identity and are never scoped by the current
+    // library; they are shown whenever the answer used them.
+    if source.url.is_some() {
+        return true;
+    }
     allowed.contains(&source.book_id)
         && !source.unit_id.trim().is_empty()
         && source
@@ -1258,6 +1273,28 @@ fn allowed_source_link(allowed: &HashSet<String>, source: &AiSourceLink) -> bool
 fn should_show_no_knowledge_base_source_warning(message: &AiMessage) -> bool {
     message.role == AiMessageRole::Assistant
         && message.source_status == Some(AgentAnswerSourceStatus::NoVerifiedSources)
+}
+
+/// A short basis badge shown above a grounded answer, telling the user whether
+/// the answer came from the current books, a web search, or both.
+fn source_basis_badge(message: &AiMessage) -> Option<(&'static str, &'static str)> {
+    if message.role != AiMessageRole::Assistant {
+        return None;
+    }
+    match message.source_status? {
+        AgentAnswerSourceStatus::VerifiedKnowledgeBaseSources => {
+            Some(("已基于当前图书内容回答", "回答引用均来自本次选中的图书。"))
+        }
+        AgentAnswerSourceStatus::VerifiedWebSources => Some((
+            "已基于联网搜索结果回答",
+            "当前图书中未检索到相关内容，回答引用来自联网搜索。",
+        )),
+        AgentAnswerSourceStatus::VerifiedMixedSources => Some((
+            "已结合图书与联网搜索回答",
+            "回答同时引用图书内容和联网搜索结果。",
+        )),
+        AgentAnswerSourceStatus::NoVerifiedSources => None,
+    }
 }
 
 fn selectable_message_html(message: &str) -> String {
@@ -2326,6 +2363,32 @@ impl AiSidebar {
                                 ),
                         )
                     })
+                    .when_some(source_basis_badge(message), |this, (title, body)| {
+                        this.child(
+                            div()
+                                .v_flex()
+                                .w_full()
+                                .gap_0p5()
+                                .px_2()
+                                .py_2()
+                                .rounded(px(8.))
+                                .border_1()
+                                .border_color(rgb(0xb9cfe6))
+                                .bg(rgb(0xe9f1fa))
+                                .text_color(rgb(0x2c5c86))
+                                .child(
+                                    div()
+                                        .h_flex()
+                                        .gap_1()
+                                        .font_semibold()
+                                        .child(Icon::new(IconName::CircleCheck).small())
+                                        .child(title),
+                                )
+                                .child(
+                                    div().text_xs().line_height(gpui::relative(1.5)).child(body),
+                                ),
+                        )
+                    })
                     .child(
                         div()
                             .h_flex()
@@ -2612,6 +2675,7 @@ mod tests {
             quote: Some("引用目标".to_string()),
             selection_snapshot: false,
             stale: false,
+            url: None,
         };
         (document, source)
     }
@@ -2924,6 +2988,70 @@ mod tests {
     }
 
     #[test]
+    fn source_basis_badge_names_the_knowledge_the_answer_used() {
+        fn assistant(status: AgentAnswerSourceStatus) -> AiMessage {
+            AiMessage {
+                id: 1,
+                role: AiMessageRole::Assistant,
+                content: "answer".to_string(),
+                sources: Vec::new(),
+                source_status: Some(status),
+                request_id: None,
+            }
+        }
+        assert_eq!(
+            source_basis_badge(&assistant(
+                AgentAnswerSourceStatus::VerifiedKnowledgeBaseSources
+            ))
+            .unwrap()
+            .0,
+            "已基于当前图书内容回答"
+        );
+        assert_eq!(
+            source_basis_badge(&assistant(AgentAnswerSourceStatus::VerifiedWebSources))
+                .unwrap()
+                .0,
+            "已基于联网搜索结果回答"
+        );
+        assert_eq!(
+            source_basis_badge(&assistant(AgentAnswerSourceStatus::VerifiedMixedSources))
+                .unwrap()
+                .0,
+            "已结合图书与联网搜索回答"
+        );
+        // Ungrounded answers keep the existing warning instead of a badge.
+        assert!(
+            source_basis_badge(&assistant(AgentAnswerSourceStatus::NoVerifiedSources)).is_none()
+        );
+    }
+
+    #[test]
+    fn web_source_links_survive_the_book_scope_filter() {
+        let allowed = std::collections::HashSet::from(["book-a".to_string()]);
+        let web = AiSourceLink {
+            citation_id: "web:0".to_string(),
+            book_id: String::new(),
+            unit_id: String::new(),
+            unit_index: None,
+            document_revision: Revision::new(0),
+            unit_revision: Revision::new(0),
+            locator: None,
+            label: "Docs".to_string(),
+            quote: Some("snippet".to_string()),
+            selection_snapshot: false,
+            stale: false,
+            url: Some("https://example.test/docs".to_string()),
+        };
+        assert!(allowed_source_link(&allowed, &web));
+
+        // A book citation outside the current scope is still rejected.
+        let mut foreign_book = web.clone();
+        foreign_book.url = None;
+        foreign_book.book_id = "secret".to_string();
+        assert!(!allowed_source_link(&allowed, &foreign_book));
+    }
+
+    #[test]
     fn session_picker_tracks_active_thread_and_recovers_from_errors() {
         let first = AiThreadOption::new("thread-a", "First", vec!["book-a".to_string()]);
         let second = AiThreadOption::new("thread-b", "Second", vec!["book-a".to_string()]);
@@ -3218,6 +3346,7 @@ mod tests {
                     quote: None,
                     selection_snapshot: false,
                     stale: false,
+                    url: None,
                 },
                 AiSourceLink {
                     citation_id: "citation-b".to_string(),
@@ -3231,6 +3360,7 @@ mod tests {
                     quote: None,
                     selection_snapshot: false,
                     stale: false,
+                    url: None,
                 },
             ],
             source_status: Some(AgentAnswerSourceStatus::VerifiedKnowledgeBaseSources),
@@ -3319,6 +3449,7 @@ mod tests {
             quote: Some("evidence".to_string()),
             selection_snapshot: false,
             stale: false,
+            url: None,
         };
         let foreign = AiSourceLink {
             citation_id: "source-foreign".to_string(),
@@ -3362,6 +3493,7 @@ mod tests {
             quote: None,
             selection_snapshot: false,
             stale: false,
+            url: None,
         };
         assert_eq!(source.current_unit_index(&document), Some(0));
 

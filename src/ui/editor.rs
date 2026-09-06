@@ -19,7 +19,7 @@ use moye_epub_editor::{
     media::{MediaBackend, MediaMetadata, MediaResponse, MediaService},
     services::{AppServices, LibraryMutation},
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const EDITOR_SHELL_HOST: &str = "shell";
@@ -345,6 +345,10 @@ pub(super) struct EditorIpcUpdate {
     selected_text: Option<String>,
     too_large: bool,
     ready: bool,
+    /// `true` when the rich-text page reported an actual document change.
+    /// Used to distinguish real edits from "no change" snapshots that just
+    /// echo the current page body.
+    edited: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -900,6 +904,7 @@ impl EditorWebState {
                 selected_text,
                 too_large: false,
                 ready: true,
+                edited: false,
             });
         }
         if message.too_large
@@ -918,8 +923,10 @@ impl EditorWebState {
                 selected_text,
                 too_large: true,
                 ready: false,
+                edited: false,
             });
         }
+        let body_was_some = message.body.is_some();
         let html = match message.body {
             Some(body) => {
                 let body = canonicalize_editor_asset_urls(&body, &media.assets);
@@ -938,6 +945,7 @@ impl EditorWebState {
             selected_text,
             too_large: false,
             ready: false,
+            edited: body_was_some,
         })
     }
 }
@@ -2620,6 +2628,10 @@ pub struct EditorApp {
     chapters: Vec<EditorChapter>,
     canonical_document: Option<BookDocument>,
     unit_states: Vec<EditorUnitState>,
+    /// Chapter IDs whose source has been edited (source tab or rich text)
+    /// since the last load or successful save. Used to skip pointless
+    /// re-serialization when toggling the source kind on a pristine chapter.
+    modified_chapter_ids: HashSet<String>,
     pending_asset_bytes: HashMap<String, Arc<Vec<u8>>>,
     media_loading: bool,
     media_modal: Option<EditorMediaModal>,
@@ -2788,6 +2800,7 @@ impl EditorApp {
             chapters,
             canonical_document,
             unit_states,
+            modified_chapter_ids: HashSet::new(),
             pending_asset_bytes: HashMap::new(),
             media_loading: false,
             media_modal: None,
@@ -3136,6 +3149,15 @@ impl EditorApp {
         cx: &mut Context<Self>,
     ) {
         if matches!(event, InputEvent::Change) {
+            // A programmatic `sync_body_input` sets the value to exactly the
+            // stored unit source, so the equality check below ignores those
+            // reloads and only flags genuine user edits.
+            let value = self.body_input.read(cx).value();
+            if let Some(state) = self.unit_states.get(self.selected) {
+                if value.as_ref() != state.source.as_str() {
+                    self.modified_chapter_ids.insert(state.id.clone());
+                }
+            }
             self.draft_generation = self.draft_generation.wrapping_add(1);
             if self.tab == EditorTab::Source && !self.search_query.is_empty() {
                 let _ = self.flush_body(cx);
@@ -3390,6 +3412,11 @@ impl EditorApp {
             self.draft_generation = self.draft_generation.wrapping_add(1);
         }
         self.chapters[chapter_index].html = message.html.clone();
+        if message.edited {
+            if let Some(state) = self.unit_states.get(chapter_index) {
+                self.modified_chapter_ids.insert(state.id.clone());
+            }
+        }
         if let Err(error) = self.update_unit_from_rich_text(chapter_index, &message.html) {
             self.notice = Some(Notice {
                 text: format!("无法解析富文本编辑结果：{error:#}"),
@@ -4198,6 +4225,7 @@ impl EditorApp {
         self.canonical_document = Some(editor.into_document());
         self.chapters.remove(self.selected);
         self.unit_states.remove(self.selected);
+        self.modified_chapter_ids.remove(&state.id);
         if self.selected >= self.chapters.len() {
             self.selected = self.chapters.len().saturating_sub(1);
         }
@@ -4427,6 +4455,13 @@ impl EditorApp {
         let Some(state) = self.unit_states.get(self.selected).cloned() else {
             return;
         };
+        // Toggling the source kind on a chapter that has not been edited only
+        // re-serialises the original content into a different representation,
+        // which the user perceives as the source "being converted" for no
+        // reason. Leave the pristine source untouched.
+        if !self.modified_chapter_ids.contains(&state.id) {
+            return;
+        }
         let Some(document) = self.canonical_document.as_mut() else {
             return;
         };
@@ -5390,6 +5425,9 @@ impl EditorApp {
                     self.set_rich_text_write_locked(false, cx);
                     return;
                 }
+                // The persisted state is now authoritative for every chapter;
+                // the in-memory dirty flags are reset in lockstep.
+                self.modified_chapter_ids.clear();
                 match &result.export {
                     EditorExportOutcome::NotRequested => {
                         self.notice = Some(Notice {

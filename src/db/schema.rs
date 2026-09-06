@@ -6,7 +6,7 @@ use crate::document::{DocumentLocator, SourceLocator};
 /// Identifies SQLite files owned by this application (ASCII "MOYE").
 pub(super) const APPLICATION_ID: i64 = 0x4D4F_5945;
 /// Development schemas are deliberately rebuilt instead of migrated.
-pub(super) const SCHEMA_VERSION: i64 = 8;
+pub(super) const SCHEMA_VERSION: i64 = 9;
 
 #[derive(Clone, Copy)]
 struct ColumnSpec {
@@ -252,9 +252,12 @@ const CHAT_CITATION_COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("search_chunk_id", "TEXT", false, 0),
     ColumnSpec::new("ordinal", "INTEGER", true, 0),
     ColumnSpec::new("quote", "TEXT", true, 0),
-    ColumnSpec::new("document_revision", "INTEGER", true, 0),
-    ColumnSpec::new("unit_revision", "INTEGER", true, 0),
-    ColumnSpec::new("locator_json", "TEXT", true, 0),
+    ColumnSpec::new("document_revision", "INTEGER", false, 0),
+    ColumnSpec::new("unit_revision", "INTEGER", false, 0),
+    ColumnSpec::new("locator_json", "TEXT", false, 0),
+    ColumnSpec::new("source_kind", "TEXT", true, 0),
+    ColumnSpec::new("url", "TEXT", false, 0),
+    ColumnSpec::new("source_title", "TEXT", false, 0),
     ColumnSpec::new("created_at", "INTEGER", true, 0),
 ];
 const SETTING_COLUMNS: &[ColumnSpec] = &[
@@ -896,9 +899,12 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
              search_chunk_id TEXT REFERENCES search_chunks(id) ON DELETE SET NULL,
              ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
              quote TEXT NOT NULL,
-             document_revision INTEGER NOT NULL CHECK(document_revision >= 0),
-             unit_revision INTEGER NOT NULL CHECK(unit_revision >= 0),
-             locator_json TEXT NOT NULL,
+             document_revision INTEGER CHECK(document_revision >= 0),
+             unit_revision INTEGER CHECK(unit_revision >= 0),
+             locator_json TEXT,
+             source_kind TEXT NOT NULL DEFAULT 'book' CHECK(source_kind IN ('book','web')),
+             url TEXT,
+             source_title TEXT,
              created_at INTEGER NOT NULL CHECK(created_at >= 0)
          );
          CREATE UNIQUE INDEX idx_chat_citations_message_ordinal ON chat_citations(message_id, ordinal);

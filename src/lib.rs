@@ -24,5 +24,6 @@ pub mod runtime;
 pub mod search;
 pub mod services;
 pub mod storage;
+pub mod web_search;
 #[cfg(target_os = "windows")]
 pub mod windows_pdf_renderer;

@@ -1688,8 +1688,14 @@ fn validate_current_chat_citation(
     citation: &ChatCitation,
     allowed_book_ids: &[String],
 ) -> Result<()> {
-    let locator = serde_json::from_str::<DocumentLocator>(&citation.locator_json)
-        .context("对话引用定位信息无效")?;
+    // Web-sourced citations carry no book locator and must not be validated
+    // against the current content tree.
+    if citation.locator_json.is_none() {
+        return Ok(());
+    }
+    let locator =
+        serde_json::from_str::<DocumentLocator>(citation.locator_json.as_deref().unwrap())
+            .context("对话引用定位信息无效")?;
     locator.validate().context("对话引用定位信息无效")?;
     ensure!(
         !matches!(
@@ -2461,11 +2467,16 @@ mod tests {
             quote: "preview text".to_string(),
             document_revision: fixture.book.revision,
             unit_revision: fixture.units[0].revision,
-            locator_json: serde_json::to_string(
-                &DocumentLocator::unit(&fixture.book.id, &fixture.units[0].id)
-                    .with_source(SourceLocator::office_rendered_page(1)),
-            )
-            .unwrap(),
+            locator_json: Some(
+                serde_json::to_string(
+                    &DocumentLocator::unit(&fixture.book.id, &fixture.units[0].id)
+                        .with_source(SourceLocator::office_rendered_page(1)),
+                )
+                .unwrap(),
+            ),
+            source_kind: "book".to_string(),
+            url: None,
+            source_title: None,
             created_at: 3,
         };
 
@@ -2804,7 +2815,10 @@ mod tests {
             quote: "document body".to_string(),
             document_revision: 1,
             unit_revision: 1,
-            locator_json: fixture.chunks[0].locator_json.clone(),
+            locator_json: Some(fixture.chunks[0].locator_json.clone()),
+            source_kind: "book".to_string(),
+            url: None,
+            source_title: None,
             created_at: 3,
         };
         insert_chat_message(&mut conn, &message, std::slice::from_ref(&citation), 3).unwrap();

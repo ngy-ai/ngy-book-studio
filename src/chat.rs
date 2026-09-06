@@ -18,6 +18,7 @@ use anyhow::{Context as _, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    agent::AgentCitationSourceKind,
     ai::ChatRole,
     db,
     document::{DocumentLocator, Revision, SourceLocator, deterministic_id},
@@ -156,6 +157,9 @@ pub struct ChatCitation {
     pub unit_revision: Revision,
     pub quote: String,
     pub locator: DocumentLocator,
+    pub source_kind: AgentCitationSourceKind,
+    pub url: Option<String>,
+    pub source_title: Option<String>,
     pub created_at: u64,
 }
 
@@ -167,6 +171,9 @@ pub struct NewChatCitation {
     pub unit_revision: Revision,
     pub quote: String,
     pub locator: DocumentLocator,
+    pub source_kind: AgentCitationSourceKind,
+    pub url: Option<String>,
+    pub source_title: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -421,8 +428,21 @@ impl ChatRepository {
                         quote: citation.quote.clone(),
                         document_revision: citation.document_revision.get(),
                         unit_revision: citation.unit_revision.get(),
-                        locator_json: serde_json::to_string(&citation.locator)
-                            .context("failed to serialize citation locator")?,
+                        locator_json: if citation.source_kind.is_web() {
+                            None
+                        } else {
+                            Some(
+                                serde_json::to_string(&citation.locator)
+                                    .context("failed to serialize citation locator")?,
+                            )
+                        },
+                        source_kind: match citation.source_kind {
+                            AgentCitationSourceKind::Web => "web".to_string(),
+                            AgentCitationSourceKind::Book => "book".to_string(),
+                        },
+
+                        url: citation.url.clone(),
+                        source_title: citation.source_title.clone(),
                         created_at: now,
                     });
                     stored_citations.push(ChatCitation {
@@ -433,6 +453,9 @@ impl ChatRepository {
                         unit_revision: citation.unit_revision,
                         quote: citation.quote,
                         locator: citation.locator,
+                        source_kind: citation.source_kind,
+                        url: citation.url.clone(),
+                        source_title: citation.source_title.clone(),
                         created_at: now,
                     });
                 }
@@ -473,11 +496,12 @@ impl ChatRepository {
                         .collect::<Result<Vec<_>>>()?
                         .into_iter()
                         .filter(|citation| {
-                            thread.scope.contains(&citation.locator.book_id)
-                                && citation
-                                    .content_unit_id
-                                    .as_deref()
-                                    .is_none_or(|unit_id| unit_id == citation.locator.unit_id)
+                            citation.source_kind.is_web()
+                                || (thread.scope.contains(&citation.locator.book_id)
+                                    && citation
+                                        .content_unit_id
+                                        .as_deref()
+                                        .is_none_or(|unit_id| unit_id == citation.locator.unit_id))
                         })
                         .collect();
                     messages.push(message_from_db(message, citations)?);
@@ -544,11 +568,23 @@ fn thread_from_db(row: db::chat_threads::ChatThread) -> Result<ChatThread> {
 }
 
 fn citation_from_db(row: db::chat_citations::ChatCitation) -> Result<ChatCitation> {
-    let locator = serde_json::from_str::<DocumentLocator>(&row.locator_json)
-        .context("stored citation locator is invalid")?;
-    locator
-        .validate()
-        .context("stored citation locator is invalid")?;
+    let source_kind = parse_citation_source_kind(&row.source_kind);
+    // Web citations carry no book locator; only book citations are validated
+    // against the current content tree.
+    let locator = if source_kind.is_web() {
+        DocumentLocator::unit("", "")
+    } else {
+        let json = match row.locator_json.as_deref() {
+            Some(json) if !json.trim().is_empty() => json,
+            _ => "{}",
+        };
+        let locator = serde_json::from_str::<DocumentLocator>(json)
+            .context("stored citation locator is invalid")?;
+        locator
+            .validate()
+            .context("stored citation locator is invalid")?;
+        locator
+    };
     Ok(ChatCitation {
         id: row.id,
         content_unit_id: row.content_unit_id,
@@ -557,8 +593,18 @@ fn citation_from_db(row: db::chat_citations::ChatCitation) -> Result<ChatCitatio
         unit_revision: Revision::new(row.unit_revision),
         quote: row.quote,
         locator,
+        source_kind,
+        url: row.url,
+        source_title: row.source_title,
         created_at: row.created_at,
     })
+}
+
+fn parse_citation_source_kind(value: &str) -> AgentCitationSourceKind {
+    match value {
+        "web" => AgentCitationSourceKind::Web,
+        _ => AgentCitationSourceKind::Book,
+    }
 }
 
 fn message_from_db(
@@ -604,6 +650,28 @@ fn validate_message(message: &NewChatMessage) -> Result<()> {
 }
 
 fn validate_citation(citation: &NewChatCitation, scope: &ChatScope) -> Result<()> {
+    if citation.source_kind.is_web() {
+        ensure!(
+            citation.content_unit_id.is_none() && citation.search_chunk_id.is_none(),
+            "web citation must not reference a content unit or search chunk"
+        );
+        ensure!(
+            citation
+                .url
+                .as_deref()
+                .is_some_and(|url| !url.trim().is_empty()),
+            "web citation must carry a source URL"
+        );
+        ensure!(
+            !citation.quote.trim().is_empty(),
+            "citation quote cannot be empty"
+        );
+        ensure!(
+            citation.quote.len() <= MAX_QUOTE_BYTES,
+            "citation quote exceeds {MAX_QUOTE_BYTES} bytes"
+        );
+        return Ok(());
+    }
     citation
         .locator
         .validate()
@@ -645,6 +713,10 @@ fn validate_current_citation(
     citation: &NewChatCitation,
     scope: &ChatScope,
 ) -> Result<()> {
+    // Web citations have no book identity and skip the current-content checks.
+    if citation.source_kind.is_web() {
+        return validate_citation(citation, scope);
+    }
     validate_citation(citation, scope)?;
     let book = db::books::get(conn, &citation.locator.book_id)?
         .context("citation book no longer exists")?;
@@ -891,6 +963,9 @@ mod tests {
                             unit_revision: Revision::new(1),
                             quote: "quoted text".to_string(),
                             locator: DocumentLocator::unit("book-1", "unit-1"),
+                            source_kind: AgentCitationSourceKind::Book,
+                            url: None,
+                            source_title: None,
                         }],
                     },
                 )
@@ -924,6 +999,72 @@ mod tests {
                 listed[0].updated_at >= thread.updated_at,
                 "appending messages must not move the thread timestamp backwards"
             );
+        });
+    }
+
+    #[test]
+    fn web_citations_persist_without_a_book_locator() {
+        let (_temp, runtime, repository) = repository();
+        insert_book_graph(repository.database_path());
+        runtime.block_on(async {
+            let thread = repository
+                .create_thread(NewChatThread {
+                    primary_book_id: Some("book-1".to_string()),
+                    title: "Web grounded".to_string(),
+                    scope: ChatScope::new(["book-1"]).unwrap(),
+                    window_kind: ChatWindowKind::Reader,
+                })
+                .await
+                .unwrap();
+            let user = repository
+                .append_message(
+                    &thread.id,
+                    NewChatMessage::text(ChatRole::User, "最新进展是什么？"),
+                )
+                .await
+                .unwrap();
+            let answer = repository
+                .append_message(
+                    &thread.id,
+                    NewChatMessage {
+                        parent_id: Some(user.id.clone()),
+                        role: ChatRole::Assistant,
+                        content: "来自互联网的回答".to_string(),
+                        model: Some("chat-model".to_string()),
+                        citations: vec![NewChatCitation {
+                            content_unit_id: None,
+                            search_chunk_id: None,
+                            document_revision: Revision::new(0),
+                            unit_revision: Revision::new(0),
+                            quote: "verified web snippet".to_string(),
+                            locator: DocumentLocator::unit("", ""),
+                            source_kind: AgentCitationSourceKind::Web,
+                            url: Some("https://example.test/docs".to_string()),
+                            source_title: Some("Docs".to_string()),
+                        }],
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(answer.citations.len(), 1);
+            assert_eq!(
+                answer.citations[0].source_kind,
+                AgentCitationSourceKind::Web
+            );
+            assert_eq!(
+                answer.citations[0].url.as_deref(),
+                Some("https://example.test/docs")
+            );
+            assert_eq!(answer.citations[0].source_title.as_deref(), Some("Docs"));
+            assert!(answer.citations[0].content_unit_id.is_none());
+
+            let restored = repository.session(&thread.id).await.unwrap().unwrap();
+            let citation = &restored.messages.last().unwrap().citations[0];
+            assert_eq!(citation.source_kind, AgentCitationSourceKind::Web);
+            assert_eq!(citation.url.as_deref(), Some("https://example.test/docs"));
+            assert_eq!(citation.source_title.as_deref(), Some("Docs"));
+            assert!(citation.locator.book_id.is_empty());
+            assert!(citation.locator.unit_id.is_empty());
         });
     }
 
@@ -963,6 +1104,9 @@ mod tests {
                             unit_revision: Revision::new(1),
                             quote: "quoted text".to_string(),
                             locator: DocumentLocator::unit("book-1", "unit-1"),
+                            source_kind: AgentCitationSourceKind::Book,
+                            url: None,
+                            source_title: None,
                         }],
                     },
                 )
@@ -1017,6 +1161,9 @@ mod tests {
                             unit_revision: Revision::new(1),
                             quote: "quote".to_string(),
                             locator: DocumentLocator::unit("book-1", "unit-1"),
+                            source_kind: AgentCitationSourceKind::Book,
+                            url: None,
+                            source_title: None,
                         }],
                     },
                 )
@@ -1070,6 +1217,9 @@ mod tests {
                                 unit_revision: Revision::new(1),
                                 quote: "foreign".to_string(),
                                 locator: DocumentLocator::unit("book-2", "unit-x"),
+                                source_kind: AgentCitationSourceKind::Book,
+                                url: None,
+                                source_title: None,
                             }],
                         },
                     )

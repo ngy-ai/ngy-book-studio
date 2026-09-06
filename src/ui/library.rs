@@ -4896,6 +4896,7 @@ mod tests {
             quote: None,
             selection_snapshot: false,
             stale: false,
+            url: None,
         };
         assert_eq!(
             current_canonical_source_unit_index(&exact, &document),

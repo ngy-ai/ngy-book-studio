@@ -11,14 +11,18 @@ pub(crate) struct ChatCitation {
     pub(crate) quote: String,
     pub(crate) document_revision: u64,
     pub(crate) unit_revision: u64,
-    pub(crate) locator_json: String,
+    pub(crate) locator_json: Option<String>,
+    pub(crate) source_kind: String,
+    pub(crate) url: Option<String>,
+    pub(crate) source_title: Option<String>,
     pub(crate) created_at: u64,
 }
 
 pub(crate) fn get(conn: &Connection, citation_id: &str) -> Result<Option<ChatCitation>> {
     conn.query_row(
         "SELECT id, message_id, content_unit_id, search_chunk_id, ordinal, quote,
-         document_revision, unit_revision, locator_json, created_at
+         document_revision, unit_revision, locator_json, source_kind, url, source_title,
+         created_at
          FROM chat_citations WHERE id = ?1",
         [citation_id],
         citation_from_row,
@@ -31,7 +35,8 @@ pub(crate) fn list_for_message(conn: &Connection, message_id: &str) -> Result<Ve
     let mut stmt = conn
         .prepare(
             "SELECT id, message_id, content_unit_id, search_chunk_id, ordinal, quote,
-             document_revision, unit_revision, locator_json, created_at FROM chat_citations
+             document_revision, unit_revision, locator_json, source_kind, url, source_title,
+             created_at FROM chat_citations
              WHERE message_id = ?1 ORDER BY ordinal",
         )
         .context("无法准备对话引用查询")?;
@@ -46,8 +51,9 @@ pub(crate) fn insert(conn: &Connection, citation: &ChatCitation) -> Result<usize
     conn.execute(
         "INSERT INTO chat_citations
          (id, message_id, content_unit_id, search_chunk_id, ordinal, quote,
-          document_revision, unit_revision, locator_json, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+          document_revision, unit_revision, locator_json, source_kind, url, source_title,
+          created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             citation.id,
             citation.message_id,
@@ -58,6 +64,9 @@ pub(crate) fn insert(conn: &Connection, citation: &ChatCitation) -> Result<usize
             citation.document_revision as i64,
             citation.unit_revision as i64,
             citation.locator_json,
+            citation.source_kind,
+            citation.url,
+            citation.source_title,
             citation.created_at as i64,
         ],
     )
@@ -83,6 +92,9 @@ fn citation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatCitation> 
         document_revision: row.get::<_, i64>(6)? as u64,
         unit_revision: row.get::<_, i64>(7)? as u64,
         locator_json: row.get(8)?,
-        created_at: row.get::<_, i64>(9)? as u64,
+        source_kind: row.get(9)?,
+        url: row.get(10)?,
+        source_title: row.get(11)?,
+        created_at: row.get::<_, i64>(12)? as u64,
     })
 }
