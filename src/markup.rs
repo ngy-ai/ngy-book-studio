@@ -8,7 +8,7 @@ use std::{borrow::Cow, collections::HashSet};
 
 use anyhow::{Context as _, Result, bail};
 use html5ever::{
-    parse_document,
+    QualName, parse_document, parse_fragment,
     serialize::{SerializeOpts, TraversalScope, serialize},
     tendril::TendrilSink as _,
 };
@@ -65,6 +65,143 @@ pub fn serialize_source(document: &BlockDocument, source_kind: SourceKind) -> Re
         SourceKind::Html => write_html_blocks(&document.blocks, &mut output),
     }
     Ok(output.trim().to_string())
+}
+
+/// Produces a display fragment to embed in an XHTML body. Stored HTML remains
+/// HTML: normalize its already-cleaned DOM only at the XML display boundary,
+/// including documents persisted before this projection was introduced.
+pub fn serialize_xhtml(document: &BlockDocument) -> Result<String> {
+    let html = serialize_source(document, SourceKind::Html)?;
+    ensure_xml_characters(&html)?;
+    let dom = parse_fragment(
+        RcDom::default(),
+        Default::default(),
+        QualName::new(None, XHTML_NAMESPACE.into(), "body".into()),
+        Vec::new(),
+    )
+    .one(html);
+    let root = find_html_element(&dom.document, "html").context("无法生成 XHTML 正文片段")?;
+    ensure_html_dom_depth(&root)?;
+    let mut output = String::new();
+    for child in root.children.borrow().iter() {
+        write_xhtml_node(child, 0, &mut output)?;
+    }
+    Ok(output)
+}
+
+const XHTML_NAMESPACE: &str = "http://www.w3.org/1999/xhtml";
+const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
+
+fn ensure_xml_characters(value: &str) -> Result<()> {
+    if let Some(character) = value.chars().find(|character| {
+        !matches!(*character, '\u{9}' | '\u{a}' | '\u{d}')
+            && !matches!(*character as u32, 0x20..=0xd7ff | 0xe000..=0xfffd | 0x10000..=0x10ffff)
+    }) {
+        bail!(
+            "正文包含 XHTML 不允许的字符 U+{:04X}，请在源码模式中删除或替换该字符",
+            character as u32
+        );
+    }
+    Ok(())
+}
+
+fn write_xhtml_value(value: &str, attribute: bool, output: &mut String) -> Result<()> {
+    ensure_xml_characters(value)?;
+    for character in value.chars() {
+        match character {
+            '&' => output.push_str("&amp;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            '"' if attribute => output.push_str("&quot;"),
+            '\r' => output.push_str("&#13;"),
+            '\n' if attribute => output.push_str("&#10;"),
+            '\t' if attribute => output.push_str("&#9;"),
+            _ => output.push(character),
+        }
+    }
+    Ok(())
+}
+
+fn ensure_xhtml_local_name(name: &str) -> Result<()> {
+    let mut characters = name.chars();
+    let valid = characters
+        .next()
+        .is_some_and(|character| character.is_ascii_alphabetic() || character == '_')
+        && characters.all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+        });
+    if !valid {
+        bail!("正文包含无法安全转换为 XHTML 的元素或属性名称");
+    }
+    Ok(())
+}
+
+fn write_xhtml_node(node: &Handle, depth: usize, output: &mut String) -> Result<()> {
+    match &node.data {
+        NodeData::Text { contents } => write_xhtml_value(&contents.borrow(), false, output)?,
+        NodeData::Element { name, attrs, .. } => {
+            ensure_html_depth(depth)?;
+            if name.ns.as_ref() != XHTML_NAMESPACE {
+                bail!("正文包含无法安全转换为 XHTML 的元素命名空间");
+            }
+            let tag = name.local.as_ref();
+            ensure_xhtml_local_name(tag)?;
+            output.push('<');
+            output.push_str(tag);
+            for attribute in attrs.borrow().iter() {
+                ensure_xhtml_local_name(attribute.name.local.as_ref())?;
+                let prefix = match attribute.name.ns.as_ref() {
+                    "" => "",
+                    XML_NAMESPACE => "xml:",
+                    _ => bail!("正文包含无法安全转换为 XHTML 的属性命名空间"),
+                };
+                output.push(' ');
+                output.push_str(prefix);
+                output.push_str(attribute.name.local.as_ref());
+                output.push_str("=\"");
+                write_xhtml_value(&attribute.value, true, output)?;
+                output.push('"');
+            }
+            if matches!(
+                tag,
+                "area"
+                    | "base"
+                    | "br"
+                    | "col"
+                    | "embed"
+                    | "hr"
+                    | "img"
+                    | "input"
+                    | "link"
+                    | "meta"
+                    | "param"
+                    | "source"
+                    | "track"
+                    | "wbr"
+            ) {
+                output.push_str("/>");
+            } else {
+                output.push('>');
+                for child in node.children.borrow().iter() {
+                    let child_depth = if matches!(&child.data, NodeData::Element { .. }) {
+                        depth + 1
+                    } else {
+                        depth
+                    };
+                    write_xhtml_node(child, child_depth, output)?;
+                }
+                output.push_str("</");
+                output.push_str(tag);
+                output.push('>');
+            }
+        }
+        // Comments and document declarations are not editable body content.
+        NodeData::Comment { .. }
+        | NodeData::Doctype { .. }
+        | NodeData::ProcessingInstruction { .. } => {}
+        NodeData::Document => bail!("XHTML 正文片段包含意外的文档根节点"),
+    }
+    Ok(())
 }
 
 pub fn sanitize_html(source: &str) -> String {
@@ -1700,6 +1837,194 @@ fn escape_markdown_text(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn xhtml_body(fragment: &str) -> String {
+        format!("<body xmlns=\"{XHTML_NAMESPACE}\">{fragment}</body>")
+    }
+
+    #[test]
+    fn xhtml_projection_preserves_controlled_media_and_task_attributes() {
+        let document = BlockDocument::new(vec![
+            Block::Image {
+                id: "image".into(),
+                asset_id: "image-asset".into(),
+                alt: "图示 <A> & B".into(),
+                title: Some("带\"引号\"".into()),
+                caption: vec![Inline::text("图注")],
+            },
+            Block::Paragraph {
+                id: "paragraph".into(),
+                content: vec![
+                    Inline::text("第一行"),
+                    Inline::HardBreak,
+                    Inline::Image {
+                        asset_id: "inline-image".into(),
+                        alt: "行内图".into(),
+                        title: None,
+                    },
+                ],
+            },
+            Block::ThematicBreak { id: "rule".into() },
+            Block::BulletList {
+                id: "tasks".into(),
+                items: vec![
+                    ListItem::task(true, vec![Block::paragraph("done", "已完成")]),
+                    ListItem::task(false, vec![Block::paragraph("todo", "待办")]),
+                ],
+            },
+            Block::Audio {
+                id: "audio".into(),
+                asset_id: "audio-asset".into(),
+                title: None,
+                caption: Vec::new(),
+            },
+            Block::Video {
+                id: "video".into(),
+                asset_id: "video-asset".into(),
+                poster_asset_id: Some("poster-asset".into()),
+                title: None,
+                caption: Vec::new(),
+            },
+        ]);
+        let original_html = serialize_source(&document, SourceKind::Html).unwrap();
+        let fragment = serialize_xhtml(&document).unwrap();
+        let body = xhtml_body(&fragment);
+        let xml = resvg::usvg::roxmltree::Document::parse(&body).expect("strict XHTML");
+        let images = xml
+            .descendants()
+            .filter(|node| node.has_tag_name((XHTML_NAMESPACE, "img")))
+            .collect::<Vec<_>>();
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].attribute("alt"), Some("图示 <A> & B"));
+        assert_eq!(images[0].attribute("title"), Some("带\"引号\""));
+        assert_eq!(images[1].attribute("src"), Some("moye-asset:inline-image"));
+        for tag in ["br", "hr"] {
+            assert!(xml.descendants().any(|node| node.has_tag_name(tag)));
+        }
+        let tasks = xml
+            .descendants()
+            .filter(|node| node.has_tag_name("input"))
+            .collect::<Vec<_>>();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].attribute("checked"), Some(""));
+        assert_eq!(tasks[1].attribute("checked"), None);
+        assert!(tasks.iter().all(|node| node.has_attribute("disabled")));
+        for tag in ["audio", "video"] {
+            let media = xml
+                .descendants()
+                .find(|node| node.has_tag_name(tag))
+                .unwrap();
+            assert_eq!(media.attribute("controls"), Some(""));
+        }
+        let video = xml
+            .descendants()
+            .find(|node| node.has_tag_name("video"))
+            .unwrap();
+        assert_eq!(video.attribute("poster"), Some("moye-asset:poster-asset"));
+        assert_eq!(
+            serialize_source(&document, SourceKind::Html).unwrap(),
+            original_html
+        );
+    }
+
+    #[test]
+    fn xhtml_projection_preserves_cleaned_raw_html_entities_and_quoted_attributes() {
+        let raw = r#"<div title="A &quot;B&quot; &lt;tag> &amp; C">A&nbsp;B &amp; C<picture><source src="moye-asset:source"><img src="moye-asset:raw-image" alt="raw"></picture><hr><script>unsafe()</script></div>"#;
+        let inline = r#"<span title="x < y &amp; &quot;q&quot;">inline&nbsp;value<br></span>"#;
+        let document = BlockDocument::new(vec![
+            Block::RawHtml {
+                id: "raw".into(),
+                source: raw.into(),
+                plain_text: raw_html_plain_text(raw).unwrap(),
+            },
+            Block::Paragraph {
+                id: "inline".into(),
+                content: vec![Inline::RawHtml {
+                    source: inline.into(),
+                    plain_text: raw_html_plain_text(inline).unwrap(),
+                }],
+            },
+        ]);
+        let body = xhtml_body(&serialize_xhtml(&document).unwrap());
+        let xml = resvg::usvg::roxmltree::Document::parse(&body).expect("strict XHTML");
+        let div = xml
+            .descendants()
+            .find(|node| node.has_tag_name("div"))
+            .unwrap();
+        assert_eq!(div.attribute("title"), Some("A \"B\" <tag> & C"));
+        assert_eq!(div.text(), Some("A\u{a0}B & C"));
+        let span = xml
+            .descendants()
+            .find(|node| node.has_tag_name("span"))
+            .unwrap();
+        assert_eq!(span.attribute("title"), Some("x < y & \"q\""));
+        assert_eq!(span.text(), Some("inline\u{a0}value"));
+        let source = xml
+            .descendants()
+            .find(|node| node.has_tag_name("source"))
+            .unwrap();
+        assert_eq!(source.attribute("src"), Some("moye-asset:source"));
+        assert!(xml.descendants().any(|node| node.has_tag_name("img")));
+        assert!(xml.descendants().any(|node| node.has_tag_name("br")));
+        assert!(xml.descendants().any(|node| node.has_tag_name("hr")));
+        assert!(!xml.descendants().any(|node| node.has_tag_name("script")));
+        assert!(!body.contains("unsafe()"));
+    }
+
+    #[test]
+    fn xhtml_projection_keeps_text_markup_literal() {
+        let text = r#"显示 <img src="https://example.invalid/a"> & &#160; >"#;
+        let document = BlockDocument::new(vec![Block::paragraph("text", text)]);
+        let body = xhtml_body(&serialize_xhtml(&document).unwrap());
+        let xml = resvg::usvg::roxmltree::Document::parse(&body).expect("strict XHTML");
+        let paragraph = xml
+            .descendants()
+            .find(|node| node.has_tag_name("p"))
+            .unwrap();
+        assert_eq!(paragraph.text(), Some(text));
+        assert!(!xml.descendants().any(|node| node.has_tag_name("img")));
+    }
+
+    #[test]
+    fn xhtml_projection_rejects_xml_forbidden_characters() {
+        for character in ['\u{1}', '\u{b}', '\u{fffe}', '\u{ffff}'] {
+            let document = BlockDocument::new(vec![Block::paragraph(
+                "invalid-text",
+                format!("前{character}后"),
+            )]);
+            let error = serialize_xhtml(&document).expect_err("XML must reject this character");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("U+{:04X}", character as u32))
+            );
+        }
+    }
+
+    #[test]
+    fn xhtml_projection_obeys_the_existing_html_depth_limit() {
+        let source = format!(
+            "{}正文{}",
+            "<div>".repeat(MAX_DOCUMENT_DEPTH),
+            "</div>".repeat(MAX_DOCUMENT_DEPTH)
+        );
+        let document = BlockDocument::new(vec![Block::RawHtml {
+            id: "nested".into(),
+            plain_text: raw_html_plain_text(&source).unwrap(),
+            source,
+        }]);
+        let body = xhtml_body(&serialize_xhtml(&document).unwrap());
+        resvg::usvg::roxmltree::Document::parse(&body).expect("bounded XHTML remains valid");
+
+        let mut combined = document;
+        for index in 0..3 {
+            combined = BlockDocument::new(vec![Block::BlockQuote {
+                id: format!("quote-{index}"),
+                blocks: combined.blocks,
+            }]);
+        }
+        assert!(serialize_xhtml(&combined).is_err());
+    }
 
     #[test]
     fn markdown_gfm_round_trip_is_semantically_idempotent() {

@@ -755,6 +755,14 @@ impl CitationRegistry {
         Ok(())
     }
 
+    /// Removes passage sources omitted from the accepted model request after
+    /// context reduction. Frozen selection aliases and web sources are kept
+    /// because their source text is carried outside passage tool messages.
+    pub(crate) fn retain_passage_markers(&mut self, markers: &HashSet<String>) {
+        self.served_by_marker
+            .retain(|marker, _| !marker.starts_with("passage:") || markers.contains(marker));
+    }
+
     pub fn finish(
         &self,
         markdown: impl Into<String>,
@@ -1663,9 +1671,18 @@ impl ToolCallDeltaAccumulator {
                 call.arguments
             };
             let parsed: Value = serde_json::from_str(&arguments).map_err(|error| {
+                tracing::warn!(target: "moye_ai", stage = "tool_arguments_json",
+                    tool = crate::ai_diagnostics::tool_label(&call.name),
+                    argument_bytes = arguments.len(), json_category = ?error.classify(),
+                    json_line = error.line(), json_column = error.column(),
+                    "AI streamed tool arguments are invalid JSON");
                 AgentError::StreamProtocol(format!("tool arguments are not valid JSON: {error}"))
             })?;
             if !parsed.is_object() {
+                tracing::warn!(target: "moye_ai", stage = "tool_arguments_shape",
+                    tool = crate::ai_diagnostics::tool_label(&call.name),
+                    arguments = ?crate::ai_diagnostics::ToolArgumentsSummary::new(&arguments),
+                    "AI streamed tool arguments are not an object");
                 return Err(AgentError::StreamProtocol(
                     "tool arguments must be a JSON object".to_string(),
                 ));
@@ -2439,6 +2456,86 @@ mod tests {
             AgentAnswerSourceStatus::NoVerifiedSources
         );
         assert!(ungrounded.citations.is_empty());
+    }
+
+    #[test]
+    fn reduced_passage_registry_preserves_only_visible_passages_and_other_sources() {
+        let passages = sanitize_passages(
+            vec![
+                passage("book-a", "retained", "完整保留的正文"),
+                passage("book-a", "removed", "已从请求中删除的正文"),
+            ],
+            &scope(),
+            &HashSet::from(["book-a".to_string()]),
+            None,
+            2,
+        );
+        let mut registry = CitationRegistry::default();
+        for passage in &passages {
+            registry.record_citation(passage.citation()).unwrap();
+        }
+        let selection = SelectionSnapshot::capture("book-a", "unit-1", 8, "原样选区")
+            .unwrap()
+            .with_host_citation(
+                DocumentLocator::unit("book-a", "unit-1"),
+                Revision::new(4),
+                Revision::new(2),
+                "Book",
+                "Chapter",
+            )
+            .unwrap()
+            .citation()
+            .unwrap();
+        let web = AgentCitation::web(
+            "web:stable-id".to_string(),
+            "Web source".to_string(),
+            "https://example.test/source".to_string(),
+            "web evidence".to_string(),
+        );
+        registry
+            .record_citation_for_marker("selection:turn:1", selection.clone())
+            .unwrap();
+        registry
+            .record_citation_for_marker("web:0", web.clone())
+            .unwrap();
+
+        registry.retain_passage_markers(&HashSet::from(["passage:retained".to_string()]));
+
+        assert!(matches!(
+            registry.finish("不应验证", &["passage:removed".to_string()]),
+            Err(AgentError::UnknownCitation(marker)) if marker == "passage:removed"
+        ));
+        let answer = registry
+            .finish(
+                "引用仍在请求中的来源",
+                &[
+                    "passage:retained".to_string(),
+                    "selection:turn:1".to_string(),
+                    "web:0".to_string(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            answer.citations,
+            [passages[0].citation(), selection.clone(), web.clone()]
+        );
+
+        registry.retain_passage_markers(&HashSet::new());
+        assert!(
+            registry
+                .finish("也已删除", &["passage:retained".to_string()])
+                .is_err()
+        );
+        assert_eq!(
+            registry
+                .finish(
+                    "其它来源仍可使用",
+                    &["selection:turn:1".to_string(), "web:0".to_string()],
+                )
+                .unwrap()
+                .citations,
+            [selection, web]
+        );
     }
 
     #[test]

@@ -476,6 +476,9 @@ pub struct ReaderApp {
     protocol_gate: Option<ReaderProtocolGate>,
     closing_webview: Option<WeakEntity<WebView>>,
     closing: bool,
+    /// Set when the window closes because its book left the library: the final
+    /// reading position belongs to a document that no longer exists.
+    closing_for_removed_book: bool,
     progress_close_ready: bool,
     removal_scheduled: bool,
     notice: Option<Notice>,
@@ -1265,6 +1268,7 @@ impl ReaderApp {
             protocol_gate: None,
             closing_webview: None,
             closing: false,
+            closing_for_removed_book: false,
             progress_close_ready: false,
             removal_scheduled: false,
             notice: None,
@@ -1478,7 +1482,7 @@ impl ReaderApp {
         self.webview = Some(webview);
         self.protocol_gate = Some(protocol_gate);
         if self.webview_build_gate.finish() {
-            self.schedule_window_removal(window, cx);
+            self.resume_deferred_close(window, cx);
             // Final persistence is asynchronous. Keep the page event receiver
             // alive while the child WebView is retained so a failed close can
             // restore a fully functional reader; successful teardown cancels
@@ -1490,6 +1494,15 @@ impl ReaderApp {
         true
     }
 
+    /// Resumes a close that was vetoed while the child WebView was building.
+    fn resume_deferred_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing_for_removed_book {
+            self.finish_removal_close(window, cx);
+        } else {
+            self.schedule_window_removal(window, cx);
+        }
+    }
+
     pub(super) fn fail_webview_build(
         &mut self,
         error: String,
@@ -1497,7 +1510,7 @@ impl ReaderApp {
         cx: &mut Context<Self>,
     ) {
         if self.webview_build_gate.finish() {
-            self.schedule_window_removal(window, cx);
+            self.resume_deferred_close(window, cx);
             return;
         }
         self.set_error(error, cx);
@@ -1878,6 +1891,12 @@ impl ReaderApp {
     }
 
     fn complete_progress_close(&mut self, cx: &mut Context<Self>) {
+        self.finish_close(cx);
+    }
+
+    /// Drops every resource the window owns. Render removes the native window
+    /// once `closing` and `progress_close_ready` are both set.
+    fn finish_close(&mut self, cx: &mut Context<Self>) {
         self.ai_sidebar.update(cx, |sidebar, cx| {
             sidebar.cancel_for_window_close(cx);
         });
@@ -1935,6 +1954,34 @@ impl ReaderApp {
         }
         self.schedule_window_removal(window, cx);
         false
+    }
+
+    /// Closes this reader because its book left the library.
+    ///
+    /// Unlike a user-initiated close there is nothing left to persist: the
+    /// final position is dropped with its writer, and no failed write may
+    /// reopen a window whose document no longer exists.
+    pub(super) fn close_for_removed_book(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing || self.closing_for_removed_book {
+            return;
+        }
+        self.closing_for_removed_book = true;
+        if self.webview_build_gate.request_close() {
+            return;
+        }
+        self.finish_removal_close(window, cx);
+    }
+
+    fn finish_removal_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
+        self.closing = true;
+        // Dropping the writer stops its runtime worker without queueing a
+        // final position for a book that has already been removed.
+        self.progress_writer.take();
+        self.finish_close(cx);
+        window.refresh();
     }
 }
 

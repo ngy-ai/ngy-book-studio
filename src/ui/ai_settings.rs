@@ -3,15 +3,51 @@ use super::*;
 use gpui_component::checkbox::Checkbox;
 use moye_epub_editor::{
     ai::{
-        DEFAULT_AI_REQUEST_TIMEOUT_SECS, DEFAULT_OLLAMA_OPENAI_BASE_URL,
-        MAX_AI_REQUEST_TIMEOUT_SECS, MIN_AI_REQUEST_TIMEOUT_SECS, ModelInfo,
-        normalize_provider_base_url,
+        ChatGenerationSettings, DEFAULT_AI_REQUEST_TIMEOUT_SECS, DEFAULT_CHAT_OUTPUT_TOKENS,
+        DEFAULT_OLLAMA_OPENAI_BASE_URL, MAX_AI_REQUEST_TIMEOUT_SECS, MIN_AI_REQUEST_TIMEOUT_SECS,
+        ModelInfo, normalize_provider_base_url,
     },
     services::{
         ApiKeyUpdate, AppServices, DEFAULT_CHAT_MODEL, DEFAULT_EMBEDDING_MODEL,
         DEFAULT_VISION_MODEL, ProviderSettings,
     },
 };
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SettingsTab {
+    #[default]
+    Endpoint,
+    Models,
+    WebSearch,
+    BackgroundJobs,
+}
+
+impl SettingsTab {
+    const ALL: [Self; 4] = [
+        Self::Endpoint,
+        Self::Models,
+        Self::WebSearch,
+        Self::BackgroundJobs,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Endpoint => "Endpoint",
+            Self::Models => "对话模型",
+            Self::WebSearch => "联网搜索",
+            Self::BackgroundJobs => "后台任务",
+        }
+    }
+
+    fn selector(self) -> &'static str {
+        match self {
+            Self::Endpoint => "ai-settings-tab-endpoint",
+            Self::Models => "ai-settings-tab-models",
+            Self::WebSearch => "ai-settings-tab-web-search",
+            Self::BackgroundJobs => "ai-settings-tab-background-jobs",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PendingOperation {
@@ -123,11 +159,17 @@ pub(super) struct AiSettingsWindow {
     services: Arc<AppServices>,
     base_url_input: Entity<InputState>,
     chat_model_input: Entity<InputState>,
+    temperature_input: Entity<InputState>,
+    top_p_input: Entity<InputState>,
+    max_output_tokens_input: Entity<InputState>,
+    presence_penalty_input: Entity<InputState>,
+    frequency_penalty_input: Entity<InputState>,
     embedding_model_input: Entity<InputState>,
     vision_model_input: Entity<InputState>,
     request_timeout_input: Entity<InputState>,
     api_key_input: Entity<InputState>,
-    scroll_handle: gpui::ScrollHandle,
+    active_tab: SettingsTab,
+    scroll_handles: [gpui::ScrollHandle; 4],
     window_handle: gpui::AnyWindowHandle,
     remote_content_confirmed: bool,
     allow_insecure_remote_http: bool,
@@ -146,6 +188,7 @@ pub(super) struct AiSettingsWindow {
     web_search_allow_insecure_http: bool,
     web_search_confirmed_remote_endpoint: String,
     delete_web_search_api_key: bool,
+    auto_run_background_jobs: bool,
     operation: PendingOperation,
     detected_models: Vec<String>,
     missing_models: Vec<String>,
@@ -170,6 +213,18 @@ impl AiSettingsWindow {
                 .default_value(settings.chat_model)
                 .placeholder(DEFAULT_CHAT_MODEL)
         });
+        let generation = &settings.chat_generation;
+        let temperature_input = optional_parameter_input(generation.temperature, window, cx);
+        let top_p_input = optional_parameter_input(generation.top_p, window, cx);
+        let max_output_tokens_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(generation.max_output_tokens.to_string())
+                .placeholder(DEFAULT_CHAT_OUTPUT_TOKENS.to_string())
+        });
+        let presence_penalty_input =
+            optional_parameter_input(generation.presence_penalty, window, cx);
+        let frequency_penalty_input =
+            optional_parameter_input(generation.frequency_penalty, window, cx);
         let embedding_model_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .default_value(settings.embedding_model)
@@ -238,11 +293,17 @@ impl AiSettingsWindow {
             services,
             base_url_input,
             chat_model_input,
+            temperature_input,
+            top_p_input,
+            max_output_tokens_input,
+            presence_penalty_input,
+            frequency_penalty_input,
             embedding_model_input,
             vision_model_input,
             request_timeout_input,
             api_key_input,
-            scroll_handle: gpui::ScrollHandle::new(),
+            active_tab: SettingsTab::default(),
+            scroll_handles: std::array::from_fn(|_| gpui::ScrollHandle::new()),
             window_handle: gpui::Window::window_handle(window),
             remote_content_confirmed: settings.remote_content_confirmed,
             allow_insecure_remote_http: settings.allow_insecure_remote_http,
@@ -260,6 +321,7 @@ impl AiSettingsWindow {
             web_search_allow_insecure_http: settings.web_search_allow_insecure_http,
             web_search_confirmed_remote_endpoint: settings.web_search_confirmed_remote_endpoint,
             delete_web_search_api_key: false,
+            auto_run_background_jobs: settings.auto_run_background_jobs,
             operation: PendingOperation::Idle,
             detected_models: Vec::new(),
             missing_models: Vec::new(),
@@ -269,6 +331,13 @@ impl AiSettingsWindow {
     }
 
     fn entered_settings(&self, cx: &App) -> Result<ProviderSettings> {
+        let chat_generation = parse_chat_generation(
+            self.temperature_input.read(cx).value().as_ref(),
+            self.top_p_input.read(cx).value().as_ref(),
+            self.max_output_tokens_input.read(cx).value().as_ref(),
+            self.presence_penalty_input.read(cx).value().as_ref(),
+            self.frequency_penalty_input.read(cx).value().as_ref(),
+        )?;
         let request_timeout_secs =
             parse_request_timeout_secs(self.request_timeout_input.read(cx).value().as_ref())?;
         let web_search_timeout_secs =
@@ -297,6 +366,7 @@ impl AiSettingsWindow {
         let settings = ProviderSettings {
             base_url: self.base_url_input.read(cx).value().trim().to_string(),
             chat_model: self.chat_model_input.read(cx).value().trim().to_string(),
+            chat_generation,
             embedding_model: self
                 .embedding_model_input
                 .read(cx)
@@ -328,6 +398,7 @@ impl AiSettingsWindow {
             web_search_confirmed_remote_endpoint: self.web_search_confirmed_remote_endpoint.clone(),
             web_search_timeout_secs,
             web_search_max_results,
+            auto_run_background_jobs: self.auto_run_background_jobs,
         };
         settings.validate()?;
         Ok(settings)
@@ -396,6 +467,7 @@ impl AiSettingsWindow {
         };
         let key_update = self.api_key_update(cx);
         self.clear_entered_api_key(window, cx);
+        self.switch_tab(SettingsTab::Models, window, cx);
         self.operation = PendingOperation::Detecting;
         self.detected_models.clear();
         self.missing_models.clear();
@@ -425,7 +497,7 @@ impl AiSettingsWindow {
                         });
                     }
                 }
-                this.scroll_handle.scroll_to_bottom();
+                this.scroll_handles[SettingsTab::Models as usize].scroll_to_bottom();
                 cx.notify();
             });
         })
@@ -627,23 +699,511 @@ impl AiSettingsWindow {
                 .into_any_element(),
         )
     }
+
+    fn switch_tab(&mut self, tab: SettingsTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.operation.busy() || self.active_tab == tab {
+            return;
+        }
+        // Keep drafts and input history while removing focus from hidden fields.
+        window.blur();
+        self.active_tab = tab;
+        cx.notify();
+    }
+
+    #[inline(never)]
+    fn render_endpoint_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let remote_view = cx.entity();
+        let insecure_view = cx.entity();
+        let endpoint_for_confirmation = self.base_url_input.clone();
+        let busy = self.operation.busy();
+
+        div()
+            .v_flex()
+            .gap_3()
+            .p_4()
+            .rounded(px(12.))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(SURFACE))
+            .child(self.render_input_field(
+                "Endpoint",
+                "默认使用本机 Ollama 的 http://127.0.0.1:11434/v1/；不会静默切换到云端。",
+                &self.base_url_input,
+            ))
+            .child(
+                Checkbox::new("ai-confirm-remote")
+                    .checked(self.remote_content_confirmed)
+                    .disabled(busy)
+                    .label("确认允许把图书内容发送到远程 endpoint")
+                    .on_click(move |checked, _, cx| {
+                        let checked = *checked;
+                        remote_view.update(cx, |this, cx| {
+                            if checked {
+                                let entered = endpoint_for_confirmation.read(cx).value();
+                                match normalize_provider_base_url(entered.trim()) {
+                                    Ok(url) => {
+                                        this.remote_content_confirmed = true;
+                                        this.confirmed_remote_endpoint = url.to_string();
+                                    }
+                                    Err(error) => {
+                                        this.remote_content_confirmed = false;
+                                        this.confirmed_remote_endpoint.clear();
+                                        this.notice = Some(SettingsNotice {
+                                            text: format!("Endpoint 无效，无法确认：{error:#}"),
+                                            error: true,
+                                        });
+                                    }
+                                }
+                            } else {
+                                this.remote_content_confirmed = false;
+                                this.allow_insecure_remote_http = false;
+                                this.confirmed_remote_endpoint.clear();
+                            }
+                            cx.notify();
+                        });
+                    }),
+            )
+            .child(
+                Checkbox::new("ai-allow-insecure-http")
+                    .checked(self.allow_insecure_remote_http)
+                    .disabled(busy || !self.remote_content_confirmed)
+                    .label("额外允许非 HTTPS 的远程 endpoint（内容可能被窃听）")
+                    .on_click(move |checked, _, cx| {
+                        let checked = *checked;
+                        insecure_view.update(cx, |this, cx| {
+                            this.allow_insecure_remote_http = checked;
+                            cx.notify();
+                        });
+                    }),
+            )
+            .child(self.render_input_field(
+                "请求超时（秒）",
+                "单次 OpenAI-compatible HTTP 请求的总超时；可设置 1–600 秒，默认 120 秒。",
+                &self.request_timeout_input,
+            ))
+            .into_any_element()
+    }
+
+    #[inline(never)]
+    fn render_models_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        div()
+            .v_flex()
+            .gap_4()
+            .p_4()
+            .rounded(px(12.))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(SURFACE))
+            .child(self.render_input_field(
+                "对话模型",
+                "用于流式问答和只读工具调用。",
+                &self.chat_model_input,
+            ))
+            .child(self.render_generation_panel(cx))
+            .child(self.render_input_field(
+                "Embedding 模型",
+                "用于向量索引；不可用时全文检索仍可工作。",
+                &self.embedding_model_input,
+            ))
+            .child(self.render_input_field(
+                "视觉模型",
+                "用于后续页面 OCR 与视觉说明任务。",
+                &self.vision_model_input,
+            ))
+            .when_some(self.render_model_detection(cx), |this, result| {
+                this.child(result)
+            })
+            .into_any_element()
+    }
+
+    fn reset_chat_generation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.operation.busy() {
+            return;
+        }
+        let defaults = ChatGenerationSettings::default();
+        for (input, value) in [
+            (
+                &self.temperature_input,
+                optional_parameter_text(defaults.temperature),
+            ),
+            (&self.top_p_input, optional_parameter_text(defaults.top_p)),
+            (
+                &self.max_output_tokens_input,
+                defaults.max_output_tokens.to_string(),
+            ),
+            (
+                &self.presence_penalty_input,
+                optional_parameter_text(defaults.presence_penalty),
+            ),
+            (
+                &self.frequency_penalty_input,
+                optional_parameter_text(defaults.frequency_penalty),
+            ),
+        ] {
+            input.update(cx, |input, cx| input.set_value(value, window, cx));
+        }
+        self.notice = Some(SettingsNotice {
+            text: "对话生成参数已恢复默认，点击“保存设置”后生效。".into(),
+            error: false,
+        });
+        cx.notify();
+    }
+
+    #[inline(never)]
+    fn render_generation_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        div()
+            .v_flex()
+            .gap_4()
+            .p_4()
+            .rounded(px(10.))
+            .bg(rgb(PAPER))
+            .child(
+                div()
+                    .h_flex()
+                    .justify_between()
+                    .gap_3()
+                    .child(div().text_sm().font_semibold().child("对话生成参数"))
+                    .child(
+                        Button::new("ai-reset-chat-generation")
+                            .label("恢复默认")
+                            .disabled(self.operation.busy())
+                            .debug_selector(|| "ai-reset-chat-generation".into())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.reset_chat_generation(window, cx);
+                            })),
+                    ),
+            )
+            .child(div().text_xs().text_color(rgb(MUTED)).child(
+                "保存后用于新的对话请求。除最大输出外，其余参数可留空，使用服务端默认值；具体支持以所选模型为准。",
+            ))
+            .child(self.render_input_field(
+                "温度（Temperature）",
+                "0–2；默认 0.1。越低越集中，越高越随机。通常与 Top P 选择一项调整。",
+                &self.temperature_input,
+            ))
+            .child(self.render_input_field(
+                "核采样（Top P）",
+                "0–1；控制候选词的累计概率范围，越小越集中。",
+                &self.top_p_input,
+            ))
+            .child(self.render_input_field(
+                "最大输出 token 数",
+                "正整数，默认 4096；请按所选模型设置，墨页不设固定上限。上下文不足时可能进一步降低。",
+                &self.max_output_tokens_input,
+            ))
+            .child(self.render_input_field(
+                "出现惩罚（Presence Penalty）",
+                "−2–2；正值降低已出现词的再次使用倾向，负值提高。",
+                &self.presence_penalty_input,
+            ))
+            .child(self.render_input_field(
+                "频率惩罚（Frequency Penalty）",
+                "−2–2；正值按出现次数抑制重复，负值鼓励重复。",
+                &self.frequency_penalty_input,
+            ))
+            .child(div().text_xs().text_color(rgb(MUTED)).child(
+                "最大输出 token 数不改变模型的上下文窗口；Ollama 上下文长度需在服务端设置。",
+            ))
+            .into_any_element()
+    }
+
+    #[inline(never)]
+    fn render_api_key_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let delete_view = cx.entity();
+        let busy = self.operation.busy();
+
+        div()
+            .v_flex()
+            .gap_3()
+            .p_4()
+            .rounded(px(12.))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(SURFACE))
+            .child(
+                div()
+                    .text_sm()
+                    .font_semibold()
+                    .text_color(rgb(INK))
+                    .child("API key"),
+            )
+            .child(
+                Input::new(&self.api_key_input)
+                    .mask_toggle()
+                    .disabled(busy || self.delete_api_key),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .line_height(gpui::relative(1.5))
+                    .text_color(rgb(MUTED))
+                    .child("现有密钥不会回填明文。留空表示保持；输入新值表示替换。密钥只存入 Windows Credential Manager。"),
+            )
+            .child(
+                Checkbox::new("ai-delete-api-key")
+                    .checked(self.delete_api_key)
+                    .disabled(busy)
+                    .label("删除这个 endpoint 已保存的 API key")
+                    .on_click(move |checked, window, cx| {
+                        let checked = *checked;
+                        delete_view.update(cx, |this, cx| {
+                            this.delete_api_key = checked;
+                            if checked {
+                                this.clear_entered_api_key(window, cx);
+                            }
+                            cx.notify();
+                        });
+                    }),
+            )
+            .into_any_element()
+    }
+
+    #[inline(never)]
+    fn render_web_search_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let web_enable_view = cx.entity();
+        let web_confirm_view = cx.entity();
+        let web_insecure_view = cx.entity();
+        let web_delete_view = cx.entity();
+        let web_url_input = self.web_search_url_input.clone();
+        let busy = self.operation.busy();
+
+        div()
+            .v_flex()
+            .gap_3()
+            .p_4()
+            .rounded(px(12.))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(SURFACE))
+            .child(
+                div()
+                    .h_flex()
+                    .justify_between()
+                    .child(
+                        div()
+                            .v_flex()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .text_color(rgb(INK))
+                                    .child("联网搜索（可选）"),
+                            )
+                            .child(div().text_xs().text_color(rgb(MUTED)).child(
+                                "书中检索不到时，宿主补充一次联网搜索作为回答依据；关闭则不联网。",
+                            )),
+                    )
+                    .child(
+                        Checkbox::new("ai-web-search-enabled")
+                            .checked(self.web_search_enabled)
+                            .disabled(busy)
+                            .label("启用")
+                            .on_click(move |checked, _, cx| {
+                                let checked = *checked;
+                                web_enable_view.update(cx, |this, cx| {
+                                    this.web_search_enabled = checked;
+                                    cx.notify();
+                                });
+                            }),
+                    ),
+            )
+            .child(self.render_input_field(
+                "请求模板（URL）",
+                "必须包含 {query}；可配置 SearxNG、Brave、Tavily 等端点。",
+                &self.web_search_url_input,
+            ))
+            .child(self.render_input_field(
+                "方法",
+                "GET 或 POST；POST 端点需填写下方的请求体模板。",
+                &self.web_search_method_input,
+            ))
+            .child(self.render_input_field(
+                "请求体模板（可选）",
+                "POST 时使用，需包含 {query}；留空则用 GET。",
+                &self.web_search_body_input,
+            ))
+            .child(self.render_input_field(
+                "API key 头（可选）",
+                "自定义携带密钥的请求头名；留空则用 Authorization: Bearer。",
+                &self.web_search_key_header_input,
+            ))
+            .child(
+                Input::new(&self.web_search_api_key_input)
+                    .mask_toggle()
+                    .disabled(busy || self.delete_web_search_api_key || !self.web_search_enabled),
+            )
+            .child(
+                div().text_xs().text_color(rgb(MUTED)).child(
+                    "联网搜索 API key 只存入 Windows Credential Manager；留空保持、输入替换。",
+                ),
+            )
+            .child(
+                Checkbox::new("ai-web-confirm-remote")
+                    .checked(self.web_search_remote_confirmed)
+                    .disabled(busy || !self.web_search_enabled)
+                    .label("确认允许把检索词发送到远程搜索端点")
+                    .on_click(move |checked, _, cx| {
+                        let checked = *checked;
+                        web_confirm_view.update(cx, |this, cx| {
+                            if checked {
+                                let entered = web_url_input.read(cx).value();
+                                match moye_epub_editor::web_search::normalize_web_endpoint(
+                                    entered.trim(),
+                                ) {
+                                    Some(url) => {
+                                        this.web_search_remote_confirmed = true;
+                                        this.web_search_confirmed_remote_endpoint = url;
+                                    }
+                                    None => {
+                                        this.web_search_remote_confirmed = false;
+                                        this.web_search_confirmed_remote_endpoint.clear();
+                                        this.notice = Some(SettingsNotice {
+                                            text: "联网搜索端点无效，无法确认。".to_string(),
+                                            error: true,
+                                        });
+                                    }
+                                }
+                            } else {
+                                this.web_search_remote_confirmed = false;
+                                this.web_search_allow_insecure_http = false;
+                                this.web_search_confirmed_remote_endpoint.clear();
+                            }
+                            cx.notify();
+                        });
+                    }),
+            )
+            .child(
+                Checkbox::new("ai-web-allow-insecure-http")
+                    .checked(self.web_search_allow_insecure_http)
+                    .disabled(busy || !self.web_search_enabled || !self.web_search_remote_confirmed)
+                    .label("额外允许非 HTTPS 的搜索端点（内容可能被窃听）")
+                    .on_click(move |checked, _, cx| {
+                        let checked = *checked;
+                        web_insecure_view.update(cx, |this, cx| {
+                            this.web_search_allow_insecure_http = checked;
+                            cx.notify();
+                        });
+                    }),
+            )
+            .child(self.render_input_field(
+                "超时（秒）",
+                "单次联网搜索请求的总超时。",
+                &self.web_search_timeout_input,
+            ))
+            .child(self.render_input_field(
+                "结果条数",
+                "返回给模型的最大搜索结果数量。",
+                &self.web_search_max_results_input,
+            ))
+            .child(
+                Checkbox::new("ai-web-delete-api-key")
+                    .checked(self.delete_web_search_api_key)
+                    .disabled(busy || !self.web_search_enabled)
+                    .label("删除已保存的联网搜索 API key")
+                    .on_click(move |checked, window, cx| {
+                        let checked = *checked;
+                        web_delete_view.update(cx, |this, cx| {
+                            this.delete_web_search_api_key = checked;
+                            if checked {
+                                this.clear_entered_web_api_key(window, cx);
+                            }
+                            cx.notify();
+                        });
+                    }),
+            )
+            .into_any_element()
+    }
+
+    #[inline(never)]
+    fn render_background_jobs_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let auto_run_view = cx.entity();
+
+        div()
+            .v_flex()
+            .gap_3()
+            .p_4()
+            .rounded(px(12.))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(SURFACE))
+            .child(
+                div()
+                    .text_sm()
+                    .font_semibold()
+                    .text_color(rgb(INK))
+                    .child("新任务运行方式"),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .line_height(gpui::relative(1.5))
+                    .text_color(rgb(MUTED))
+                    .child(
+                        "导入或编辑图书后，墨页会创建逻辑页面渲染、视觉理解和向量索引任务。",
+                    ),
+            )
+            .child(
+                Checkbox::new("ai-auto-run-background-jobs")
+                    .checked(self.auto_run_background_jobs)
+                    .disabled(self.operation.busy())
+                    .label("自动运行新创建的后台任务")
+                    .debug_selector(|| "ai-auto-run-background-jobs".into())
+                    .on_click(move |checked, _, cx| {
+                        let checked = *checked;
+                        auto_run_view.update(cx, |this, cx| {
+                            this.auto_run_background_jobs = checked;
+                            cx.notify();
+                        });
+                    }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .line_height(gpui::relative(1.5))
+                    .text_color(rgb(MUTED))
+                    .child(
+                        "关闭后，新导入、创建或编辑图书产生的三类任务会以暂停状态创建，可在“后台任务”窗口逐项恢复。更改此设置不会暂停、恢复或取消已经排队或运行的任务。",
+                    ),
+            )
+            .into_any_element()
+    }
+
+    #[inline(never)]
+    fn render_active_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        match self.active_tab {
+            SettingsTab::Endpoint => div()
+                .v_flex()
+                .gap_5()
+                .child(self.render_endpoint_panel(cx))
+                .child(self.render_api_key_panel(cx))
+                .into_any_element(),
+            SettingsTab::Models => self.render_models_panel(cx),
+            SettingsTab::WebSearch => self.render_web_search_panel(cx),
+            SettingsTab::BackgroundJobs => self.render_background_jobs_panel(cx),
+        }
+    }
 }
 
 impl Render for AiSettingsWindow {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let view = cx.entity().clone();
-        let remote_view = view.clone();
-        let insecure_view = view.clone();
-        let delete_view = view.clone();
-        let detect_view = view.clone();
-        let save_view = view.clone();
-        let web_enable_view = view.clone();
-        let web_confirm_view = view.clone();
-        let web_insecure_view = view.clone();
-        let web_delete_view = view.clone();
-        let web_url_input = self.web_search_url_input.clone();
+        let detect_view = cx.entity();
+        let save_view = cx.entity();
         let busy = self.operation.busy();
-        let endpoint_for_confirmation = self.base_url_input.clone();
+        let panel = self.render_active_panel(cx);
+        let tabs = TabBar::new("ai-settings-tabs")
+            .selected_index(self.active_tab as usize)
+            .on_click(cx.listener(|this, index: &usize, window, cx| {
+                if let Some(tab) = SettingsTab::ALL.get(*index) {
+                    this.switch_tab(*tab, window, cx);
+                }
+            }))
+            .children(SettingsTab::ALL.into_iter().map(|tab| {
+                Tab::new()
+                    .label(tab.label())
+                    .disabled(busy)
+                    .debug_selector(move || tab.selector().into())
+            }));
 
         div()
             .v_flex()
@@ -686,12 +1246,9 @@ impl Render for AiSettingsWindow {
                                             .text_color(rgb(INK))
                                             .child("AI Provider"),
                                     )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(MUTED))
-                                            .child("OpenAI-compatible · 本地 Ollama 或显式配置的远程端点"),
-                                    ),
+                                    .child(div().text_xs().text_color(rgb(MUTED)).child(
+                                        "OpenAI-compatible · 本地 Ollama 或显式配置的远程端点",
+                                    )),
                             ),
                     )
                     .child(
@@ -703,325 +1260,26 @@ impl Render for AiSettingsWindow {
             )
             .child(
                 div()
-                    .id("ai-settings-scroll")
+                    .flex_none()
+                    .px_6()
+                    .pt_3()
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(SURFACE))
+                    .child(tabs),
+            )
+            .child(
+                div()
+                    .id(("ai-settings-scroll", self.active_tab as usize))
                     .flex_1()
                     .min_h(px(0.))
                     .overflow_y_scroll()
-                    .track_scroll(&self.scroll_handle)
-                    .child(
-                        div()
-                            .v_flex()
-                            .gap_5()
-                            .p_6()
-                            .child(
-                                div()
-                                    .v_flex()
-                                    .gap_3()
-                                    .p_4()
-                                    .rounded(px(12.))
-                                    .border_1()
-                                    .border_color(rgb(BORDER))
-                                    .bg(rgb(SURFACE))
-                                    .child(self.render_input_field(
-                                        "Endpoint",
-                                        "默认使用本机 Ollama 的 http://127.0.0.1:11434/v1/；不会静默切换到云端。",
-                                        &self.base_url_input,
-                                    ))
-                                    .child(
-                                        Checkbox::new("ai-confirm-remote")
-                                            .checked(self.remote_content_confirmed)
-                                            .disabled(busy)
-                                            .label("确认允许把图书内容发送到远程 endpoint")
-                                            .on_click(move |checked, _, cx| {
-                                                let checked = *checked;
-                                                remote_view.update(cx, |this, cx| {
-                                                    if checked {
-                                                        let entered = endpoint_for_confirmation
-                                                            .read(cx)
-                                                            .value();
-                                                        match normalize_provider_base_url(
-                                                            entered.trim(),
-                                                        ) {
-                                                            Ok(url) => {
-                                                                this.remote_content_confirmed = true;
-                                                                this.confirmed_remote_endpoint =
-                                                                    url.to_string();
-                                                            }
-                                                            Err(error) => {
-                                                                this.remote_content_confirmed = false;
-                                                                this.confirmed_remote_endpoint
-                                                                    .clear();
-                                                                this.notice = Some(SettingsNotice {
-                                                                    text: format!(
-                                                                        "Endpoint 无效，无法确认：{error:#}"
-                                                                    ),
-                                                                    error: true,
-                                                                });
-                                                            }
-                                                        }
-                                                    } else {
-                                                        this.remote_content_confirmed = false;
-                                                        this.allow_insecure_remote_http = false;
-                                                        this.confirmed_remote_endpoint.clear();
-                                                    }
-                                                    cx.notify();
-                                                });
-                                            }),
-                                    )
-                                    .child(
-                                        Checkbox::new("ai-allow-insecure-http")
-                                            .checked(self.allow_insecure_remote_http)
-                                            .disabled(busy || !self.remote_content_confirmed)
-                                            .label("额外允许非 HTTPS 的远程 endpoint（内容可能被窃听）")
-                                            .on_click(move |checked, _, cx| {
-                                                let checked = *checked;
-                                                insecure_view.update(cx, |this, cx| {
-                                                    this.allow_insecure_remote_http = checked;
-                                                    cx.notify();
-                                                });
-                                            }),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .v_flex()
-                                    .gap_4()
-                                    .p_4()
-                                    .rounded(px(12.))
-                                    .border_1()
-                                    .border_color(rgb(BORDER))
-                                    .bg(rgb(SURFACE))
-                                    .child(self.render_input_field(
-                                        "对话模型",
-                                        "用于流式问答和只读工具调用。",
-                                        &self.chat_model_input,
-                                    ))
-                                    .child(self.render_input_field(
-                                        "Embedding 模型",
-                                        "用于向量索引；不可用时全文检索仍可工作。",
-                                        &self.embedding_model_input,
-                                    ))
-                                    .child(self.render_input_field(
-                                        "视觉模型",
-                                        "用于后续页面 OCR 与视觉说明任务。",
-                                        &self.vision_model_input,
-                                    ))
-                                    .child(self.render_input_field(
-                                        "请求超时（秒）",
-                                        "单次 OpenAI-compatible HTTP 请求的总超时；可设置 1–600 秒，默认 120 秒。",
-                                        &self.request_timeout_input,
-                                    ))
-                                    .when_some(self.render_model_detection(cx), |this, result| {
-                                        this.child(result)
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .v_flex()
-                                    .gap_3()
-                                    .p_4()
-                                    .rounded(px(12.))
-                                    .border_1()
-                                    .border_color(rgb(BORDER))
-                                    .bg(rgb(SURFACE))
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_semibold()
-                                            .text_color(rgb(INK))
-                                            .child("API key"),
-                                    )
-                                    .child(
-                                        Input::new(&self.api_key_input)
-                                            .mask_toggle()
-                                            .disabled(busy || self.delete_api_key),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .line_height(gpui::relative(1.5))
-                                            .text_color(rgb(MUTED))
-                                            .child("现有密钥不会回填明文。留空表示保持；输入新值表示替换。密钥只存入 Windows Credential Manager。"),
-                                    )
-                                    .child(
-                                        Checkbox::new("ai-delete-api-key")
-                                            .checked(self.delete_api_key)
-                                            .disabled(busy)
-                                            .label("删除这个 endpoint 已保存的 API key")
-                                            .on_click(move |checked, window, cx| {
-                                                let checked = *checked;
-                                                delete_view.update(cx, |this, cx| {
-                                                    this.delete_api_key = checked;
-                                                    if checked {
-                                                        this.clear_entered_api_key(window, cx);
-                                                    }
-                                                    cx.notify();
-                                                });
-                                            }),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .v_flex()
-                                    .gap_3()
-                                    .p_4()
-                                    .rounded(px(12.))
-                                    .border_1()
-                                    .border_color(rgb(BORDER))
-                                    .bg(rgb(SURFACE))
-                                    .child(
-                                        div()
-                                            .h_flex()
-                                            .justify_between()
-                                            .child(
-                                                div()
-                                                    .v_flex()
-                                                    .gap_0p5()
-                                                    .child(
-                                                        div()
-                                                            .text_sm()
-                                                            .font_semibold()
-                                                            .text_color(rgb(INK))
-                                                            .child("联网搜索（可选）"),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .text_xs()
-                                                            .text_color(rgb(MUTED))
-                                                            .child("书中检索不到时，宿主补充一次联网搜索作为回答依据；关闭则不联网。"),
-                                                    ),
-                                            )
-                                            .child(
-                                                Checkbox::new("ai-web-search-enabled")
-                                                    .checked(self.web_search_enabled)
-                                                    .disabled(busy)
-                                                    .label("启用")
-                                                    .on_click(move |checked, _, cx| {
-                                                        let checked = *checked;
-                                                        web_enable_view.update(cx, |this, cx| {
-                                                            this.web_search_enabled = checked;
-                                                            cx.notify();
-                                                        });
-                                                    }),
-                                            ),
-                                    )
-                                    .child(self.render_input_field(
-                                        "请求模板（URL）",
-                                        "必须包含 {query}；可配置 SearxNG、Brave、Tavily 等端点。",
-                                        &self.web_search_url_input,
-                                    ))
-                                    .child(self.render_input_field(
-                                        "方法",
-                                        "GET 或 POST；POST 端点需填写下方的请求体模板。",
-                                        &self.web_search_method_input,
-                                    ))
-                                    .child(self.render_input_field(
-                                        "请求体模板（可选）",
-                                        "POST 时使用，需包含 {query}；留空则用 GET。",
-                                        &self.web_search_body_input,
-                                    ))
-                                    .child(self.render_input_field(
-                                        "API key 头（可选）",
-                                        "自定义携带密钥的请求头名；留空则用 Authorization: Bearer。",
-                                        &self.web_search_key_header_input,
-                                    ))
-                                    .child(
-                                        Input::new(&self.web_search_api_key_input)
-                                            .mask_toggle()
-                                            .disabled(
-                                                busy
-                                                    || self.delete_web_search_api_key
-                                                    || !self.web_search_enabled,
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(MUTED))
-                                            .child("联网搜索 API key 只存入 Windows Credential Manager；留空保持、输入替换。"),
-                                    )
-                                    .child(
-                                        Checkbox::new("ai-web-confirm-remote")
-                                            .checked(self.web_search_remote_confirmed)
-                                            .disabled(busy || !self.web_search_enabled)
-                                            .label("确认允许把检索词发送到远程搜索端点")
-                                            .on_click(move |checked, _, cx| {
-                                                let checked = *checked;
-                                                web_confirm_view.update(cx, |this, cx| {
-                                                    if checked {
-                                                        let entered = web_url_input.read(cx).value();
-                                                        match moye_epub_editor::web_search::normalize_web_endpoint(
-                                                            entered.trim(),
-                                                        ) {
-                                                            Some(url) => {
-                                                                this.web_search_remote_confirmed = true;
-                                                                this.web_search_confirmed_remote_endpoint = url;
-                                                            }
-                                                            None => {
-                                                                this.web_search_remote_confirmed = false;
-                                                                this.web_search_confirmed_remote_endpoint.clear();
-                                                                this.notice = Some(SettingsNotice {
-                                                                    text: "联网搜索端点无效，无法确认。".to_string(),
-                                                                    error: true,
-                                                                });
-                                                            }
-                                                        }
-                                                    } else {
-                                                        this.web_search_remote_confirmed = false;
-                                                        this.web_search_allow_insecure_http = false;
-                                                        this.web_search_confirmed_remote_endpoint.clear();
-                                                    }
-                                                    cx.notify();
-                                                });
-                                            }),
-                                    )
-                                    .child(
-                                        Checkbox::new("ai-web-allow-insecure-http")
-                                            .checked(self.web_search_allow_insecure_http)
-                                            .disabled(
-                                                busy
-                                                    || !self.web_search_enabled
-                                                    || !self.web_search_remote_confirmed,
-                                            )
-                                            .label("额外允许非 HTTPS 的搜索端点（内容可能被窃听）")
-                                            .on_click(move |checked, _, cx| {
-                                                let checked = *checked;
-                                                web_insecure_view.update(cx, |this, cx| {
-                                                    this.web_search_allow_insecure_http = checked;
-                                                    cx.notify();
-                                                });
-                                            }),
-                                    )
-                                    .child(self.render_input_field(
-                                        "超时（秒）",
-                                        "单次联网搜索请求的总超时。",
-                                        &self.web_search_timeout_input,
-                                    ))
-                                    .child(self.render_input_field(
-                                        "结果条数",
-                                        "返回给模型的最大搜索结果数量。",
-                                        &self.web_search_max_results_input,
-                                    ))
-                                    .child(
-                                        Checkbox::new("ai-web-delete-api-key")
-                                            .checked(self.delete_web_search_api_key)
-                                            .disabled(busy || !self.web_search_enabled)
-                                            .label("删除已保存的联网搜索 API key")
-                                            .on_click(move |checked, window, cx| {
-                                                let checked = *checked;
-                                                web_delete_view.update(cx, |this, cx| {
-                                                    this.delete_web_search_api_key = checked;
-                                                    if checked {
-                                                        this.clear_entered_web_api_key(window, cx);
-                                                    }
-                                                    cx.notify();
-                                                });
-                                            }),
-                                    ),
-                            )
-                            .when_some(self.render_notice(), |this, notice| this.child(notice)),
-                    ),
+                    .track_scroll(&self.scroll_handles[self.active_tab as usize])
+                    .child(div().p_6().child(panel)),
             )
+            .when_some(self.render_notice(), |this, notice| {
+                this.child(div().flex_none().px_6().py_2().child(notice))
+            })
             .child(
                 div()
                     .h_flex()
@@ -1039,30 +1297,41 @@ impl Render for AiSettingsWindow {
                             .text_xs()
                             .line_height(gpui::relative(1.5))
                             .text_color(rgb(MUTED))
-                            .child("本地模型缺失时，请在终端执行页面给出的 ollama pull 命令。"),
+                            .child("切换标签保留输入；保存设置会应用全部四个标签中的配置。"),
                     )
                     .child(
                         div()
                             .h_flex()
                             .gap_2()
-                            .child(
-                                Button::new("ai-detect-models")
-                                    .outline()
-                                    .icon(IconName::Search)
-                                    .label(if self.operation == PendingOperation::Detecting {
-                                        "正在检测…"
-                                    } else {
-                                        "检测模型"
-                                    })
-                                    .disabled(busy)
-                                    .on_click(move |_, window, cx| {
-                                        detect_view.update(cx, |this, cx| {
-                                            this.detect_models(window, cx)
-                                        });
-                                    }),
+                            .when(
+                                matches!(
+                                    self.active_tab,
+                                    SettingsTab::Endpoint | SettingsTab::Models
+                                ),
+                                |this| {
+                                    this.child(
+                                        Button::new("ai-detect-models")
+                                            .outline()
+                                            .icon(IconName::Search)
+                                            .label(
+                                                if self.operation == PendingOperation::Detecting {
+                                                    "正在检测…"
+                                                } else {
+                                                    "检测模型"
+                                                },
+                                            )
+                                            .disabled(busy)
+                                            .on_click(move |_, window, cx| {
+                                                detect_view.update(cx, |this, cx| {
+                                                    this.detect_models(window, cx)
+                                                });
+                                            }),
+                                    )
+                                },
                             )
                             .child(
                                 Button::new("ai-save-settings")
+                                    .debug_selector(|| "ai-save-settings".into())
                                     .primary()
                                     .icon(IconName::Check)
                                     .label(if self.operation == PendingOperation::Saving {
@@ -1158,6 +1427,53 @@ fn api_key_update_for_input(value: &str, delete: bool) -> ApiKeyUpdate {
     }
 }
 
+fn optional_parameter_text(value: Option<f32>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_default()
+}
+
+fn optional_parameter_input(
+    value: Option<f32>,
+    window: &mut Window,
+    cx: &mut Context<AiSettingsWindow>,
+) -> Entity<InputState> {
+    cx.new(|cx| {
+        InputState::new(window, cx)
+            .default_value(optional_parameter_text(value))
+            .placeholder("留空使用服务端默认值")
+    })
+}
+
+fn parse_chat_generation(
+    temperature: &str,
+    top_p: &str,
+    max_output_tokens: &str,
+    presence_penalty: &str,
+    frequency_penalty: &str,
+) -> Result<ChatGenerationSettings> {
+    fn optional_number(label: &str, value: &str) -> Result<Option<f32>> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Ok(None);
+        }
+        value
+            .parse::<f32>()
+            .map(Some)
+            .map_err(|_| anyhow::anyhow!("{label}必须是数字，或留空使用服务端默认值"))
+    }
+    let settings = ChatGenerationSettings {
+        temperature: optional_number("温度（Temperature）", temperature)?,
+        top_p: optional_number("核采样（Top P）", top_p)?,
+        max_output_tokens: max_output_tokens
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| anyhow::anyhow!("最大输出 token 数必须是有效的正整数"))?,
+        presence_penalty: optional_number("出现惩罚（Presence Penalty）", presence_penalty)?,
+        frequency_penalty: optional_number("频率惩罚（Frequency Penalty）", frequency_penalty)?,
+    };
+    settings.validate()?;
+    Ok(settings)
+}
+
 fn parse_request_timeout_secs(value: &str) -> Result<u64> {
     let value = value.trim();
     let timeout = value.parse::<u64>().map_err(|_| {
@@ -1235,6 +1551,306 @@ fn looks_like_local_ollama(endpoint: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{Focusable as _, Modifiers, TestAppContext, VisualTestContext};
+    use moye_epub_editor::credentials::MemoryCredentialStore;
+
+    fn redraw(visual: &mut VisualTestContext) {
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear());
+        visual.run_until_parked();
+    }
+
+    fn open_settings(
+        cx: &mut TestAppContext,
+    ) -> (
+        tempfile::TempDir,
+        Entity<AiSettingsWindow>,
+        &mut VisualTestContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let services = Arc::new(
+            AppServices::open_with_credentials(
+                directory.path(),
+                Arc::new(MemoryCredentialStore::default()),
+            )
+            .unwrap(),
+        );
+        let settings = services.provider_settings().unwrap();
+        cx.update(gpui_component::init);
+        let mut settings_view = None;
+        let (_, visual) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| AiSettingsWindow::new(services, settings, window, cx));
+            settings_view = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        visual.simulate_resize(size(px(1080.), px(1000.)));
+        redraw(visual);
+        (directory, settings_view.unwrap(), visual)
+    }
+
+    fn click_tab(visual: &mut VisualTestContext, tab: SettingsTab) {
+        let bounds = visual
+            .debug_bounds(tab.selector())
+            .expect("settings tab must be rendered");
+        assert!(bounds.size.width > px(0.) && bounds.size.height > px(0.));
+        visual.simulate_mouse_move(bounds.center(), None, Modifiers::none());
+        visual.simulate_click(bounds.center(), Modifiers::none());
+        redraw(visual);
+    }
+
+    fn edit_input(visual: &mut VisualTestContext, input: &Entity<InputState>, text: &str) {
+        visual.update(|window, cx| {
+            input.update(cx, |input, cx| input.focus(window, cx));
+        });
+        redraw(visual);
+        visual.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-a"
+        } else {
+            "ctrl-a"
+        });
+        visual.simulate_input(text);
+        redraw(visual);
+        input.read_with(visual, |input, _| assert_eq!(input.value().as_ref(), text));
+        visual.update(|window, cx| assert!(input.read(cx).focus_handle(cx).is_focused(window)));
+    }
+
+    fn assert_hidden_input_does_not_receive_text(
+        visual: &mut VisualTestContext,
+        input: &Entity<InputState>,
+        expected: &str,
+    ) {
+        visual.update(|window, cx| assert!(!input.read(cx).focus_handle(cx).is_focused(window)));
+        visual.simulate_input("hidden-input-must-not-change");
+        redraw(visual);
+        input.read_with(visual, |input, _| {
+            assert_eq!(input.value().as_ref(), expected);
+        });
+    }
+
+    #[gpui::test]
+    fn tab_clicks_preserve_unsaved_inputs_and_blur_hidden_fields(cx: &mut TestAppContext) {
+        let (_directory, settings, visual) = open_settings(cx);
+        let [endpoint, api_key, model, web_url] = settings.read_with(visual, |view, _| {
+            [
+                view.base_url_input.clone(),
+                view.api_key_input.clone(),
+                view.chat_model_input.clone(),
+                view.web_search_url_input.clone(),
+            ]
+        });
+        let original_ids = [
+            endpoint.entity_id(),
+            api_key.entity_id(),
+            model.entity_id(),
+            web_url.entity_id(),
+        ];
+        let endpoint_draft = "http://127.0.0.1:18081/v1/";
+        let model_draft = "draft-chat-model";
+        let web_draft = "http://127.0.0.1:18082/search?q={query}&format=json";
+        let key_draft = "fixture-only-unsaved-key";
+
+        edit_input(visual, &endpoint, endpoint_draft);
+        edit_input(visual, &api_key, key_draft);
+        click_tab(visual, SettingsTab::Models);
+        settings.read_with(visual, |view, _| {
+            assert_eq!(view.active_tab, SettingsTab::Models)
+        });
+        assert_hidden_input_does_not_receive_text(visual, &api_key, key_draft);
+
+        edit_input(visual, &model, model_draft);
+        click_tab(visual, SettingsTab::WebSearch);
+        settings.read_with(visual, |view, _| {
+            assert_eq!(view.active_tab, SettingsTab::WebSearch)
+        });
+        assert_hidden_input_does_not_receive_text(visual, &model, model_draft);
+
+        edit_input(visual, &web_url, web_draft);
+        click_tab(visual, SettingsTab::BackgroundJobs);
+        settings.read_with(visual, |view, _| {
+            assert_eq!(view.active_tab, SettingsTab::BackgroundJobs);
+            assert!(!view.auto_run_background_jobs);
+        });
+        assert!(visual.debug_bounds("ai-detect-models").is_none());
+        let auto_run = visual
+            .debug_bounds("ai-auto-run-background-jobs")
+            .expect("background-job auto-run checkbox must be rendered");
+        visual.simulate_click(auto_run.center(), Modifiers::none());
+        redraw(visual);
+        settings.read_with(visual, |view, cx| {
+            assert!(view.auto_run_background_jobs);
+            assert!(view.entered_settings(cx).unwrap().auto_run_background_jobs);
+            assert!(
+                !view
+                    .services
+                    .provider_settings()
+                    .unwrap()
+                    .auto_run_background_jobs,
+                "changing the checkbox must not save the draft",
+            );
+        });
+
+        click_tab(visual, SettingsTab::Endpoint);
+        settings.read_with(visual, |view, _| {
+            assert_eq!(view.active_tab, SettingsTab::Endpoint)
+        });
+        assert_hidden_input_does_not_receive_text(visual, &web_url, web_draft);
+
+        for tab in SettingsTab::ALL {
+            click_tab(visual, tab);
+            settings.read_with(visual, |view, cx| {
+                assert_eq!(view.active_tab, tab);
+                assert_eq!(
+                    [
+                        view.base_url_input.entity_id(),
+                        view.api_key_input.entity_id(),
+                        view.chat_model_input.entity_id(),
+                        view.web_search_url_input.entity_id(),
+                    ],
+                    original_ids,
+                );
+                let entered = view.entered_settings(cx).unwrap();
+                assert_eq!(entered.base_url, endpoint_draft);
+                assert_eq!(entered.chat_model, model_draft);
+                assert_eq!(entered.web_search_url_template, web_draft);
+                assert!(!entered.web_search_enabled);
+                assert!(entered.auto_run_background_jobs);
+                assert_eq!(view.api_key_update(cx), ApiKeyUpdate::Set(key_draft.into()));
+                assert_eq!(
+                    view.services.provider_settings().unwrap().base_url,
+                    DEFAULT_OLLAMA_OPENAI_BASE_URL,
+                    "changing tabs must not save the draft",
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn generation_drafts_survive_tabs_and_invalid_save_then_reset(cx: &mut TestAppContext) {
+        let (_directory, settings, visual) = open_settings(cx);
+        visual.simulate_resize(size(px(1080.), px(1500.)));
+        redraw(visual);
+        click_tab(visual, SettingsTab::Models);
+        let inputs = settings.read_with(visual, |view, _| {
+            [
+                view.temperature_input.clone(),
+                view.top_p_input.clone(),
+                view.max_output_tokens_input.clone(),
+                view.presence_penalty_input.clone(),
+                view.frequency_penalty_input.clone(),
+            ]
+        });
+        for (input, value) in inputs.iter().zip(["0.7", "0.8", "131072", "0.3", "-0.4"]) {
+            edit_input(visual, input, value);
+        }
+        click_tab(visual, SettingsTab::Endpoint);
+        assert_hidden_input_does_not_receive_text(visual, &inputs[4], "-0.4");
+        settings.read_with(visual, |view, cx| {
+            let parameters = view.entered_settings(cx).unwrap().chat_generation;
+            assert_eq!(parameters.temperature, Some(0.7));
+            assert_eq!(parameters.top_p, Some(0.8));
+            assert_eq!(parameters.max_output_tokens, 131_072);
+            assert_eq!(parameters.presence_penalty, Some(0.3));
+            assert_eq!(parameters.frequency_penalty, Some(-0.4));
+            assert_eq!(
+                view.services.provider_settings().unwrap().chat_generation,
+                ChatGenerationSettings::default()
+            );
+        });
+
+        click_tab(visual, SettingsTab::Models);
+        edit_input(visual, &inputs[2], "0");
+        let save = visual.debug_bounds("ai-save-settings").unwrap();
+        visual.simulate_click(save.center(), Modifiers::none());
+        redraw(visual);
+        settings.read_with(visual, |view, cx| {
+            assert_eq!(view.operation, PendingOperation::Idle);
+            assert!(view.notice.as_ref().is_some_and(|notice| notice.error));
+            assert_eq!(view.max_output_tokens_input.read(cx).value().as_ref(), "0");
+            assert_eq!(
+                view.services.provider_settings().unwrap().chat_generation,
+                ChatGenerationSettings::default()
+            );
+        });
+
+        let model = settings.read_with(visual, |view, _| view.chat_model_input.clone());
+        edit_input(visual, &model, "preserved-model-draft");
+        let reset = visual.debug_bounds("ai-reset-chat-generation").unwrap();
+        visual.simulate_click(reset.center(), Modifiers::none());
+        redraw(visual);
+        settings.read_with(visual, |view, cx| {
+            let entered = view.entered_settings(cx).unwrap();
+            assert_eq!(entered.chat_generation, ChatGenerationSettings::default());
+            assert_eq!(entered.chat_model, "preserved-model-draft");
+            assert_eq!(
+                view.services.provider_settings().unwrap().chat_model,
+                DEFAULT_CHAT_MODEL
+            );
+            assert!(!view.notice.as_ref().unwrap().error);
+        });
+    }
+
+    #[test]
+    fn generation_text_parsing_supports_blank_options_and_rejects_invalid_drafts() {
+        let empty_options = parse_chat_generation(" ", "", " 1 ", "", " ").unwrap();
+        assert_eq!(empty_options.temperature, None);
+        assert_eq!(empty_options.top_p, None);
+        assert_eq!(empty_options.presence_penalty, None);
+        assert_eq!(empty_options.frequency_penalty, None);
+        assert_eq!(empty_options.max_output_tokens, 1);
+        for value in ["4097", "65536", "131072", "4294967295"] {
+            assert_eq!(
+                parse_chat_generation("", "", value, "", "")
+                    .unwrap()
+                    .max_output_tokens,
+                value.parse::<u32>().unwrap(),
+            );
+        }
+        for invalid in ["", "0", "1.5", "-1", "NaN", "4294967296"] {
+            assert!(parse_chat_generation("", "", invalid, "", "").is_err());
+        }
+        for invalid in ["NaN", "inf", "-inf", "0,7", "abc", "2.1", "-0.1"] {
+            assert!(parse_chat_generation(invalid, "", "4096", "", "").is_err());
+        }
+        assert!(parse_chat_generation("", "1.1", "4096", "", "").is_err());
+        assert!(parse_chat_generation("", "", "4096", "-2.1", "").is_err());
+        assert!(parse_chat_generation("", "", "4096", "", "2.1").is_err());
+    }
+
+    #[gpui::test]
+    fn tab_clicks_wait_for_detection_and_saving_to_finish(cx: &mut TestAppContext) {
+        let (_directory, settings, visual) = open_settings(cx);
+        for operation in [PendingOperation::Detecting, PendingOperation::Saving] {
+            visual.update(|_, cx| {
+                settings.update(cx, |view, cx| {
+                    view.operation = operation;
+                    cx.notify();
+                });
+            });
+            redraw(visual);
+            for tab in [
+                SettingsTab::Models,
+                SettingsTab::WebSearch,
+                SettingsTab::BackgroundJobs,
+            ] {
+                click_tab(visual, tab);
+                settings.read_with(visual, |view, _| {
+                    assert_eq!(view.operation, operation);
+                    assert_eq!(view.active_tab, SettingsTab::Endpoint);
+                });
+            }
+        }
+        visual.update(|_, cx| {
+            settings.update(cx, |view, cx| {
+                view.operation = PendingOperation::Idle;
+                cx.notify();
+            });
+        });
+        redraw(visual);
+        click_tab(visual, SettingsTab::BackgroundJobs);
+        settings.read_with(visual, |view, _| {
+            assert_eq!(view.active_tab, SettingsTab::BackgroundJobs)
+        });
+    }
 
     #[test]
     fn singleton_window_state_distinguishes_live_stale_and_reentrant_requests() {

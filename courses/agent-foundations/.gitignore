@@ -1,0 +1,9 @@
+/.venv/
+/.uv-cache/
+/.pytest_cache/
+/.ruff_cache/
+/runs/
+/workspaces/
+/local-config.json
+**/__pycache__/
+*.py[cod]

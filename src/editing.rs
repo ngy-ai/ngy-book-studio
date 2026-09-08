@@ -163,9 +163,11 @@ impl DocumentEditor {
                 .iter_mut()
                 .find(|unit| unit.id == unit_id)
                 .context("内容单元不存在")?;
-            unit.title = title.clone();
+            let old_title = std::mem::replace(&mut unit.title, title.clone());
             unit.kind = kind;
-            rename_toc_targets(&mut candidate.toc, unit_id, &title);
+            if old_title != title {
+                rename_toc_targets(&mut candidate.toc, unit_id, &old_title, &title);
+            }
             Ok(())
         })
     }
@@ -303,12 +305,17 @@ fn remove_toc_targets(nodes: &mut Vec<TocNode>, unit_id: &str) {
     }
 }
 
-fn rename_toc_targets(nodes: &mut [TocNode], unit_id: &str, title: &str) {
+fn rename_toc_targets(nodes: &mut [TocNode], unit_id: &str, old_title: &str, title: &str) {
     for node in nodes {
-        if node.target.unit_id() == unit_id {
+        // A unit can have several independently named TOC entries. Only the
+        // unit-level entries that followed its old title follow a rename;
+        // block targets keep their section labels, even when the text matches.
+        if matches!(&node.target, TocTarget::Unit { unit_id: target } if target == unit_id)
+            && node.label == old_title
+        {
             node.label = title.to_string();
         }
-        rename_toc_targets(&mut node.children, unit_id, title);
+        rename_toc_targets(&mut node.children, unit_id, old_title, title);
     }
 }
 
@@ -337,6 +344,74 @@ mod tests {
             .push(TocNode::new("toc-1", "第一章", TocTarget::unit("unit-1")));
         document.validate().unwrap();
         document
+    }
+
+    fn fixture_with_independent_toc_labels() -> BookDocument {
+        let mut document = fixture();
+        document.toc[0].children = vec![
+            TocNode::new("toc-section", "全书结构", TocTarget::unit("unit-1")),
+            TocNode::new("toc-block", "第一章", TocTarget::block("unit-1", "block-1")),
+        ];
+        document.toc.push(TocNode::new(
+            "toc-alias",
+            "如何阅读本书",
+            TocTarget::unit("unit-1"),
+        ));
+        let mut other_unit = document.units[0].clone();
+        other_unit.id = "unit-2".to_string();
+        other_unit.document = BlockDocument::new(vec![Block::paragraph("block-2", "第一章")]);
+        document.units.push(other_unit);
+        document.toc.push(TocNode::new(
+            "toc-other-unit",
+            "第一章",
+            TocTarget::unit("unit-2"),
+        ));
+        document.validate().unwrap();
+        document
+    }
+
+    #[test]
+    fn saving_unchanged_unit_identity_preserves_independent_toc_labels() {
+        let document = fixture_with_independent_toc_labels();
+        let expected_toc = document.toc.clone();
+        let mut editor = DocumentEditor::new(document).unwrap();
+
+        editor
+            .update_unit_identity("unit-1", "第一章", ContentUnitKind::Chapter)
+            .unwrap();
+
+        assert_eq!(editor.document().toc, expected_toc);
+    }
+
+    #[test]
+    fn changing_unit_kind_preserves_independent_toc_labels() {
+        let document = fixture_with_independent_toc_labels();
+        let expected_toc = document.toc.clone();
+        let mut editor = DocumentEditor::new(document).unwrap();
+
+        editor
+            .update_unit_identity("unit-1", "第一章", ContentUnitKind::Page)
+            .unwrap();
+
+        assert_eq!(editor.document().units[0].kind, ContentUnitKind::Page);
+        assert_eq!(editor.document().toc, expected_toc);
+    }
+
+    #[test]
+    fn renaming_unit_only_updates_unit_targets_with_its_old_title() {
+        let document = fixture_with_independent_toc_labels();
+        let mut expected_toc = document.toc.clone();
+        expected_toc[0].label = "引言".to_string();
+        let mut editor = DocumentEditor::new(document).unwrap();
+
+        editor
+            .update_unit_identity("unit-1", "引言", ContentUnitKind::Chapter)
+            .unwrap();
+
+        assert_eq!(editor.document().units[0].title, "引言");
+        assert_eq!(editor.document().units[1].title, "第一章");
+        assert_eq!(editor.document().toc, expected_toc);
+        editor.document().validate().unwrap();
     }
 
     #[test]

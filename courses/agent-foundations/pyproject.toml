@@ -1,0 +1,23 @@
+[project]
+name = "moye-agent-foundations"
+version = "0.1.0"
+description = "墨页第一章：工具调用循环与失败处理的开发实验包"
+requires-python = ">=3.12,<3.13"
+dependencies = ["langgraph==1.2.11"]
+
+[dependency-groups]
+dev = ["pytest==9.1.1", "ruff==0.16.6"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]

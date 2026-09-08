@@ -132,7 +132,11 @@ pub(crate) fn update_current_unit_progress(
 
 /// Atomically publishes a newly imported document after all referenced object
 /// files have been committed by the caller.
-pub(crate) fn insert_document(conn: &mut Connection, graph: &DocumentGraph<'_>) -> Result<()> {
+pub(crate) fn insert_document(
+    conn: &mut Connection,
+    graph: &DocumentGraph<'_>,
+    auto_run_background_jobs: bool,
+) -> Result<()> {
     validate_document_graph(graph)?;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -141,7 +145,7 @@ pub(crate) fn insert_document(conn: &mut Connection, graph: &DocumentGraph<'_>) 
     books::insert(&tx, graph.book)?;
     book_sources::insert(&tx, graph.source)?;
     insert_document_children(&tx, graph)?;
-    enqueue_derivative_jobs(&tx, graph)?;
+    enqueue_derivative_jobs(&tx, graph, auto_run_background_jobs)?;
     tx.commit().context("无法提交文档导入事务")?;
     Ok(())
 }
@@ -153,6 +157,7 @@ pub(crate) fn insert_document(conn: &mut Connection, graph: &DocumentGraph<'_>) 
 pub(crate) fn install_document_revision(
     conn: &mut Connection,
     graph: &DocumentGraph<'_>,
+    auto_run_background_jobs: bool,
 ) -> Result<Vec<BlobRecord>> {
     validate_document_graph(graph)?;
     let tx = conn
@@ -180,7 +185,7 @@ pub(crate) fn install_document_revision(
     }
     book_sources::insert(&tx, graph.source)?;
     insert_document_children(&tx, graph)?;
-    enqueue_derivative_jobs(&tx, graph)?;
+    enqueue_derivative_jobs(&tx, graph, auto_run_background_jobs)?;
     let catalog = books::BookCatalogUpdate {
         title: &graph.book.title,
         author: &graph.book.author,
@@ -1864,10 +1869,16 @@ fn insert_document_children(conn: &Connection, graph: &DocumentGraph<'_>) -> Res
     Ok(())
 }
 
-/// Queues embedding and visual-understanding work in the same transaction as
+/// Persists embedding and visual-understanding work in the same transaction as
 /// the canonical units and FTS chunks. A visible revision therefore always has
-/// durable intent to build its derived indexes after a restart.
-fn enqueue_derivative_jobs(conn: &Connection, graph: &DocumentGraph<'_>) -> Result<()> {
+/// durable intent to build its derived indexes after a restart. When automatic
+/// execution is disabled, new work starts paused and remains available for an
+/// explicit resume from the background-task UI.
+fn enqueue_derivative_jobs(
+    conn: &Connection,
+    graph: &DocumentGraph<'_>,
+    auto_run_background_jobs: bool,
+) -> Result<()> {
     index_jobs::cancel_superseded_for_book(
         conn,
         &graph.book.id,
@@ -1883,6 +1894,11 @@ fn enqueue_derivative_jobs(conn: &Connection, graph: &DocumentGraph<'_>) -> Resu
     });
     let visual_job_id = format!("visual-render:{}", graph.source.id);
     let visual_spec = visual_job_spec(graph, visual_job_id.clone());
+    let initial_status = if auto_run_background_jobs {
+        IndexJobStatus::Queued
+    } else {
+        IndexJobStatus::Paused
+    };
     index_jobs::insert(
         conn,
         &IndexJob {
@@ -1890,7 +1906,7 @@ fn enqueue_derivative_jobs(conn: &Connection, graph: &DocumentGraph<'_>) -> Resu
             book_id: graph.book.id.clone(),
             source_id: Some(graph.source.id.clone()),
             kind: "visual_render".to_string(),
-            status: IndexJobStatus::Queued,
+            status: initial_status,
             pause_requested: false,
             cancel_requested: false,
             attempts: 0,
@@ -1912,7 +1928,7 @@ fn enqueue_derivative_jobs(conn: &Connection, graph: &DocumentGraph<'_>) -> Resu
                 book_id: graph.book.id.clone(),
                 source_id: Some(graph.source.id.clone()),
                 kind: kind.to_string(),
-                status: IndexJobStatus::Queued,
+                status: initial_status,
                 pause_requested: false,
                 cancel_requested: false,
                 attempts: 0,
@@ -2437,7 +2453,7 @@ mod tests {
     fn preview_only_office_locator_cannot_be_committed_as_chat_citation() {
         let (_temp, mut conn) = open_database();
         let fixture = Fixture::new();
-        insert_document(&mut conn, &fixture.graph()).unwrap();
+        insert_document(&mut conn, &fixture.graph(), true).unwrap();
         let thread = ChatThread {
             id: "thread-preview-only".to_string(),
             book_id: Some(fixture.book.id.clone()),
@@ -2491,7 +2507,7 @@ mod tests {
     fn visual_page_checkpoints_are_atomic_and_publish_as_one_final_commit() {
         let (_temp, mut conn) = open_database();
         let fixture = Fixture::new();
-        insert_document(&mut conn, &fixture.graph()).unwrap();
+        insert_document(&mut conn, &fixture.graph(), true).unwrap();
         let spec = running_visual_job(&conn);
         let first_blob = staged_visual_blob("first", 17);
         let first_page = staged_visual_page(
@@ -2589,7 +2605,7 @@ mod tests {
     fn visual_job_retry_discards_staging_before_resetting_cursor() {
         let (_temp, mut conn) = open_database();
         let fixture = Fixture::new();
-        insert_document(&mut conn, &fixture.graph()).unwrap();
+        insert_document(&mut conn, &fixture.graph(), true).unwrap();
         let spec = running_visual_job(&conn);
         let blob = staged_visual_blob("retry", 29);
         let page = staged_visual_page(&fixture, &spec, "staged-page-retry", 0, &blob.object_key);
@@ -2643,7 +2659,7 @@ mod tests {
         for cancel in [false, true] {
             let (_temp, mut conn) = open_database();
             let fixture = Fixture::new();
-            insert_document(&mut conn, &fixture.graph()).unwrap();
+            insert_document(&mut conn, &fixture.graph(), true).unwrap();
             let spec = running_visual_job(&conn);
             let suffix = if cancel { "cancel-race" } else { "pause-race" };
             let blob = staged_visual_blob(suffix, 31);
@@ -2683,7 +2699,7 @@ mod tests {
     fn document_and_supporting_crud_round_trip() {
         let (_temp, mut conn) = open_database();
         let fixture = Fixture::new();
-        insert_document(&mut conn, &fixture.graph()).unwrap();
+        insert_document(&mut conn, &fixture.graph(), true).unwrap();
 
         let derivative_jobs = index_jobs::list_for_book(&conn, "book-1").unwrap();
         assert_eq!(derivative_jobs.len(), 3);
@@ -2897,7 +2913,7 @@ mod tests {
     fn deleting_a_mapped_unit_cascades_its_derived_visual_pages() {
         let (_temp, mut conn) = open_database();
         let fixture = Fixture::new();
-        insert_document(&mut conn, &fixture.graph()).unwrap();
+        insert_document(&mut conn, &fixture.graph(), true).unwrap();
 
         conn.execute("DELETE FROM content_units WHERE id = ?1", ["unit-1"])
             .unwrap();
@@ -2913,9 +2929,9 @@ mod tests {
     fn newer_revision_drops_old_derivative_jobs_and_queues_current_work() {
         let (_temp, mut conn) = open_database();
         let fixture = Fixture::new();
-        insert_document(&mut conn, &fixture.graph()).unwrap();
+        insert_document(&mut conn, &fixture.graph(), true).unwrap();
         let next = fixture.revision_two();
-        let _ = install_document_revision(&mut conn, &next.graph()).unwrap();
+        let _ = install_document_revision(&mut conn, &next.graph(), true).unwrap();
 
         let jobs = index_jobs::list_for_book(&conn, "book-1").unwrap();
         assert_eq!(jobs.len(), 3);
@@ -2935,10 +2951,48 @@ mod tests {
     }
 
     #[test]
+    fn disabled_auto_run_pauses_import_and_replacement_derivative_jobs() {
+        fn assert_paused_jobs(jobs: &[IndexJob], source_id: &str) {
+            assert_eq!(jobs.len(), 3);
+            assert!(jobs.iter().all(|job| {
+                matches!(job.kind.as_str(), "embedding" | "vision" | "visual_render")
+                    && job.status == IndexJobStatus::Paused
+                    && job.source_id.as_deref() == Some(source_id)
+                    && !job.pause_requested
+                    && !job.cancel_requested
+                    && job.attempts == 0
+                    && job.started_at.is_none()
+                    && job.finished_at.is_none()
+            }));
+        }
+
+        let (_temp, mut conn) = open_database();
+        let fixture = Fixture::new();
+        insert_document(&mut conn, &fixture.graph(), false).unwrap();
+        let imported_jobs = index_jobs::list_for_book(&conn, "book-1").unwrap();
+        assert_paused_jobs(&imported_jobs, "source-1");
+        let imported_job_ids = imported_jobs
+            .iter()
+            .map(|job| job.id.clone())
+            .collect::<Vec<_>>();
+
+        let next = fixture.revision_two();
+        let _ = install_document_revision(&mut conn, &next.graph(), false).unwrap();
+        let replacement_jobs = index_jobs::list_for_book(&conn, "book-1").unwrap();
+        assert_paused_jobs(&replacement_jobs, "source-2");
+        assert!(
+            imported_job_ids
+                .iter()
+                .all(|job_id| index_jobs::get(&conn, job_id).unwrap().is_none()),
+            "the superseded source must not retain paused derivative jobs"
+        );
+    }
+
+    #[test]
     fn renderer_change_requeues_visual_vision_and_visual_embeddings_only() {
         let (_temp, mut conn) = open_database();
         let fixture = Fixture::new();
-        insert_document(&mut conn, &fixture.graph()).unwrap();
+        insert_document(&mut conn, &fixture.graph(), true).unwrap();
         let visual_job_id = "visual-render:source-1";
         let current_spec = running_visual_job(&conn);
         let staged_blob = staged_visual_blob("reconcile", 37);
@@ -3114,7 +3168,7 @@ mod tests {
         fixture.source.format = "pptx".to_string();
         fixture.source_blob.media_type =
             "application/vnd.openxmlformats-officedocument.presentationml.presentation".to_string();
-        insert_document(&mut conn, &fixture.graph()).unwrap();
+        insert_document(&mut conn, &fixture.graph(), true).unwrap();
 
         let structural = crate::preview::VisualRenderer::descriptor(&StructuralPngRenderer);
         let enhanced = RendererDescriptor {
@@ -3212,7 +3266,7 @@ mod tests {
         second_unit.source_locator_json =
             serde_json::to_string(&SourceLocator::office_section(2)).unwrap();
         fixture.units.push(second_unit);
-        insert_document(&mut conn, &fixture.graph()).unwrap();
+        insert_document(&mut conn, &fixture.graph(), true).unwrap();
 
         let structural = crate::preview::VisualRenderer::descriptor(&StructuralPngRenderer);
         let enhanced = RendererDescriptor {
@@ -3295,7 +3349,7 @@ mod tests {
     fn office_opt_in_rejects_non_office_sources_without_persisting_state() {
         let (_temp, mut conn) = open_database();
         let fixture = Fixture::new();
-        insert_document(&mut conn, &fixture.graph()).unwrap();
+        insert_document(&mut conn, &fixture.graph(), true).unwrap();
         let structural = crate::preview::VisualRenderer::descriptor(&StructuralPngRenderer);
         let enhanced = RendererDescriptor {
             renderer: "moye-office-com-enhanced".to_string(),
@@ -3334,7 +3388,7 @@ mod tests {
         duplicate.id = "chunk-duplicate".to_string();
         fixture.chunks.push(duplicate);
 
-        assert!(insert_document(&mut conn, &fixture.graph()).is_err());
+        assert!(insert_document(&mut conn, &fixture.graph(), true).is_err());
         assert!(!books::exists(&conn, "book-1").unwrap());
         assert!(blobs::get(&conn, "objects/source-1").unwrap().is_none());
         let fts_count: i64 = conn
@@ -3349,7 +3403,7 @@ mod tests {
     fn revision_reuses_stable_child_ids_and_keeps_only_original_history() {
         let (_temp, mut conn) = open_database();
         let first = Fixture::new();
-        insert_document(&mut conn, &first.graph()).unwrap();
+        insert_document(&mut conn, &first.graph(), true).unwrap();
         let current_spec = running_visual_job(&conn);
         let staged_blob = staged_visual_blob("old-source", 41);
         let staged_page = staged_visual_page(
@@ -3362,7 +3416,7 @@ mod tests {
         checkpoint_visual_page(&mut conn, &current_spec, &staged_blob, &staged_page, 1, 2).unwrap();
         let second = first.revision_two();
 
-        let unreferenced = install_document_revision(&mut conn, &second.graph()).unwrap();
+        let unreferenced = install_document_revision(&mut conn, &second.graph(), true).unwrap();
         assert!(
             unreferenced
                 .iter()
@@ -3396,7 +3450,7 @@ mod tests {
     fn deleting_document_cascades_graph_and_reports_unreferenced_objects() {
         let (_temp, mut conn) = open_database();
         let fixture = Fixture::new();
-        insert_document(&mut conn, &fixture.graph()).unwrap();
+        insert_document(&mut conn, &fixture.graph(), true).unwrap();
         let spec = running_visual_job(&conn);
         let staged_blob = staged_visual_blob("deleted-book", 43);
         let staged_page = staged_visual_page(

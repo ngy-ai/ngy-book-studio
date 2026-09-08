@@ -98,6 +98,16 @@ impl GroupFilter {
     }
 }
 
+/// Groups the book group picker expands on open: every ancestor of the current
+/// group, so the current selection is visible without expanding the tree by
+/// hand. The group itself stays collapsed unless it has expanded children.
+fn picker_expanded_groups(path: &[BookGroup]) -> HashSet<String> {
+    path.iter()
+        .take(path.len().saturating_sub(1))
+        .map(|group| group.id.clone())
+        .collect()
+}
+
 fn should_apply_library_projection(incoming_generation: u64, applied_generation: u64) -> bool {
     incoming_generation >= applied_generation
 }
@@ -210,6 +220,9 @@ enum GroupModal {
         input: Entity<InputState>,
         pending_request: Option<u64>,
         error: Option<String>,
+        /// Modal to reopen once this one completes, so an inline "新建分组"
+        /// dialog can hand control back to the group tree picker.
+        return_to: Option<Box<GroupModal>>,
     },
     DeleteConfirm {
         group_id: String,
@@ -225,6 +238,15 @@ enum GroupModal {
         book_id: String,
         title: String,
         description: String,
+    },
+    /// Group tree used to set one book's group. The flat context-menu variant
+    /// grew a menu item per group, which became unusable once a library had
+    /// more than a handful of nested groups.
+    BookGroupPicker {
+        book_id: String,
+        book_title: String,
+        selected: Option<String>,
+        expanded: HashSet<String>,
     },
 }
 
@@ -524,6 +546,18 @@ fn open_pdf_reader_window(request: PdfReaderWindowRequest, cx: &mut App) {
                         .update(cx, |reader, cx| reader.handle_window_close(window, cx))
                         .unwrap_or(false)
                 });
+                let removed_weak = reader.downgrade();
+                register_book_window(
+                    record.id.clone(),
+                    window,
+                    move |window, cx| {
+                        if let Some(reader) = removed_weak.upgrade() {
+                            reader
+                                .update(cx, |reader, cx| reader.close_for_removed_book(window, cx));
+                        }
+                    },
+                    cx,
+                );
                 return cx.new(|cx| Root::new(reader, window, cx));
             }
         };
@@ -549,6 +583,17 @@ fn open_pdf_reader_window(request: PdfReaderWindowRequest, cx: &mut App) {
         });
         let weak = reader.downgrade();
         let title = record.title.clone();
+        let removed_weak = weak.clone();
+        register_book_window(
+            record.id.clone(),
+            window,
+            move |window, cx| {
+                if let Some(reader) = removed_weak.upgrade() {
+                    reader.update(cx, |reader, cx| reader.close_for_removed_book(window, cx));
+                }
+            },
+            cx,
+        );
         window
             .spawn(cx, async move |cx| {
                 match build_pdf_reader_webview(bytes, initial_page, &parent).await {
@@ -775,6 +820,12 @@ impl EpubReaderApp {
         }
     }
 
+    fn open_learning(&mut self, cx: &mut Context<Self>) {
+        if let Err(error) = open_learning_window(Arc::clone(&self.services), cx) {
+            self.set_error(format!("无法打开学习中心：{error:#}"), cx);
+        }
+    }
+
     fn open_background_jobs(&mut self, cx: &mut Context<Self>) {
         let indices = self.visible_book_indices();
         let books = indices
@@ -890,22 +941,30 @@ impl EpubReaderApp {
         error: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let Some(GroupModal::NameInput {
-            pending_request,
-            error: modal_error,
-            ..
-        }) = self.group_modal.as_mut()
-        else {
-            return;
+        let (current, return_to) = match self.group_modal.as_mut() {
+            Some(GroupModal::NameInput {
+                pending_request,
+                return_to,
+                ..
+            }) => (*pending_request == Some(request_id), return_to.take()),
+            _ => return,
         };
-        if *pending_request != Some(request_id) {
+        if !current {
             return;
         }
-        if error.is_none() {
-            self.group_modal = None;
-        } else {
-            *pending_request = None;
-            *modal_error = error;
+        match error {
+            None => self.group_modal = return_to.map(|modal| *modal),
+            Some(message) => {
+                if let Some(GroupModal::NameInput {
+                    pending_request,
+                    error: modal_error,
+                    ..
+                }) = self.group_modal.as_mut()
+                {
+                    *pending_request = None;
+                    *modal_error = Some(message);
+                }
+            }
         }
         cx.notify();
     }
@@ -1892,6 +1951,19 @@ impl EpubReaderApp {
                                             })
                                             .unwrap_or(false)
                                     });
+                                    let removed_weak = reader.downgrade();
+                                    register_book_window(
+                                        record.id.clone(),
+                                        window,
+                                        move |window, cx| {
+                                            if let Some(reader) = removed_weak.upgrade() {
+                                                reader.update(cx, |reader, cx| {
+                                                    reader.close_for_removed_book(window, cx)
+                                                });
+                                            }
+                                        },
+                                        cx,
+                                    );
                                     return cx.new(|cx| Root::new(reader, window, cx));
                                 }
                             };
@@ -1913,6 +1985,19 @@ impl EpubReaderApp {
                                 )
                             });
                             let weak = reader.downgrade();
+                            let removed_weak = weak.clone();
+                            register_book_window(
+                                record.id.clone(),
+                                window,
+                                move |window, cx| {
+                                    if let Some(reader) = removed_weak.upgrade() {
+                                        reader.update(cx, |reader, cx| {
+                                            reader.close_for_removed_book(window, cx)
+                                        });
+                                    }
+                                },
+                                cx,
+                            );
 
                             // Build the child WebView against this window's HWND and
                             // attach it once ready.
@@ -2181,6 +2266,19 @@ impl EpubReaderApp {
                                     .update(cx, |editor, cx| editor.handle_window_close(window, cx))
                                     .unwrap_or(false)
                             });
+                            let removed_weak = editor.downgrade();
+                            register_book_window(
+                                record.id.clone(),
+                                window,
+                                move |window, cx| {
+                                    if let Some(editor) = removed_weak.upgrade() {
+                                        editor.update(cx, |editor, cx| {
+                                            editor.close_for_removed_book(window, cx)
+                                        });
+                                    }
+                                },
+                                cx,
+                            );
                             return cx.new(|cx| Root::new(editor, window, cx));
                         }
                     };
@@ -2206,6 +2304,19 @@ impl EpubReaderApp {
                         )
                     });
                     let weak = editor.downgrade();
+                    let removed_weak = weak.clone();
+                    register_book_window(
+                        record.id.clone(),
+                        window,
+                        move |window, cx| {
+                            if let Some(editor) = removed_weak.upgrade() {
+                                editor.update(cx, |editor, cx| {
+                                    editor.close_for_removed_book(window, cx)
+                                });
+                            }
+                        },
+                        cx,
+                    );
 
                     // Build the preview/rich-text webview in the background and
                     // attach it once ready. The source tab needs no webview.
@@ -2868,7 +2979,15 @@ impl EpubReaderApp {
                     .border_1()
                     .border_color(rgb(BORDER))
                     .bg(rgb(SURFACE))
-                    .on_click(move |_, window, cx| {
+                    // Same rule as the book grid: a hit is opened on double
+                    // click, so a stray click while reading snippets cannot
+                    // jump into a book. `Button` has no `on_double_click`, so
+                    // the click count is checked here; keyboard activation is
+                    // kept working.
+                    .on_click(move |event, window, cx| {
+                        if event.click_count() != 2 && !event.is_keyboard() {
+                            return;
+                        }
                         open_view.update(cx, |this, cx| {
                             this.open_search_hit(open_hit.clone(), window, cx)
                         });
@@ -2994,12 +3113,9 @@ impl EpubReaderApp {
         let open_id = book_id.clone();
         let card_id = SharedString::from(format!("book-card-{book_id}"));
 
-        // Right-click menu: open / move / edit / export / delete. Group entries are collected
-        // outside the menu builder (which receives a `Context<PopupMenu>` that
-        // has no access to the app entity).
-        let mut group_entries = Vec::new();
-        self.collect_group_menu_entries(None, 0, &mut group_entries);
-        let current_group = book.group_id.clone();
+        // Right-click menu: open / group / edit / export / delete. Groups are
+        // edited in a tree dialog instead of a flat entry per group, so the
+        // menu stays short whatever the library size is.
         let office_supported = is_office_format_name(&book.format);
         let office_running = self
             .office_preview
@@ -3023,14 +3139,15 @@ impl EpubReaderApp {
             .cursor_pointer()
             .hover(|style| style.bg(rgb(PAPER)).border_color(rgb(BORDER)))
             .active(|style| style.bg(rgb(SIDEBAR)))
-            .on_click(move |_, window, cx| {
+            // Books open on double click, matching the shell's file list: a
+            // single click only focuses the card, so browsing the grid or
+            // reaching for the card's own buttons cannot open a reader.
+            .on_double_click(move |_, window, cx| {
                 open_view.update(cx, |this, cx| this.open_book(open_id.clone(), window, cx));
             })
             .context_menu({
                 let menu_view = view.clone();
                 let menu_book_id = book_id.clone();
-                let current_group = current_group.clone();
-                let group_entries = group_entries.clone();
                 move |mut menu, _window, _cx| {
                     let open_view = menu_view.clone();
                     let open_id = menu_book_id.clone();
@@ -3046,36 +3163,19 @@ impl EpubReaderApp {
                         )
                         .separator();
 
-                    let ungrouped_view = menu_view.clone();
-                    let ungrouped_book_id = menu_book_id.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new("未分组")
-                            .checked(current_group.is_none())
-                            .on_click(move |_, _, cx| {
-                                ungrouped_view.update(cx, |this, cx| {
-                                    this.move_book_to_group(ungrouped_book_id.clone(), None, cx);
-                                });
-                            }),
-                    );
-                    for (group_id, label, _depth) in &group_entries {
-                        let view = menu_view.clone();
-                        let book_id = menu_book_id.clone();
-                        let group_id = group_id.clone();
-                        let selected = current_group.as_deref() == Some(group_id.as_str());
-                        menu = menu.item(
-                            PopupMenuItem::new(label.clone())
-                                .checked(selected)
+                    let group_view = menu_view.clone();
+                    let group_book_id = menu_book_id.clone();
+                    menu = menu
+                        .item(
+                            PopupMenuItem::new("编辑分组…")
+                                .icon(Icon::new(IconName::Folder))
                                 .on_click(move |_, _, cx| {
-                                    view.update(cx, |this, cx| {
-                                        this.move_book_to_group(
-                                            book_id.clone(),
-                                            Some(group_id.clone()),
-                                            cx,
-                                        );
+                                    group_view.update(cx, |this, cx| {
+                                        this.open_book_group_picker(group_book_id.clone(), cx);
                                     });
                                 }),
-                        );
-                    }
+                        )
+                        .separator();
 
                     let office_view = menu_view.clone();
                     let office_book_id = menu_book_id.clone();
@@ -3257,9 +3357,9 @@ impl EpubReaderApp {
                     .absolute()
                     .top_2()
                     .right_2()
-                    // The folder button's popover is opened by the mouse-down that
-                    // bubbles up to the card underneath it. Stop the propagation at
-                    // this overlay so the click doesn't also open the book.
+                    // The folder button sits on top of the card that opens the
+                    // book. Stop the propagation at this overlay so pressing it
+                    // doesn't also open the book.
                     .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
                         cx.stop_propagation();
                     })
@@ -3278,8 +3378,8 @@ impl EpubReaderApp {
     // children fill the available 178px and the `img().size_full()` actually
     // fills the cover box.
 
-    /// The small folder button on a book card: files the book under any group,
-    /// or takes it out of every group.
+    /// The small folder button on a book card: opens the group tree dialog so
+    /// the book can be filed under any group, or taken out of every group.
     fn render_book_group_menu(
         &self,
         book: &BookRecord,
@@ -3287,13 +3387,6 @@ impl EpubReaderApp {
     ) -> gpui::AnyElement {
         let view = cx.entity().clone();
         let book_id = book.id.clone();
-        let current_group = book.group_id.clone();
-
-        let mut entries = Vec::new();
-        self.collect_group_menu_entries(None, 0, &mut entries);
-
-        let menu_book_id = book_id.clone();
-        let menu_view = view.clone();
         Button::new(SharedString::from(format!("book-group-{book_id}")))
             .ghost()
             .xsmall()
@@ -3302,86 +3395,39 @@ impl EpubReaderApp {
             .border_1()
             .border_color(rgb(BORDER))
             .rounded(px(7.))
-            .tooltip("移动到分组")
-            .dropdown_menu(move |menu, _, _| {
-                let mut menu = menu
-                    .item(
-                        PopupMenuItem::new("未分组")
-                            .checked(current_group.is_none())
-                            .on_click({
-                                let view = menu_view.clone();
-                                let book_id = menu_book_id.clone();
-                                move |_, _, cx| {
-                                    view.update(cx, |this, cx| {
-                                        this.move_book_to_group(book_id.clone(), None, cx);
-                                    });
-                                }
-                            }),
-                    )
-                    .separator();
-                if entries.is_empty() {
-                    menu = menu.item(PopupMenuItem::new("还没有分组").disabled(true));
-                }
-                for (group_id, label, _depth) in &entries {
-                    let view = menu_view.clone();
-                    let book_id = menu_book_id.clone();
-                    let group_id = group_id.clone();
-                    let selected = current_group.as_deref() == Some(group_id.as_str());
-                    menu = menu.item(
-                        PopupMenuItem::new(label.clone())
-                            .checked(selected)
-                            .on_click(move |_, _, cx| {
-                                view.update(cx, |this, cx| {
-                                    this.move_book_to_group(
-                                        book_id.clone(),
-                                        Some(group_id.clone()),
-                                        cx,
-                                    );
-                                });
-                            }),
-                    );
-                }
-                menu.separator()
-                    .item(
-                        PopupMenuItem::new("删除图书")
-                            .icon(Icon::new(IconName::Delete).text_color(rgb(DANGER)))
-                            .on_click({
-                                let view = menu_view.clone();
-                                let book_id = menu_book_id.clone();
-                                move |_, window, cx| {
-                                    view.update(cx, |this, cx| {
-                                        this.open_delete_book_dialog(book_id.clone(), window, cx);
-                                    });
-                                }
-                            }),
-                    )
-                    .max_h(px(320.))
-                    .scrollable(true)
+            .tooltip("设置分组")
+            .on_click(move |_, _, cx| {
+                // The card underneath opens the book on click; keep this
+                // button's own click from reaching it.
+                cx.stop_propagation();
+                view.update(cx, |this, cx| {
+                    this.open_book_group_picker(book_id.clone(), cx);
+                });
             })
             .into_any_element()
-    }
-
-    fn collect_group_menu_entries(
-        &self,
-        parent_id: Option<&str>,
-        depth: usize,
-        out: &mut Vec<(String, String, usize)>,
-    ) {
-        for group in self.library.child_groups(parent_id) {
-            let label = if depth == 0 {
-                group.name.clone()
-            } else {
-                format!("{}{}", "　".repeat(depth), group.name)
-            };
-            out.push((group.id.clone(), label, depth));
-            self.collect_group_menu_entries(Some(&group.id), depth + 1, out);
-        }
     }
 
     fn render_group_sidebar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let view = cx.entity().clone();
 
         let mut rows: Vec<gpui::AnyElement> = vec![
+            Button::new("open-learning-center")
+                .ghost()
+                .icon(IconName::BookOpen)
+                .label("学习中心 · AI Agent")
+                .tooltip("亲手构建并修好一个资料研究 Agent")
+                .w_full()
+                .on_click({
+                    let view = view.clone();
+                    move |_, _, cx| view.update(cx, |this, cx| this.open_learning(cx))
+                })
+                .into_any_element(),
+            div()
+                .h(px(1.))
+                .my_2()
+                .mx_2()
+                .bg(rgb(BORDER))
+                .into_any_element(),
             div()
                 .h_flex()
                 .h(px(28.))
@@ -3871,6 +3917,15 @@ impl EpubReaderApp {
 
     fn create_group(&mut self, parent_id: Option<String>, name: String, cx: &mut Context<Self>) {
         let filter_generation = self.group_filter_generation;
+        // A group created from the book group picker must not also switch the
+        // shelf behind it; the picker keeps the user's current shelf intact.
+        let returns_to_picker = matches!(
+            self.group_modal.as_ref(),
+            Some(GroupModal::NameInput {
+                return_to: Some(_),
+                ..
+            })
+        );
         let Some(request_id) = self.begin_library_request("正在创建分组…", cx) else {
             return;
         };
@@ -3896,7 +3951,8 @@ impl EpubReaderApp {
                         if this
                             .apply_shared_library_projection(mutation.generation, mutation.snapshot)
                         {
-                            if request_id == this.library_request_generation
+                            if !returns_to_picker
+                                && request_id == this.library_request_generation
                                 && filter_generation == this.group_filter_generation
                             {
                                 this.group_filter = GroupFilter::Group(group.id.clone());
@@ -3905,7 +3961,20 @@ impl EpubReaderApp {
                             }
                             this.sync_ai_scope(cx);
                         }
+                        let created_id = group.id.clone();
+                        let created_parent = group.parent_id.clone();
                         this.finish_name_modal_request(request_id, None, cx);
+                        // Select the new group in the restored picker so the
+                        // user only has to confirm.
+                        if let Some(GroupModal::BookGroupPicker {
+                            selected, expanded, ..
+                        }) = this.group_modal.as_mut()
+                        {
+                            if let Some(parent_id) = created_parent {
+                                expanded.insert(parent_id);
+                            }
+                            *selected = Some(created_id);
+                        }
                         if this.library_notice_request == Some(request_id) {
                             this.notice = Some(Notice {
                                 text: format!("已创建分组「{}」", group.name),
@@ -4107,6 +4176,50 @@ impl EpubReaderApp {
         cx.notify();
     }
 
+    /// Opens the group tree picker for a single book. The tree replaces the
+    /// flat group list that used to be inlined into the book context menu; a
+    /// menu item per group does not scale once a library has nested groups.
+    fn open_book_group_picker(&mut self, book_id: String, cx: &mut Context<Self>) {
+        let Some(book) = self
+            .library
+            .books()
+            .iter()
+            .find(|book| book.id == book_id)
+            .cloned()
+        else {
+            return;
+        };
+        let selected = book.group_id.clone();
+        let expanded = match selected.as_deref() {
+            // Expand the ancestors so the book's current group is visible.
+            Some(group_id) => picker_expanded_groups(&self.library.group_path(group_id)),
+            None => HashSet::new(),
+        };
+        self.group_modal = Some(GroupModal::BookGroupPicker {
+            book_id: book.id,
+            book_title: book.title,
+            selected,
+            expanded,
+        });
+        cx.notify();
+    }
+
+    fn select_picker_group(&mut self, group_id: Option<String>, cx: &mut Context<Self>) {
+        if let Some(GroupModal::BookGroupPicker { selected, .. }) = self.group_modal.as_mut() {
+            *selected = group_id;
+            cx.notify();
+        }
+    }
+
+    fn toggle_picker_group(&mut self, group_id: String, cx: &mut Context<Self>) {
+        if let Some(GroupModal::BookGroupPicker { expanded, .. }) = self.group_modal.as_mut() {
+            if !expanded.remove(&group_id) {
+                expanded.insert(group_id);
+            }
+            cx.notify();
+        }
+    }
+
     fn open_create_book_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_importing {
             return;
@@ -4124,6 +4237,7 @@ impl EpubReaderApp {
             input,
             pending_request: None,
             error: None,
+            return_to: None,
         });
         cx.notify();
     }
@@ -4145,6 +4259,12 @@ impl EpubReaderApp {
         };
         let input = cx.new(|cx| InputState::new(window, cx).default_value(String::new()));
         input.update(cx, |state, cx| state.focus(window, cx));
+        // Creating a group from inside the book group picker must not swallow
+        // the picker: the name input hands control back once it completes.
+        let return_to = match self.group_modal.as_ref() {
+            Some(GroupModal::BookGroupPicker { .. }) => self.group_modal.clone().map(Box::new),
+            _ => None,
+        };
         self.group_modal = Some(GroupModal::NameInput {
             title,
             confirm_label: "创建".to_string(),
@@ -4152,6 +4272,7 @@ impl EpubReaderApp {
             input,
             pending_request: None,
             error: None,
+            return_to,
         });
         cx.notify();
     }
@@ -4174,6 +4295,7 @@ impl EpubReaderApp {
             input,
             pending_request: None,
             error: None,
+            return_to: None,
         });
         cx.notify();
     }
@@ -4227,7 +4349,7 @@ impl EpubReaderApp {
             book_id,
             title: book.title.clone(),
             description: format!(
-                "将删除图书「{}」及书库中的副本与封面，源文件不会被移除。此操作不可撤销。",
+                "将删除图书「{}」及书库中的副本与封面，源文件不会被移除。该书已打开的阅读、预览与编辑窗口会一并关闭，其中未保存的修改将丢失。此操作不可撤销。",
                 book.title
             ),
         });
@@ -4328,6 +4450,24 @@ impl EpubReaderApp {
                 // Office trust confirmation is handled by its button callback
                 // because starting the preview also needs the active Window.
             }
+            GroupModal::BookGroupPicker {
+                book_id, selected, ..
+            } => {
+                let book_id = book_id.clone();
+                // A group can disappear while the picker is open.
+                let target = selected.filter(|group_id| self.library.group(group_id).is_some());
+                let current = self
+                    .library
+                    .books()
+                    .iter()
+                    .find(|book| book.id == book_id)
+                    .and_then(|book| book.group_id.clone());
+                self.group_modal = None;
+                cx.notify();
+                if target != current {
+                    self.move_book_to_group(book_id, target, cx);
+                }
+            }
         }
     }
 
@@ -4346,9 +4486,11 @@ impl EpubReaderApp {
             return;
         };
         let services = Arc::clone(&self.services);
+        let close_book_id = book_id.clone();
         let task = services.spawn_library_projected(move |library| library.remove_book(&book_id));
         cx.spawn(async move |view, cx| {
             let outcome = task.await;
+            let deleted = outcome.as_ref().is_ok_and(|inner| inner.is_ok());
             let close_window = view.update(cx, |this, cx| {
                 match outcome {
                     Ok(Ok(mutation)) => {
@@ -4358,9 +4500,6 @@ impl EpubReaderApp {
                             this.sync_ai_scope(cx);
                         }
                         if this.library_notice_request == Some(request_id) {
-                            // Reader windows hold their own copy of the store, so
-                            // a book deleted here stays readable until those
-                            // windows close.
                             this.notice = Some(Notice {
                                 text: format!("已删除图书「{}」", book.title),
                                 error: false,
@@ -4381,6 +4520,12 @@ impl EpubReaderApp {
                 }
                 this.finish_library_request(cx)
             });
+            if deleted {
+                // Reader, PDF/Office preview and editor windows keep their own
+                // copy of the store and their own child WebView, so removing a
+                // book has to take those windows with it.
+                let _ = cx.update(|app| close_book_windows(&close_book_id, app));
+            }
             if let Ok(Some(window)) = close_window {
                 schedule_library_window_removal(window, cx);
             }
@@ -4413,6 +4558,283 @@ impl EpubReaderApp {
         });
     }
 
+    /// Body of the "编辑分组" dialog: an indented, scrollable group tree. A row
+    /// click only stages the choice; `确定` commits it, so a stray click while
+    /// browsing deep groups cannot move the book.
+    fn render_book_group_picker_body(
+        &self,
+        book_id: &str,
+        book_title: &str,
+        selected: &Option<String>,
+        expanded: &HashSet<String>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let view = cx.entity().clone();
+        let ungrouped_selected = selected.is_none();
+        let ungrouped_view = view.clone();
+        let ungrouped_row = div()
+            .id("picker-ungrouped")
+            .h_flex()
+            .w_full()
+            .h(px(32.))
+            .items_center()
+            .gap_2()
+            .px_2()
+            .rounded(px(8.))
+            .cursor_pointer()
+            .when(ungrouped_selected, |this| this.bg(rgb(ACCENT_SOFT)))
+            .when(!ungrouped_selected, |this| {
+                this.hover(|style| style.bg(rgba(0x2926210a)))
+            })
+            .child(
+                Icon::new(IconName::Inbox)
+                    .small()
+                    .text_color(if ungrouped_selected {
+                        rgb(ACCENT)
+                    } else {
+                        rgb(MUTED)
+                    }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_sm()
+                    .text_color(if ungrouped_selected {
+                        rgb(ACCENT_DARK)
+                    } else {
+                        rgb(INK)
+                    })
+                    .child("未分组"),
+            )
+            .when(ungrouped_selected, |this| {
+                this.child(Icon::new(IconName::Check).small().text_color(rgb(ACCENT)))
+            })
+            .on_click(move |_, _, cx| {
+                ungrouped_view.update(cx, |this, cx| this.select_picker_group(None, cx));
+            })
+            .into_any_element();
+
+        let mut rows = Vec::new();
+        self.collect_picker_rows(None, 0, selected, expanded, &mut rows, cx);
+        let tree = if rows.is_empty() {
+            div()
+                .p_3()
+                .text_sm()
+                .text_color(rgb(MUTED))
+                .child("还没有分组，可用下方「新建分组」创建一个。")
+                .into_any_element()
+        } else {
+            div()
+                .v_flex()
+                .w_full()
+                .gap_0p5()
+                .children(rows)
+                .into_any_element()
+        };
+
+        let new_parent = selected
+            .clone()
+            .filter(|group_id| self.library.group(group_id).is_some());
+        let dirty = selected.as_deref()
+            != self
+                .library
+                .books()
+                .iter()
+                .find(|book| book.id == book_id)
+                .and_then(|book| book.group_id.as_deref());
+        let new_group_view = view.clone();
+        let cancel_view = view.clone();
+        let confirm_view = view.clone();
+
+        div()
+            .v_flex()
+            .w_full()
+            .gap_3()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(MUTED))
+                    .child(format!("为《{book_title}》选择分组")),
+            )
+            .child(
+                div()
+                    .id("book-group-picker-scroll")
+                    .w_full()
+                    .max_h(px(320.))
+                    .overflow_y_scrollbar()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .rounded(px(10.))
+                    .bg(rgb(SURFACE))
+                    .child(
+                        div()
+                            .v_flex()
+                            .w_full()
+                            .gap_0p5()
+                            .p_1()
+                            .child(ungrouped_row)
+                            .child(tree),
+                    ),
+            )
+            .child(
+                div()
+                    .h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        Button::new("picker-new-group")
+                            .ghost()
+                            .small()
+                            .icon(IconName::Plus)
+                            .label("新建分组")
+                            .tooltip(if new_parent.is_some() {
+                                "在选中分组下新建子分组"
+                            } else {
+                                "新建顶级分组"
+                            })
+                            .on_click(move |_, window, cx| {
+                                new_group_view.update(cx, |this, cx| {
+                                    this.open_create_group_dialog(new_parent.clone(), window, cx);
+                                });
+                            }),
+                    )
+                    .child(
+                        div()
+                            .h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("picker-cancel")
+                                    .label("取消")
+                                    .outline()
+                                    .on_click(move |_, _, cx| {
+                                        cancel_view
+                                            .update(cx, |this, cx| this.close_group_modal(cx));
+                                    }),
+                            )
+                            .child(
+                                Button::new("picker-confirm")
+                                    .label("确定")
+                                    .primary()
+                                    .disabled(!dirty)
+                                    .on_click(move |_, _, cx| {
+                                        confirm_view
+                                            .update(cx, |this, cx| this.confirm_group_modal(cx));
+                                    }),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn collect_picker_rows(
+        &self,
+        parent_id: Option<&str>,
+        depth: usize,
+        selected: &Option<String>,
+        expanded: &HashSet<String>,
+        out: &mut Vec<gpui::AnyElement>,
+        cx: &mut Context<Self>,
+    ) {
+        for group in self.library.child_groups(parent_id) {
+            out.push(self.render_picker_row(group, depth, selected, expanded, cx));
+            if expanded.contains(&group.id) {
+                self.collect_picker_rows(Some(&group.id), depth + 1, selected, expanded, out, cx);
+            }
+        }
+    }
+
+    fn render_picker_row(
+        &self,
+        group: &BookGroup,
+        depth: usize,
+        selected: &Option<String>,
+        expanded: &HashSet<String>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let view = cx.entity().clone();
+        let group_id = group.id.clone();
+        let has_children = !self.library.child_groups(Some(&group.id)).is_empty();
+        let is_expanded = expanded.contains(&group.id);
+        let is_selected = selected.as_deref() == Some(group.id.as_str());
+
+        let toggle = if has_children {
+            let toggle_view = view.clone();
+            let toggle_id = group_id.clone();
+            Button::new(SharedString::from(format!("picker-toggle-{}", group.id)))
+                .ghost()
+                .xsmall()
+                .icon(if is_expanded {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .on_click(move |_, _, cx| {
+                    // Expanding a node must not also select it.
+                    cx.stop_propagation();
+                    toggle_view.update(cx, |this, cx| {
+                        this.toggle_picker_group(toggle_id.clone(), cx);
+                    });
+                })
+                .into_any_element()
+        } else {
+            div().size(px(22.)).flex_none().into_any_element()
+        };
+
+        let row_view = view.clone();
+        let row_id = group_id.clone();
+        div()
+            .id(SharedString::from(format!("picker-row-{}", group.id)))
+            .h_flex()
+            .w_full()
+            .h(px(32.))
+            .items_center()
+            .gap_1p5()
+            .pr_2()
+            .pl(px(4. + depth as f32 * 16.))
+            .rounded(px(8.))
+            .cursor_pointer()
+            .when(is_selected, |this| this.bg(rgb(ACCENT_SOFT)))
+            .when(!is_selected, |this| {
+                this.hover(|style| style.bg(rgba(0x2926210a)))
+            })
+            .child(toggle)
+            .child(
+                Icon::new(if is_selected {
+                    IconName::FolderOpen
+                } else {
+                    IconName::Folder
+                })
+                .small()
+                .text_color(if is_selected { rgb(ACCENT) } else { rgb(MUTED) }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_sm()
+                    .text_color(if is_selected {
+                        rgb(ACCENT_DARK)
+                    } else {
+                        rgb(INK)
+                    })
+                    .child(group.name.clone()),
+            )
+            .when(is_selected, |this| {
+                this.child(Icon::new(IconName::Check).small().text_color(rgb(ACCENT)))
+            })
+            .on_click(move |_, _, cx| {
+                row_view.update(cx, |this, cx| {
+                    this.select_picker_group(Some(row_id.clone()), cx);
+                });
+            })
+            .into_any_element()
+    }
+
     fn render_group_modal(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let modal = self.group_modal.clone()?;
         let view = cx.entity().clone();
@@ -4432,6 +4854,7 @@ impl EpubReaderApp {
                 pending_request,
                 error,
                 action: _,
+                return_to: _,
             } => {
                 let title = title.clone();
                 let pending = pending_request.is_some();
@@ -4556,8 +4979,21 @@ impl EpubReaderApp {
                     .into_any_element();
                 (title, body)
             }
+            GroupModal::BookGroupPicker {
+                book_id,
+                book_title,
+                selected,
+                expanded,
+            } => (
+                "编辑分组".to_string(),
+                self.render_book_group_picker_body(book_id, book_title, selected, expanded, cx),
+            ),
         };
 
+        let panel_width = match &modal {
+            GroupModal::BookGroupPicker { .. } => px(420.),
+            _ => px(380.),
+        };
         let cancel_view = view.clone();
         Some(
             div()
@@ -4584,7 +5020,7 @@ impl EpubReaderApp {
                         // dismissal handler while leaving its controls active.
                         .occlude()
                         .v_flex()
-                        .w(px(380.))
+                        .w(panel_width)
                         .p_5()
                         .gap_4()
                         .rounded(px(12.))
@@ -4944,5 +5380,37 @@ mod tests {
         assert!(!is_current_office_preview(None, 8, "book-8"));
         cancellation.cancel();
         assert!(cancellation.is_cancelled());
+    }
+
+    fn test_group(id: &str, parent_id: Option<&str>) -> BookGroup {
+        BookGroup {
+            id: id.to_string(),
+            name: id.to_string(),
+            parent_id: parent_id.map(str::to_owned),
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn group_picker_expands_only_the_ancestors_of_the_current_group() {
+        let path = vec![
+            test_group("root", None),
+            test_group("child", Some("root")),
+            test_group("leaf", Some("child")),
+        ];
+        let expanded = picker_expanded_groups(&path);
+        assert_eq!(expanded.len(), 2);
+        assert!(expanded.contains("root"));
+        assert!(expanded.contains("child"));
+        assert!(
+            !expanded.contains("leaf"),
+            "the current group itself stays collapsed until the user expands it"
+        );
+    }
+
+    #[test]
+    fn group_picker_without_a_current_group_expands_nothing() {
+        assert!(picker_expanded_groups(&[]).is_empty());
+        assert!(picker_expanded_groups(&[test_group("root", None)]).is_empty());
     }
 }

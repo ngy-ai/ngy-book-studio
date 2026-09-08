@@ -269,6 +269,9 @@ pub struct PdfReaderApp {
     progress_sync_task: Option<Task<()>>,
     closing_webview: Option<WeakEntity<WebView>>,
     closing: bool,
+    /// Set when the window closes because its book left the library: the final
+    /// reading position belongs to a document that no longer exists.
+    closing_for_removed_book: bool,
     progress_close_ready: bool,
     removal_scheduled: bool,
     notice: Option<Notice>,
@@ -375,6 +378,7 @@ impl PdfReaderApp {
             progress_sync_task: None,
             closing_webview: None,
             closing: false,
+            closing_for_removed_book: false,
             progress_close_ready: !persist_progress,
             removal_scheduled: false,
             notice: None,
@@ -569,7 +573,7 @@ impl PdfReaderApp {
     ) -> bool {
         self.webview = Some(webview);
         if self.webview_build_gate.finish() {
-            self.schedule_window_removal(window, cx);
+            self.resume_deferred_close(window, cx);
             // A persistent PDF reader keeps its WebView until the final write
             // completes. Install the IPC receiver now so failure recovery does
             // not reopen a view that can no longer report page changes.
@@ -580,6 +584,15 @@ impl PdfReaderApp {
         true
     }
 
+    /// Resumes a close that was vetoed while the child WebView was building.
+    fn resume_deferred_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing_for_removed_book {
+            self.finish_removal_close(window, cx);
+        } else {
+            self.schedule_window_removal(window, cx);
+        }
+    }
+
     pub(super) fn fail_webview_build(
         &mut self,
         error: String,
@@ -587,7 +600,7 @@ impl PdfReaderApp {
         cx: &mut Context<Self>,
     ) {
         if self.webview_build_gate.finish() {
-            self.schedule_window_removal(window, cx);
+            self.resume_deferred_close(window, cx);
             return;
         }
         self.set_error(error, cx);
@@ -937,6 +950,34 @@ impl PdfReaderApp {
         }
         self.schedule_window_removal(window, cx);
         false
+    }
+
+    /// Closes this reader because its book left the library.
+    ///
+    /// Unlike a user-initiated close there is nothing left to persist: the
+    /// final position is dropped with its writer, and no failed write may
+    /// reopen a window whose document no longer exists.
+    pub(super) fn close_for_removed_book(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing || self.closing_for_removed_book {
+            return;
+        }
+        self.closing_for_removed_book = true;
+        if self.webview_build_gate.request_close() {
+            return;
+        }
+        self.finish_removal_close(window, cx);
+    }
+
+    fn finish_removal_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
+        self.closing = true;
+        // Dropping the writer stops its runtime worker without queueing a
+        // final position for a book that has already been removed.
+        self.progress_writer.take();
+        self.complete_progress_close(cx);
+        window.refresh();
     }
 
     fn render_pane_resize_handle(

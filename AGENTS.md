@@ -38,6 +38,28 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   主窗口。
 - `src/services.rs`、`src/runtime.rs`：进程级服务组合与独立 Tokio runtime；统一持有
   图书库、对象存储、格式注册表、搜索、AI、Office 和后台任务。
+- `src/learning.rs`、`src/learning_records.rs`、`src/learning_catalog.rs`、
+  `src/ui/learning.rs`：学习中心异步服务、逐章目录、
+  独立 JSON 学习档案和原生 GPUI 训练窗口。记录不进入图书数据库；运行前保存不可变
+  代码、预测与提示级别，运行报告由受信宿主生成；恢复前原样归档当前文件。
+  恢复文件对话框使用后台准备的 Shell 路径：Windows 的 `\\?\` 盘符 / UNC 前缀
+  只在对话框路径中转换，不改存储路径。选择器失败或取消不得锁住当前输入；实际
+  保存 / 恢复失败才要求重新检测记录，已有的不确定状态不得被选择器错误清除。
+  学习窗口构造编辑器前注册固定版本 `tree-sitter-python`；组件默认语言集只有 JSON，
+  不能仅凭 `code_editor("python")` 或查询语言非空就判断 Python 高亮已生效。
+  默认完整教程总览来自 `courses/ai-agent-tutorial/README.md`；十章正文、导读和
+  课程资料属于浏览状态，不插入或重排第一章六个持久化步骤。开始 / 继续第一章
+  使用保留的步骤；章节与节间导航不得丢失当前编辑，运行中不得隐藏取消控制。
+  第2—10章点击“本章代码实验”后进入各章工作区；切换前异步保存旧章，保存失败保留
+  输入。章节身份绑定不可变 service，十章共享各章独立的锁；档案与备份必须校验章节，
+  不得将别章报告混入历史。各章存于 `learning/chapter-NN.json`，第一章原六步索引不变。
+  目标章载入失败后进入其恢复状态，未加载的坏章不应阻断进入其它章。更换工作区或
+  恢复备份时重建编辑器和订阅，隔离撤销历史；`InputState::set_value` 不会清除历史，
+  不能让 Ctrl+Z 将上一章文字带入本章。
+  可选择的只读正文使用 `scrollable_learning_text`：自然高度的 TextView 放在外层
+  滚动容器内。0.5.1 的 TextView 内部虚拟列表滚动不会平移选区坐标，不得恢复
+  `selectable(true).scrollable(true)` 组合。GPUI `test-support` 仅用于开发测试，
+  事件与内存剪贴板回归不能替代真实 Windows 鼠标、字体和系统剪贴板验收。
 - `src/document.rs`：稳定 ID 的格式无关模型，包括 `BookDocument`、`ContentUnit`、
   `BlockDocument`、`TocNode` 和 `DocumentLocator`。
 - `src/formats/`：`DocumentImporter` 注册表及 EPUB、PDF、Office、Kindle 适配器；
@@ -70,7 +92,21 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
 - `src/ui/`：按窗口/职责拆分的 GPUI 界面。`library.rs`、`reader.rs`、`pdf_reader.rs`、
   `editor.rs`、`office_slides.rs` 分别管理对应窗口；`ai_sidebar.rs`、
   `ai_controller.rs`、`ai_settings.rs` 管理 AI 交互；`background_jobs.rs` 管理当前图书范围
-  的派生任务；`mod.rs` 只保留跨窗口主题、窗口打开与安全关闭基础设施。
+  的派生任务；`mod.rs` 只保留跨窗口主题、窗口打开与安全关闭基础设施，其中包含按
+  图书登记的窗口表：删除图书后关闭该书已打开的阅读、PDF/Office 预览和编辑窗口。
+  这类关闭走各窗口的“图书已移除”路径，不写最终阅读进度、不保存草稿、不弹保存确认，
+  WebView 仍在构建时等构建结束后再拆除。
+  AI 回复用与 `gpui-component` 相同的固定版 `markdown` 解析器生成展示投影，按消息
+  缓存；链接、图片与原始 HTML 只显示文字，不能让模型正文自动加载资源或打开 URL。
+  Markdown 渲染保留自然高度和外层会话滚动，复制与持久化使用原文；来源按钮继续走
+  宿主引用校验。TextView 在 flex 消息列内必须获得扣除 padding、边框和复制按钮后的
+  明确像素宽度；仅用 `w_full()` 会使 Windows 上的短列表正文被裁掉，测试字体不一定
+  复现。`src/ui/ai_sidebar/` 保存展示清洗和 GPUI 选择、流式更新回归。
+  编辑器导航按独立 `TocNode` 树显示，节点 ID 与正文单元 ID 分开保存，不能用目录
+  序号定位线性正文，也不能将同一单元的多个目录项合并。`src/ui/editor/navigation.rs`
+  提供树展平和按节点缩进/提升；正文保存仅在章名实际改变时更新同名目录，保留
+  独立子目录标题。EPUB 导入的 fragment 当前尚未映射为块目标，编辑器子目录定位到
+  所属内容单元，不可按目录标签或序号猜测块位置。
 - `web/editor/` 与 `assets/editor/`：固定版本 ProseMirror 源码、lockfile 和提交的构建
   产物；普通 Cargo 构建不运行 Node。
 - `web/pdf/` 与 `assets/pdfjs/`：固定版本 PDF.js shell、lockfile、清单和提交的本地
@@ -140,6 +176,127 @@ cargo test --test openai_compatible_flow --locked
 `src/ui/` 的单元测试属于产品二进制目标，不包含在 `cargo test --lib` 中。完成 Rust
 改动前仍应执行全目标检查和测试；不要只用快速命令作最终验收。
 
+### AI 问答诊断日志
+
+AI 日志统一使用 `moye_ai` target。未设置 `RUST_LOG` 时，默认
+`warn,moye_ai=info`，记录问答开始、完成、取消及失败；详细排障使用
+`warn,moye_ai=debug`。日志输出到终端，并带源码文件和行号；不会自动写入文件。
+需要保留一次复现时，在 PowerShell 中运行：
+
+```powershell
+$env:RUST_LOG = "warn,moye_ai=debug"
+$aiLog = Join-Path ([System.IO.Path]::GetTempPath()) ("moye-ai-" + [guid]::NewGuid() + ".log")
+cargo run --locked --bin moye-epub-editor 2>&1 | Tee-Object -FilePath $aiLog
+```
+
+开发验证还须按下文 GUI 冒烟要求设置唯一 `MOYE_DATA_DIR`。环境变量只作用于从该
+终端新启动的进程；复现结束后恢复原来的 `RUST_LOG`，或原来未设置时用
+`Remove-Item Env:RUST_LOG` 移除。不要用全局 `trace` 抓取 HTTP 请求正文。
+
+- `trace_id` 是进程内跨窗口唯一的问答编号，从请求注册、冻结选区、作用域与历史、
+  模型/工具调用到保存和界面完成共用；重启后重新计数。`request_id` 是窗口内代次。
+- `http_id` 标识一次 HTTP 调用；`round` 是工具轮次，`attempt` 是该轮启动流的尝试。
+  `stage` 与 `error_kind` 区分 HTTP 拒绝、流读取、JSON/工具校验、来源校验和保存失败。
+  `AI request token invalidated` 也会在正常释放请求时出现，不代表用户取消。
+- HTTP 记录主机、端口、模型、请求字节数、超时、状态码和受控错误类型；流结束记录
+  事件数、首事件等待、耗时、`finish_reason` 与 provider 实际返回的 token usage。
+  `length` 可作为输出达到限制的排查线索，不能单独证明 JSON 截断的根因。
+- 工具仅记录允许的名称、参数字节数、JSON 类型/字段数量、已知数组长度和解析错误
+  分类/行/列。未知工具名和 provider 标识归一化；不记录提问、书名、正文、选区、
+  回答、完整参数、引用 ID、密钥、HTTP headers 或端点路径/查询串。
+- 不逐 token 打日志。新增日志必须使用同一 target、继承异步 span，并经
+  `src/ai_diagnostics.rs` 的分类/摘要函数处理不可信值；不能直接格式化任意错误链。
+  HTTP/SSE 故障与日志脱敏回归位于 `tests/openai_compatible_flow.rs`。
+
+## Python 课程实验包
+
+`courses/agent-foundations/` 是独立的第一章开发与试学包，使用 Python 3.12、uv 和
+LangGraph。它不连接墨页数据库，也不读取真实图书库。包内 README 是学习入口，
+`spec.md` 与 `worksheets/rubric.md` 描述课程和评分契约；不得把作品自动检查当作独立
+掌握、真实学员试学或专家水平证据。
+
+讲义修订单独标记（当前 `2026-09-07.tutorial-1`），不要为了只改教学支架而变更
+实验/评分契约并使已有档案失效；说明中要区分阅读示例、提示后完成与独立重写。
+新增教学代码应按当前受控接口运行核对，局部片段注明放入哪个函数/分支、所需导入及
+能否直接运行。桌面内嵌讲义使用 `include_str!`，更新文本后需要重新构建产品才能展示。
+
+`courses/ai-agent-tutorial/` 保存完整教程总览和第2—10章正文；示例位于本包
+`tutorial_examples/`，复用唯一 `uv.lock`。正文应自足、首次解释新术语、给出输入与
+预期结果，外链仅用于延伸阅读。两版示例输出一致只是行为对照，不代表独立掌握。
+这些示例是普通本地 Python 程序，不是第一章受控 `run` 提交，也不自动获得桌面隔离。
+另有 `exercises/` 中的第2—10章桌面练习说明，提交骨架和参考实现在
+`agent-foundations/starters/chNN_*.py` 与 `references/chNN_*.py`；二者不能与本地
+无参示例混用。桌面继续使用五参数 `run` 和 Windows LPAC，课程身份通过 `chapter`
+绑定；缺省仅表示第一章。后续章节场景为 `normal/fault/transfer`，宿主每次产生虚构
+输入；`chapter_runtime.py` 的资料、权限及评分留在宿主，工作进程只得到
+`chapter_support.py` 的消息与结果传递帮助函数，不得暂存评分器或参考实现。
+第2—10章的一次模型接口调用是获取练习输入，并非实际 LLM 推理；报告与界面需明确
+区别。审批、草稿写入与 MCP 为受控模拟，不能据此声称已支持真实外部写入或 MCP 连接。
+在本包目录使用 `uv run --locked python -m tutorial_examples` 运行全部章节对照；
+`tests/test_tutorial_examples.py` 单独核验权限、证据、记忆和停止等行为。
+
+在课程目录运行以下开发门禁。`uv.lock` 是唯一 Python 依赖锁；普通安装与运行必须
+带 `--locked`，只在明确调整依赖时重新生成锁文件。不要变更 Rust 或前端锁文件。
+
+```powershell
+Set-Location courses/agent-foundations
+uv sync --locked
+uv run --locked ruff format --check .
+uv run --locked ruff check .
+uv run --locked python -m pytest -q
+uv run --locked python -m moye_lab compare --scenario all
+```
+
+`runs/`、`workspaces/`、`.venv/` 和缓存均忽略，不提交运行报告、个人作答、凭据或
+代码快照产物。固定响应模式离线运行；HTTP 测试只使用临时本机 mock 服务。需要真实
+模型时显式传 `--mode live --base-url URL --model MODEL`；远程必须另传
+`--allow-remote`，远程 HTTP 还必须传 `--allow-insecure`。本实验凭据使用独立的
+Windows Credential Manager 命名空间，不复用产品凭据、环境变量或明文配置文件。
+不得自动启动 Ollama 或下载模型。
+
+课程代码通过 `run(task, model, tools, limits, emit)` 注入。宿主观察模型和工具调用，
+核验回填、来源、重试与预算；学生 `emit` 和框架节点标注只是展示信息。CLI 的进程内
+运行器仍只执行已审查代码，不能把它当作隔离执行器。
+
+桌面从课程 `.venv/Scripts/python.exe -I -u moye_lab/desktop_host.py` 启动受信宿主，
+宿主通过受限 RPC 执行一次性 Windows LPAC 工作进程，不在宿主导入学生代码。每次
+复制独立解释器、依赖与课程接口，课程文件仅从暂存区读取；模型、资料、工具校验和评分
+留在宿主。固定允许 `registryRead` 以初始化系统 DLL，不授予网络能力；启动前核验
+AppContainer SID、能力集合、Job 和实际 AAP 文件授权差异，普通 AppContainer 必须
+被拒绝。只封闭本次临时 profile 的文件和注册表写入，不修改系统或用户原有 ACL。
+Job 限制单进程、256 MiB、10 CPU 秒及 25% CPU；应用另限制 180 秒课程期限、输出和
+RPC 数量。取消/宿主异常退出必须终止 Job 并清理 profile，不得回退非隔离执行。
+
+本章边界是同步 `run`。工作进程内的 `desktop_compat.py` 延迟 CPython 3.12 的真实
+`_overlapped` 初始化，让同步 LangGraph 能导入 asyncio；不模拟 IOCP 功能，实际访问
+原生 IOCP 和网络仍受系统拒绝。不修改已安装解释器或第三方依赖，兼容标识与源码
+进入报告。不要把这个适配解释为已支持任意异步或联网实验。
+
+`tests/test_sandbox_windows.py`、`test_sandbox.py`、`test_desktop_host.py` 验证真实
+Windows 隔离、资源耗尽、伪造报告、管道背压、取消及宿主死亡。
+
+第2—10章的宿主规则与变式由 `test_chapter_runtime.py` 验证，真实隔离矩阵与反例在
+`test_chapter_sandbox.py`（九章 × 三场景 × 两实现）。资料、请求、样本等 ID 不得编码
+判断类别，洗牌也不能代替内容变式。大批 LPAC 运行复制临时解释器，pytest 历史目录
+清理可能拖慢收尾；需要指定 `--basetemp` 时只用本次唯一临时路径，不能指向已有目录。
+
+桌面跨语言专项门禁：
+
+```powershell
+cargo test --lib --locked learning::tests::supervisor_control_flow -- --ignored --nocapture
+cargo test --lib --locked learning::tests::desktop_learning_runs_both_implementations_and_restores_evidence -- --ignored --nocapture
+cargo test --lib --locked learning::tests::desktop_later_chapters_preserve_identity_and_restore_only_their_own_evidence -- --ignored --nocapture
+```
+
+学习档案采用版本、摘要、容量限制、revision 校验和临时文件原子替换；损坏档案只读
+报错，允许验证备份后原样归档坏文件再恢复。导入报告必须显示待核验，文件摘要只
+证明一致性，不证明实际运行或掌握。每轮最多 64 次报告、总档案最多 32 MiB；新一轮
+先归档历史再保存当前编辑，不能先向已满档案追加。关闭学习窗口需等待取消、已接受
+保存及报告落盘；失败时保留窗口和可重试提示。
+
+只修改此独立 Python 包与文档时运行上述 Python 门禁；若触及 Rust 或桌面路径，
+仍须执行本文件规定的 Rust 全目标验证和相应 GUI 路径。
+
 ## 前端构建产物
 
 只有修改 `web/editor/`、`web/pdf/` 或对应依赖时才需要 Node.js 22+。前端统一使用
@@ -193,6 +350,9 @@ EPUB/PDF/原件导出、重新打开及原件字节一致性。
 - 耗时的哈希、归档/文档解析、对象 I/O、索引、数据库批量操作、模型调用、Office
   COM 和导出不得阻塞 GPUI。使用 `AppServices` 的独立 runtime/后台任务，并在正确
   的 GPUI context 中更新实体。
+- 事务已提交的视觉任务按完整 `VisualJobSpec` 确认调度；后台可能已把它推进到
+  Running / Succeeded，不得仅因不再 Queued 就误报提交失败。缺失、身份变化、停止
+  状态或队列关闭仍须报错，迟到的唤醒不得重置任务或重复渲染。
 - GPUI 状态改变后沿用 `cx.notify()`；事件 `Subscription` 必须保存在实体字段中，
   避免订阅因临时值析构而失效。关闭窗口时取消流式请求和后台回调。
 - 每个顶层 UI 的结构体、`Render`、私有状态和专用 WebView/IPC helper 放在
@@ -279,8 +439,32 @@ EPUB/PDF/原件导出、重新打开及原件字节一致性。
   此类 locator。PPTX 独立逐页图片路径必须保留精确的幻灯片 locator 与内容单元归属。
 - OpenAI-compatible 默认端点固定为本机 Ollama，不得静默切云。非回环端点发送内容
   前要求确认，非 HTTPS 远程端点还要单独允许；密钥只进 Windows Credential Manager。
+- 对话生成参数与 Provider 配置一并校验和保存，使用独立 settings key 并在同一事务
+  提交，不扩展旧 Provider JSON 契约或增加旧字段回退。Temperature 可空且范围为
+  0..=2（默认 0.1），Top P 可空且范围为 0..=1，Presence/Frequency penalty 可空且
+  范围为 -2..=2；浮点值必须有限。空值省略对应请求字段，最大输出 token 必须为
+  正整数（默认 4096），不设模型业务上限，由用户按所选模型设置；内部使用 `u32`
+  表示并拒绝整数溢出，不能作为服务端上下文容量设置。新问答固定参数快照，各工具
+  轮次及联网后备回答沿用该快照；保存设置不影响在途请求，不改变 embedding/vision。
+  上下文缩减只能降低输出上限；不完整工具 JSON 的既有恢复请求仍使用温度 0。
+  参数区的“恢复默认”只重置参数草稿，不提交设置，也不改其它草稿。覆盖参数校验、保存后
+  重启、可空字段序列化、工具/联网轮次和恢复优先级的 mock 回归；GUI 验证需使用隔离目录。
+- 后台任务自动运行配置使用独立 settings key，默认关闭（`DEFAULT_AUTO_RUN_BACKGROUND_JOBS`
+  = false，AI 设置中“自动运行新创建的后台任务”默认不勾选），不得扩展 Provider JSON。
+  默认或关闭时，新导入、创建或保存编辑仍须在文档事务内创建 `visual_render`、`vision`、
+  `embedding` 三类任务，但初始状态为 `Paused` 且未开始；已有任务不随设置切换改变状态，
+  用户仍可在后台任务窗口逐项恢复。
 - Agent 只允许 `search_books`、`read_passages`、`get_outline` 三个只读工具。宿主先
   计算授权 book IDs，模型参数只能缩小范围；保留工具轮次、结果数、上下文和超时限制。
+- 上下文超限仅在 provider 明确拒绝启动流时最多重试三次；先按完整轮次减少旧历史，
+  再按完整记录减少搜索/片段结果，并从引用注册表去除已不在当前请求里的 passage
+  marker。字节比例仅辅助估计裁剪量，不能当作精确 token 数。保留当前问题、冻结
+  选区、系统策略、工具定义和 assistant/tool 配对；每个工具结果至少留一条原文。
+  SSE 开始后不重试，取消沿用原请求令牌，不自动提高模型服务端上下文上限。
+- Ollama 明确返回 HTTP 500 且错误封套报告已提供工具的参数为不完整 JSON 时，每次
+  问答最多追加一次宿主固定提示并重试流启动；不得把服务端错误原文注入 prompt，
+  不得猜补参数、重跑已完成工具或降低来源校验。普通 500、未提供工具和流内错误不重试；
+  该次数不得重置上下文重试计数，取消仍需阻止下一次请求。
 - 冻结选区只有在宿主重新校验 scope、book/unit/locator 和当前 document/unit revision
   并签发稳定 citation ID 后才能作为来源。最终回答必须引用本轮已登记来源，或使用宿主
   协议明确表示无来源；模型生成、正文夹带或被篡改的 citation ID 一律拒绝。
@@ -314,6 +498,9 @@ EPUB/PDF/原件导出、重新打开及原件字节一致性。
    现有 build gate 否决关闭并延迟处理；不要假设 detached task 随窗口自动取消。
 4. Reader/Editor/PDF Reader 关闭时，先从状态和渲染帧移除并隐藏子 WebView，等待
    entity 释放，再调用现有原生窗口移除 helper。不要让默认 `WM_CLOSE` 抢先销毁父 HWND。
+  Editor 关闭先询问保存并关闭、不保存或取消；只有确认保存才进入快照和写入流程，
+   放弃修改直接安全释放，取消保留输入与 AI 状态。初始化或已接受写入尚未完成时先
+   等待；确认框期间若旧请求开始写入，放弃关闭也须等其结果回填，不得另行触发保存。
    Reader/PDF Reader 还必须等最终稳定 locator 的阅读进度写入成功；写入失败时保持窗口
    打开并允许再次关闭重试，不能把“后台 worker 已退出”当作持久化成功。
 5. 图书库窗口关闭只关闭该窗口，不调用 `App::quit()`/`cx.quit()`；否则会绕过其它
@@ -334,6 +521,14 @@ EPUB/PDF/原件导出、重新打开及原件字节一致性。
 10. 富文本 IPC 返回完整的可信 XHTML 页面壳，但只有 `<body>` 属于可编辑正文。更新
     统一 AST 前先提取该元素再清洗解析；不要把含 `<head><title>` 的整页交给片段
     清洗器，否则移除标签后留下的标题文本可能进入正文并在保存时重复。
+11. HTML 源码不是 XHTML。编辑器首次投影及源码刷新都用 `markup::serialize_xhtml`
+    从已清洗的 AST 生成展示片段，再放入 XHTML 壳；通过 HTML DOM 处理空元素、
+    布尔属性与实体并按 XML 转义，不能只替换 `<img>` 或放宽前端严格解析。
+    不为展示改写数据库源码，也不能再次清洗并误删受控任务勾选框或媒体。
+    富文本 `body: null` 回执与已接纳章节一致时，只释放精确匹配的待处理动作，不重建
+    AST；其附带的是展示壳，重新解析会把正文变成 RawHtml 并丢失结构化媒体引用。
+    若前次正文解析失败，回执仍携带未接纳正文，必须重试校验并继续阻止保存和切章，
+    直到正文修复；不能把前端的 unchanged 标记当作宿主已经接纳该快照的证据。
 
 ## 不可破坏的内容安全约束
 
@@ -343,7 +538,7 @@ EPUB/PDF/原件导出、重新打开及原件字节一致性。
   资产与当前 PDF，不得映射任意主机文件。
 - Editor 的宿主初始化脚本是可信桥接，不代表允许书内脚本。IPC 必须校验 origin、
   href、session/revision/request-id、Ready/请求状态和大小上限。保存、切章、导出、
-  关闭和 AI 引用必须取得完全匹配的快照，旧页面回调不能覆盖新章节。
+  确认保存后关闭和 AI 引用必须取得完全匹配的快照，旧页面回调不能覆盖新章节。
 - 打开 Editor 时只从当前 revision 的 `BookDocument` AST 生成会话投影，不读取或重新
   打包整本原格式容器，也不回退提供原件中的 CSS/字体/任意路径资源。持久媒体只在
   协议请求时经 `AppServices` 后台读取；关闭时先封闭协议响应屏障，再释放 WebView，

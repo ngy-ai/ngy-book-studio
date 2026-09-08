@@ -2,21 +2,27 @@
 
 use std::{
     collections::HashMap,
+    future::Future,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     sync::{
         OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::Instant,
 };
 
 use anyhow::{Context as _, Result, bail, ensure};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use tracing::Instrument as _;
 
 use crate::{
     agent::{AgentAnswer, SearchBackend, SelectionSnapshot},
-    agent_runtime::{AgentCancellation, AgentQuestion, AgentRunEvent, AgentRuntime},
-    ai::{ChatMessage, ChatRole},
+    agent_runtime::{
+        AgentCancellation, AgentQuestion, AgentRequestCancelled, AgentRunEvent, AgentRuntime,
+    },
+    ai::{ChatGenerationSettings, ChatMessage, ChatRole},
+    ai_diagnostics::error_kind,
     chat::{
         ChatRepository, ChatScope, ChatSession, ChatThread, ChatWindowKind, NewChatCitation,
         NewChatMessage, NewChatThread, StoredChatMessage,
@@ -225,11 +231,13 @@ pub struct ConversationAnswer {
 ///
 /// Keeping this value alive makes the request visible to [`AgentConversation::cancel`]
 /// while editor references are still being frozen. Dropping it cancels and
-/// unregisters only this exact request generation.
+/// unregisters only this exact request generation. Sampling controls are frozen
+/// here so saving settings during preparation affects only subsequent requests.
 #[must_use = "a prepared AI request must be executed or explicitly dropped"]
 pub struct PreparedAgentRequest {
     request_id: u64,
     cancellation: AgentCancellation,
+    chat_generation: ChatGenerationSettings,
     active: Arc<Mutex<HashMap<u64, AgentCancellation>>>,
 }
 
@@ -255,6 +263,13 @@ impl std::fmt::Debug for PreparedAgentRequest {
 
 impl Drop for PreparedAgentRequest {
     fn drop(&mut self) {
+        tracing::debug!(
+            target: "moye_ai",
+            trace_id = self.cancellation.trace_id(),
+            request_id = self.request_id,
+            cancelled = self.cancellation.is_cancelled(),
+            "AI request lease released"
+        );
         self.cancellation.cancel();
         let Ok(mut active) = self.active.lock() else {
             return;
@@ -297,7 +312,9 @@ fn finalize_committed_delete(
     *selection = ConversationSelection::Fresh;
     if let Err(error) = release_claim() {
         tracing::error!(
-            %error,
+            target: "moye_ai",
+            stage = "release_deleted_session",
+            error_kind = error_kind(&error),
             "conversation was deleted but its process-local claim could not be released"
         );
     }
@@ -643,11 +660,21 @@ impl AgentConversation {
             !active.contains_key(&request_id),
             "request ID is already active"
         );
+        let chat_generation = self.services.provider_settings()?.chat_generation;
         active.insert(request_id, cancellation.clone());
         drop(active);
+        tracing::debug!(
+            target: "moye_ai",
+            trace_id = cancellation.trace_id(),
+            request_id,
+            window_kind = ?self.window_kind,
+            stage = "prepare_request",
+            "AI request registered before reference preparation"
+        );
         Ok(PreparedAgentRequest {
             request_id,
             cancellation,
+            chat_generation,
             active: Arc::clone(&self.active),
         })
     }
@@ -661,29 +688,50 @@ impl AgentConversation {
         events: Option<mpsc::UnboundedSender<AgentRunEvent>>,
         prepared: PreparedAgentRequest,
     ) -> Result<ConversationAnswer> {
-        ensure!(
-            !request.question.trim().is_empty(),
-            "question must not be empty"
+        let span = tracing::info_span!(
+            target: "moye_ai",
+            "ai_conversation",
+            trace_id = prepared.cancellation.trace_id(),
+            request_id = request.request_id,
+            window_kind = ?self.window_kind,
+            allowed_books = request.allowed_book_ids.len(),
+            snapshots = request.snapshots.len(),
+            question_bytes = request.question.len()
         );
-        ensure!(
-            request.request_id == prepared.request_id,
-            "prepared request ID does not match the question"
-        );
-        ensure!(
-            Arc::ptr_eq(&prepared.active, &self.active),
-            "prepared request belongs to another conversation"
-        );
-        let registered = self
-            .active
-            .lock()
-            .map_err(|_| anyhow::anyhow!("conversation cancellation lock is poisoned"))?
-            .get(&prepared.request_id)
-            .is_some_and(|token| token.same_request(&prepared.cancellation));
-        ensure!(registered, "prepared request is no longer active");
-        ensure_request_not_cancelled(&prepared.cancellation)?;
-
-        self.ask_inner(request, events, prepared.cancellation.clone())
+        conversation_stage("conversation_request", async {
+            conversation_stage("validate_prepared_request", async {
+                ensure!(
+                    !request.question.trim().is_empty(),
+                    "question must not be empty"
+                );
+                ensure!(
+                    request.request_id == prepared.request_id,
+                    "prepared request ID does not match the question"
+                );
+                ensure!(
+                    Arc::ptr_eq(&prepared.active, &self.active),
+                    "prepared request belongs to another conversation"
+                );
+                let registered = self
+                    .active
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("conversation cancellation lock is poisoned"))?
+                    .get(&prepared.request_id)
+                    .is_some_and(|token| token.same_request(&prepared.cancellation));
+                ensure!(registered, "prepared request is no longer active");
+                ensure_request_not_cancelled(&prepared.cancellation)
+            })
+            .await?;
+            self.ask_inner(
+                request,
+                events,
+                prepared.cancellation.clone(),
+                prepared.chat_generation.clone(),
+            )
             .await
+        })
+        .instrument(span)
+        .await
     }
 
     async fn ask_inner(
@@ -691,22 +739,27 @@ impl AgentConversation {
         request: ConversationQuestion,
         events: Option<mpsc::UnboundedSender<AgentRunEvent>>,
         cancellation: AgentCancellation,
+        chat_generation: ChatGenerationSettings,
     ) -> Result<ConversationAnswer> {
-        ensure_request_not_cancelled(&cancellation)?;
-        let scope = ChatScope::new(request.allowed_book_ids.iter().cloned())?;
-        match self.window_kind {
-            ChatWindowKind::Library => {}
-            ChatWindowKind::Reader | ChatWindowKind::Editor => {
-                let primary = self
-                    .primary_book_id
-                    .as_deref()
-                    .context("conversation primary book is missing")?;
-                ensure!(
-                    scope.contains(primary),
-                    "host scope does not contain the required current book"
-                );
+        let scope = conversation_stage("authorize_scope", async {
+            ensure_request_not_cancelled(&cancellation)?;
+            let scope = ChatScope::new(request.allowed_book_ids.iter().cloned())?;
+            match self.window_kind {
+                ChatWindowKind::Library => {}
+                ChatWindowKind::Reader | ChatWindowKind::Editor => {
+                    let primary = self
+                        .primary_book_id
+                        .as_deref()
+                        .context("conversation primary book is missing")?;
+                    ensure!(
+                        scope.contains(primary),
+                        "host scope does not contain the required current book"
+                    );
+                }
             }
-        }
+            Ok(scope)
+        })
+        .await?;
 
         // Resolve frozen editor text against the single shared library before
         // it reaches the provider. This is the trust transition that supplies
@@ -714,45 +767,59 @@ impl AgentConversation {
         // JSON alone is never a persistable source.
         let snapshot_scope = scope.clone();
         let snapshot_cancellation = cancellation.clone();
-        let snapshots = self
-            .services
-            .spawn_library_read(move |library| {
-                ensure_request_not_cancelled(&snapshot_cancellation)?;
-                authorize_selection_snapshots(library, &snapshot_scope, request.snapshots)
-            })
-            .await
-            .context("frozen selection authorization worker stopped")??;
+        let snapshots = conversation_stage("authorize_snapshots", async {
+            self.services
+                .spawn_library_read(move |library| {
+                    ensure_request_not_cancelled(&snapshot_cancellation)?;
+                    authorize_selection_snapshots(library, &snapshot_scope, request.snapshots)
+                })
+                .await
+                .context("frozen selection authorization worker stopped")?
+        })
+        .await?;
         ensure_request_not_cancelled(&cancellation)?;
 
         let repository = self.services.chat();
-        let (thread_id, previous) = self
-            .thread_and_history(&repository, &request.question, scope.clone())
-            .await?;
+        let (thread_id, previous) = conversation_stage(
+            "load_thread_history",
+            self.thread_and_history(&repository, &request.question, scope.clone()),
+        )
+        .await?;
+        tracing::debug!(target: "moye_ai", history_messages = previous.len(), "AI conversation history loaded");
         ensure_request_not_cancelled(&cancellation)?;
         let mut user_draft = NewChatMessage::text(ChatRole::User, request.question.clone());
         user_draft.parent_id = previous.last().map(|message| message.id.clone());
         ensure_request_not_cancelled(&cancellation)?;
-        let user_message = repository
-            .append_message(&thread_id, user_draft)
-            .await
-            .context("failed to persist the user question")?;
+        let user_message = conversation_stage("persist_user_question", async {
+            repository
+                .append_message(&thread_id, user_draft)
+                .await
+                .context("failed to persist the user question")
+        })
+        .await?;
         ensure_request_not_cancelled(&cancellation)?;
 
-        let settings = self.services.provider_settings()?;
-        let provider = self.services.provider()?;
-        let search = self.services.search()?;
-        let search_backend: Arc<dyn SearchBackend> = search;
-        let web_search = self.services.web_search_backend()?;
-        let runtime = AgentRuntime::for_database(
-            provider,
-            search_backend,
-            self.services.database_path(),
-            settings.chat_model.clone(),
-            web_search,
-        )?;
+        let (settings, runtime) = conversation_stage("configure_runtime", async {
+            let settings = self.services.provider_settings()?;
+            let provider = self.services.provider()?;
+            let search = self.services.search()?;
+            let search_backend: Arc<dyn SearchBackend> = search;
+            let web_search = self.services.web_search_backend()?;
+            let runtime = AgentRuntime::for_database(
+                provider,
+                search_backend,
+                self.services.database_path(),
+                settings.chat_model.clone(),
+                web_search,
+            )?
+            .with_chat_generation(chat_generation)?;
+            Ok((settings, runtime))
+        })
+        .await?;
         ensure_request_not_cancelled(&cancellation)?;
-        let answer = runtime
-            .answer(
+        let answer = conversation_stage(
+            "run_agent",
+            runtime.answer(
                 AgentQuestion {
                     question: request.question,
                     allowed_book_ids: scope.book_ids,
@@ -762,8 +829,9 @@ impl AgentConversation {
                 },
                 events,
                 cancellation.clone(),
-            )
-            .await?;
+            ),
+        )
+        .await?;
         ensure_request_not_cancelled(&cancellation)?;
 
         let citations = answer
@@ -788,19 +856,23 @@ impl AgentConversation {
                 source_title: citation.source_title.clone(),
             })
             .collect();
-        let stored_message = repository
-            .append_message(
-                &thread_id,
-                NewChatMessage {
-                    parent_id: Some(user_message.id),
-                    role: ChatRole::Assistant,
-                    content: answer.markdown.clone(),
-                    model: Some(settings.chat_model),
-                    citations,
-                },
-            )
-            .await
-            .context("failed to persist the AI answer")?;
+        tracing::debug!(target: "moye_ai", answer_bytes = answer.markdown.len(), citations = answer.citations.len(), "AI answer ready for persistence");
+        let stored_message = conversation_stage("persist_answer_citations", async {
+            repository
+                .append_message(
+                    &thread_id,
+                    NewChatMessage {
+                        parent_id: Some(user_message.id),
+                        role: ChatRole::Assistant,
+                        content: answer.markdown.clone(),
+                        model: Some(settings.chat_model),
+                        citations,
+                    },
+                )
+                .await
+                .context("failed to persist the AI answer")
+        })
+        .await?;
 
         Ok(ConversationAnswer {
             thread_id,
@@ -910,24 +982,49 @@ impl AgentConversation {
             return false;
         };
         let Some(token) = active.get(&request_id) else {
+            tracing::debug!(target: "moye_ai", request_id, window_kind = ?self.window_kind, "AI cancellation ignored for inactive request");
             return false;
         };
+        tracing::info!(target: "moye_ai", trace_id = token.trace_id(), request_id, window_kind = ?self.window_kind, "AI conversation cancellation requested");
         token.cancel();
         true
     }
 
     pub fn cancel_all(&self) {
         if let Ok(active) = self.active.lock() {
-            for token in active.values() {
+            for (request_id, token) in active.iter() {
+                tracing::info!(target: "moye_ai", trace_id = token.trace_id(), request_id, window_kind = ?self.window_kind, "AI conversation closing; cancelling request");
                 token.cancel();
             }
         }
     }
 }
 
+async fn conversation_stage<T>(
+    stage: &'static str,
+    future: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    let started = Instant::now();
+    tracing::debug!(target: "moye_ai", stage, "AI conversation stage started");
+    let result = future.await;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    match &result {
+        Ok(_) => {
+            tracing::debug!(target: "moye_ai", stage, elapsed_ms, "AI conversation stage completed")
+        }
+        Err(error) if error.is::<AgentRequestCancelled>() => {
+            tracing::debug!(target: "moye_ai", stage, elapsed_ms, error_kind = "cancelled", "AI conversation stage cancelled")
+        }
+        Err(error) => {
+            tracing::warn!(target: "moye_ai", stage, elapsed_ms, error_kind = error_kind(error), "AI conversation stage failed")
+        }
+    }
+    result
+}
+
 fn ensure_request_not_cancelled(cancellation: &AgentCancellation) -> Result<()> {
     if cancellation.is_cancelled() {
-        bail!("AI request was cancelled");
+        bail!(AgentRequestCancelled);
     }
     Ok(())
 }
@@ -1902,6 +1999,8 @@ mod tests {
             ))
             .expect_err("cancelled preparation must not run");
         assert!(error.to_string().contains("cancelled"));
+        assert!(error.is::<AgentRequestCancelled>());
+        assert_eq!(error_kind(&error), "cancelled");
         assert!(!conversation.cancel(41), "request lease must be removed");
 
         let threads = runtime

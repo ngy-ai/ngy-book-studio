@@ -4,18 +4,29 @@
 //! particular, nothing in this module assumes that the endpoint is Ollama;
 //! Ollama is merely the safe, loopback default.
 
-use std::{net::IpAddr, pin::Pin, time::Duration};
+use std::{
+    fmt,
+    net::IpAddr,
+    pin::Pin,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context as _, Result, bail, ensure};
 use futures_util::{FutureExt as _, Stream, StreamExt as _, future::BoxFuture, stream};
 use reqwest::{Client, Response, StatusCode, Url};
 use serde::{Deserialize, Serialize};
+use tracing::Instrument as _;
+
+use crate::ai_diagnostics::{error_kind, finish_reason_label, safe_label, tool_label};
 
 pub const DEFAULT_OLLAMA_OPENAI_BASE_URL: &str = "http://127.0.0.1:11434/v1/";
 pub const DEFAULT_AI_REQUEST_TIMEOUT_SECS: u64 = 120;
 pub const MIN_AI_REQUEST_TIMEOUT_SECS: u64 = 1;
 pub const MAX_AI_REQUEST_TIMEOUT_SECS: u64 = 600;
+pub const DEFAULT_CHAT_OUTPUT_TOKENS: u32 = 4096;
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+const MAX_CONTEXT_ERROR_DEPTH: usize = 8;
 const MAX_MODELS_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_MODEL_ENTRIES: usize = 4096;
 const MAX_MODEL_FIELD_BYTES: usize = 4096;
@@ -25,8 +36,109 @@ const MAX_EMBEDDING_DIMENSIONS: usize = 65_536;
 const MAX_CHAT_STREAM_BYTES: usize = 32 * 1024 * 1024;
 const MAX_CHAT_EVENT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CHAT_EVENTS: usize = 65_536;
+static NEXT_HTTP_ID: AtomicU64 = AtomicU64::new(1);
 
 pub type ChatEventStream = Pin<Box<dyn Stream<Item = Result<ChatStreamEvent>> + Send>>;
+
+/// A provider rejection received before a completion stream starts. Token
+/// counts describe the endpoint's tokenizer and active context configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextWindowExceeded {
+    pub prompt_tokens: Option<usize>,
+    pub context_tokens: Option<usize>,
+}
+
+impl fmt::Display for ContextWindowExceeded {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "模型服务的上下文容量不足")?;
+        match (self.prompt_tokens, self.context_tokens) {
+            (Some(prompt), Some(context)) => {
+                write!(formatter, "（输入 {prompt} tokens，上限 {context} tokens）")?;
+            }
+            (_, Some(context)) => write!(formatter, "（上限 {context} tokens）")?,
+            (Some(prompt), _) => write!(formatter, "（输入 {prompt} tokens）")?,
+            (None, None) => {}
+        }
+        write!(
+            formatter,
+            "。请缩短问题或选区、开启新对话，或在模型服务中增大上下文容量后重试。"
+        )
+    }
+}
+
+impl std::error::Error for ContextWindowExceeded {}
+
+/// The endpoint rejected model-generated arguments before starting SSE. This
+/// never authorizes the host to complete or execute the malformed arguments.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IncompleteToolArguments {
+    pub tool_name: String,
+}
+
+impl fmt::Display for IncompleteToolArguments {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "模型服务生成的 {} 工具参数不是完整 JSON（HTTP 500，unexpected end of JSON input）。请在 AI 设置中切换到支持工具调用的模型，或检查模型服务的工具调用模板与输出长度设置后重试。",
+            self.tool_name
+        )
+    }
+}
+
+impl std::error::Error for IncompleteToolArguments {}
+
+/// Optional sampling controls are omitted from requests when unset so the
+/// endpoint can use its own defaults. The user chooses a positive output limit
+/// appropriate for the model; the host does not impose a model-specific ceiling.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatGenerationSettings {
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub max_output_tokens: u32,
+    pub presence_penalty: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+}
+
+impl Default for ChatGenerationSettings {
+    fn default() -> Self {
+        Self {
+            temperature: Some(0.1),
+            top_p: None,
+            max_output_tokens: DEFAULT_CHAT_OUTPUT_TOKENS,
+            presence_penalty: None,
+            frequency_penalty: None,
+        }
+    }
+}
+
+impl ChatGenerationSettings {
+    pub fn validate(&self) -> Result<()> {
+        for (label, value, minimum, maximum) in [
+            ("温度（Temperature）", self.temperature, 0.0, 2.0),
+            ("核采样（Top P）", self.top_p, 0.0, 1.0),
+            (
+                "出现惩罚（Presence Penalty）",
+                self.presence_penalty,
+                -2.0,
+                2.0,
+            ),
+            (
+                "频率惩罚（Frequency Penalty）",
+                self.frequency_penalty,
+                -2.0,
+                2.0,
+            ),
+        ] {
+            ensure!(
+                value.is_none_or(|value| value.is_finite() && (minimum..=maximum).contains(&value)),
+                "{label} 必须是 {minimum}～{maximum} 之间的有限数字，或留空使用服务默认值"
+            );
+        }
+        ensure!(self.max_output_tokens > 0, "最大输出 token 数必须是正整数");
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderConfig {
@@ -239,6 +351,12 @@ pub struct ChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -408,46 +526,97 @@ impl OpenAiCompatibleProvider for OpenAiHttpProvider {
     }
 
     fn chat_stream(&self, request: ChatRequest) -> BoxFuture<'_, Result<ChatEventStream>> {
+        // Record only the endpoint origin: paths can contain tenant names or
+        // credentials even when query strings and userinfo are prohibited.
+        let span = tracing::info_span!(
+            target: "moye_ai",
+            "ai_http",
+            http_id = NEXT_HTTP_ID.fetch_add(1, Ordering::Relaxed),
+            operation = "chat_stream",
+            model = %safe_label(&request.model),
+            endpoint_scheme = self.base_url.scheme(),
+            endpoint_host = self.base_url.host_str().unwrap_or(""),
+            endpoint_port = self.base_url.port_or_known_default(),
+            timeout_secs = self.config.request_timeout_secs,
+            message_count = request.messages.len(),
+            tool_count = request.tools.len(),
+            max_tokens = request.max_tokens,
+            temperature = request.temperature,
+            reasoning_effort = ?request.reasoning_effort,
+            request_body_bytes = tracing::field::Empty,
+        );
         async move {
-            if request.model.trim().is_empty() {
-                bail!("chat model is required");
-            }
-            if request.messages.is_empty() {
-                bail!("at least one chat message is required");
-            }
+            let started_at = Instant::now();
+            let result = async {
+                if request.model.trim().is_empty() {
+                    bail!("chat model is required");
+                }
+                if request.messages.is_empty() {
+                    bail!("at least one chat message is required");
+                }
 
-            let mut body =
-                serde_json::to_value(&request).context("failed to encode chat request")?;
-            let object = body
-                .as_object_mut()
-                .context("chat request must be an object")?;
-            object.insert("stream".to_string(), serde_json::Value::Bool(true));
-            object.insert(
-                "stream_options".to_string(),
-                serde_json::json!({ "include_usage": true }),
-            );
-            if !request.tools.is_empty() {
+                let mut body =
+                    serde_json::to_value(&request).context("failed to encode chat request")?;
+                let object = body
+                    .as_object_mut()
+                    .context("chat request must be an object")?;
+                object.insert("stream".to_string(), serde_json::Value::Bool(true));
                 object.insert(
-                    "tool_choice".to_string(),
-                    serde_json::Value::String("auto".into()),
+                    "stream_options".to_string(),
+                    serde_json::json!({ "include_usage": true }),
+                );
+                if !request.tools.is_empty() {
+                    object.insert(
+                        "tool_choice".to_string(),
+                        serde_json::Value::String("auto".into()),
+                    );
+                }
+
+                let http_request = self
+                    .authorized(self.client.post(self.endpoint("chat/completions")?))
+                    .json(&body)
+                    .build()
+                    .context("failed to start streaming chat completion")?;
+                let request_body_bytes = http_request
+                    .body()
+                    .and_then(reqwest::Body::as_bytes)
+                    .map_or(0, <[u8]>::len);
+                tracing::Span::current().record("request_body_bytes", request_body_bytes);
+                tracing::debug!(target: "moye_ai", stage = "http_send", "Sending AI chat request");
+                let response = self
+                    .client
+                    .execute(http_request)
+                    .await
+                    .context("failed to start streaming chat completion")?;
+                let response = checked_response(response).await?;
+                if response
+                    .content_length()
+                    .is_some_and(|length| length > MAX_CHAT_STREAM_BYTES as u64)
+                {
+                    bail!("AI chat stream exceeds the {MAX_CHAT_STREAM_BYTES}-byte limit");
+                }
+                tracing::debug!(
+                    target: "moye_ai",
+                    stage = "http_started",
+                    http_status = response.status().as_u16(),
+                    elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    "AI chat response stream started"
+                );
+                Ok(bounded_chat_sse_stream(response, SseLimits::CHAT))
+            }
+            .await;
+            if let Err(error) = &result {
+                tracing::warn!(
+                    target: "moye_ai",
+                    stage = "http_start_failed",
+                    error_kind = error_kind(error),
+                    elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    "AI chat response stream failed to start"
                 );
             }
-
-            let response = self
-                .authorized(self.client.post(self.endpoint("chat/completions")?))
-                .json(&body)
-                .send()
-                .await
-                .context("failed to start streaming chat completion")?;
-            let response = checked_response(response).await?;
-            if response
-                .content_length()
-                .is_some_and(|length| length > MAX_CHAT_STREAM_BYTES as u64)
-            {
-                bail!("AI chat stream exceeds the {MAX_CHAT_STREAM_BYTES}-byte limit");
-            }
-            Ok(bounded_chat_sse_stream(response, SseLimits::CHAT))
+            result
         }
+        .instrument(span)
         .boxed()
     }
 
@@ -492,12 +661,235 @@ async fn checked_response(response: reqwest::Response) -> Result<reqwest::Respon
         return Ok(response);
     }
     let body = read_error_body_prefix(response, MAX_ERROR_BODY_BYTES).await;
+    let envelope = serde_json::from_slice::<serde_json::Value>(&body).ok();
+    let provider_field = |field| {
+        envelope
+            .as_ref()
+            .and_then(|value| value.get("error"))
+            .and_then(|error| error.get(field))
+            .and_then(serde_json::Value::as_str)
+            .map(provider_error_label)
+    };
+    tracing::warn!(
+        target: "moye_ai",
+        stage = "http_rejected",
+        http_status = status.as_u16(),
+        error_body_bytes = body.len(),
+        error_body_at_limit = body.len() >= MAX_ERROR_BODY_BYTES,
+        error_json_valid = envelope.is_some(),
+        provider_code = ?provider_field("code"),
+        provider_type = ?provider_field("type"),
+        "AI endpoint rejected the request"
+    );
+    if let Some(error) = parse_context_window_error(status, &body) {
+        tracing::debug!(
+            target: "moye_ai",
+            stage = "http_error_classified",
+            error_kind = "context_window_exceeded",
+            prompt_tokens = error.prompt_tokens,
+            context_tokens = error.context_tokens,
+            "AI endpoint reported insufficient context capacity"
+        );
+        return Err(error.into());
+    }
+    if let Some(error) = parse_incomplete_tool_arguments(status, &body) {
+        tracing::debug!(
+            target: "moye_ai",
+            stage = "http_error_classified",
+            error_kind = "incomplete_tool_arguments",
+            tool = tool_label(&error.tool_name),
+            "AI endpoint reported incomplete tool arguments"
+        );
+        return Err(error.into());
+    }
     let detail = String::from_utf8_lossy(&body);
     bail!(
         "AI endpoint returned {}: {}",
         display_status(status),
         detail.trim()
     );
+}
+
+/// Only protocol identifiers can leave the error envelope through diagnostics.
+/// An arbitrary identifier-shaped string can still contain private data.
+fn provider_error_label(value: &str) -> &'static str {
+    match value {
+        "api_error" => "api_error",
+        "invalid_request_error" => "invalid_request_error",
+        "authentication_error" => "authentication_error",
+        "permission_error" => "permission_error",
+        "not_found_error" => "not_found_error",
+        "rate_limit_error" => "rate_limit_error",
+        "server_error" => "server_error",
+        "internal_server_error" => "internal_server_error",
+        "overloaded_error" => "overloaded_error",
+        "context_length_exceeded" => "context_length_exceeded",
+        "exceed_context_size_error" => "exceed_context_size_error",
+        "model_not_found" => "model_not_found",
+        "invalid_api_key" => "invalid_api_key",
+        "rate_limit_exceeded" => "rate_limit_exceeded",
+        "insufficient_quota" => "insufficient_quota",
+        _ => "other",
+    }
+}
+
+fn parse_incomplete_tool_arguments(
+    status: StatusCode,
+    body: &[u8],
+) -> Option<IncompleteToolArguments> {
+    if status != StatusCode::INTERNAL_SERVER_ERROR || body.len() > MAX_ERROR_BODY_BYTES {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    // Match only the known endpoint error envelope, never echoed requests or
+    // arbitrary JSON-error substrings in another server failure.
+    let message = value.get("error")?.get("message")?.as_str()?;
+    let tool_name = message
+        .strip_prefix("llama-server returned invalid tool call arguments for \"")?
+        .strip_suffix("\": unexpected end of JSON input")?;
+    if tool_name.is_empty()
+        || tool_name.len() > 64
+        || !tool_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return None;
+    }
+    Some(IncompleteToolArguments {
+        tool_name: tool_name.to_string(),
+    })
+}
+
+fn parse_context_window_error(status: StatusCode, body: &[u8]) -> Option<ContextWindowExceeded> {
+    if !matches!(
+        status,
+        StatusCode::BAD_REQUEST | StatusCode::PAYLOAD_TOO_LARGE
+    ) || body.len() > MAX_ERROR_BODY_BYTES
+    {
+        return None;
+    }
+    let text = std::str::from_utf8(body).ok()?.trim();
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(value) => context_error_value(&value, 0),
+        Err(_) if text.starts_with(['{', '[', '"']) => None,
+        Err(_) => context_error_message(text),
+    }
+}
+
+fn context_error_value(value: &serde_json::Value, depth: usize) -> Option<ContextWindowExceeded> {
+    if depth >= MAX_CONTEXT_ERROR_DEPTH {
+        return None;
+    }
+    match value {
+        serde_json::Value::Object(object) => {
+            // Follow only error envelopes. Arbitrary request echoes must not
+            // turn an unrelated 400 into a retryable context rejection.
+            let mut error = ["error", "message"]
+                .iter()
+                .filter_map(|key| object.get(*key))
+                .find_map(|nested| context_error_value(nested, depth + 1))
+                .or_else(|| {
+                    ["code", "type"]
+                        .iter()
+                        .filter_map(|key| object.get(*key)?.as_str())
+                        .any(|code| {
+                            matches!(
+                                code,
+                                "context_length_exceeded" | "exceed_context_size_error"
+                            )
+                        })
+                        .then_some(ContextWindowExceeded {
+                            prompt_tokens: None,
+                            context_tokens: None,
+                        })
+                })?;
+            error.prompt_tokens =
+                context_token_count(object, &["n_prompt_tokens", "prompt_tokens"])
+                    .or(error.prompt_tokens);
+            error.context_tokens = context_token_count(
+                object,
+                &[
+                    "n_ctx",
+                    "context_tokens",
+                    "context_length",
+                    "max_context_length",
+                    "max_context_tokens",
+                ],
+            )
+            .or(error.context_tokens);
+            Some(error)
+        }
+        serde_json::Value::String(message) => {
+            let message = message.trim();
+            if message.starts_with(['{', '[', '"']) {
+                let nested = serde_json::from_str::<serde_json::Value>(message).ok()?;
+                context_error_value(&nested, depth + 1)
+            } else {
+                context_error_message(message)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn context_token_count(
+    object: &serde_json::Map<String, serde_json::Value>,
+    names: &[&str],
+) -> Option<usize> {
+    names
+        .iter()
+        .filter_map(|name| object.get(*name)?.as_u64())
+        .filter_map(|count| usize::try_from(count).ok())
+        .find(|count| *count > 0)
+}
+
+fn context_error_message(message: &str) -> Option<ContextWindowExceeded> {
+    let message = message.to_ascii_lowercase();
+    let is_context_error = message.contains("exceeds the available context size")
+        || (message.contains("maximum context length")
+            && ["exceed", "requested", "resulted in"]
+                .iter()
+                .any(|phrase| message.contains(phrase)))
+        || (message.contains("context window")
+            && ["exceeded", "too large", "too long"]
+                .iter()
+                .any(|phrase| message.contains(phrase)));
+    if !is_context_error {
+        return None;
+    }
+    Some(ContextWindowExceeded {
+        prompt_tokens: tokens_after_phrase(
+            &message,
+            &["request (", "messages resulted in", "prompt contains"],
+        ),
+        context_tokens: tokens_after_phrase(
+            &message,
+            &[
+                "available context size (",
+                "maximum context length is",
+                "maximum context length:",
+                "context window is",
+            ],
+        ),
+    })
+}
+
+fn tokens_after_phrase(message: &str, phrases: &[&str]) -> Option<usize> {
+    phrases.iter().find_map(|phrase| {
+        let start = message.find(phrase)? + phrase.len();
+        let suffix = message[start..].trim_start();
+        let digits = suffix.bytes().take_while(u8::is_ascii_digit).count();
+        // Never interpret a fractional, scientific, or grouped value as a
+        // smaller integer token count.
+        if suffix
+            .as_bytes()
+            .get(digits)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b',' | b'_'))
+        {
+            return None;
+        }
+        suffix[..digits].parse::<usize>().ok().filter(|n| *n > 0)
+    })
 }
 
 async fn read_success_body_limited(
@@ -539,8 +931,20 @@ async fn read_error_body_prefix(response: Response, max_bytes: usize) -> Vec<u8>
     let mut stream = response.bytes_stream();
     let mut body = Vec::new();
     while body.len() < max_bytes {
-        let Some(Ok(chunk)) = stream.next().await else {
-            break;
+        let chunk = match stream.next().await {
+            Some(Ok(chunk)) => chunk,
+            Some(Err(error)) => {
+                let error = anyhow::Error::from(error);
+                tracing::warn!(
+                    target: "moye_ai",
+                    stage = "http_error_body_read_failed",
+                    error_kind = error_kind(&error),
+                    error_body_bytes = body.len(),
+                    "AI endpoint error body could not be read completely"
+                );
+                break;
+            }
+            None => break,
         };
         let remaining = max_bytes - body.len();
         body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
@@ -807,10 +1211,131 @@ fn append_sse_data_line(output: &mut Vec<u8>, line: &[u8], max_bytes: usize) -> 
 
 fn bounded_chat_sse_stream(response: Response, limits: SseLimits) -> ChatEventStream {
     let state = BoundedSseState::new(response.bytes_stream(), limits);
-    let stream = stream::try_unfold(state, |mut state| async move {
-        Ok(state.next_event().await?.map(|event| (event, state)))
+    let diagnostics = SseDiagnostics::new();
+    let span = tracing::Span::current();
+    let stream = stream::try_unfold((state, diagnostics), move |(mut state, mut diagnostics)| {
+        let span = span.clone();
+        async move {
+            let result = state.next_event().await;
+            match &result {
+                Ok(Some(event)) => {
+                    diagnostics.observe(event);
+                    // Consumers can stop polling as soon as [DONE] arrives.
+                    if event.done {
+                        diagnostics.finish("done", state.total_bytes, state.event_count, None);
+                    }
+                }
+                Ok(None) => {
+                    diagnostics.finish("eof", state.total_bytes, state.event_count, None);
+                }
+                Err(error) => {
+                    diagnostics.finish("failed", state.total_bytes, state.event_count, Some(error));
+                }
+            }
+            Ok(result?.map(|event| (event, (state, diagnostics))))
+        }
+        .instrument(span)
     });
     Box::pin(stream)
+}
+
+/// Constant-size stream diagnostics. No event payloads or generated arguments
+/// are retained here, and there is no log entry for each token/chunk.
+struct SseDiagnostics {
+    started_at: Instant,
+    first_event_ms: Option<u64>,
+    content_bytes: usize,
+    tool_delta_count: usize,
+    tool_argument_bytes: usize,
+    finish_reason: Option<&'static str>,
+    usage: Option<Usage>,
+    finished: bool,
+}
+
+impl SseDiagnostics {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            first_event_ms: None,
+            content_bytes: 0,
+            tool_delta_count: 0,
+            tool_argument_bytes: 0,
+            finish_reason: None,
+            usage: None,
+            finished: false,
+        }
+    }
+
+    fn observe(&mut self, event: &ChatStreamEvent) {
+        self.first_event_ms
+            .get_or_insert_with(|| self.started_at.elapsed().as_millis() as u64);
+        self.content_bytes = self
+            .content_bytes
+            .saturating_add(event.content_delta.as_ref().map_or(0, String::len));
+        self.tool_delta_count = self
+            .tool_delta_count
+            .saturating_add(event.tool_call_deltas.len());
+        for delta in &event.tool_call_deltas {
+            self.tool_argument_bytes = self
+                .tool_argument_bytes
+                .saturating_add(delta.arguments_delta.as_ref().map_or(0, String::len));
+        }
+        if let Some(reason) = &event.finish_reason {
+            self.finish_reason = Some(finish_reason_label(reason));
+        }
+        if let Some(usage) = &event.usage {
+            self.usage = Some(usage.clone());
+        }
+    }
+
+    fn finish(
+        &mut self,
+        outcome: &'static str,
+        wire_bytes: usize,
+        event_count: usize,
+        error: Option<&anyhow::Error>,
+    ) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        let json_error = error.and_then(|error| {
+            error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<serde_json::Error>())
+        });
+        if let Some(error) = error {
+            tracing::warn!(
+                target: "moye_ai",
+                stage = "sse_failed",
+                error_kind = error_kind(error),
+                json_error_category = ?json_error.map(serde_json::Error::classify),
+                json_error_line = json_error.map(serde_json::Error::line),
+                json_error_column = json_error.map(serde_json::Error::column),
+                wire_bytes,
+                event_count,
+                elapsed_ms = self.started_at.elapsed().as_millis() as u64,
+                "AI response stream failed"
+            );
+        }
+        tracing::debug!(
+            target: "moye_ai",
+            stage = "sse_finished",
+            outcome,
+            wire_bytes,
+            event_count,
+            content_bytes = self.content_bytes,
+            tool_delta_count = self.tool_delta_count,
+            tool_argument_bytes = self.tool_argument_bytes,
+            finish_reason = ?self.finish_reason,
+            first_event_ms = self.first_event_ms,
+            elapsed_ms = self.started_at.elapsed().as_millis() as u64,
+            prompt_tokens = self.usage.as_ref().map(|usage| usage.prompt_tokens),
+            completion_tokens = self.usage.as_ref().map(|usage| usage.completion_tokens),
+            total_tokens = self.usage.as_ref().map(|usage| usage.total_tokens),
+            "AI response stream summary"
+        );
+    }
 }
 
 fn display_status(status: StatusCode) -> String {
@@ -899,6 +1424,325 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_generation_settings_validate_boundaries_and_reject_non_finite_numbers() {
+        ChatGenerationSettings::default().validate().unwrap();
+        for settings in [
+            ChatGenerationSettings {
+                temperature: None,
+                top_p: None,
+                max_output_tokens: 1,
+                presence_penalty: None,
+                frequency_penalty: None,
+            },
+            ChatGenerationSettings {
+                temperature: Some(0.0),
+                top_p: Some(0.0),
+                max_output_tokens: 1,
+                presence_penalty: Some(-2.0),
+                frequency_penalty: Some(-2.0),
+            },
+            ChatGenerationSettings {
+                temperature: Some(2.0),
+                top_p: Some(1.0),
+                max_output_tokens: DEFAULT_CHAT_OUTPUT_TOKENS,
+                presence_penalty: Some(2.0),
+                frequency_penalty: Some(2.0),
+            },
+        ] {
+            settings.validate().unwrap();
+        }
+        for (field, minimum, maximum) in
+            [(0, 0.0, 2.0), (1, 0.0, 1.0), (2, -2.0, 2.0), (3, -2.0, 2.0)]
+        {
+            for value in [
+                minimum - 0.1,
+                maximum + 0.1,
+                f32::NAN,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+            ] {
+                let mut settings = ChatGenerationSettings::default();
+                match field {
+                    0 => settings.temperature = Some(value),
+                    1 => settings.top_p = Some(value),
+                    2 => settings.presence_penalty = Some(value),
+                    _ => settings.frequency_penalty = Some(value),
+                }
+                assert!(
+                    settings.validate().is_err(),
+                    "field {field} accepted {value}"
+                );
+            }
+        }
+        for max_output_tokens in [DEFAULT_CHAT_OUTPUT_TOKENS + 1, 65_536, 131_072, u32::MAX] {
+            ChatGenerationSettings {
+                max_output_tokens,
+                ..Default::default()
+            }
+            .validate()
+            .unwrap();
+        }
+        assert!(
+            ChatGenerationSettings {
+                max_output_tokens: 0,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        let mut value = serde_json::to_value(ChatGenerationSettings::default()).unwrap();
+        value["unsupported"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<ChatGenerationSettings>(value).is_err());
+    }
+
+    #[test]
+    fn chat_request_omits_unset_sampling_parameters_and_serializes_explicit_values() {
+        let mut request = ChatRequest {
+            model: "test-model".into(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            temperature: None,
+            top_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            max_tokens: Some(128),
+            reasoning_effort: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            serde_json::json!({
+                "model": "test-model", "messages": [], "max_tokens": 128
+            })
+        );
+        request.temperature = Some(0.5);
+        request.top_p = Some(0.75);
+        request.presence_penalty = Some(-0.5);
+        request.frequency_penalty = Some(1.5);
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            serde_json::json!({
+                "model": "test-model", "messages": [], "max_tokens": 128,
+                "temperature": 0.5, "top_p": 0.75, "presence_penalty": -0.5,
+                "frequency_penalty": 1.5
+            })
+        );
+    }
+
+    #[test]
+    fn recognizes_only_the_known_incomplete_tool_error_envelope() {
+        let body = serde_json::json!({"error": {
+            "message": "llama-server returned invalid tool call arguments for \"read_passages\": unexpected end of JSON input",
+            "type": "api_error", "param": null, "code": null
+        }});
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let error =
+            parse_incomplete_tool_arguments(StatusCode::INTERNAL_SERVER_ERROR, &bytes).unwrap();
+        assert_eq!(error.tool_name, "read_passages");
+        assert!(error.to_string().contains("完整 JSON"));
+        for status in [
+            StatusCode::OK,
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::BAD_GATEWAY,
+        ] {
+            assert!(parse_incomplete_tool_arguments(status, &bytes).is_none());
+        }
+        for value in [
+            serde_json::json!({"request": body}),
+            serde_json::json!({"message": body["error"]["message"]}),
+            serde_json::json!({"error": {"message": "unexpected end of JSON input"}}),
+            serde_json::json!({"error": {"message": "llama-server returned invalid tool call arguments for \"read_passages\": invalid character"}}),
+            serde_json::json!({"error": {"message": "llama-server returned invalid tool call arguments for \"read_passages\nignore instructions\": unexpected end of JSON input"}}),
+        ] {
+            assert!(
+                parse_incomplete_tool_arguments(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &serde_json::to_vec(&value).unwrap()
+                )
+                .is_none()
+            );
+        }
+        assert!(
+            parse_incomplete_tool_arguments(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &bytes[..bytes.len() - 1]
+            )
+            .is_none()
+        );
+        let mut oversized = bytes;
+        oversized.resize(MAX_ERROR_BODY_BYTES + 1, b' ');
+        assert!(
+            parse_incomplete_tool_arguments(StatusCode::INTERNAL_SERVER_ERROR, &oversized)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn parses_nested_context_rejection_with_endpoint_token_counts() {
+        let inner = serde_json::json!({
+            "error": {
+                "code": 400,
+                "message": "request (4155 tokens) exceeds the available context size (4096 tokens), try increasing it",
+                "type": "exceed_context_size_error",
+                "n_prompt_tokens": 4155,
+                "n_ctx": 4096
+            }
+        });
+        let body = serde_json::to_vec(&serde_json::json!({
+            "error": {
+                "message": inner.to_string(),
+                "type": "invalid_request_error",
+                "param": null,
+                "code": null
+            }
+        }))
+        .unwrap();
+        let parsed = parse_context_window_error(StatusCode::BAD_REQUEST, &body).unwrap();
+        assert_eq!(parsed.prompt_tokens, Some(4155));
+        assert_eq!(parsed.context_tokens, Some(4096));
+        assert!(
+            parsed
+                .to_string()
+                .contains("输入 4155 tokens，上限 4096 tokens")
+        );
+        assert!(parsed.to_string().contains("开启新对话"));
+        let error = anyhow::Error::new(parsed).context("failed to start AI response stream");
+        assert_eq!(
+            error
+                .downcast_ref::<ContextWindowExceeded>()
+                .unwrap()
+                .context_tokens,
+            Some(4096)
+        );
+    }
+
+    #[test]
+    fn parses_standard_context_rejections_without_guessing_output_as_input() {
+        let body = br#"{"error":{"code":"context_length_exceeded","type":"invalid_request_error","message":"This model's maximum context length is 4096 tokens. However, your messages resulted in 4155 tokens."}}"#;
+        let error = parse_context_window_error(StatusCode::BAD_REQUEST, body).unwrap();
+        assert_eq!(error.prompt_tokens, Some(4155));
+        assert_eq!(error.context_tokens, Some(4096));
+        let requested = br#"{"error":{"message":"This model's maximum context length is 4096 tokens. However, you requested 8000 tokens (4000 in messages, 4000 in completion)."}}"#;
+        let error = parse_context_window_error(StatusCode::BAD_REQUEST, requested).unwrap();
+        assert_eq!(error.prompt_tokens, None);
+        assert_eq!(error.context_tokens, Some(4096));
+        let plain = b"request (4155 tokens) exceeds the available context size (4096 tokens)";
+        assert_eq!(
+            parse_context_window_error(StatusCode::PAYLOAD_TOO_LARGE, plain),
+            Some(ContextWindowExceeded {
+                prompt_tokens: Some(4155),
+                context_tokens: Some(4096),
+            })
+        );
+    }
+
+    #[test]
+    fn does_not_reclassify_unrelated_http_errors_or_request_echoes() {
+        for body in [
+            br#"{"error":{"code":"invalid_request_error","message":"Unsupported reasoning_effort value"}}"#.as_slice(),
+            br#"{"error":{"message":"Invalid context_length parameter"}}"#.as_slice(),
+            br#"{"error":{"message":"Payload too large"}}"#.as_slice(),
+            br#"{"request":{"message":"request (4155 tokens) exceeds the available context size (4096 tokens)"},"error":{"message":"Invalid model"}}"#.as_slice(),
+            br#"{"error":{"code":"prefix_context_length_exceeded_suffix"}}"#.as_slice(),
+        ] {
+            assert!(parse_context_window_error(StatusCode::BAD_REQUEST, body).is_none());
+            assert!(parse_context_window_error(StatusCode::PAYLOAD_TOO_LARGE, body).is_none());
+        }
+        let body = br#"{"error":{"code":"context_length_exceeded"}}"#;
+        for status in [
+            StatusCode::OK,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert!(parse_context_window_error(status, body).is_none());
+        }
+    }
+
+    #[test]
+    fn context_error_parsing_rejects_invalid_or_excessively_nested_envelopes() {
+        for body in [
+            b"{broken JSON: exceeds the available context size".as_slice(),
+            br#"{"error":{"message":"{not JSON: exceeds the available context size"}}"#.as_slice(),
+            br#"[{"code":"context_length_exceeded"}]"#.as_slice(),
+            b"\xffexceeds the available context size".as_slice(),
+        ] {
+            assert!(parse_context_window_error(StatusCode::BAD_REQUEST, body).is_none());
+        }
+        let mut nested = serde_json::json!({"code": "context_length_exceeded"});
+        for _ in 0..MAX_CONTEXT_ERROR_DEPTH {
+            nested = serde_json::json!({"error": nested});
+        }
+        assert!(
+            parse_context_window_error(
+                StatusCode::BAD_REQUEST,
+                &serde_json::to_vec(&nested).unwrap()
+            )
+            .is_none()
+        );
+        let mut encoded = serde_json::json!({"code": "context_length_exceeded"});
+        for _ in 0..MAX_CONTEXT_ERROR_DEPTH {
+            encoded = serde_json::json!({"message": encoded.to_string()});
+        }
+        assert!(
+            parse_context_window_error(
+                StatusCode::BAD_REQUEST,
+                &serde_json::to_vec(&encoded).unwrap()
+            )
+            .is_none()
+        );
+        let oversized = format!(
+            "request (4155 tokens) exceeds the available context size (4096 tokens){}",
+            " ".repeat(MAX_ERROR_BODY_BYTES)
+        );
+        assert!(
+            parse_context_window_error(StatusCode::BAD_REQUEST, oversized.as_bytes()).is_none()
+        );
+    }
+
+    #[test]
+    fn context_token_counts_reject_invalid_numeric_values_without_overflow() {
+        for value in [
+            "0",
+            "-1",
+            "1.5",
+            "1e30",
+            "18446744073709551616",
+            "null",
+            "\"4096\"",
+        ] {
+            let body = format!(
+                "{{\"error\":{{\"type\":\"exceed_context_size_error\",\"n_prompt_tokens\":{value},\"n_ctx\":{value}}}}}"
+            );
+            let error =
+                parse_context_window_error(StatusCode::BAD_REQUEST, body.as_bytes()).unwrap();
+            assert_eq!(error.prompt_tokens, None, "{value}");
+            assert_eq!(error.context_tokens, None, "{value}");
+        }
+        let body = serde_json::to_vec(&serde_json::json!({
+            "error": {
+                "code": "context_length_exceeded",
+                "prompt_tokens": usize::MAX,
+                "context_tokens": 1
+            }
+        }))
+        .unwrap();
+        let error = parse_context_window_error(StatusCode::BAD_REQUEST, &body).unwrap();
+        assert_eq!(error.prompt_tokens, Some(usize::MAX));
+        assert_eq!(error.context_tokens, Some(1));
+        for value in ["0", "-1", "1.5", "1e30", "4,096", "18446744073709551616"] {
+            let body = format!(
+                "request ({value} tokens) exceeds the available context size ({value} tokens)"
+            );
+            let error =
+                parse_context_window_error(StatusCode::BAD_REQUEST, body.as_bytes()).unwrap();
+            assert_eq!(error.prompt_tokens, None, "{value}");
+            assert_eq!(error.context_tokens, None, "{value}");
+        }
+    }
 
     fn sse_state(
         bytes: Vec<u8>,

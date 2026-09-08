@@ -1155,6 +1155,9 @@ fn vision_request(model: &str, image_url: String) -> ChatRequest {
         }],
         tools: Vec::new(),
         temperature: Some(0.0),
+        top_p: None,
+        presence_penalty: None,
+        frequency_penalty: None,
         max_tokens: Some(1_500),
         reasoning_effort: None,
     }
@@ -2049,6 +2052,11 @@ mod tests {
             let mut library =
                 LibraryStore::load_from_with_runtime(temp.path().to_path_buf(), runtime.clone())
                     .unwrap();
+            // These tests exercise queue/run semantics, so new derivative jobs
+            // must be created queued instead of relying on the product default.
+            library
+                .background_job_auto_run_flag()
+                .store(true, Ordering::Release);
             let book = library.create_book("Index test", "Author").unwrap();
             let db_path = temp.path().join(db::DATABASE_FILE);
             let conn = db::open_conn(&db_path).unwrap();

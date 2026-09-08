@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -25,8 +25,9 @@ use crate::windows_pdf_renderer::WindowsPdfRenderer;
 use crate::{
     agent::WebSearchBackend,
     ai::{
-        DEFAULT_AI_REQUEST_TIMEOUT_SECS, DEFAULT_OLLAMA_OPENAI_BASE_URL, ModelInfo,
-        OpenAiCompatibleProvider, OpenAiHttpProvider, ProviderConfig, normalize_provider_base_url,
+        ChatGenerationSettings, DEFAULT_AI_REQUEST_TIMEOUT_SECS, DEFAULT_OLLAMA_OPENAI_BASE_URL,
+        ModelInfo, OpenAiCompatibleProvider, OpenAiHttpProvider, ProviderConfig,
+        normalize_provider_base_url,
     },
     chat::ChatRepository,
     credentials::{CredentialStore, SystemCredentialStore},
@@ -49,6 +50,8 @@ use crate::{
 
 const OBJECT_DIRECTORY: &str = "objects";
 const PROVIDER_SETTINGS_KEY: &str = "ai.openai_compatible.provider.v1";
+const CHAT_GENERATION_SETTINGS_KEY: &str = "ai.openai_compatible.chat_generation.v1";
+const BACKGROUND_JOB_SETTINGS_KEY: &str = "background_jobs.preferences.v1";
 const WEB_SEARCH_CREDENTIAL_TARGET: &str = "ai.openai_compatible.web_search.v1";
 const MAX_MODEL_NAME_CHARS: usize = 256;
 #[cfg(target_os = "windows")]
@@ -60,13 +63,42 @@ pub const DEFAULT_CHAT_MODEL: &str = "qwen3.5:0.8b";
 pub const DEFAULT_EMBEDDING_MODEL: &str = "qwen3-embedding:0.6b";
 pub const DEFAULT_VISION_MODEL: &str = "qwen3.5:0.8b";
 
+/// New derivative jobs start paused until the user opts into automatic
+/// execution in the AI settings window.
+pub(crate) const DEFAULT_AUTO_RUN_BACKGROUND_JOBS: bool = false;
+
+fn default_auto_run_background_jobs() -> bool {
+    DEFAULT_AUTO_RUN_BACKGROUND_JOBS
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedBackgroundJobSettings {
+    auto_run: bool,
+}
+
+impl Default for PersistedBackgroundJobSettings {
+    fn default() -> Self {
+        Self {
+            auto_run: default_auto_run_background_jobs(),
+        }
+    }
+}
+
 /// Persisted provider choices. Secrets intentionally cannot be represented by
 /// this type; API keys live behind [`CredentialStore`].
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderSettings {
     pub base_url: String,
     pub chat_model: String,
+    /// Stored under its own settings key and combined here for the UI/runtime.
+    #[serde(skip)]
+    pub chat_generation: ChatGenerationSettings,
+    /// Stored under its own settings key so the established provider JSON
+    /// contract remains unchanged.
+    #[serde(skip, default = "default_auto_run_background_jobs")]
+    pub auto_run_background_jobs: bool,
     pub embedding_model: String,
     pub vision_model: String,
     pub remote_content_confirmed: bool,
@@ -122,6 +154,8 @@ impl Default for ProviderSettings {
         Self {
             base_url: DEFAULT_OLLAMA_OPENAI_BASE_URL.to_string(),
             chat_model: DEFAULT_CHAT_MODEL.to_string(),
+            chat_generation: ChatGenerationSettings::default(),
+            auto_run_background_jobs: default_auto_run_background_jobs(),
             embedding_model: DEFAULT_EMBEDDING_MODEL.to_string(),
             vision_model: DEFAULT_VISION_MODEL.to_string(),
             remote_content_confirmed: false,
@@ -147,6 +181,7 @@ impl ProviderSettings {
         validate_model_name("chat", &self.chat_model)?;
         validate_model_name("embedding", &self.embedding_model)?;
         validate_model_name("vision", &self.vision_model)?;
+        self.chat_generation.validate()?;
         self.provider_config(None).validated_base_url()?;
         // Validate the web endpoint eagerly so a malformed configuration is
         // caught at save time instead of silently disabling the fallback.
@@ -402,6 +437,7 @@ pub struct AppServices {
     data_dir: PathBuf,
     db_path: PathBuf,
     library: Arc<Mutex<LibraryStore>>,
+    learning: Arc<crate::learning::LearningService>,
     library_generation: Arc<AtomicU64>,
     library_mutations: Arc<LibraryMutationQueue>,
     blobs: Arc<LocalBlobStore>,
@@ -412,6 +448,7 @@ pub struct AppServices {
     ai: RwLock<AiServices>,
     office: Arc<dyn OfficeEnhancer>,
     indexing: Arc<IndexingCoordinator>,
+    auto_run_background_jobs: Arc<AtomicBool>,
     visual_jobs: RwLock<Option<Arc<VisualJobCoordinator>>>,
     visual_renderer_descriptors: RwLock<Vec<RendererDescriptor>>,
     runtime: IoRuntime,
@@ -426,6 +463,10 @@ impl std::fmt::Debug for AppServices {
             .field("formats", &self.formats)
             .field("ai", &self.ai)
             .field("indexing", &self.indexing)
+            .field(
+                "auto_run_background_jobs",
+                &self.auto_run_background_jobs.load(Ordering::Acquire),
+            )
             .field("has_visual_jobs", &self.visual_jobs().is_some())
             .finish_non_exhaustive()
     }
@@ -451,14 +492,20 @@ impl AppServices {
             )
         })?;
         let db_path = data_dir.join(db::DATABASE_FILE);
+        let learning = Arc::new(crate::learning::LearningService::new(
+            data_dir.join("learning"),
+            runtime.clone(),
+        ));
         let blobs = Arc::new(LocalBlobStore::new(data_dir.join(OBJECT_DIRECTORY))?);
         let formats = Arc::new(FormatRegistry::with_builtin_importers());
         let blob_publication = library.blob_publication_lock();
+        let auto_run_background_jobs = library.background_job_auto_run_flag();
         let library = Arc::new(Mutex::new(library));
         let library_generation = Arc::new(AtomicU64::new(0));
         let library_mutations = Arc::new(LibraryMutationQueue::new(&runtime.handle()));
         let chat = ChatRepository::new(db_path.clone(), runtime.clone());
         let settings = load_provider_settings(&db_path)?;
+        auto_run_background_jobs.store(settings.auto_run_background_jobs, Ordering::Release);
         let api_key = credentials.api_key(&settings.base_url)?;
         let ai = build_ai_services(&db_path, settings, api_key)?;
         let office: Arc<dyn OfficeEnhancer> = Arc::new(OfficeComWorker::start()?);
@@ -529,6 +576,7 @@ impl AppServices {
             data_dir,
             db_path,
             library,
+            learning,
             library_generation,
             library_mutations,
             blobs,
@@ -539,6 +587,7 @@ impl AppServices {
             ai: RwLock::new(ai),
             office,
             indexing,
+            auto_run_background_jobs,
             visual_jobs: RwLock::new(Some(Arc::new(visual_jobs))),
             visual_renderer_descriptors: RwLock::new(renderer_descriptors),
             runtime,
@@ -547,6 +596,10 @@ impl AppServices {
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    pub fn learning(&self) -> Arc<crate::learning::LearningService> {
+        Arc::clone(&self.learning)
     }
 
     pub fn database_path(&self) -> &Path {
@@ -850,6 +903,8 @@ impl AppServices {
         // The persisted settings and all derived job contracts now agree.
         // Recovering a poisoned whole-value lock avoids reporting a failure
         // after those durable commit points have already succeeded.
+        self.auto_run_background_jobs
+            .store(next.settings.auto_run_background_jobs, Ordering::Release);
         let mut ai = self.ai.write().unwrap_or_else(|error| error.into_inner());
         *ai = next;
         drop(ai);
@@ -997,18 +1052,31 @@ impl AppServices {
         let profile = RenderProfile::default();
         let db_path = self.db_path.clone();
         let publication_guard = self.blob_publication.acquire().await;
-        let (committed_source_id, reconciliation) = self
+        let (committed_source_id, reconciliation, committed_spec) = self
             .runtime
             .handle()
             .spawn_blocking(move || {
-                db::transactions::set_office_enhancement(
-                    &mut db::open_conn(&db_path)?,
+                let mut conn = db::open_conn(&db_path)?;
+                let (source_id, reconciliation) = db::transactions::set_office_enhancement(
+                    &mut conn,
                     &book_id,
                     enabled,
                     &descriptors,
                     &profile,
                     unix_timestamp()?,
-                )
+                )?;
+                // The mutation turn prevents another source/settings replacement;
+                // the background renderer may only advance this committed job.
+                // Freeze its full identity before object reclamation yields.
+                let job_id = format!("visual-render:{source_id}");
+                let job = db::index_jobs::get(&conn, &job_id)?
+                    .context("Office 增强视觉任务提交后不存在")?;
+                let (spec, _) = crate::preview::decode_persisted_visual_job(&job.cursor_json)?;
+                ensure!(
+                    spec.id == job_id && spec.book_id == book_id && spec.source_id == source_id,
+                    "Office 增强视觉任务与本次提交的来源不一致"
+                );
+                Ok((source_id, reconciliation, spec))
             })
             .await
             .context("Office 增强预览设置线程异常退出")??;
@@ -1025,10 +1093,10 @@ impl AppServices {
             "Office 增强替换的视觉页面对象",
         )
         .await;
-        ensure!(
-            coordinator.recover(&job_id).await?,
-            "Office 增强视觉任务未进入待执行队列"
-        );
+        coordinator
+            .schedule_committed(&committed_spec)
+            .await
+            .context("无法确认 Office 增强视觉任务已交给后台处理")?;
         self.indexing.wake();
         Ok(job_id)
     }
@@ -1517,13 +1585,28 @@ fn embedding_execution_identity(settings: &ProviderSettings) -> Result<String> {
 }
 
 fn load_provider_settings(db_path: &Path) -> Result<ProviderSettings> {
-    let conn = db::open_conn(db_path)?;
-    let settings = match db::settings::get(&conn, PROVIDER_SETTINGS_KEY)? {
+    let mut conn = db::open_conn(db_path)?;
+    let tx = conn.transaction().context("无法读取 AI 设置快照")?;
+    let mut settings = match db::settings::get(&tx, PROVIDER_SETTINGS_KEY)? {
         Some(row) => serde_json::from_str::<ProviderSettings>(&row.value_json)
             .context("stored AI provider settings are invalid")?,
         None => ProviderSettings::default(),
     };
+    settings.chat_generation = match db::settings::get(&tx, CHAT_GENERATION_SETTINGS_KEY)? {
+        Some(row) => serde_json::from_str::<ChatGenerationSettings>(&row.value_json)
+            .context("保存的对话模型参数无效")?,
+        None => ChatGenerationSettings::default(),
+    };
+    settings.auto_run_background_jobs = match db::settings::get(&tx, BACKGROUND_JOB_SETTINGS_KEY)? {
+        Some(row) => {
+            serde_json::from_str::<PersistedBackgroundJobSettings>(&row.value_json)
+                .context("保存的后台任务设置无效")?
+                .auto_run
+        }
+        None => default_auto_run_background_jobs(),
+    };
     settings.validate()?;
+    tx.commit().context("无法完成 AI 设置快照读取")?;
     Ok(settings)
 }
 
@@ -1541,15 +1624,41 @@ fn save_provider_settings(db_path: &Path, settings: &ProviderSettings) -> Result
         }),
         "refusing to persist a secret-bearing AI setting"
     );
+    let updated_at = unix_timestamp()?;
     let setting = db::settings::Setting {
         key: PROVIDER_SETTINGS_KEY.to_string(),
         value_json,
-        updated_at: unix_timestamp()?,
+        updated_at,
     };
+    let generation = db::settings::Setting {
+        key: CHAT_GENERATION_SETTINGS_KEY.to_string(),
+        value_json: serde_json::to_string(&settings.chat_generation)
+            .context("无法序列化对话模型参数")?,
+        updated_at,
+    };
+    let background_jobs = db::settings::Setting {
+        key: BACKGROUND_JOB_SETTINGS_KEY.to_string(),
+        value_json: serde_json::to_string(&PersistedBackgroundJobSettings {
+            auto_run: settings.auto_run_background_jobs,
+        })
+        .context("无法序列化后台任务设置")?,
+        updated_at,
+    };
+    let mut conn = db::open_conn(db_path)?;
+    let tx = conn.transaction().context("无法开始保存 AI 设置")?;
     ensure!(
-        db::settings::upsert(&db::open_conn(db_path)?, &setting)? == 1,
+        db::settings::upsert(&tx, &setting)? == 1,
         "AI provider settings were not stored"
     );
+    ensure!(
+        db::settings::upsert(&tx, &generation)? == 1,
+        "对话模型参数未能保存"
+    );
+    ensure!(
+        db::settings::upsert(&tx, &background_jobs)? == 1,
+        "后台任务设置未能保存"
+    );
+    tx.commit().context("无法提交 AI 设置")?;
     Ok(())
 }
 
@@ -1977,6 +2086,23 @@ mod tests {
     }
 
     #[cfg(target_os = "windows")]
+    struct GatedFakeOfficeSlides {
+        started: async_channel::Sender<()>,
+        release: async_channel::Receiver<()>,
+    }
+
+    #[cfg(target_os = "windows")]
+    impl OfficeEnhancer for GatedFakeOfficeSlides {
+        fn enhance<'a>(&'a self, request: OfficeEnhanceRequest) -> OfficeFuture<'a> {
+            Box::pin(async move {
+                self.started.send(()).await?;
+                self.release.recv().await?;
+                FakeOfficeSlides.enhance(request).await
+            })
+        }
+    }
+
+    #[cfg(target_os = "windows")]
     fn tiny_office_slide_png(channel: u8) -> Vec<u8> {
         let image = image::RgbaImage::from_pixel(4, 3, image::Rgba([channel, 2, 3, 255]));
         let mut bytes = Vec::new();
@@ -2097,13 +2223,20 @@ mod tests {
             blob_publication: services.blob_publication.clone(),
             indexing: Arc::clone(&services.indexing),
         });
+        let (started_tx, started_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
         services
             .replace_visual_renderers(
                 source,
                 sink,
                 vec![
                     Arc::new(StructuralPngRenderer),
-                    Arc::new(OfficeEnhancedRenderer::new(Arc::new(FakeOfficeSlides))),
+                    Arc::new(OfficeEnhancedRenderer::new(Arc::new(
+                        GatedFakeOfficeSlides {
+                            started: started_tx,
+                            release: release_rx,
+                        },
+                    ))),
                 ],
             )
             .unwrap();
@@ -2149,13 +2282,41 @@ mod tests {
                 .block_on(services.office_enhancement_enabled(record.id.clone()))
                 .unwrap()
         );
-        runtime
+        let coordinator = services.visual_jobs().unwrap();
+        let running = runtime
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), started_rx.recv()).await??;
+                let running = coordinator.status(&job_id).await?.unwrap();
+                assert_eq!(running.state, VisualJobState::Running);
+                assert!(!coordinator.recover(&job_id).await?);
+                // Deterministically place the caller's post-commit notification
+                // after worker takeover, without a timing-based sleep.
+                coordinator.schedule_committed(&running.spec).await?;
+                release_tx.send(()).await?;
+                Ok::<_, anyhow::Error>(running)
+            })
+            .unwrap();
+        let succeeded = runtime
             .block_on(services.visual_jobs().unwrap().wait_for_state(
                 &job_id,
                 VisualJobState::Succeeded,
                 Duration::from_secs(5),
             ))
             .unwrap();
+        assert_eq!(succeeded.spec, running.spec);
+        assert_eq!(succeeded.attempts, 1);
+        assert!(!runtime.block_on(coordinator.recover(&job_id)).unwrap());
+        runtime
+            .block_on(coordinator.schedule_committed(&running.spec))
+            .expect("a completed committed Office job is still successfully submitted");
+        assert_eq!(
+            runtime
+                .block_on(coordinator.status(&job_id))
+                .unwrap()
+                .unwrap(),
+            succeeded,
+            "late confirmation must not reset the completed job"
+        );
         let pages = db::visual_pages::list_for_source(
             &db::open_conn(&services.db_path).unwrap(),
             &source_id,
@@ -2287,6 +2448,14 @@ mod tests {
         let settings = ProviderSettings {
             base_url: "https://models.example.test/v1".to_string(),
             chat_model: "chat-test".to_string(),
+            chat_generation: ChatGenerationSettings {
+                temperature: None,
+                top_p: Some(0.8),
+                max_output_tokens: 512,
+                presence_penalty: Some(0.3),
+                frequency_penalty: Some(-0.4),
+            },
+            auto_run_background_jobs: false,
             embedding_model: "embed-test".to_string(),
             vision_model: "vision-test".to_string(),
             remote_content_confirmed: true,
@@ -2313,11 +2482,237 @@ mod tests {
         .unwrap();
         assert!(!row.value_json.contains("credential-only-secret"));
         assert!(!row.value_json.to_ascii_lowercase().contains("api_key"));
+        assert!(!row.value_json.contains("chat_generation"));
+        assert!(!row.value_json.contains("auto_run_background_jobs"));
+        let generation_row = db::settings::get(
+            &db::open_conn(services.database_path()).unwrap(),
+            CHAT_GENERATION_SETTINGS_KEY,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<ChatGenerationSettings>(&generation_row.value_json).unwrap(),
+            settings.chat_generation
+        );
+        let background_job_row = db::settings::get(
+            &db::open_conn(services.database_path()).unwrap(),
+            BACKGROUND_JOB_SETTINGS_KEY,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<PersistedBackgroundJobSettings>(&background_job_row.value_json)
+                .unwrap(),
+            PersistedBackgroundJobSettings { auto_run: false }
+        );
         drop(services);
 
         let reopened = AppServices::open_with_credentials(temp.path(), credentials).unwrap();
         assert_eq!(reopened.provider_settings().unwrap(), settings);
         assert_eq!(reopened.search().unwrap().embedding_model(), "embed-test");
+    }
+
+    #[test]
+    fn configured_background_job_policy_reaches_service_library_mutations() {
+        let temp = tempfile::tempdir().unwrap();
+        let services = AppServices::open_with_credentials(
+            temp.path(),
+            Arc::new(MemoryCredentialStore::default()),
+        )
+        .unwrap();
+        let mut settings = services.provider_settings().unwrap();
+        settings.auto_run_background_jobs = false;
+        block_on_without_tokio(services.configure_provider(settings.clone(), ApiKeyUpdate::Keep))
+            .unwrap();
+
+        let created = block_on_without_tokio(async {
+            services
+                .spawn_library_projected(|library| library.create_book("暂停服务派生任务", "作者"))
+                .await
+                .context("library mutation worker stopped")?
+        })
+        .unwrap();
+        let jobs = db::index_jobs::list_for_book(
+            &db::open_conn(services.database_path()).unwrap(),
+            &created.value.id,
+        )
+        .unwrap();
+        assert_eq!(jobs.len(), 3);
+        assert!(jobs.iter().all(|job| {
+            job.status == db::index_jobs::IndexJobStatus::Paused
+                && job.attempts == 0
+                && job.started_at.is_none()
+                && job.finished_at.is_none()
+        }));
+        assert_eq!(services.provider_settings().unwrap(), settings);
+
+        settings.auto_run_background_jobs = true;
+        block_on_without_tokio(services.configure_provider(settings.clone(), ApiKeyUpdate::Keep))
+            .unwrap();
+        let existing_jobs = db::index_jobs::list_for_book(
+            &db::open_conn(services.database_path()).unwrap(),
+            &created.value.id,
+        )
+        .unwrap();
+        assert_eq!(existing_jobs.len(), 3);
+        assert!(existing_jobs.iter().all(|job| {
+            job.status == db::index_jobs::IndexJobStatus::Paused
+                && job.attempts == 0
+                && job.started_at.is_none()
+                && job.finished_at.is_none()
+        }));
+        assert_eq!(services.provider_settings().unwrap(), settings);
+    }
+
+    #[test]
+    fn existing_provider_settings_start_with_unconfigured_generation_defaults() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join(db::DATABASE_FILE);
+        let conn = db::open_or_recreate(&db_path).unwrap();
+        let settings = ProviderSettings {
+            chat_model: "existing-chat-choice".into(),
+            ..Default::default()
+        };
+        let provider_row = db::settings::Setting {
+            key: PROVIDER_SETTINGS_KEY.into(),
+            value_json: serde_json::to_string(&settings).unwrap(),
+            updated_at: 1,
+        };
+        db::settings::upsert(&conn, &provider_row).unwrap();
+        assert!(
+            db::settings::get(&conn, CHAT_GENERATION_SETTINGS_KEY)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db::settings::get(&conn, BACKGROUND_JOB_SETTINGS_KEY)
+                .unwrap()
+                .is_none()
+        );
+        drop(conn);
+
+        let services = AppServices::open_with_credentials(
+            temp.path(),
+            Arc::new(MemoryCredentialStore::default()),
+        )
+        .unwrap();
+        assert_eq!(services.provider_settings().unwrap(), settings);
+        assert!(
+            !services
+                .provider_settings()
+                .unwrap()
+                .auto_run_background_jobs
+        );
+        let conn = db::open_conn(services.database_path()).unwrap();
+        assert_eq!(
+            db::settings::get(&conn, PROVIDER_SETTINGS_KEY).unwrap(),
+            Some(provider_row)
+        );
+        assert!(
+            db::settings::get(&conn, CHAT_GENERATION_SETTINGS_KEY)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db::settings::get(&conn, BACKGROUND_JOB_SETTINGS_KEY)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn malformed_or_invalid_saved_generation_is_reported_and_preserved() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join(db::DATABASE_FILE);
+        let conn = db::open_or_recreate(&db_path).unwrap();
+        let mut out_of_bounds = serde_json::to_value(ChatGenerationSettings::default()).unwrap();
+        out_of_bounds["max_output_tokens"] = serde_json::json!(0);
+        let mut unknown_field = serde_json::to_value(ChatGenerationSettings::default()).unwrap();
+        unknown_field["extra"] = serde_json::json!(true);
+        for value_json in [
+            "{".to_string(),
+            "{}".to_string(),
+            out_of_bounds.to_string(),
+            unknown_field.to_string(),
+        ] {
+            let row = db::settings::Setting {
+                key: CHAT_GENERATION_SETTINGS_KEY.into(),
+                value_json,
+                updated_at: 1,
+            };
+            db::settings::upsert(&conn, &row).unwrap();
+            assert!(load_provider_settings(&db_path).is_err());
+            assert_eq!(
+                db::settings::get(&conn, CHAT_GENERATION_SETTINGS_KEY).unwrap(),
+                Some(row)
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_saved_background_job_setting_is_reported_and_preserved() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join(db::DATABASE_FILE);
+        let conn = db::open_or_recreate(&db_path).unwrap();
+        for value_json in [
+            "{".to_string(),
+            "{}".to_string(),
+            serde_json::json!({ "auto_run": "yes" }).to_string(),
+            serde_json::json!({ "auto_run": true, "extra": false }).to_string(),
+        ] {
+            let row = db::settings::Setting {
+                key: BACKGROUND_JOB_SETTINGS_KEY.into(),
+                value_json,
+                updated_at: 1,
+            };
+            db::settings::upsert(&conn, &row).unwrap();
+            assert!(load_provider_settings(&db_path).is_err());
+            assert_eq!(
+                db::settings::get(&conn, BACKGROUND_JOB_SETTINGS_KEY).unwrap(),
+                Some(row)
+            );
+        }
+    }
+
+    #[test]
+    fn generation_save_failure_rolls_back_provider_generation_and_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = Arc::new(MemoryCredentialStore::default());
+        let services =
+            AppServices::open_with_credentials(temp.path(), credentials.clone()).unwrap();
+        let previous = services.provider_settings().unwrap();
+        block_on_without_tokio(services.configure_provider(previous.clone(), ApiKeyUpdate::Keep))
+            .unwrap();
+        let conn = db::open_conn(services.database_path()).unwrap();
+        let previous_rows = db::settings::list(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER test_chat_generation_save_failure
+             BEFORE INSERT ON settings
+             WHEN NEW.key = 'ai.openai_compatible.chat_generation.v1'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected chat generation save failure');
+             END;",
+        )
+        .unwrap();
+        let mut next = previous.clone();
+        next.chat_model = "must-not-persist".into();
+        next.chat_generation.max_output_tokens = 128;
+        assert!(
+            block_on_without_tokio(services.configure_provider(
+                next,
+                ApiKeyUpdate::Set("must-rollback-generation-test".into())
+            ))
+            .is_err()
+        );
+        assert_eq!(services.provider_settings().unwrap(), previous);
+        assert_eq!(
+            load_provider_settings(services.database_path()).unwrap(),
+            previous
+        );
+        assert_eq!(db::settings::list(&conn).unwrap(), previous_rows);
+        assert!(credentials.api_key(&previous.base_url).unwrap().is_none());
+        conn.execute_batch("DROP TRIGGER test_chat_generation_save_failure")
+            .unwrap();
     }
 
     #[test]
@@ -2327,6 +2722,8 @@ mod tests {
         let mut unrelated = base.clone();
         unrelated.base_url = format!("{}/", unrelated.base_url.trim_end_matches('/'));
         unrelated.chat_model = "chat-other".to_string();
+        unrelated.chat_generation.max_output_tokens = 128;
+        unrelated.chat_generation.temperature = None;
         unrelated.vision_model = "vision-other".to_string();
         unrelated.request_timeout_secs = 1;
         unrelated.remote_content_confirmed = true;
@@ -2385,6 +2782,8 @@ mod tests {
 
         let mut next = services.provider_settings().unwrap();
         next.chat_model = "chat-only-change".to_string();
+        next.chat_generation.max_output_tokens = 512;
+        next.chat_generation.top_p = Some(0.75);
         next.request_timeout_secs = (next.request_timeout_secs + 1).min(600);
         block_on_without_tokio(
             services.configure_provider(next, ApiKeyUpdate::Set("key-only-change".to_string())),
@@ -2449,6 +2848,8 @@ mod tests {
 
         let mut next = previous.clone();
         next.chat_model = "chat-rollback-test".to_string();
+        next.chat_generation.max_output_tokens = 128;
+        next.chat_generation.temperature = None;
         next.embedding_model = "embed-rollback-test".to_string();
         next.vision_model = "vision-rollback-test".to_string();
         let result = block_on_without_tokio(services.configure_provider(
@@ -2582,6 +2983,11 @@ mod tests {
             Arc::new(MemoryCredentialStore::default()),
         )
         .unwrap();
+        // This test exercises the durable visual queue, so new derivative jobs
+        // must be created queued instead of using the product default.
+        services
+            .auto_run_background_jobs
+            .store(true, Ordering::Release);
         // This deliberately bypasses AppServices::spawn_library, matching the
         // existing UI clones. The durable visual queue must still be noticed.
         let (book, document) = {
@@ -2758,6 +3164,11 @@ mod tests {
         .unwrap();
         let source_path = temp.path().join("native-visual.pdf");
         fs::write(&source_path, native_pdf_fixture()).unwrap();
+        // The native renderer only runs on a queued job, not on the default
+        // paused one.
+        services
+            .auto_run_background_jobs
+            .store(true, Ordering::Release);
         let mut library = services.library_snapshot().unwrap();
         let book = match library.import(&source_path).unwrap() {
             ImportOutcome::Added(book) => book,

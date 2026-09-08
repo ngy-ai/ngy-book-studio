@@ -25,6 +25,8 @@ gpui-component-assets = { version = "0.5.1" }
 html5ever = "=0.27.0"
 image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 lopdf = { version = "=0.44.0", default-features = false }
+# Keep chat sanitization on the same Markdown parser as gpui-component.
+markdown = "=1.0.0"
 mime_guess = "2.0"
 markup5ever_rcdom = "=0.3.0"
 native-dialog = { version = "0.9.7", features = ["windows_dpi_awareness", "windows_visual_styles"] }
@@ -46,11 +48,15 @@ tempfile = "3.27"
 tokio = { version = "=1.53.1", features = ["fs", "macros", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tree-sitter-python = "=0.23.6"
 zip = { version = "8.6", default-features = false }
 
 # Deliberately pinned pre-v1 Kindle parser. Keep changes behind the Windows
 # corpus and hostile-file gates documented in AGENTS.md.
 ebook-rs = { version = "=0.16.4", default-features = false }
+
+[dev-dependencies]
+gpui = { version = "0.2.2", features = ["test-support"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "=4.2.0", default-features = false, features = ["v1"] }

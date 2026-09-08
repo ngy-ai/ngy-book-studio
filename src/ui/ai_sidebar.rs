@@ -12,6 +12,10 @@ use moye_epub_editor::{
 use serde::Serialize;
 use std::net::IpAddr;
 
+mod markdown;
+#[cfg(test)]
+mod markdown_ui_tests;
+
 pub(super) const AI_SIDEBAR_WIDTH: f32 = 360.;
 pub(super) const AI_SIDEBAR_MIN_WIDTH: f32 = 280.;
 pub(super) const AI_SIDEBAR_MAX_WIDTH: f32 = 640.;
@@ -1322,6 +1326,71 @@ fn selectable_message_html(message: &str) -> String {
     html
 }
 
+// Cache the display projection by message, so repainting the sidebar does not
+// reparse every historical answer. The original content remains the copy/save
+// value; only assistant messages opt into Markdown formatting.
+#[inline(never)]
+fn selectable_message_text(
+    id: impl Into<SharedString>,
+    role: AiMessageRole,
+    content: &str,
+    width: Pixels,
+    window: &mut Window,
+    cx: &mut App,
+) -> TextView {
+    let id = id.into();
+    let cache = window.use_keyed_state(SharedString::from(format!("{id}/display")), cx, |_, _| {
+        None::<(AiMessageRole, String, SharedString)>
+    });
+    if cache
+        .read(cx)
+        .as_ref()
+        .is_none_or(|(cached_role, original, _)| *cached_role != role || original != content)
+    {
+        let display = if role == AiMessageRole::Assistant {
+            markdown::assistant_display_markdown(content)
+        } else {
+            selectable_message_html(content)
+        };
+        cache.update(cx, |cache, _| {
+            *cache = Some((role, content.to_owned(), display.into()));
+        });
+    }
+    let display = cache.read(cx).as_ref().unwrap().2.clone();
+    let text = if role == AiMessageRole::Assistant {
+        TextView::markdown(
+            SharedString::from(format!("{id}/markdown")),
+            display,
+            window,
+            cx,
+        )
+        .style(TextViewStyle::default().paragraph_gap(rems(0.5)))
+    } else {
+        TextView::html(
+            SharedString::from(format!("{id}/plain")),
+            display,
+            window,
+            cx,
+        )
+        .style(TextViewStyle::default().paragraph_gap(rems(0.)))
+    };
+    // Move the whole naturally sized view with the outer conversation scroller.
+    // TextView's internal virtual scrolling invalidates selection coordinates.
+    text.selectable(true)
+        .scrollable(false)
+        .w(width)
+        .h_auto()
+        .min_w(px(0.))
+}
+
+fn message_text_width(sidebar_width: Pixels, rem_size: Pixels) -> Pixels {
+    // Two horizontal padding pairs (3 rem), the copy-button gap (0.25 rem),
+    // the 24 px copy column and 4 px for borders/rounding. TextView 0.5.1's
+    // clipped list rows lose short text on Windows when width is only a percent
+    // inside a flex item. Resolve it before laying out the Markdown tree.
+    (sidebar_width - rems(3.25).to_pixels(rem_size) - px(28.)).max(px(0.))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ResponsiveSidebar {
     collapsed: bool,
@@ -2396,27 +2465,22 @@ impl AiSidebar {
                             .items_start()
                             .gap_1()
                             .line_height(gpui::relative(1.5))
+                            .child(div().min_w(px(0.)).flex_1().child(selectable_message_text(
+                                SharedString::from(format!("ai-message-text-{}", message.id)),
+                                message.role,
+                                &message.content,
+                                message_text_width(self.expanded_width, window.rem_size()),
+                                window,
+                                cx,
+                            )))
                             .child(
-                                div().min_w(px(0.)).flex_1().child(
-                                    TextView::html(
-                                        SharedString::from(format!(
-                                            "ai-message-text-{}",
-                                            message.id
-                                        )),
-                                        selectable_message_html(&message.content),
-                                        window,
-                                        cx,
-                                    )
-                                    .style(TextViewStyle::default().paragraph_gap(rems(0.)))
-                                    .selectable(true),
+                                div().w(px(24.)).flex_none().child(
+                                    Clipboard::new(SharedString::from(format!(
+                                        "ai-message-copy-{}",
+                                        message.id
+                                    )))
+                                    .value(message.content.clone()),
                                 ),
-                            )
-                            .child(
-                                Clipboard::new(SharedString::from(format!(
-                                    "ai-message-copy-{}",
-                                    message.id
-                                )))
-                                .value(message.content.clone()),
                             ),
                     )
                     .when(!sources.is_empty(), |this| {

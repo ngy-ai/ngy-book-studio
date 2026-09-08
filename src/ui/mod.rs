@@ -3,6 +3,7 @@ mod ai_settings;
 mod ai_sidebar;
 mod background_jobs;
 mod editor;
+mod learning;
 mod library;
 mod office_slides;
 mod pdf_reader;
@@ -21,6 +22,7 @@ use editor::{
     EditorApp, EditorWebState, build_editor_webview, editor_chapters_from_document,
     suggested_epub_filename,
 };
+use learning::open_learning_window;
 use office_slides::open_office_slides_window;
 use pdf_reader::{PdfReaderApp, PdfReaderInit, PdfReaderPage, build_pdf_reader_webview};
 use reader::{ReaderApp, ReaderWebViewBuildGate, build_reader_webview};
@@ -36,14 +38,15 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use gpui::{
-    App, AppContext as _, Bounds, Context, Entity, Image, ImageFormat, InteractiveElement as _,
-    IntoElement, ObjectFit, ParentElement as _, Render, SharedString,
+    AnyWindowHandle, App, AppContext as _, Bounds, Context, Entity, Image, ImageFormat,
+    InteractiveElement as _, IntoElement, ObjectFit, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription, Task, Timer,
     TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions, div, img,
     prelude::FluentBuilder as _, px, rgb, rgba, size, white,
 };
 use gpui_component::{
-    Disableable as _, Icon, IconName, Root, Sizable as _, StyledExt as _,
+    Disableable as _, Icon, IconName, InteractiveElementExt as _, Root, Sizable as _,
+    StyledExt as _,
     button::{Button, ButtonCustomVariant, ButtonVariants as _},
     input::{Input, InputEvent, InputState},
     menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem},
@@ -292,6 +295,76 @@ fn remove_window_after_current_frame(
     });
 }
 
+/// Windows that were opened for one specific book.
+///
+/// Reader, PDF/Office preview and editor windows keep their own library copy
+/// and their own child WebView, so removing a book has to take them down
+/// explicitly: left open they would keep persisting progress or saving edits
+/// for a document that no longer exists.
+#[derive(Default)]
+struct BookWindowRegistry {
+    windows: Vec<BookWindowHandle>,
+}
+
+impl gpui::Global for BookWindowRegistry {}
+
+struct BookWindowHandle {
+    book_id: String,
+    window: AnyWindowHandle,
+    close: Box<dyn Fn(&mut Window, &mut App)>,
+}
+
+/// Registers `window` as belonging to `book_id`.
+///
+/// `close` tears the window down without the barriers a user-initiated close
+/// uses: the book is already gone, so nothing is left to save and a failed
+/// write must never keep the window open.
+fn register_book_window(
+    book_id: String,
+    window: &Window,
+    close: impl Fn(&mut Window, &mut App) + 'static,
+    cx: &mut App,
+) {
+    if !cx.has_global::<BookWindowRegistry>() {
+        cx.set_global(BookWindowRegistry::default());
+    }
+    cx.global_mut::<BookWindowRegistry>()
+        .windows
+        .push(BookWindowHandle {
+            book_id,
+            window: window.window_handle(),
+            close: Box::new(close),
+        });
+}
+
+/// Closes every registered window of `book_id`, forgetting registrations whose
+/// window has already disappeared.
+fn close_book_windows(book_id: &str, cx: &mut App) {
+    if !cx.has_global::<BookWindowRegistry>() {
+        return;
+    }
+    let open = cx.windows();
+    let registered = std::mem::take(&mut cx.global_mut::<BookWindowRegistry>().windows);
+    let mut remaining = Vec::with_capacity(registered.len());
+    let mut closing = Vec::new();
+    for entry in registered {
+        if !open.contains(&entry.window) {
+            continue;
+        }
+        if entry.book_id == book_id {
+            closing.push(entry);
+        } else {
+            remaining.push(entry);
+        }
+    }
+    cx.global_mut::<BookWindowRegistry>().windows = remaining;
+    for entry in closing {
+        let _ = entry
+            .window
+            .update(cx, |_, window, cx| (entry.close)(window, cx));
+    }
+}
+
 struct Notice {
     text: String,
     error: bool,
@@ -325,5 +398,62 @@ impl HasWindowHandle for ParentWindowHandle {
         // SAFETY: each child window's close veto keeps this HWND alive while
         // the detached foreground task builds its WebView.
         Ok(unsafe { WindowHandle::borrow_raw(RawWindowHandle::Win32(self.0)) })
+    }
+}
+
+#[cfg(test)]
+mod book_window_tests {
+    use super::*;
+    use gpui::TestAppContext;
+    use std::{cell::RefCell, rc::Rc};
+
+    struct TrackedWindow;
+
+    impl Render for TrackedWindow {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    #[gpui::test]
+    fn closing_a_book_closes_only_its_own_windows(cx: &mut TestAppContext) {
+        let closed: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let first: AnyWindowHandle = cx.add_window(|_, _| TrackedWindow).into();
+        let second: AnyWindowHandle = cx.add_window(|_, _| TrackedWindow).into();
+        let register = |cx: &mut TestAppContext, window: AnyWindowHandle, book_id: &str| {
+            let closed = Rc::clone(&closed);
+            let book_id = book_id.to_string();
+            cx.update_window(window, |_, window, cx| {
+                register_book_window(
+                    book_id.clone(),
+                    window,
+                    move |window, _| {
+                        closed.borrow_mut().push(book_id.clone());
+                        window.remove_window();
+                    },
+                    cx,
+                );
+            })
+            .expect("测试窗口仍然存在");
+        };
+        register(cx, first, "book-a");
+        register(cx, second, "book-b");
+
+        cx.update(|cx| close_book_windows("book-a", cx));
+        assert_eq!(*closed.borrow(), vec!["book-a".to_string()]);
+        let open = cx.windows();
+        assert!(!open.contains(&first));
+        assert!(open.contains(&second));
+
+        // A closed book leaves no registration behind, and the other book's
+        // window is untouched until its own book goes away.
+        cx.update(|cx| close_book_windows("book-a", cx));
+        assert_eq!(*closed.borrow(), vec!["book-a".to_string()]);
+        cx.update(|cx| close_book_windows("book-b", cx));
+        assert_eq!(
+            *closed.borrow(),
+            vec!["book-a".to_string(), "book-b".to_string()]
+        );
+        assert!(!cx.windows().contains(&second));
     }
 }

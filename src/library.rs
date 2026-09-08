@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -261,6 +261,7 @@ pub struct LibraryStore {
     blob_publication: BlobPublicationLock,
     io: IoRuntime,
     registry: Arc<FormatRegistry>,
+    auto_run_background_jobs: Arc<AtomicBool>,
     books: Vec<BookRecord>,
     groups: Vec<BookGroup>,
     cover_cache: HashMap<String, Arc<Vec<u8>>>,
@@ -351,6 +352,9 @@ impl LibraryStore {
             blob_publication,
             io,
             registry: Arc::new(FormatRegistry::with_builtin_importers()),
+            auto_run_background_jobs: Arc::new(AtomicBool::new(
+                crate::services::DEFAULT_AUTO_RUN_BACKGROUND_JOBS,
+            )),
             books,
             groups,
             cover_cache: HashMap::new(),
@@ -387,6 +391,13 @@ impl LibraryStore {
 
     pub fn blob_store(&self) -> Arc<LocalBlobStore> {
         self.blob_store.clone()
+    }
+
+    /// Shared process-level switch consulted when a document revision commits.
+    /// AppServices owns the user-facing persisted setting and updates this exact
+    /// flag so cloned LibraryStore projections observe the latest value.
+    pub(crate) fn background_job_auto_run_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.auto_run_background_jobs)
     }
 
     pub(crate) fn blob_publication_lock(&self) -> BlobPublicationLock {
@@ -1327,10 +1338,19 @@ impl LibraryStore {
         // a transient read error at that point would misreport an already
         // durable import/save as failed and leave the UI projection stale.
         let committed_record = graph.book.clone();
+        let auto_run_background_jobs = self.auto_run_background_jobs.load(Ordering::Acquire);
         let unreferenced = if previous.is_some() {
-            db::transactions::install_document_revision(&mut conn, &graph.borrow())?
+            db::transactions::install_document_revision(
+                &mut conn,
+                &graph.borrow(),
+                auto_run_background_jobs,
+            )?
         } else {
-            db::transactions::insert_document(&mut conn, &graph.borrow())?;
+            db::transactions::insert_document(
+                &mut conn,
+                &graph.borrow(),
+                auto_run_background_jobs,
+            )?;
             Vec::new()
         };
         drop(conn);
@@ -2512,6 +2532,67 @@ mod tests {
         let document = restored.document(&book.id).unwrap();
         assert_eq!(document.units[0].source_kind, SourceKind::Markdown);
         assert!(matches!(document.source, DocumentSource::Created));
+    }
+
+    #[test]
+    fn shared_auto_run_flag_pauses_new_and_edited_document_jobs() {
+        fn assert_paused_jobs(library: &LibraryStore, book_id: &str, source_id: &str) {
+            let conn = db::open_conn(library.database_path()).unwrap();
+            let jobs = db::index_jobs::list_for_book(&conn, book_id).unwrap();
+            assert_eq!(jobs.len(), 3);
+            assert!(jobs.iter().all(|job| {
+                job.source_id.as_deref() == Some(source_id)
+                    && job.status == db::index_jobs::IndexJobStatus::Paused
+                    && !job.pause_requested
+                    && !job.cancel_requested
+                    && job.attempts == 0
+                    && job.started_at.is_none()
+                    && job.finished_at.is_none()
+            }));
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut library = LibraryStore::load_from(temp.path().join("library")).unwrap();
+        let flag = library.background_job_auto_run_flag();
+        let projected_clone = library.clone();
+        assert!(Arc::ptr_eq(
+            &flag,
+            &projected_clone.background_job_auto_run_flag()
+        ));
+        flag.store(false, Ordering::Release);
+
+        let created = library.create_book("暂停派生任务", "作者").unwrap();
+        let first_source = db::book_sources::get_revision(
+            &db::open_conn(library.database_path()).unwrap(),
+            &created.id,
+            created.revision,
+        )
+        .unwrap()
+        .unwrap();
+        assert_paused_jobs(&library, &created.id, &first_source.id);
+
+        let mut document = library.document(&created.id).unwrap();
+        document.title = "暂停编辑后的派生任务".to_string();
+        let updated = library.apply_document(document).unwrap();
+        let second_source = db::book_sources::get_revision(
+            &db::open_conn(library.database_path()).unwrap(),
+            &updated.id,
+            updated.revision,
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(second_source.id, first_source.id);
+        assert_paused_jobs(&library, &updated.id, &second_source.id);
+        assert!(
+            db::index_jobs::list_for_source_kind(
+                &db::open_conn(library.database_path()).unwrap(),
+                &first_source.id,
+                "embedding",
+            )
+            .unwrap()
+            .is_empty(),
+            "the edited revision must remove superseded paused work"
+        );
     }
 
     #[test]

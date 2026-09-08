@@ -9,13 +9,15 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::Instant,
 };
 
 use anyhow::{Context as _, Result, bail, ensure};
 use futures_util::{FutureExt as _, StreamExt as _, future::BoxFuture};
 use tokio::sync::{Notify, mpsc};
+use tracing::Instrument as _;
 
 use crate::{
     agent::{
@@ -26,8 +28,12 @@ use crate::{
         agent_tool_definitions,
     },
     ai::{
-        ChatMessage, ChatRequest, ChatRole, MessageContent, OpenAiCompatibleProvider,
+        ChatEventStream, ChatGenerationSettings, ChatMessage, ChatRequest, ChatRole,
+        ContextWindowExceeded, IncompleteToolArguments, MessageContent, OpenAiCompatibleProvider,
         ReasoningEffort,
+    },
+    ai_diagnostics::{
+        ToolArgumentsSummary, error_kind, finish_reason_label, safe_label, tool_label,
     },
     db,
     document::{DocumentLocator, Revision, SourceLocator},
@@ -41,6 +47,25 @@ const MAX_TOOL_ARGUMENT_BYTES: usize = 256 * 1024;
 const CITATION_MARKER_PREFIX: &str = "[[moye-source:";
 const CITATION_MARKER_SUFFIX: &str = "]]";
 const MAX_CITATION_MARKERS: usize = 256;
+const MAX_CONTEXT_RETRIES: usize = 3;
+const TOOL_ARGUMENT_RECOVERY_GUIDANCE: &str = concat!(
+    "\nThe previous generation was rejected because tool arguments were incomplete JSON. ",
+    "Generate at most one tool call at a time, with a short, complete JSON object matching ",
+    "its schema. Close every string, array and object. For read_passages, use passage_ids ",
+    "containing only exact passage_id values already returned by search_books; do not use ",
+    "citation_id or book titles as passage IDs. If no passage IDs have been served, use ",
+    "search_books first. Do not copy source text into arguments. Keep all existing source ",
+    "citation and authorization rules."
+);
+
+/// The removable history is an explicit prefix after the system message.
+/// Later user messages (including web sources) must never be mistaken for it.
+struct RequestContext {
+    round: usize,
+    history_messages: usize,
+    max_output_tokens: u32,
+    tool_arguments_retried: bool,
+}
 
 /// Host-performed web fallback: how many results are requested and injected.
 const WEB_SEARCH_RESULT_LIMIT: usize = 8;
@@ -113,10 +138,34 @@ pub struct AgentCancellation {
     inner: Arc<CancellationState>,
 }
 
-#[derive(Default)]
+/// Host cancellation is a distinct outcome even after a completed request's
+/// token is invalidated during cleanup. Keep its established display text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AgentRequestCancelled;
+
+impl std::fmt::Display for AgentRequestCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AI request was cancelled")
+    }
+}
+
+impl std::error::Error for AgentRequestCancelled {}
+
 struct CancellationState {
+    trace_id: u64,
     cancelled: AtomicBool,
     notify: Notify,
+}
+
+impl Default for CancellationState {
+    fn default() -> Self {
+        static NEXT_TRACE_ID: AtomicU64 = AtomicU64::new(1);
+        Self {
+            trace_id: NEXT_TRACE_ID.fetch_add(1, Ordering::Relaxed),
+            cancelled: AtomicBool::default(),
+            notify: Notify::default(),
+        }
+    }
 }
 
 impl std::fmt::Debug for AgentCancellation {
@@ -129,8 +178,15 @@ impl std::fmt::Debug for AgentCancellation {
 }
 
 impl AgentCancellation {
+    /// Process-local diagnostic identity, shared across preparation, execution
+    /// and cancellation. Unlike UI request IDs it is unique across windows.
+    pub fn trace_id(&self) -> u64 {
+        self.inner.trace_id
+    }
+
     pub fn cancel(&self) {
         if !self.inner.cancelled.swap(true, Ordering::AcqRel) {
+            tracing::debug!(target: "moye_ai", trace_id = self.trace_id(), "AI request token invalidated");
             // A question has at most one active cancellation waiter. notify_one
             // also stores a permit when cancellation wins the tiny window
             // between the atomic check and polling `notified()`.
@@ -168,6 +224,7 @@ pub struct AgentRuntime {
     /// books cannot ground an answer.
     web: Option<Arc<dyn WebSearchBackend>>,
     chat_model: String,
+    chat_generation: ChatGenerationSettings,
     limits: AgentLimits,
 }
 
@@ -176,6 +233,7 @@ impl std::fmt::Debug for AgentRuntime {
         formatter
             .debug_struct("AgentRuntime")
             .field("chat_model", &self.chat_model)
+            .field("chat_generation", &self.chat_generation)
             .field("limits", &self.limits)
             .finish_non_exhaustive()
     }
@@ -198,8 +256,15 @@ impl AgentRuntime {
             books,
             web: None,
             chat_model,
+            chat_generation: ChatGenerationSettings::default(),
             limits,
         })
+    }
+
+    pub fn with_chat_generation(mut self, settings: ChatGenerationSettings) -> Result<Self> {
+        settings.validate()?;
+        self.chat_generation = settings;
+        Ok(self)
     }
 
     /// Attaches the host-performed web search used only when the authorized
@@ -235,8 +300,41 @@ impl AgentRuntime {
         events: Option<mpsc::UnboundedSender<AgentRunEvent>>,
         cancellation: AgentCancellation,
     ) -> Result<AgentAnswer> {
+        let span = tracing::info_span!(target: "moye_ai", "ai_run",
+            trace_id = cancellation.trace_id(), model = %safe_label(&self.chat_model));
+        async {
+            let started = Instant::now();
+            let mut stage = "prepare";
+            tracing::info!(target: "moye_ai",
+                question_bytes = question.question.len(), history_messages = question.history.len(),
+                scope_books = question.allowed_book_ids.len(), snapshots = question.snapshots.len(),
+                max_tool_rounds = self.limits.max_tool_rounds, max_context_bytes = self.limits.max_context_bytes,
+                "AI run started");
+            let result = self.answer_inner(question, events, &cancellation, &mut stage).await;
+            match &result {
+                Ok(answer) => tracing::info!(target: "moye_ai", elapsed_ms = started.elapsed().as_millis() as u64,
+                    answer_bytes = answer.markdown.len(), citations = answer.citations.len(),
+                    source_status = ?answer.source_status, "AI run completed"),
+                Err(error) if error.is::<AgentRequestCancelled>() => tracing::info!(target: "moye_ai", stage,
+                    elapsed_ms = started.elapsed().as_millis() as u64, "AI run cancelled"),
+                Err(error) => tracing::warn!(target: "moye_ai", stage,
+                    elapsed_ms = started.elapsed().as_millis() as u64, error_kind = error_kind(error),
+                    "AI run failed"),
+            }
+            result
+        }.instrument(span).await
+    }
+
+    async fn answer_inner(
+        &self,
+        question: AgentQuestion,
+        events: Option<mpsc::UnboundedSender<AgentRunEvent>>,
+        cancellation: &AgentCancellation,
+        stage: &mut &'static str,
+    ) -> Result<AgentAnswer> {
+        mark_stage(stage, "scope_and_snapshots");
         if cancellation.is_cancelled() {
-            bail!("AI request was cancelled");
+            bail!(AgentRequestCancelled);
         }
         validate_history(&question.history)?;
         let scope = AllowedBookScope::new(question.allowed_book_ids)
@@ -270,6 +368,12 @@ impl AgentRuntime {
             .question_messages(&question.question, &question.book_titles)
             .map_err(anyhow::Error::new)?;
         let mut messages = Vec::with_capacity(question.history.len() + 2);
+        let mut context = RequestContext {
+            round: 0,
+            history_messages: question.history.len(),
+            max_output_tokens: self.chat_generation.max_output_tokens,
+            tool_arguments_retried: false,
+        };
         messages.push(question_messages[0].clone());
         messages.extend(question.history);
         messages.push(question_messages[1].clone());
@@ -278,8 +382,11 @@ impl AgentRuntime {
         // One tool-free final response is allowed after all tool calls have
         // been spent. An empty host scope is tool-free from the first turn.
         for round in 0..=self.limits.max_tool_rounds {
+            context.round = round + 1;
+            mark_stage(stage, "stream_start");
+            let round_started = Instant::now();
             let tools_offered = has_authorized_books && round < self.limits.max_tool_rounds;
-            let request = ChatRequest {
+            let mut request = ChatRequest {
                 model: self.chat_model.clone(),
                 messages: messages.clone(),
                 tools: if tools_offered {
@@ -287,19 +394,24 @@ impl AgentRuntime {
                 } else {
                     Vec::new()
                 },
-                temperature: Some(0.1),
-                max_tokens: Some(4096),
+                temperature: self.chat_generation.temperature,
+                top_p: self.chat_generation.top_p,
+                presence_penalty: self.chat_generation.presence_penalty,
+                frequency_penalty: self.chat_generation.frequency_penalty,
+                max_tokens: Some(context.max_output_tokens),
                 // Agent answers need the final `content`, not a hidden reasoning
                 // trace. Small thinking models can otherwise spend the entire
                 // output budget before emitting any answer text.
                 reasoning_effort: Some(ReasoningEffort::None),
             };
-            let mut stream = tokio::select! {
-                result = self.provider.chat_stream(request) => {
-                    result.context("failed to start AI response stream")?
-                }
-                _ = cancellation.cancelled() => bail!("AI request was cancelled"),
-            };
+            let mut stream = self
+                .start_stream(&mut request, &mut context, cancellation)
+                .await?;
+            mark_stage(stage, "request_citations");
+            // Carry accepted history reduction into later tool rounds. The
+            // persisted conversation itself is never edited or deleted.
+            messages = request.messages;
+            retain_request_citations(&mut citations, &messages)?;
 
             let mut accumulator = AgentStreamAccumulator::new(
                 MAX_ANSWER_BYTES,
@@ -310,18 +422,23 @@ impl AgentRuntime {
             let mut projection = StreamingAnswerProjection::default();
             let mut publisher = AnswerEventPublisher::new(events.as_ref());
             let mut tool_turn = false;
+            let mut stream_events = 0usize;
+            mark_stage(stage, "stream_receive");
             loop {
                 let item = tokio::select! {
                     item = stream.next() => item,
-                    _ = cancellation.cancelled() => bail!("AI request was cancelled"),
+                    _ = cancellation.cancelled() => bail!(AgentRequestCancelled),
                 };
                 let Some(item) = item else { break };
                 let event = item.context("AI response stream failed")?;
+                stream_events += 1;
                 if !tool_turn && !event.tool_call_deltas.is_empty() {
                     tool_turn = true;
                     publisher.reset();
                 }
+                mark_stage(stage, "stream_accumulate");
                 accumulator.push(&event).map_err(anyhow::Error::new)?;
+                mark_stage(stage, "stream_receive");
                 if !tool_turn && let Some(delta) = event.content_delta.as_deref() {
                     let visible = projection.push(delta);
                     publisher.delta(visible);
@@ -330,13 +447,19 @@ impl AgentRuntime {
                     break;
                 }
             }
+            mark_stage(stage, "stream_finish");
             let turn = accumulator.finish().map_err(anyhow::Error::new)?;
+            tracing::debug!(target: "moye_ai", round = context.round, stream_events, elapsed_ms = round_started.elapsed().as_millis() as u64,
+                finish_reason = ?turn.finish_reason.as_deref().map(finish_reason_label),
+                completed = turn.completed, answer_bytes = turn.content.len(), tool_calls = turn.tool_calls.len(),
+                usage = ?turn.usage, "AI tool round received");
             ensure!(
                 turn.completed || turn.finish_reason.is_some(),
                 "AI response stream ended before a completion marker"
             );
 
             if turn.tool_calls.is_empty() {
+                mark_stage(stage, "answer_validation");
                 ensure!(
                     !turn.content.trim().is_empty(),
                     "AI endpoint returned an empty answer"
@@ -360,20 +483,23 @@ impl AgentRuntime {
                 if answer.source_status == AgentAnswerSourceStatus::NoVerifiedSources
                     && let Some(web) = self.web.clone()
                 {
+                    mark_stage(stage, "web_fallback");
                     if let Some(web_answer) = self
                         .web_fallback(
                             web.as_ref(),
                             &question.question,
                             &messages,
+                            &mut context,
                             &mut citations,
                             &mut publisher,
-                            &cancellation,
+                            cancellation,
                         )
                         .await?
                     {
                         return Ok(web_answer);
                     }
                 }
+                mark_stage(stage, "answer_projection");
                 // The projection withheld possible cross-chunk protocol
                 // markers. Publish only the validated remainder, then commit
                 // all preceding provisional deltas atomically.
@@ -397,17 +523,30 @@ impl AgentRuntime {
                 tool_calls: turn.tool_calls.clone(),
             };
             messages.push(assistant);
-            for call in &turn.tool_calls {
+            for (index, call) in turn.tool_calls.iter().enumerate() {
+                mark_stage(stage, "tool_execution");
+                let tool_started = Instant::now();
+                tracing::debug!(target: "moye_ai", round = context.round, tool_index = index, tool = tool_label(&call.function.name),
+                    arguments = ?ToolArgumentsSummary::new(&call.function.arguments), "AI tool started");
                 if let Some(sender) = events.as_ref() {
                     let _ = sender.send(AgentRunEvent::ToolStarted {
                         name: call.function.name.clone(),
                     });
                 }
                 let execution = tokio::select! {
-                    result = agent.execute_tool(call) => result.map_err(anyhow::Error::new)?,
-                    _ = cancellation.cancelled() => bail!("AI request was cancelled"),
+                    result = agent.execute_tool(call) => result.map_err(anyhow::Error::new),
+                    _ = cancellation.cancelled() => bail!(AgentRequestCancelled),
                 };
+                let execution = execution.inspect_err(|error| {
+                    tracing::warn!(target: "moye_ai", round = context.round, tool_index = index, tool = tool_label(&call.function.name),
+                        elapsed_ms = tool_started.elapsed().as_millis() as u64, error_kind = error_kind(error),
+                        arguments = ?ToolArgumentsSummary::new(&call.function.arguments), "AI tool failed");
+                })?;
+                mark_stage(stage, "tool_citations");
                 citations.record(&execution).map_err(anyhow::Error::new)?;
+                tracing::debug!(target: "moye_ai", round = context.round, tool_index = index, tool = tool_label(&execution.name),
+                    elapsed_ms = tool_started.elapsed().as_millis() as u64, result_bytes = execution.content.len(),
+                    citations = execution.citations.len(), "AI tool completed");
                 if let Some(sender) = events.as_ref() {
                     let _ = sender.send(AgentRunEvent::ToolFinished {
                         name: execution.name.clone(),
@@ -434,12 +573,13 @@ impl AgentRuntime {
         web: &dyn WebSearchBackend,
         question: &str,
         messages: &[ChatMessage],
+        request_context: &mut RequestContext,
         citations: &mut CitationRegistry,
         publisher: &mut AnswerEventPublisher,
         cancellation: &AgentCancellation,
     ) -> Result<Option<AgentAnswer>> {
         if cancellation.is_cancelled() {
-            bail!("AI request was cancelled");
+            bail!(AgentRequestCancelled);
         }
         let results = match web
             .web_search(WebSearchRequest {
@@ -452,13 +592,14 @@ impl AgentRuntime {
             Err(error) => {
                 // A misconfigured or unreachable engine must not destroy the
                 // answer the books already produced.
-                tracing::warn!("web search fallback failed: {error:#}");
+                tracing::warn!(target: "moye_ai", error_kind = error_kind(&error), "AI web search fallback failed");
                 return Ok(None);
             }
         };
         if results.is_empty() {
             return Ok(None);
         }
+        tracing::debug!(target: "moye_ai", result_count = results.len(), "AI web search completed");
 
         let mut context = String::from(WEB_SEARCH_INSTRUCTIONS);
         for (index, result) in results.iter().enumerate() {
@@ -490,7 +631,14 @@ impl AgentRuntime {
         messages.push(ChatMessage::text(ChatRole::User, context));
         let mut projection = StreamingAnswerProjection::default();
         let content = self
-            .complete(messages, &mut projection, publisher, cancellation)
+            .complete(
+                messages,
+                request_context,
+                citations,
+                &mut projection,
+                publisher,
+                cancellation,
+            )
             .await?;
 
         let (markdown, citation_ids, no_source) = extract_citation_markers(&content)?;
@@ -515,24 +663,27 @@ impl AgentRuntime {
     async fn complete(
         &self,
         messages: Vec<ChatMessage>,
+        context: &mut RequestContext,
+        citations: &mut CitationRegistry,
         projection: &mut StreamingAnswerProjection,
         publisher: &mut AnswerEventPublisher,
         cancellation: &AgentCancellation,
     ) -> Result<String> {
-        let request = ChatRequest {
+        let mut request = ChatRequest {
             model: self.chat_model.clone(),
             messages,
             tools: Vec::new(),
-            temperature: Some(0.1),
-            max_tokens: Some(4096),
+            temperature: self.chat_generation.temperature,
+            top_p: self.chat_generation.top_p,
+            presence_penalty: self.chat_generation.presence_penalty,
+            frequency_penalty: self.chat_generation.frequency_penalty,
+            max_tokens: Some(context.max_output_tokens),
             reasoning_effort: Some(ReasoningEffort::None),
         };
-        let mut stream = tokio::select! {
-            result = self.provider.chat_stream(request) => {
-                result.context("failed to start AI response stream")?
-            }
-            _ = cancellation.cancelled() => bail!("AI request was cancelled"),
-        };
+        let mut stream = self
+            .start_stream(&mut request, context, cancellation)
+            .await?;
+        retain_request_citations(citations, &request.messages)?;
         let mut accumulator = AgentStreamAccumulator::new(
             MAX_ANSWER_BYTES,
             MAX_TOOL_CALLS_PER_TURN,
@@ -542,7 +693,7 @@ impl AgentRuntime {
         loop {
             let item = tokio::select! {
                 item = stream.next() => item,
-                _ = cancellation.cancelled() => bail!("AI request was cancelled"),
+                _ = cancellation.cancelled() => bail!(AgentRequestCancelled),
             };
             let Some(item) = item else { break };
             let event = item.context("AI response stream failed")?;
@@ -566,6 +717,228 @@ impl AgentRuntime {
         );
         Ok(turn.content)
     }
+
+    /// Only a rejected stream start may be retried. Once SSE begins, normal
+    /// cancellation/reset/commit handling remains authoritative.
+    async fn start_stream(
+        &self,
+        request: &mut ChatRequest,
+        context: &mut RequestContext,
+        cancellation: &AgentCancellation,
+    ) -> Result<ChatEventStream> {
+        let mut context_retries = 0;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let started = Instant::now();
+            tracing::debug!(target: "moye_ai", round = context.round, attempt, context_retries,
+                tool_arguments_retried = context.tool_arguments_retried,
+                message_count = request.messages.len(), tools = request.tools.len(),
+                history_messages = context.history_messages, max_tokens = ?request.max_tokens,
+                "AI stream start attempt");
+            let result = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => bail!(AgentRequestCancelled),
+                result = self.provider.chat_stream(request.clone()) => result,
+            };
+            match result {
+                Ok(stream) => {
+                    tracing::debug!(target: "moye_ai", round = context.round, attempt, elapsed_ms = started.elapsed().as_millis() as u64,
+                        "AI stream start accepted");
+                    return Ok(stream);
+                }
+                Err(error) => {
+                    tracing::warn!(target: "moye_ai", round = context.round, attempt, context_retries,
+                        elapsed_ms = started.elapsed().as_millis() as u64, error_kind = error_kind(&error),
+                        "AI stream start rejected");
+                    if let Some(incomplete) = error.downcast_ref::<IncompleteToolArguments>() {
+                        if context.tool_arguments_retried
+                            || !request
+                                .tools
+                                .iter()
+                                .any(|tool| tool.function.name == incomplete.tool_name)
+                        {
+                            return Err(error);
+                        }
+                        let Some(ChatMessage {
+                            role: ChatRole::System,
+                            content: Some(MessageContent::Text(policy)),
+                            ..
+                        }) = request.messages.first_mut()
+                        else {
+                            return Err(error);
+                        };
+                        // Use only host-authored guidance. Never inject the
+                        // endpoint error or guessed arguments into the prompt.
+                        policy.push_str(TOOL_ARGUMENT_RECOVERY_GUIDANCE);
+                        request.temperature = Some(0.0);
+                        context.tool_arguments_retried = true;
+                        tracing::info!(target: "moye_ai",
+                            round = context.round, attempt, tool = tool_label(&incomplete.tool_name),
+                            "retrying AI stream start once after incomplete tool arguments"
+                        );
+                        continue;
+                    }
+                    let Some(exceeded) = error.downcast_ref::<ContextWindowExceeded>() else {
+                        return Err(error).context("failed to start AI response stream");
+                    };
+                    if context_retries == MAX_CONTEXT_RETRIES
+                        || !reduce_request_history(request, context, exceeded, context_retries)
+                    {
+                        return Err(error);
+                    }
+                    context_retries += 1;
+                    tracing::info!(target: "moye_ai",
+                        round = context.round, attempt,
+                        retry = context_retries,
+                        history_messages = context.history_messages,
+                        max_output_tokens = context.max_output_tokens,
+                        "retrying AI request after endpoint context rejection"
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn mark_stage(stage: &mut &'static str, next: &'static str) {
+    *stage = next;
+}
+
+fn reduce_request_history(
+    request: &mut ChatRequest,
+    context: &mut RequestContext,
+    exceeded: &ContextWindowExceeded,
+    attempt: usize,
+) -> bool {
+    let reserve = exceeded
+        .context_tokens
+        .map_or(1024, |size| (size / 4).clamp(1, 1024));
+    let previous_output = context.max_output_tokens;
+    context.max_output_tokens = context.max_output_tokens.min(reserve as u32);
+    request.max_tokens = Some(context.max_output_tokens);
+
+    // Endpoint token counts are authoritative; serialized byte ratios are
+    // only a hint for how much old history to omit. Different tokenizers can
+    // disagree, so retries are bounded and the last retry omits all history.
+    let wire_bytes =
+        serde_json::to_vec(&(&request.messages, &request.tools)).map_or(0, |bytes| bytes.len());
+    let bytes_to_remove = match (exceeded.prompt_tokens, exceeded.context_tokens) {
+        (Some(prompt), Some(size)) if prompt > 0 => {
+            let target = size.saturating_sub(reserve).saturating_mul(9) / 10;
+            wire_bytes.saturating_mul(prompt.saturating_sub(target)) / prompt
+        }
+        _ => wire_bytes / 2,
+    };
+    let mut removed = 0;
+    let mut removed_bytes = 0usize;
+    while removed < context.history_messages
+        && (removed_bytes < bytes_to_remove || attempt + 1 == MAX_CONTEXT_RETRIES)
+    {
+        // Drop one complete old exchange (or a leading orphan assistant from
+        // a bounded persisted history), stopping before the next user turn.
+        loop {
+            removed_bytes = removed_bytes.saturating_add(
+                serde_json::to_vec(&request.messages[1 + removed]).map_or(0, |bytes| bytes.len()),
+            );
+            removed += 1;
+            if removed == context.history_messages
+                || request.messages[1 + removed].role == ChatRole::User
+            {
+                break;
+            }
+        }
+    }
+    if removed > 0 {
+        request.messages.drain(1..1 + removed);
+        context.history_messages -= removed;
+    }
+    let reduced_sources = reduce_tool_results(
+        &mut request.messages,
+        bytes_to_remove.saturating_sub(removed_bytes),
+    );
+    if removed > 0 || reduced_sources {
+        return true;
+    }
+    // Lowering the output budget cannot repair an input that already exceeds
+    // the entire window. Keep the current question, exact frozen selections,
+    // system policy and all current tool-call/result pairs intact and explain
+    // that the user must shorten their input or enlarge the server window.
+    previous_output != context.max_output_tokens
+        && !matches!(
+            (exceeded.prompt_tokens, exceeded.context_tokens),
+            (Some(prompt), Some(size)) if prompt >= size
+        )
+}
+
+/// Omit lower-ranked, whole passages only. Keep each tool call/result pair,
+/// valid JSON, and at least one exact passage per result. Never truncate the
+/// question, frozen selection, safety policy, or an individual source quote.
+fn reduce_tool_results(messages: &mut [ChatMessage], bytes_to_remove: usize) -> bool {
+    let mut removed = 0usize;
+    while removed < bytes_to_remove {
+        let candidate = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.role == ChatRole::Tool)
+            .filter_map(|(index, message)| {
+                let Some(MessageContent::Text(content)) = &message.content else {
+                    return None;
+                };
+                let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
+                let tool = value.get("tool")?.as_str()?;
+                if !matches!(tool, "search_books" | "read_passages")
+                    || value.get("results")?.as_array()?.len() <= 1
+                {
+                    return None;
+                }
+                Some((index, content.len(), value))
+            })
+            .max_by_key(|(_, bytes, _)| *bytes);
+        let Some((index, original_bytes, mut value)) = candidate else {
+            break;
+        };
+        value["results"].as_array_mut().unwrap().pop();
+        value["truncated"] = serde_json::Value::Bool(true);
+        let Ok(content) = serde_json::to_string(&value) else {
+            break;
+        };
+        if content.len() >= original_bytes {
+            break;
+        }
+        removed += original_bytes - content.len();
+        messages[index].content = Some(MessageContent::Text(content));
+    }
+    removed > 0
+}
+
+fn retain_request_citations(
+    citations: &mut CitationRegistry,
+    messages: &[ChatMessage],
+) -> Result<()> {
+    let mut markers = HashSet::new();
+    for message in messages
+        .iter()
+        .filter(|message| message.role == ChatRole::Tool)
+    {
+        let Some(MessageContent::Text(content)) = &message.content else {
+            continue;
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(content).context("host tool result is not valid JSON")?;
+        if let Some(results) = value.get("results").and_then(serde_json::Value::as_array) {
+            for result in results {
+                if let Some(marker) = result
+                    .get("citation_id")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    markers.insert(marker.to_string());
+                }
+            }
+        }
+    }
+    citations.retain_passage_markers(&markers);
+    Ok(())
 }
 
 const PROTOCOL_MARKER_START: &str = "[[moye-";
@@ -1009,6 +1382,213 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct RejectContextProvider {
+        requests: Arc<Mutex<Vec<ChatRequest>>>,
+        cancel: Option<AgentCancellation>,
+        incomplete_tool_at: Option<usize>,
+    }
+
+    impl OpenAiCompatibleProvider for RejectContextProvider {
+        fn models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>>> {
+            async { Ok(Vec::new()) }.boxed()
+        }
+
+        fn chat_stream(&self, request: ChatRequest) -> BoxFuture<'_, Result<ChatEventStream>> {
+            async move {
+                let count = {
+                    let mut requests = self.requests.lock().unwrap();
+                    requests.push(request);
+                    requests.len()
+                };
+                if let Some(cancel) = &self.cancel {
+                    cancel.cancel();
+                }
+                if self.incomplete_tool_at == Some(count) {
+                    return Err(IncompleteToolArguments {
+                        tool_name: "read_passages".into(),
+                    }
+                    .into());
+                }
+                Err(ContextWindowExceeded {
+                    prompt_tokens: None,
+                    context_tokens: None,
+                }
+                .into())
+            }
+            .boxed()
+        }
+
+        fn embeddings(&self, _request: EmbeddingRequest) -> BoxFuture<'_, Result<EmbeddingBatch>> {
+            async { Err(anyhow!("not used")) }.boxed()
+        }
+    }
+
+    fn question_with_history() -> AgentQuestion {
+        AgentQuestion {
+            question: "Keep this current question intact.".into(),
+            allowed_book_ids: vec!["book-1".into()],
+            book_titles: Vec::new(),
+            history: (0..40)
+                .flat_map(|index| {
+                    [
+                        ChatMessage::text(ChatRole::User, format!("old question {index}")),
+                        ChatMessage::text(ChatRole::Assistant, "old answer ".repeat(100)),
+                    ]
+                })
+                .collect(),
+            snapshots: vec![authorized_snapshot()],
+        }
+    }
+
+    #[tokio::test]
+    async fn context_retries_are_bounded_and_preserve_policy_question_and_frozen_selection() {
+        let provider = RejectContextProvider::default();
+        let error = runtime(provider.clone())
+            .answer(question_with_history(), None, AgentCancellation::default())
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<ContextWindowExceeded>().is_some());
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), MAX_CONTEXT_RETRIES + 1);
+        for pair in requests.windows(2) {
+            assert!(pair[1].messages.len() < pair[0].messages.len());
+            assert_eq!(pair[1].messages[0], pair[0].messages[0]);
+            assert_eq!(pair[1].messages.last(), pair[0].messages.last());
+            assert_eq!(pair[1].tools, pair[0].tools);
+            assert_eq!(pair[1].messages[1].role, ChatRole::User);
+        }
+        assert_eq!(requests.last().unwrap().messages.len(), 2);
+        assert_eq!(requests.last().unwrap().max_tokens, Some(1024));
+        let prompt =
+            serde_json::to_string(requests.last().unwrap().messages.last().unwrap()).unwrap();
+        assert!(prompt.contains("Keep this current question intact."));
+        assert!(prompt.contains("exact unsaved selection"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_between_context_retries_stops_before_another_provider_call() {
+        let cancellation = AgentCancellation::default();
+        let provider = RejectContextProvider {
+            cancel: Some(cancellation.clone()),
+            ..Default::default()
+        };
+        let error = runtime(provider.clone())
+            .answer(question_with_history(), None, cancellation)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        assert_eq!(provider.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_between_tool_argument_retries_stops_before_another_provider_call() {
+        let cancellation = AgentCancellation::default();
+        let provider = RejectContextProvider {
+            cancel: Some(cancellation.clone()),
+            incomplete_tool_at: Some(1),
+            ..Default::default()
+        };
+        let error = runtime(provider.clone())
+            .answer(question_with_history(), None, cancellation)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        assert_eq!(provider.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tool_recovery_does_not_reset_context_retry_budget_or_change_frozen_sources() {
+        let provider = RejectContextProvider {
+            incomplete_tool_at: Some(2),
+            ..Default::default()
+        };
+        let error = runtime(provider.clone())
+            .answer(question_with_history(), None, AgentCancellation::default())
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<ContextWindowExceeded>().is_some());
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), MAX_CONTEXT_RETRIES + 2);
+        assert_eq!(&requests[2].messages[1..], &requests[1].messages[1..]);
+        assert_eq!(requests[2].max_tokens, requests[1].max_tokens);
+        assert_eq!(requests[2].temperature, Some(0.0));
+        for request in requests.iter() {
+            assert_eq!(request.tools, requests[0].tools);
+            assert_eq!(request.messages.last(), requests[0].messages.last());
+        }
+        let Some(MessageContent::Text(original)) = &requests[0].messages[0].content else {
+            panic!("system policy must be text")
+        };
+        for request in &requests[2..] {
+            let Some(MessageContent::Text(policy)) = &request.messages[0].content else {
+                panic!("system policy must be text")
+            };
+            assert_eq!(
+                policy,
+                &format!("{original}{TOOL_ARGUMENT_RECOVERY_GUIDANCE}")
+            );
+        }
+    }
+
+    #[test]
+    fn history_reduction_preserves_current_question_and_appended_web_sources() {
+        let mut request = ChatRequest {
+            model: "chat-model".into(),
+            messages: vec![
+                ChatMessage::text(ChatRole::System, "policy"),
+                ChatMessage::text(ChatRole::Assistant, "leading orphan"),
+                ChatMessage::text(ChatRole::User, "old question"),
+                ChatMessage::text(ChatRole::Assistant, "old answer"),
+                ChatMessage::text(ChatRole::User, "current question"),
+                ChatMessage::text(ChatRole::User, "host web sources"),
+            ],
+            tools: Vec::new(),
+            temperature: None,
+            top_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            max_tokens: Some(4096),
+            reasoning_effort: None,
+        };
+        let original = request.clone();
+        let mut context = RequestContext {
+            round: 1,
+            history_messages: 3,
+            max_output_tokens: 4096,
+            tool_arguments_retried: false,
+        };
+        assert!(reduce_request_history(
+            &mut request,
+            &mut context,
+            &ContextWindowExceeded {
+                prompt_tokens: Some(4155),
+                context_tokens: Some(4096)
+            },
+            MAX_CONTEXT_RETRIES - 1,
+        ));
+        assert_eq!(
+            request.messages,
+            vec![
+                original.messages[0].clone(),
+                original.messages[4].clone(),
+                original.messages[5].clone()
+            ]
+        );
+        assert_eq!(context.history_messages, 0);
+        let reduced = request.clone();
+        assert!(!reduce_request_history(
+            &mut request,
+            &mut context,
+            &ContextWindowExceeded {
+                prompt_tokens: Some(4155),
+                context_tokens: Some(4096)
+            },
+            0,
+        ));
+        assert_eq!(request, reduced);
+    }
+
     #[derive(Clone)]
     struct SelectionAliasProvider {
         split_marker: bool,
@@ -1321,6 +1901,37 @@ mod tests {
         .unwrap()
     }
 
+    fn custom_generation() -> ChatGenerationSettings {
+        ChatGenerationSettings {
+            temperature: Some(0.7),
+            top_p: Some(0.8),
+            max_output_tokens: 128,
+            presence_penalty: Some(0.3),
+            frequency_penalty: Some(-0.4),
+        }
+    }
+
+    fn assert_custom_generation(request: &ChatRequest) {
+        let expected = custom_generation();
+        assert_eq!(request.temperature, expected.temperature);
+        assert_eq!(request.top_p, expected.top_p);
+        assert_eq!(request.presence_penalty, expected.presence_penalty);
+        assert_eq!(request.frequency_penalty, expected.frequency_penalty);
+        assert_eq!(request.max_tokens, Some(expected.max_output_tokens));
+    }
+
+    #[test]
+    fn runtime_rejects_invalid_generation_before_calling_the_provider() {
+        let provider = answer_only("unused");
+        let requests = Arc::clone(&provider.requests);
+        let settings = ChatGenerationSettings {
+            max_output_tokens: 0,
+            ..Default::default()
+        };
+        assert!(runtime(provider).with_chat_generation(settings).is_err());
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
     async fn ask(runtime: &AgentRuntime) -> Result<AgentAnswer> {
         runtime
             .answer(
@@ -1378,14 +1989,16 @@ mod tests {
 
     #[tokio::test]
     async fn web_fallback_grounds_an_answer_when_the_books_cannot() {
-        let runtime = runtime(ungrounded_then_web_answer(
-            "Answer from the web [[moye-source:web:0]].",
-        ))
-        .with_web_search(Some(web_backend(vec![web_result(
-            "Docs",
-            "https://example.test/docs",
-            "verified body",
-        )])));
+        let provider = ungrounded_then_web_answer("Answer from the web [[moye-source:web:0]].");
+        let requests = Arc::clone(&provider.requests);
+        let runtime = runtime(provider)
+            .with_chat_generation(custom_generation())
+            .unwrap()
+            .with_web_search(Some(web_backend(vec![web_result(
+                "Docs",
+                "https://example.test/docs",
+                "verified body",
+            )])));
 
         let answer = ask(&runtime).await.unwrap();
         assert_eq!(
@@ -1399,6 +2012,11 @@ mod tests {
             Some("https://example.test/docs")
         );
         assert!(!answer.markdown.contains("[[moye-source:"));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests.iter() {
+            assert_custom_generation(request);
+        }
     }
 
     #[tokio::test]
@@ -1807,6 +2425,8 @@ mod tests {
             "chat-model",
             limits,
         )
+        .unwrap()
+        .with_chat_generation(custom_generation())
         .unwrap();
 
         let answer = ask(&runtime).await.unwrap();
@@ -1822,6 +2442,9 @@ mod tests {
         assert_eq!(requests[0].tools, expected_tools);
         assert_eq!(requests[1].tools, agent_tool_definitions());
         assert!(requests[2].tools.is_empty());
+        for request in requests.iter() {
+            assert_custom_generation(request);
+        }
     }
 
     #[tokio::test]

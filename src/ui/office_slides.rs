@@ -31,6 +31,7 @@ pub(super) fn open_office_slides_window(
         app_id: Some("dev.moye.epub-editor.office-slides".to_string()),
         ..Default::default()
     };
+    let window_book_id = book_id.clone();
     cx.open_window(options, move |window, cx| {
         let preview = cx.new(|cx| {
             OfficePagesApp::new(
@@ -50,6 +51,21 @@ pub(super) fn open_office_slides_window(
                 .update(cx, |preview, cx| preview.handle_window_close(cx))
                 .unwrap_or(true)
         });
+        // Deleting the book must take this preview with it. There is no child
+        // WebView and nothing left to save, so the window can go after the
+        // current frame.
+        let removed_preview = preview.downgrade();
+        register_book_window(
+            window_book_id,
+            window,
+            move |window, cx| {
+                if let Some(preview) = removed_preview.upgrade() {
+                    preview.update(cx, |preview, cx| preview.close_for_removed_book(cx));
+                }
+                remove_window_after_current_frame(window, cx, None);
+            },
+            cx,
+        );
         cx.new(|cx| Root::new(preview, window, cx))
     })?;
     Ok(())
@@ -332,6 +348,12 @@ impl OfficePagesApp {
         });
         self.ai_controller.close();
         true
+    }
+
+    /// Cancels this preview because its book left the library. The caller
+    /// removes the native window; nothing here is left to save.
+    fn close_for_removed_book(&mut self, cx: &mut Context<Self>) {
+        self.handle_window_close(cx);
     }
 }
 

@@ -2571,6 +2571,43 @@ impl VisualJobCoordinator {
         Ok(changed)
     }
 
+    /// Wakes the worker for an exact job already committed by a transaction.
+    /// The persisted-job scanner can win the race and start or finish that job
+    /// before this notification. Sending its ID again is harmless: the worker
+    /// only executes queued records. Missing/replaced/stopped jobs and a closed
+    /// worker queue remain errors; this never creates, resets or retries a job.
+    pub(crate) async fn schedule_committed(&self, expected: &VisualJobSpec) -> Result<()> {
+        expected.validate()?;
+        let record = self
+            .status(&expected.id)
+            .await?
+            .with_context(|| format!("已提交的视觉任务不存在：{}", expected.id))?;
+        ensure!(
+            record.spec == *expected,
+            "视觉任务与本次提交的身份不一致：{}",
+            expected.id
+        );
+        ensure!(
+            !record.pause_requested && !record.cancel_requested,
+            "已提交的视觉任务已请求暂停或取消：{}",
+            expected.id
+        );
+        ensure!(
+            matches!(
+                record.state,
+                VisualJobState::Queued | VisualJobState::Running | VisualJobState::Succeeded
+            ),
+            "已提交的视觉任务无法调度：{}，状态 {:?}，原因 {}",
+            expected.id,
+            record.state,
+            record.error.as_deref().unwrap_or("无")
+        );
+        self.sender
+            .send(expected.id.clone())
+            .await
+            .context("视觉任务队列已经关闭")
+    }
+
     /// Requeues a persisted queued job after application restart. The complete
     /// rendering spec lives in `cursor_json`, so no in-memory document snapshot
     /// is required.
@@ -3762,6 +3799,106 @@ mod tests {
             RenderProfile::default(),
             renderer,
         )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn committed_visual_job_rejects_missing_replaced_stopped_and_closed_queue() {
+        let store = Arc::new(MemoryVisualJobStore::default());
+        let source = Arc::new(MemoryDocumentSource(sample_document()));
+        let sink = Arc::new(MemoryPageSink::new(Arc::clone(&store)));
+        let renderer: Arc<dyn VisualRenderer> = Arc::new(SlowRenderer);
+        let expected = spec("committed-job", renderer.as_ref());
+        let mut coordinator = VisualJobCoordinator::new(
+            Handle::current(),
+            store.clone(),
+            source,
+            sink,
+            vec![renderer],
+        )
+        .unwrap();
+
+        let error = coordinator.schedule_committed(&expected).await.unwrap_err();
+        assert!(error.to_string().contains("不存在"));
+
+        // A same-ID record alone is insufficient: every part of the frozen
+        // rendering identity must still agree, even after successful execution.
+        for field in [
+            "book", "source", "revision", "renderer", "version", "fidelity", "units", "profile",
+        ] {
+            let mut record = VisualJobRecord::queued(expected.clone(), 1);
+            record.state = VisualJobState::Succeeded;
+            match field {
+                "book" => record.spec.book_id = "other-book".to_string(),
+                "source" => record.spec.source_id = "other-source".to_string(),
+                "revision" => record.spec.document_revision = Revision::new(4),
+                "renderer" => record.spec.renderer = "other-renderer".to_string(),
+                "version" => record.spec.renderer_version = "2".to_string(),
+                "fidelity" => record.spec.fidelity = RenderFidelity::Normalized,
+                "units" => record.spec.unit_ids = vec!["unit-1".to_string()],
+                "profile" => record.spec.profile.viewport_width += 1,
+                _ => unreachable!(),
+            }
+            store
+                .jobs
+                .lock()
+                .unwrap()
+                .insert(expected.id.clone(), record);
+            let error = coordinator.schedule_committed(&expected).await.unwrap_err();
+            assert!(error.to_string().contains("身份不一致"), "{field}: {error}");
+        }
+
+        for state in [
+            VisualJobState::Paused,
+            VisualJobState::Cancelled,
+            VisualJobState::Failed,
+        ] {
+            let mut record = VisualJobRecord::queued(expected.clone(), 1);
+            record.state = state;
+            record.error = Some("injected renderer failure".to_string());
+            store
+                .jobs
+                .lock()
+                .unwrap()
+                .insert(expected.id.clone(), record);
+            let error = coordinator.schedule_committed(&expected).await.unwrap_err();
+            assert!(error.to_string().contains("无法调度"), "{state:?}: {error}");
+            assert!(error.to_string().contains("injected renderer failure"));
+        }
+
+        for pause in [false, true] {
+            let mut record = VisualJobRecord::queued(expected.clone(), 1);
+            record.state = VisualJobState::Running;
+            record.pause_requested = pause;
+            record.cancel_requested = !pause;
+            store
+                .jobs
+                .lock()
+                .unwrap()
+                .insert(expected.id.clone(), record);
+            let error = coordinator.schedule_committed(&expected).await.unwrap_err();
+            assert!(error.to_string().contains("已请求暂停或取消"));
+        }
+
+        coordinator.sender.close();
+        (&mut coordinator.worker).await.unwrap();
+        for state in [
+            VisualJobState::Queued,
+            VisualJobState::Running,
+            VisualJobState::Succeeded,
+        ] {
+            let mut record = VisualJobRecord::queued(expected.clone(), 1);
+            record.state = state;
+            store
+                .jobs
+                .lock()
+                .unwrap()
+                .insert(expected.id.clone(), record);
+            let error = coordinator.schedule_committed(&expected).await.unwrap_err();
+            assert!(
+                error.to_string().contains("队列已经关闭"),
+                "{state:?}: {error}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -6,7 +6,7 @@ use super::{
         AiSourceLink, citation_dom_navigation_script,
     },
 };
-use gpui::Pixels;
+use gpui::{Pixels, PromptButton, PromptLevel};
 use moye_epub_editor::{
     chat::ChatWindowKind,
     document::{
@@ -15,12 +15,15 @@ use moye_epub_editor::{
     },
     editing::{DocumentEditor, NewContentUnit},
     library::{MediaDraft, MediaKind},
-    markup::{ParsedSource, parse_source_for_unit, serialize_source},
+    markup::{ParsedSource, parse_source_for_unit, serialize_source, serialize_xhtml},
     media::{MediaBackend, MediaMetadata, MediaResponse, MediaService},
     services::{AppServices, LibraryMutation},
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+mod navigation;
+use navigation::{editor_toc_rows, toc_indent_destination, toc_outdent_destination};
 
 const EDITOR_SHELL_HOST: &str = "shell";
 const EDITOR_CONTENT_HOST: &str = "content";
@@ -120,7 +123,7 @@ pub(super) fn editor_chapters_from_document(document: &BookDocument) -> Result<V
         .iter()
         .enumerate()
         .map(|(index, unit)| {
-            let body = serialize_source(&unit.document, SourceKind::Html)
+            let body = serialize_xhtml(&unit.document)
                 .with_context(|| format!("无法生成内容单元预览：{}", unit.title))?;
             Ok(EditorChapter {
                 title: unit.title.clone(),
@@ -402,6 +405,7 @@ impl ActiveEditorPage {
 enum PendingEditorAction {
     SwitchTab(EditorTab),
     SelectChapter(usize),
+    SelectToc,
     AddChapter,
     RemoveChapter,
     MoveChapterUp,
@@ -1685,7 +1689,7 @@ fn preview_document_from_source(
     source: &str,
 ) -> Result<(String, String, moye_epub_editor::document::BlockDocument)> {
     let parsed = parse_source_for_unit(source_kind, source, unit_id)?;
-    let html = serialize_source(&parsed.document, SourceKind::Html)?;
+    let html = serialize_xhtml(&parsed.document)?;
     let fallback = editor_document_shell(title, &html);
     let replacement = if xml_body_element_range(&html).is_some() {
         html
@@ -2160,14 +2164,7 @@ fn next_unit_kind(kind: ContentUnitKind) -> ContentUnitKind {
     }
 }
 
-fn toc_node_for_unit<'a>(nodes: &'a [TocNode], unit_id: &str) -> Option<&'a TocNode> {
-    nodes.iter().find_map(|node| {
-        (node.target.unit_id() == unit_id)
-            .then_some(node)
-            .or_else(|| toc_node_for_unit(&node.children, unit_id))
-    })
-}
-
+#[cfg(test)]
 fn toc_depth_for_unit(nodes: &[TocNode], unit_id: &str) -> usize {
     fn find(nodes: &[TocNode], unit_id: &str, depth: usize) -> Option<usize> {
         nodes.iter().find_map(|node| {
@@ -2638,6 +2635,8 @@ pub struct EditorApp {
     media_target: Option<EditorMediaBlock>,
     pending_media_action: Option<PendingEditorAction>,
     selected: usize,
+    selected_toc_id: Option<String>,
+    pending_toc_id: Option<String>,
     tab: EditorTab,
     editor_webview: Option<Entity<WebView>>,
     web_state: EditorWebState,
@@ -2652,12 +2651,18 @@ pub struct EditorApp {
     active_write: Option<ActiveEditorWrite>,
     write_sequence: u64,
     close_after_write: bool,
+    close_prompt_open: bool,
+    close_confirmation_pending: bool,
+    close_without_saving_pending: bool,
     draft_generation: u64,
     webview_build_gate: EditorWebViewBuildGate,
     pub(super) ipc_sync_task: Option<Task<()>>,
     ready_timeout_task: Option<Task<()>>,
     closing_webview: Option<WeakEntity<WebView>>,
     closing: bool,
+    /// Set when the window closes because its book left the library: unsaved
+    /// edits belong to a document that no longer exists.
+    closing_for_removed_book: bool,
     removal_scheduled: bool,
     pub(super) notice: Option<Notice>,
 }
@@ -2807,6 +2812,8 @@ impl EditorApp {
             media_target: None,
             pending_media_action: None,
             selected: 0,
+            selected_toc_id: None,
+            pending_toc_id: None,
             tab: EditorTab::Source,
             editor_webview: None,
             web_state,
@@ -2821,12 +2828,16 @@ impl EditorApp {
             active_write: None,
             write_sequence: 0,
             close_after_write: false,
+            close_prompt_open: false,
+            close_confirmation_pending: false,
+            close_without_saving_pending: false,
             draft_generation: 0,
             webview_build_gate: EditorWebViewBuildGate::new(webview_building),
             ipc_sync_task: None,
             ready_timeout_task: None,
             closing_webview: None,
             closing: false,
+            closing_for_removed_book: false,
             removal_scheduled: false,
             notice: None,
         }
@@ -3180,16 +3191,7 @@ impl EditorApp {
         cx: &mut Context<Self>,
     ) -> bool {
         self.editor_webview = Some(webview);
-        if self.webview_build_gate.finish() {
-            self.begin_action(PendingEditorAction::Close, window, cx);
-            if self.active_write.is_some()
-                || self.pending_snapshot.is_some()
-                || self.pending_ready_action.is_some()
-                || self.closing
-            {
-                return true;
-            }
-        }
+        let close_after_build = self.webview_build_gate.finish();
         // Building is asynchronous, so honor whichever tab is active when the
         // native child WebView actually becomes ready.
         if self.tab.uses_webview() {
@@ -3197,8 +3199,20 @@ impl EditorApp {
         } else if let Some(webview) = &self.editor_webview {
             webview.update(cx, |webview, _| webview.hide());
         }
+        if close_after_build {
+            self.resume_deferred_close(window, cx);
+        }
         cx.notify();
         true
+    }
+
+    /// Resumes a close that was vetoed while the child WebView was building.
+    fn resume_deferred_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing_for_removed_book {
+            self.finish_removal_close(window, cx);
+        } else {
+            self.handle_window_close(window, cx);
+        }
     }
 
     pub(super) fn fail_webview_build(
@@ -3213,7 +3227,7 @@ impl EditorApp {
             error: true,
         });
         if close_after_build {
-            self.begin_action(PendingEditorAction::Close, window, cx);
+            self.resume_deferred_close(window, cx);
             return;
         }
         cx.notify();
@@ -3408,25 +3422,31 @@ impl EditorApp {
         else {
             return;
         };
-        if self.chapters[chapter_index].html != message.html {
-            self.draft_generation = self.draft_generation.wrapping_add(1);
-        }
-        self.chapters[chapter_index].html = message.html.clone();
-        if message.edited {
+        if message.edited || self.chapters[chapter_index].html != message.html {
+            if let Err(error) = self.update_unit_from_rich_text(chapter_index, &message.html) {
+                self.notice = Some(Notice {
+                    text: format!("无法解析富文本编辑结果：{error:#}"),
+                    error: true,
+                });
+                self.pending_snapshot = None;
+                self.pending_export_path = None;
+                cx.notify();
+                return;
+            }
+            if self.chapters[chapter_index].html != message.html {
+                self.draft_generation = self.draft_generation.wrapping_add(1);
+            }
+            self.chapters[chapter_index].html = message.html.clone();
             if let Some(state) = self.unit_states.get(chapter_index) {
                 self.modified_chapter_ids.insert(state.id.clone());
             }
         }
-        if let Err(error) = self.update_unit_from_rich_text(chapter_index, &message.html) {
-            self.notice = Some(Notice {
-                text: format!("无法解析富文本编辑结果：{error:#}"),
-                error: true,
-            });
-            self.pending_snapshot = None;
-            self.pending_export_path = None;
-            cx.notify();
-            return;
-        }
+        // An unchanged acknowledgement carries the original display shell,
+        // including its article wrapper. It is not a new editable snapshot:
+        // reparsing it would collapse typed blocks and lose media references.
+        // A previously rejected snapshot differs from the accepted chapter and
+        // must still pass parsing, even if the web page now reports unchanged.
+        // Only an accepted snapshot releases the exact pending action below.
         if !self.search_query.is_empty() {
             self.search_results = search_editor_chapters(&self.chapters, &self.search_query);
         }
@@ -3648,11 +3668,15 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if action != PendingEditorAction::SelectToc {
+            self.pending_toc_id = None;
+        }
         match action {
             PendingEditorAction::SwitchTab(tab) => self.perform_switch_tab(tab, window, cx),
             PendingEditorAction::SelectChapter(index) => {
                 self.perform_select_chapter(index, window, cx)
             }
+            PendingEditorAction::SelectToc => self.perform_select_toc(window, cx),
             PendingEditorAction::AddChapter => self.perform_add_chapter(window, cx),
             PendingEditorAction::RemoveChapter => self.perform_remove_chapter(window, cx),
             PendingEditorAction::MoveChapterUp => self.perform_move_chapter(-1, window, cx),
@@ -3915,6 +3939,55 @@ impl EditorApp {
         self.begin_action(PendingEditorAction::SelectChapter(index), window, cx);
     }
 
+    fn select_toc(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.pending_toc_id = Some(id.to_string());
+        self.begin_action(PendingEditorAction::SelectToc, window, cx);
+    }
+
+    fn current_toc_id(&self) -> Option<String> {
+        let document = self.canonical_document.as_ref()?;
+        let unit = self.unit_states.get(self.selected)?;
+        let rows = editor_toc_rows(&document.toc);
+        self.selected_toc_id
+            .as_ref()
+            .and_then(|id| {
+                rows.iter()
+                    .find(|row| row.id == *id && row.unit_id == unit.id)
+            })
+            .or_else(|| rows.iter().find(|row| row.unit_id == unit.id))
+            .map(|row| row.id.clone())
+    }
+
+    fn perform_select_toc(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.pending_toc_id.take() else {
+            return;
+        };
+        let target = self.canonical_document.as_ref().and_then(|document| {
+            editor_toc_rows(&document.toc)
+                .into_iter()
+                .find(|row| row.id == id)
+        });
+        let Some(target) = target else {
+            self.set_error("目录项已不存在，请重新选择", cx);
+            return;
+        };
+        let Some(index) = self
+            .unit_states
+            .iter()
+            .position(|unit| unit.id == target.unit_id)
+        else {
+            self.set_error("目录对应的章节已不存在，请重新打开编辑窗口", cx);
+            return;
+        };
+        self.perform_select_chapter(index, window, cx);
+        // Source validation may veto switching. Never highlight a destination
+        // whose content did not become the current editable unit.
+        if self.selected == index {
+            self.selected_toc_id = Some(id);
+            cx.notify();
+        }
+    }
+
     fn perform_select_chapter(
         &mut self,
         index: usize,
@@ -3931,6 +4004,7 @@ impl EditorApp {
             }
         }
         self.selected = index;
+        self.selected_toc_id = None;
         self.ai_selected_text = None;
         self.sync_chapter_title_input(index, window, cx);
         match self.tab {
@@ -4304,9 +4378,6 @@ impl EditorApp {
     }
 
     fn indent_toc(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.selected == 0 {
-            return;
-        }
         self.begin_action(PendingEditorAction::IndentToc, window, cx);
     }
 
@@ -4314,24 +4385,14 @@ impl EditorApp {
         let Some(document) = self.canonical_document.clone() else {
             return;
         };
-        let Some(current) = self.unit_states.get(self.selected) else {
+        let Some(toc_id) = self.current_toc_id() else {
+            self.set_error("请先选择要调整的目录项", cx);
             return;
         };
-        let Some(previous) = self.unit_states.get(self.selected.saturating_sub(1)) else {
+        let Some((parent_id, position)) = toc_indent_destination(&document.toc, &toc_id) else {
+            self.set_error("当前目录项没有可作为父目录的前一项", cx);
             return;
         };
-        let Some(toc_id) =
-            toc_node_for_unit(&document.toc, &current.id).map(|node| node.id.clone())
-        else {
-            self.set_error("当前内容单元没有目录节点", cx);
-            return;
-        };
-        let Some(parent) = toc_node_for_unit(&document.toc, &previous.id) else {
-            self.set_error("上一内容单元没有目录节点", cx);
-            return;
-        };
-        let parent_id = parent.id.clone();
-        let position = parent.children.len();
         let mut editor = match DocumentEditor::new(document) {
             Ok(editor) => editor,
             Err(error) => {
@@ -4342,6 +4403,7 @@ impl EditorApp {
         match editor.move_toc_node(&toc_id, Some(&parent_id), position) {
             Ok(()) => {
                 self.canonical_document = Some(editor.into_document());
+                self.selected_toc_id = Some(toc_id);
                 self.notice = Some(Notice {
                     text: "已将本项缩进为上一项的子目录，保存后生效。".to_string(),
                     error: false,
@@ -4360,18 +4422,12 @@ impl EditorApp {
         let Some(document) = self.canonical_document.clone() else {
             return;
         };
-        let Some(current) = self.unit_states.get(self.selected) else {
+        let Some(toc_id) = self.current_toc_id() else {
             return;
         };
-        if toc_depth_for_unit(&document.toc, &current.id) == 0 {
-            return;
-        }
-        let Some(toc_id) =
-            toc_node_for_unit(&document.toc, &current.id).map(|node| node.id.clone())
-        else {
+        let Some((parent_id, position)) = toc_outdent_destination(&document.toc, &toc_id) else {
             return;
         };
-        let root_position = document.toc.len();
         let mut editor = match DocumentEditor::new(document) {
             Ok(editor) => editor,
             Err(error) => {
@@ -4379,11 +4435,12 @@ impl EditorApp {
                 return;
             }
         };
-        match editor.move_toc_node(&toc_id, None, root_position) {
+        match editor.move_toc_node(&toc_id, parent_id.as_deref(), position) {
             Ok(()) => {
                 self.canonical_document = Some(editor.into_document());
+                self.selected_toc_id = Some(toc_id);
                 self.notice = Some(Notice {
-                    text: "已将本项提升到目录根层，保存后生效。".to_string(),
+                    text: "已将当前目录项提升一级，保存后生效。".to_string(),
                     error: false,
                 });
                 cx.notify();
@@ -5423,6 +5480,7 @@ impl EditorApp {
                     cx,
                 ) {
                     self.set_rich_text_write_locked(false, cx);
+                    self.resume_close_confirmation(window, cx);
                     return;
                 }
                 // The persisted state is now authoritative for every chapter;
@@ -5501,6 +5559,7 @@ impl EditorApp {
                 cx.notify();
             }
         }
+        self.resume_close_confirmation(window, cx);
     }
 
     fn apply_persisted_editor_state(
@@ -5703,6 +5762,7 @@ impl EditorApp {
         self.pending_ai_request = None;
         self.pending_citation_source = None;
         self.pending_citation_navigation = None;
+        self.pending_toc_id = None;
         self.pending_media_action = None;
         self.media_modal = None;
         self.ipc_sync_task.take();
@@ -5719,6 +5779,10 @@ impl EditorApp {
             return;
         }
         self.closing = true;
+        self.ai_sidebar.update(cx, |sidebar, cx| {
+            sidebar.cancel_for_window_close(cx);
+        });
+        self.ai_controller.close();
         self.closing_webview = self.release_webview(cx);
         cx.notify();
         window.refresh();
@@ -5729,7 +5793,11 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.closing {
+        if self.closing
+            || self.close_prompt_open
+            || self.close_without_saving_pending
+            || self.save_and_close_pending()
+        {
             return false;
         }
         if self.export_dialog_open {
@@ -5740,22 +5808,130 @@ impl EditorApp {
             cx.notify();
             return false;
         }
-        self.ai_sidebar.update(cx, |sidebar, cx| {
-            sidebar.cancel_for_window_close(cx);
-        });
-        self.ai_controller.close();
         if self.webview_build_gate.request_close() {
             self.notice = Some(Notice {
-                text: "正在安全关闭编辑器…".to_string(),
+                text: "正在等待编辑器初始化，完成后将询问是否保存。".to_string(),
                 error: false,
             });
             cx.notify();
             return false;
         }
-        self.begin_action(PendingEditorAction::Close, window, cx);
+        // An explicitly accepted save/export may already be committing. Let it
+        // settle before asking; closing must not silently authorize another save.
+        if self.active_write.is_some() {
+            self.close_confirmation_pending = true;
+            self.notice = Some(Notice {
+                text: "正在等待当前保存或导出完成，随后将询问是否保存并关闭。".to_string(),
+                error: false,
+            });
+            cx.notify();
+            return false;
+        }
+        self.close_prompt_open = true;
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "关闭编辑窗口前，是否保存图书修改？",
+            Some("选择“不保存”将放弃尚未保存的修改；选择“取消”继续编辑。"),
+            &[
+                PromptButton::ok("保存并关闭"),
+                PromptButton::new("不保存"),
+                PromptButton::cancel("取消"),
+            ],
+            cx,
+        );
+        cx.spawn_in(window, async move |view, cx| {
+            let answer = answer.await;
+            let _ = view.update_in(cx, |this, window, cx| {
+                this.close_prompt_open = false;
+                match answer {
+                    Ok(0) => this.begin_action(PendingEditorAction::Close, window, cx),
+                    Ok(1) => {
+                        // A previously requested Save/Export may have finished
+                        // its snapshot barrier while the native prompt was open.
+                        // Keep its result/projection callback alive, without
+                        // authorizing any further write on close.
+                        if this.active_write.is_some() {
+                            this.close_without_saving_pending = true;
+                            this.notice = Some(Notice {
+                                text: "正在等待已开始的保存或导出结束，随后关闭编辑器。"
+                                    .to_string(),
+                                error: false,
+                            });
+                            cx.notify();
+                        } else {
+                            this.schedule_window_removal(window, cx);
+                        }
+                    }
+                    Ok(_) => cx.notify(),
+                    Err(_) => {
+                        this.notice = Some(Notice {
+                            text: "保存确认未完成，编辑器保持打开。请重试关闭。".to_string(),
+                            error: true,
+                        });
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
         false
     }
+
+    /// Closes this editor because its book left the library.
+    ///
+    /// Unsaved edits are discarded: the document they belong to is already
+    /// gone, so neither a save nor a confirmation may delay the close.
+    pub(super) fn close_for_removed_book(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing || self.closing_for_removed_book {
+            return;
+        }
+        self.closing_for_removed_book = true;
+        if self.webview_build_gate.request_close() {
+            return;
+        }
+        self.finish_removal_close(window, cx);
+    }
+
+    fn finish_removal_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
+        // Drop every pending save/close decision so teardown cannot authorize
+        // another write against a book that no longer exists.
+        self.close_prompt_open = false;
+        self.close_after_write = false;
+        self.close_confirmation_pending = false;
+        self.schedule_window_removal(window, cx);
+    }
+
+    fn save_and_close_pending(&self) -> bool {
+        self.close_after_write
+            || self
+                .pending_snapshot
+                .as_ref()
+                .is_some_and(|pending| pending.action == PendingEditorAction::Close)
+            || [
+                self.pending_ready_action,
+                self.pending_cover_action,
+                self.pending_media_action,
+            ]
+            .contains(&Some(PendingEditorAction::Close))
+    }
+
+    fn resume_close_confirmation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.close_without_saving_pending) {
+            self.schedule_window_removal(window, cx);
+        } else if std::mem::take(&mut self.close_confirmation_pending) {
+            self.handle_window_close(window, cx);
+        }
+    }
 }
+
+#[cfg(test)]
+mod close_tests;
+
+#[cfg(test)]
+mod xhtml_tests;
 
 const DEFAULT_CHAPTER_HTML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE html>
@@ -5892,30 +6068,86 @@ impl Render for EditorApp {
             editor_context,
         );
 
+        let toc_rows = self
+            .canonical_document
+            .as_ref()
+            .map(|document| editor_toc_rows(&document.toc))
+            .unwrap_or_default();
+        let selected_toc_id = self.current_toc_id();
         let chapter_list = if self.search_query.is_empty() {
-            self.chapters
+            let listed_units = toc_rows
+                .iter()
+                .map(|row| row.unit_id.as_str())
+                .collect::<HashSet<_>>();
+            let mut items = toc_rows
+                .iter()
+                .map(|row| {
+                    let selected = selected_toc_id.as_deref() == Some(row.id.as_str());
+                    let id = row.id.clone();
+                    let list_view = view.clone();
+                    Button::new(SharedString::from(format!("editor-toc-{}", row.id)))
+                        .debug_selector(|| format!("editor-toc-{}", row.id))
+                        .ghost()
+                        .w_full()
+                        .h_auto()
+                        .min_h(px(38.))
+                        .flex_none()
+                        .justify_start()
+                        .pl(px(18. + row.depth.min(4) as f32 * 14.))
+                        .pr_3()
+                        .py_2()
+                        .when(selected, |this| this.bg(rgb(ACCENT_SOFT)))
+                        .disabled(write_busy)
+                        .on_click(move |_, window, cx| {
+                            list_view.update(cx, |this, cx| this.select_toc(&id, window, cx));
+                        })
+                        .child(
+                            div()
+                                .w_full()
+                                .min_w(px(0.))
+                                .text_left()
+                                .text_sm()
+                                .line_clamp(2)
+                                .text_color(if selected { rgb(ACCENT) } else { rgb(INK) })
+                                .child(row.label.clone()),
+                        )
+                        .into_any_element()
+                })
+                .collect::<Vec<_>>();
+            let unlisted = self
+                .unit_states
                 .iter()
                 .enumerate()
-                .map(|(index, chapter)| {
-                    let selected = index == self.selected;
-                    let toc_depth = self
-                        .canonical_document
-                        .as_ref()
-                        .and_then(|document| {
-                            self.unit_states
-                                .get(index)
-                                .map(|unit| toc_depth_for_unit(&document.toc, &unit.id))
-                        })
-                        .unwrap_or(0);
-                    let list_view = view.clone();
+                .filter(|(_, unit)| !listed_units.contains(unit.id.as_str()))
+                .collect::<Vec<_>>();
+            if !toc_rows.is_empty() && !unlisted.is_empty() {
+                items.push(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child("未列入目录的章节")
+                        .into_any_element(),
+                );
+            }
+            for (index, _) in unlisted {
+                let Some(chapter) = self.chapters.get(index) else {
+                    continue;
+                };
+                let selected = index == self.selected;
+                let list_view = view.clone();
+                items.push(
                     Button::new(("editor-chapter", index))
                         .ghost()
                         .w_full()
                         .h_auto()
-                        .min_h(px(34.))
+                        .min_h(px(38.))
+                        .flex_none()
                         .justify_start()
-                        .px_2()
-                        .gap_2()
+                        .px_3()
+                        .py_2()
                         .when(selected, |this| this.bg(rgb(ACCENT_SOFT)))
                         .disabled(write_busy)
                         .on_click(move |_, window, cx| {
@@ -5923,18 +6155,16 @@ impl Render for EditorApp {
                         })
                         .child(
                             div()
-                                .min_w(px(0.))
-                                .flex_1()
-                                .ml(px((toc_depth.min(5) * 14) as f32))
-                                .truncate()
+                                .w_full()
                                 .text_left()
                                 .text_sm()
-                                .text_color(if selected { rgb(ACCENT) } else { rgb(INK) })
+                                .line_clamp(2)
                                 .child(chapter.title.clone()),
                         )
-                        .into_any_element()
-                })
-                .collect::<Vec<_>>()
+                        .into_any_element(),
+                );
+            }
+            items
         } else {
             if self.search_results.is_empty() {
                 vec![
@@ -6268,7 +6498,7 @@ impl Render for EditorApp {
                                 .text_color(rgb(INK))
                                 .child(Icon::new(IconName::Menu).small())
                                 .child(if self.search_query.is_empty() {
-                                    format!("章节（{}）", self.chapters.len())
+                                    format!("目录（{}）", toc_rows.len())
                                 } else {
                                     format!("搜索结果（{}）", self.search_results.len())
                                 }),
@@ -6325,7 +6555,7 @@ impl Render for EditorApp {
                                         .xsmall()
                                         .icon(IconName::ArrowRight)
                                         .tooltip("缩进为上一项的子目录")
-                                        .disabled(structure_disabled || self.selected == 0)
+                                        .disabled(structure_disabled || selected_toc_id.is_none())
                                         .on_click(move |_, window, cx| {
                                             indent_view
                                                 .update(cx, |this, cx| this.indent_toc(window, cx));
@@ -6379,8 +6609,15 @@ impl Render for EditorApp {
                         .flex_1()
                         .min_h(px(0.))
                         .p_2()
-                        .overflow_y_scrollbar()
-                        .child(div().v_flex().gap_0p5().children(chapter_list)),
+                        .overflow_y_scroll()
+                        .child(
+                            div()
+                                .v_flex()
+                                .h_auto()
+                                .flex_none()
+                                .gap_0p5()
+                                .children(chapter_list),
+                        ),
                 )
                 .into_any_element()
         });

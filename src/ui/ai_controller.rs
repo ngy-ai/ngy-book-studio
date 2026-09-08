@@ -6,6 +6,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::Instant,
 };
 
 use anyhow::{Context as _, Result, bail};
@@ -13,12 +14,14 @@ use gpui::{Context, Entity, Task};
 use moye_epub_editor::{
     agent::{AgentAnswerSourceStatus, AgentCitation, SelectionSnapshot},
     agent_chat::{AgentConversation, ConversationQuestion},
-    agent_runtime::{AgentCancellation, AgentRunEvent},
+    agent_runtime::{AgentCancellation, AgentRequestCancelled, AgentRunEvent},
     ai::ChatRole,
+    ai_diagnostics::error_kind,
     chat::{ChatCitation, ChatSession, ChatThread, ChatWindowKind},
     document::{BookDocument, Revision, SourceLocator},
     services::AppServices,
 };
+use tracing::Instrument as _;
 
 use super::ai_sidebar::{
     AiQuestionRequest, AiReferenceHint, AiRestoredMessage, AiRestoredRole, AiSidebar, AiSourceLink,
@@ -53,6 +56,7 @@ struct UiSessionState {
 pub(super) struct AiSidebarController {
     services: Arc<AppServices>,
     conversation: AgentConversation,
+    window_kind: ChatWindowKind,
     answer_task: Option<Task<()>>,
     session_task: Option<Task<()>>,
     session_generation: Arc<AtomicU64>,
@@ -69,6 +73,7 @@ impl AiSidebarController {
         Ok(Self {
             services,
             conversation,
+            window_kind,
             answer_task: None,
             session_task: None,
             session_generation: Arc::new(AtomicU64::new(0)),
@@ -287,7 +292,7 @@ impl AiSidebarController {
                     }
                 }
                 Ok((true, _, Err(error))) => {
-                    tracing::warn!(%error, "cannot list sessions after resetting AI scope");
+                    tracing::warn!(target: "moye_ai", stage = "list_sessions_after_scope_reset", error_kind = error_kind(&anyhow::Error::msg(error)), "cannot list sessions after resetting AI scope");
                     sidebar.apply_session(None, Vec::new(), Vec::new(), cx);
                 }
                 Ok((false, _, Err(error))) => sidebar
@@ -319,6 +324,7 @@ impl AiSidebarController {
         let prepared = match conversation.prepare_request(request_id) {
             Ok(prepared) => prepared,
             Err(error) => {
+                tracing::warn!(target: "moye_ai", request_id, window_kind = ?self.window_kind, stage = "prepare_request", error_kind = error_kind(&error), "AI request preparation failed");
                 let error = friendly_agent_error(&format!("{error:#}"));
                 sidebar.update(cx, |sidebar, cx| {
                     sidebar.fail_answer(request_id, error, cx);
@@ -327,12 +333,27 @@ impl AiSidebarController {
             }
         };
         let cancellation = prepared.cancellation();
+        let trace_id = cancellation.trace_id();
+        let started = Instant::now();
+        let ui_span = tracing::info_span!(
+            target: "moye_ai",
+            "ai_ui_request",
+            trace_id,
+            request_id,
+            window_kind = ?self.window_kind,
+            allowed_books = book_ids.len(),
+            references = reference_hints.len(),
+            question_bytes = question.len()
+        );
+        let worker_span = ui_span.clone();
         let runtime = services.runtime();
         let live_scope = book_ids.clone();
         let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel();
         let (ui_tx, ui_rx) = async_channel::unbounded();
 
-        runtime.spawn(async move {
+        let worker = async move {
+            tracing::debug!(target: "moye_ai", stage = "freeze_references", "AI reference preparation started");
+            let freeze_started = Instant::now();
             let snapshots = match freeze_references(
                 Arc::clone(&services),
                 reference_hints,
@@ -341,8 +362,16 @@ impl AiSidebarController {
             )
             .await
             {
-                Ok(snapshots) => snapshots,
+                Ok(snapshots) => {
+                    tracing::debug!(target: "moye_ai", stage = "freeze_references", snapshots = snapshots.len(), elapsed_ms = freeze_started.elapsed().as_millis() as u64, "AI reference preparation completed");
+                    snapshots
+                }
                 Err(error) => {
+                    if error.is::<AgentRequestCancelled>() {
+                        tracing::info!(target: "moye_ai", stage = "freeze_references", error_kind = "cancelled", elapsed_ms = freeze_started.elapsed().as_millis() as u64, "AI reference preparation cancelled");
+                    } else {
+                        tracing::warn!(target: "moye_ai", stage = "freeze_references", error_kind = error_kind(&error), elapsed_ms = freeze_started.elapsed().as_millis() as u64, "AI reference preparation failed");
+                    }
                     drop(prepared);
                     let _ = ui_tx
                         .send(UiAgentMessage::Completed(Box::new(Err(format!(
@@ -383,6 +412,7 @@ impl AiSidebarController {
                         if let Some(message) = message
                             && ui_tx.send(message).await.is_err()
                         {
+                                tracing::debug!(target: "moye_ai", stage = "deliver_events", "AI UI receiver closed; cancelling request");
                                 cancel_conversation.cancel(request_id);
                                 return;
                         }
@@ -418,7 +448,9 @@ impl AiSidebarController {
                         Ok(sources) => sources,
                         Err(error) => {
                             tracing::warn!(
-                                %error,
+                                target: "moye_ai",
+                                stage = "validate_live_sources",
+                                error_kind = error_kind(&error),
                                 "cannot decorate the already-persisted AI answer with live sources"
                             );
                             Vec::new()
@@ -430,7 +462,14 @@ impl AiSidebarController {
                         source_status,
                     })
                 }
-                Err(error) => Err(format!("{error:#}")),
+                Err(error) => {
+                    if error.is::<AgentRequestCancelled>() {
+                        tracing::debug!(target: "moye_ai", stage = "conversation_result", error_kind = "cancelled", elapsed_ms = started.elapsed().as_millis() as u64, "AI conversation cancellation returned to the UI");
+                    } else {
+                        tracing::warn!(target: "moye_ai", stage = "conversation_result", error_kind = error_kind(&error), elapsed_ms = started.elapsed().as_millis() as u64, "AI conversation returned an error to the UI");
+                    }
+                    Err(format!("{error:#}"))
+                }
             };
             let active_thread_id = session_conversation.selected_thread_id().await;
             match session_conversation.list_sessions(&live_scope).await {
@@ -443,72 +482,90 @@ impl AiSidebarController {
                         .await;
                 }
                 Err(error) => {
-                    tracing::warn!(%error, "cannot refresh AI conversation list");
+                    tracing::warn!(target: "moye_ai", stage = "refresh_sessions", error_kind = error_kind(&error), "cannot refresh AI conversation list");
                 }
             }
-            let _ = ui_tx
+            let succeeded = result.is_ok();
+            let delivered = ui_tx
                 .send(UiAgentMessage::Completed(Box::new(result)))
-                .await;
-        });
+                .await
+                .is_ok();
+            tracing::debug!(target: "moye_ai", stage = "deliver_completion", succeeded, delivered, elapsed_ms = started.elapsed().as_millis() as u64, "AI conversation completion sent to UI");
+        };
+        runtime.spawn(worker.instrument(worker_span));
 
         self.answer_task = Some(cx.spawn(async move |_, cx| {
-            let mut received_delta = false;
-            let mut answer_committed = false;
-            while let Ok(message) = ui_rx.recv().await {
-                match message {
-                    UiAgentMessage::Delta(delta) => {
-                        received_delta = true;
-                        let _ = sidebar.update(cx, |sidebar, cx| {
-                            sidebar.append_answer_delta(request_id, &delta, cx);
-                        });
-                    }
-                    UiAgentMessage::Reset => {
-                        received_delta = false;
-                        answer_committed = false;
-                        let _ = sidebar.update(cx, |sidebar, cx| {
-                            sidebar.reset_answer(request_id, cx);
-                        });
-                    }
-                    UiAgentMessage::Committed => {
-                        answer_committed = true;
-                    }
-                    UiAgentMessage::Sessions {
-                        active_thread_id,
-                        threads,
-                    } => {
-                        let _ = sidebar.update(cx, |sidebar, cx| {
-                            sidebar.refresh_sessions(active_thread_id, threads, cx);
-                        });
-                    }
-                    UiAgentMessage::Completed(result) => {
-                        let _ = sidebar.update(cx, |sidebar, cx| match *result {
-                            Ok(answer) => {
-                                if !answer_committed {
-                                    sidebar.reset_answer(request_id, cx);
-                                    received_delta = false;
-                                }
-                                if !received_delta {
-                                    sidebar.append_answer_delta(
+            let update = async move {
+                let mut received_delta = false;
+                let mut answer_committed = false;
+                let mut delta_bytes = 0usize;
+                while let Ok(message) = ui_rx.recv().await {
+                    match message {
+                        UiAgentMessage::Delta(delta) => {
+                            delta_bytes = delta_bytes.saturating_add(delta.len());
+                            received_delta = true;
+                            let _ = sidebar.update(cx, |sidebar, cx| {
+                                sidebar.append_answer_delta(request_id, &delta, cx);
+                            });
+                        }
+                        UiAgentMessage::Reset => {
+                            tracing::debug!(target: "moye_ai", stage = "reset_provisional_answer", "AI provisional answer reset");
+                            received_delta = false;
+                            answer_committed = false;
+                            let _ = sidebar.update(cx, |sidebar, cx| {
+                                sidebar.reset_answer(request_id, cx);
+                            });
+                        }
+                        UiAgentMessage::Committed => {
+                            answer_committed = true;
+                            tracing::debug!(target: "moye_ai", stage = "answer_source_commit", "AI source validation commit received");
+                        }
+                        UiAgentMessage::Sessions {
+                            active_thread_id,
+                            threads,
+                        } => {
+                            let _ = sidebar.update(cx, |sidebar, cx| {
+                                sidebar.refresh_sessions(active_thread_id, threads, cx);
+                            });
+                        }
+                        UiAgentMessage::Completed(result) => {
+                            let succeeded = result.is_ok();
+                            let applied = sidebar.update(cx, |sidebar, cx| match *result {
+                                Ok(answer) => {
+                                    if !answer_committed {
+                                        sidebar.reset_answer(request_id, cx);
+                                        received_delta = false;
+                                    }
+                                    if !received_delta {
+                                        sidebar.append_answer_delta(
+                                            request_id,
+                                            &answer.answer.answer.markdown,
+                                            cx,
+                                        );
+                                    }
+                                    sidebar.finish_answer(
                                         request_id,
-                                        &answer.answer.answer.markdown,
+                                        answer.sources,
+                                        answer.source_status,
                                         cx,
-                                    );
+                                    )
                                 }
-                                sidebar.finish_answer(
-                                    request_id,
-                                    answer.sources,
-                                    answer.source_status,
-                                    cx,
-                                );
+                                Err(error) => {
+                                    sidebar.fail_answer(request_id, friendly_agent_error(&error), cx)
+                                }
+                            });
+                            match applied {
+                                Ok(true) => tracing::debug!(target: "moye_ai", stage = "ui_completion", succeeded, delta_bytes, elapsed_ms = started.elapsed().as_millis() as u64, "AI result applied to sidebar"),
+                                Ok(false) => tracing::debug!(target: "moye_ai", stage = "ui_completion", succeeded, "AI stale completion ignored by sidebar"),
+                                Err(_) => tracing::debug!(target: "moye_ai", stage = "ui_completion", succeeded, "AI completion dropped because sidebar closed"),
                             }
-                            Err(error) => {
-                                sidebar.fail_answer(request_id, friendly_agent_error(&error), cx);
-                            }
-                        });
-                        return;
+                            return;
+                        }
                     }
                 }
-            }
+                tracing::debug!(target: "moye_ai", stage = "ui_events_closed", delta_bytes, elapsed_ms = started.elapsed().as_millis() as u64, "AI UI event channel closed");
+            };
+            update.instrument(ui_span).await
         }));
     }
 
@@ -739,7 +796,7 @@ async fn freeze_references(
 
 fn ensure_reference_freeze_active(cancellation: &AgentCancellation) -> Result<()> {
     if cancellation.is_cancelled() {
-        bail!("AI request was cancelled");
+        bail!(AgentRequestCancelled);
     }
     Ok(())
 }
@@ -790,7 +847,9 @@ async fn load_ui_session_state(
             Ok(messages) => messages,
             Err(error) => {
                 tracing::warn!(
-                    %error,
+                    target: "moye_ai",
+                    stage = "validate_restored_citations",
+                    error_kind = error_kind(&error),
                     "cannot validate restored AI citations; restoring message text without sources"
                 );
                 let mut messages = restored_messages(session);
@@ -805,7 +864,7 @@ async fn load_ui_session_state(
     let threads = match conversation.list_sessions(allowed_book_ids).await {
         Ok(threads) => thread_options(threads),
         Err(error) => {
-            tracing::warn!(%error, "cannot list AI sessions after selecting a session");
+            tracing::warn!(target: "moye_ai", stage = "list_selected_sessions", error_kind = error_kind(&error), "cannot list AI sessions after selecting a session");
             fallback_thread
                 .into_iter()
                 .map(|thread| AiThreadOption::new(thread.id, thread.title, thread.scope.book_ids))
@@ -937,7 +996,9 @@ fn source_link_from_agent_citation(citation: AgentCitation) -> Option<AiSourceLi
         )
     {
         tracing::warn!(
-            citation_id = %citation.citation_id,
+            target: "moye_ai",
+            stage = "convert_agent_citation",
+            error_kind = "invalid_locator",
             "discarding AI citation with an invalid or mismatched locator"
         );
         return None;
@@ -990,7 +1051,9 @@ fn source_link_from_chat_citation(citation: ChatCitation) -> Option<AiSourceLink
             .is_some_and(|unit_id| unit_id != citation.locator.unit_id)
     {
         tracing::warn!(
-            citation_id = %citation.id,
+            target: "moye_ai",
+            stage = "convert_stored_citation",
+            error_kind = "invalid_locator",
             "discarding persisted AI citation with an invalid or mismatched locator"
         );
         return None;
@@ -1359,6 +1422,8 @@ mod tests {
             .block_on(freeze_references(services, Vec::new(), &[], cancellation))
             .expect_err("cancelled freeze must stop before reading the library");
         assert!(error.to_string().contains("cancelled"));
+        assert!(error.is::<AgentRequestCancelled>());
+        assert_eq!(error_kind(&error), "cancelled");
     }
 
     #[test]
