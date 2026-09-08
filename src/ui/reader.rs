@@ -19,6 +19,9 @@ use moye_epub_editor::{
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(target_os = "windows")]
+mod selection_menu;
+
 const MAX_READER_SELECTION_BYTES: usize = 32 * 1024;
 const READER_NAVIGATION_DEFAULT_WIDTH: f32 = 286.;
 const READER_NAVIGATION_MIN_WIDTH: f32 = 200.;
@@ -99,6 +102,10 @@ enum ReaderIpcMessage {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ReaderWebEvent {
     PageLoaded(String),
+    ExplainSelection {
+        url: String,
+        selected_text: String,
+    },
     SelectionChanged {
         url: String,
         selected_text: Option<String>,
@@ -660,6 +667,10 @@ pub(super) async fn build_reader_webview(
         .build_as_child_async(parent)
         .await
         .context("无法创建正文视图")?;
+
+    #[cfg(target_os = "windows")]
+    selection_menu::install(&raw_webview, event_sender, protocol_gate.clone())
+        .context("无法添加阅读器 AI 解释菜单")?;
 
     Ok((raw_webview, event_receiver, protocol_gate))
 }
@@ -1376,6 +1387,12 @@ impl ReaderApp {
     ) {
         match event {
             AiSidebarEvent::Submit(request) => {
+                if self.closing || self.webview_build_gate.close_requested {
+                    self.ai_sidebar.update(cx, |sidebar, cx| {
+                        sidebar.cancel_for_window_close(cx);
+                    });
+                    return;
+                }
                 self.ai_controller
                     .submit(request.clone(), self.ai_sidebar.clone(), cx);
             }
@@ -1519,6 +1536,9 @@ impl ReaderApp {
     pub(super) fn sync_web_event(&mut self, event: ReaderWebEvent, cx: &mut Context<Self>) {
         match event {
             ReaderWebEvent::PageLoaded(url) => self.sync_loaded_page(&url, cx),
+            ReaderWebEvent::ExplainSelection { url, selected_text } => {
+                self.explain_selection(&url, &selected_text, cx);
+            }
             ReaderWebEvent::SelectionChanged { url, selected_text } => {
                 self.sync_selection(&url, selected_text, cx)
             }
@@ -1626,6 +1646,28 @@ impl ReaderApp {
         self.selected_text = selected_text;
         self.sync_ai_reference(cx);
         cx.notify();
+    }
+
+    fn explain_selection(&mut self, url: &str, selected_text: &str, cx: &mut Context<Self>) {
+        if self.closing || self.webview_build_gate.close_requested {
+            return;
+        }
+        let Some(reference) = reader_explanation_reference(
+            &self.book_id,
+            &self.book,
+            &self.progress_locators,
+            self.current_spine,
+            url,
+            selected_text,
+        ) else {
+            self.set_error(
+                "所选文本已失效，请在当前章节重新选择后解释。".to_string(),
+                cx,
+            );
+            return;
+        };
+        self.ai_controller
+            .explain_selection(reference, self.ai_sidebar.clone(), cx);
     }
 
     fn go_to_toc(&mut self, toc_index: usize, cx: &mut Context<Self>) {
@@ -1984,6 +2026,30 @@ impl ReaderApp {
         self.finish_close(cx);
         window.refresh();
     }
+}
+
+fn reader_explanation_reference(
+    book_id: &str,
+    book: &OpenedBook,
+    progress_locators: &[DocumentLocator],
+    current_spine: usize,
+    url: &str,
+    selected_text: &str,
+) -> Option<AiReferenceHint> {
+    let uri = url.parse().ok()?;
+    if !is_reader_document_uri(&uri) || book.spine_index_for_url(url) != Some(current_spine) {
+        return None;
+    }
+    let selected_text = normalize_reader_selection(selected_text)??;
+    reader_reference_hints(
+        book_id,
+        &book.spine,
+        progress_locators,
+        current_spine,
+        Some(&selected_text),
+    )
+    .into_iter()
+    .find(|reference| reference.frozen_text.is_some())
 }
 
 fn reader_reference_hints(
@@ -2393,6 +2459,48 @@ mod tests {
         );
         assert!(references[0].label.starts_with("当前章节"));
         assert_eq!(references[0].locator.as_ref(), Some(&locators[1]));
+    }
+
+    #[test]
+    fn explanation_reference_requires_current_chapter_and_captures_only_selected_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut library = LibraryStore::load_from(temp.path().join("library")).unwrap();
+        let record = library.create_book("解释测试", "").unwrap();
+        let book = OpenedBook::open_bytes(library.reader_epub_bytes(&record.id).unwrap()).unwrap();
+        let document = library.document(&record.id).unwrap();
+        let locators = document
+            .units
+            .iter()
+            .map(|unit| DocumentLocator::unit(&record.id, &unit.id))
+            .collect::<Vec<_>>();
+        let url = OpenedBook::navigation_url_for_href(&book.spine[0].href);
+        let reference =
+            reader_explanation_reference(&record.id, &book, &locators, 0, &url, "  所选\n\t文本  ")
+                .unwrap();
+        assert_eq!(reference.frozen_text.as_deref(), Some("所选 文本"));
+        assert_eq!(reference.locator.as_ref(), Some(&locators[0]));
+        for (spine_index, source_url, selection) in [
+            (1, url.as_str(), "过期章节"),
+            (0, "https://example.com/chapter.xhtml", "其它来源"),
+            (0, "http://epubreader.book/missing.xhtml", "缺失章节"),
+            (0, url.as_str(), " \n\t "),
+        ] {
+            assert!(
+                reader_explanation_reference(
+                    &record.id,
+                    &book,
+                    &locators,
+                    spine_index,
+                    source_url,
+                    selection,
+                )
+                .is_none()
+            );
+        }
+        assert!(
+            reader_explanation_reference("another-book", &book, &locators, 0, &url, "越权文本",)
+                .is_none()
+        );
     }
 
     #[test]

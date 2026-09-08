@@ -24,6 +24,7 @@ const AI_SIDEBAR_NARROW_THRESHOLD: f32 = 1080.;
 const AI_REFERENCE_VISIBLE_ROWS: usize = 3;
 const AI_REFERENCE_ROW_HEIGHT: f32 = 28.;
 const MAX_QUESTION_BYTES: usize = 32 * 1024;
+const SELECTION_EXPLANATION_QUESTION: &str = "详细解释一下";
 const NO_KNOWLEDGE_BASE_SOURCE_WARNING_TITLE: &str = "没有可验证的知识库来源";
 const NO_KNOWLEDGE_BASE_SOURCE_WARNING_BODY: &str =
     "以下回答由大模型根据自身能力生成，不能视为基于所选图书的回答，请自行核实。";
@@ -1099,6 +1100,30 @@ impl ConversationState {
         })
     }
 
+    /// Called only after the controller has successfully started a fresh
+    /// backend conversation. Never inherit manual references or an excluded
+    /// automatic selection from the previous conversation.
+    fn begin_selection_explanation(
+        &mut self,
+        reference: AiReferenceHint,
+    ) -> Option<AiQuestionRequest> {
+        if self.is_sending()
+            || !self.scope.book_ids().contains(&reference.book_id)
+            || !valid_reference_hint_locator(&reference)
+            || reference
+                .frozen_text
+                .as_ref()
+                .is_none_or(|text| text.trim().is_empty())
+        {
+            return None;
+        }
+        self.messages.clear();
+        self.included_references.clear();
+        self.automatic_reference = None;
+        self.set_reference_hints(vec![reference]);
+        self.begin(SELECTION_EXPLANATION_QUESTION)
+    }
+
     fn cancel(&mut self) -> Option<u64> {
         let RequestState::Sending { request_id } = self.request else {
             return None;
@@ -1548,6 +1573,50 @@ impl AiSidebar {
         }
         cx.notify();
         true
+    }
+
+    pub(super) fn show_explanation_error(
+        &mut self,
+        error: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.layout.collapsed = false;
+        self.layout.manual_override = true;
+        // A rejected context-menu action must not clear another operation's
+        // busy flag or cancel the answer currently visible in the sidebar.
+        self.sessions.error = Some(error.into());
+        cx.notify();
+    }
+
+    pub(super) fn begin_selection_explanation(&mut self, cx: &mut Context<Self>) -> bool {
+        self.layout.collapsed = false;
+        self.layout.manual_override = true;
+        if !self.begin_session_operation(cx) {
+            self.show_explanation_error("AI 正在处理当前请求，请完成或取消后再使用 AI 解释。", cx);
+            return false;
+        }
+        true
+    }
+
+    pub(super) fn complete_selection_explanation(
+        &mut self,
+        threads: Vec<AiThreadOption>,
+        reference: AiReferenceHint,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.apply_session(None, threads, Vec::new(), cx)
+            || self.sessions.busy
+            || self.pending_scope_sync
+        {
+            self.show_explanation_error("AI 图书范围正在更新，请更新完成后再次使用 AI 解释。", cx);
+            return;
+        }
+        let Some(request) = self.conversation.begin_selection_explanation(reference) else {
+            self.show_explanation_error("所选文本已不在当前 AI 范围内，请重新选择后再试。", cx);
+            return;
+        };
+        cx.emit(AiSidebarEvent::Submit(request));
+        cx.notify();
     }
 
     fn begin_scope_sync(&mut self, cx: &mut Context<Self>) {
@@ -3263,6 +3332,75 @@ mod tests {
         let request = state.begin("Explain this").expect("valid request");
         assert_eq!(request.reference_hints, vec![highlighted.clone()]);
         assert_eq!(request.reference, Some(highlighted));
+    }
+
+    #[test]
+    fn selection_explanation_replaces_previous_history_and_reference_choices() {
+        let mut state = ConversationState::new(AiSidebarScope::book(book("current"), Vec::new()));
+        let mut selected = AiReferenceHint::chapter("current", "unit-1", 0, "Selected text");
+        selected.frozen_text = Some("exact selected words\n第二行".to_string());
+        assert_eq!(
+            selected.revision, None,
+            "Reader freezes text without an editor revision"
+        );
+        let manual = AiReferenceHint::chapter("current", "unit-2", 1, "Manual chapter");
+        state.set_reference_hints(vec![selected.clone(), manual.clone()]);
+        assert!(state.toggle_reference(&selected));
+        assert!(state.toggle_reference(&manual));
+        let previous = state.begin("Previous question").unwrap();
+        assert!(state.append_delta(previous.request_id, "Previous answer"));
+        assert!(state.finish(
+            previous.request_id,
+            Vec::new(),
+            AgentAnswerSourceStatus::NoVerifiedSources,
+        ));
+
+        let request = state.begin_selection_explanation(selected.clone()).unwrap();
+
+        assert_eq!(request.question, "详细解释一下");
+        assert_eq!(request.reference_hints, vec![selected.clone()]);
+        assert_eq!(request.reference, Some(selected.clone()));
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0].content, "详细解释一下");
+        assert!(request.request_id > previous.request_id);
+        assert!(state.included_references.is_empty());
+        assert!(state.reference_is_included(&selected));
+
+        // Selection changes while the answer is running only affect a later
+        // question; they must not rewrite the already emitted request.
+        let mut changed = selected.clone();
+        changed.frozen_text = Some("new live selection".to_string());
+        state.set_reference_hints(vec![changed, manual]);
+        assert_eq!(request.reference_hints, vec![selected]);
+    }
+
+    #[test]
+    fn selection_explanation_rejects_busy_or_removed_scope_without_mutating_conversation() {
+        let mut state = ConversationState::new(AiSidebarScope::book(book("current"), Vec::new()));
+        let mut selected = AiReferenceHint::chapter("current", "unit-1", 0, "Selected text");
+        selected.frozen_text = Some("selected words".to_string());
+        state.set_reference_hints(vec![selected.clone()]);
+        let request = state.begin("Keep this request").unwrap();
+        assert!(state.append_delta(request.request_id, "Still answering"));
+        let messages = state.messages.clone();
+        assert!(
+            state
+                .begin_selection_explanation(selected.clone())
+                .is_none()
+        );
+        assert!(state.is_current(request.request_id));
+        assert_eq!(state.messages, messages);
+        assert_eq!(state.reference_hints, vec![selected.clone()]);
+
+        assert!(state.finish(
+            request.request_id,
+            Vec::new(),
+            AgentAnswerSourceStatus::NoVerifiedSources,
+        ));
+        let completed = state.messages.clone();
+        selected.book_id = "removed-book".to_string();
+        assert!(state.begin_selection_explanation(selected).is_none());
+        assert_eq!(state.messages, completed);
     }
 
     #[test]

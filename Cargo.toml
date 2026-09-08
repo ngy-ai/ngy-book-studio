@@ -61,6 +61,8 @@ gpui = { version = "0.2.2", features = ["test-support"] }
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "=4.2.0", default-features = false, features = ["v1"] }
 open = "5.4"
+# Match Wry's pinned WebView2 bindings for the native reader selection menu.
+webview2-com = "=0.38.2"
 windows = { version = "0.61.3", features = [
     "Data_Pdf",
     "Foundation",

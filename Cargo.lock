@@ -4658,6 +4658,7 @@ dependencies = [
  "tracing-subscriber",
  "tree-sitter-python",
  "urlencoding",
+ "webview2-com",
  "windows 0.61.3",
  "zip",
 ]
