@@ -891,6 +891,7 @@ impl PdfReaderApp {
     }
 
     fn recover_from_progress_close(&mut self, error: String, cx: &mut Context<Self>) {
+        cancel_application_exit(cx);
         tracing::warn!(%error, "final PDF reading progress was not persisted");
         self.progress_writer.take();
         self.progress_sync_task.take();

@@ -569,6 +569,7 @@ impl LearningWindow {
     fn set_error(&mut self, text: String, cx: &mut Context<Self>) {
         self.notice = Some(LearningNotice { text, error: true });
         if self.closing {
+            cancel_application_exit(cx);
             self.closing = false;
             cx.global_mut::<LearningWindowTracker>().closing = false;
         }
@@ -2675,6 +2676,9 @@ impl Render for LearningWindow {
 }
 
 pub(super) fn open_learning_window(services: Arc<AppServices>, cx: &mut App) -> Result<()> {
+    if application_is_exiting(cx) {
+        return Ok(());
+    }
     if !cx.has_global::<LearningWindowTracker>() {
         cx.set_global(LearningWindowTracker::default());
     }
@@ -2714,7 +2718,7 @@ pub(super) fn open_learning_window(services: Arc<AppServices>, cx: &mut App) -> 
         move |window, cx| {
             let learning = cx.new(|cx| LearningWindow::new(service, window, cx));
             let weak = learning.downgrade();
-            window.on_window_should_close(cx, move |window, cx| {
+            on_window_close(window, cx, move |window, cx| {
                 if weak
                     .update(cx, |this, cx| this.request_close(window, cx))
                     .is_err()

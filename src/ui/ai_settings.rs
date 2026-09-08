@@ -589,6 +589,7 @@ impl AiSettingsWindow {
                         .detach();
                     }
                     Err(error) => {
+                        cancel_application_exit(cx);
                         this.notice = Some(SettingsNotice {
                             text: format!("保存 Provider 设置失败：{error:#}"),
                             error: true,
@@ -1350,6 +1351,9 @@ impl Render for AiSettingsWindow {
 }
 
 pub(super) fn open_ai_settings_window(services: Arc<AppServices>, cx: &mut App) -> Result<()> {
+    if application_is_exiting(cx) {
+        return Ok(());
+    }
     if activate_existing_ai_settings_window(cx)? {
         return Ok(());
     }
@@ -1382,8 +1386,17 @@ pub(super) fn open_ai_settings_window(services: Arc<AppServices>, cx: &mut App) 
                     });
                     cx.global_mut::<AiSettingsWindowTracker>().view = Some(settings.downgrade());
                     let settings_window = gpui::Window::window_handle(window);
+                    let close_settings = settings.downgrade();
                     let close_requested = Cell::new(false);
-                    window.on_window_should_close(cx, move |window, cx| {
+                    on_window_close(window, cx, move |window, cx| {
+                        // The accepted credential/SQLite write owns its result
+                        // callback until completion. Success already closes
+                        // this window; failure keeps it open for retry.
+                        if close_settings.upgrade().is_some_and(|settings| {
+                            settings.read(cx).operation == PendingOperation::Saving
+                        }) {
+                            return false;
+                        }
                         let tracker = cx.global_mut::<AiSettingsWindowTracker>();
                         if tracker.handle == Some(settings_window) {
                             tracker.closing = true;

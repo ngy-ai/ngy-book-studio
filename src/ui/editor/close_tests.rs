@@ -180,6 +180,29 @@ fn request_close(fixture: &EditorFixture, visual: &mut VisualTestContext) {
     visual.run_until_parked();
 }
 
+fn arm_application_exit(visual: &mut VisualTestContext) {
+    visual.update(|window, cx| {
+        init_application_window_lifecycle(cx);
+        let handle = Window::window_handle(window);
+        // Isolate the real editor's veto notification from native teardown.
+        // The coordinator is waiting for this editor to finish its close.
+        cx.global_mut::<ApplicationWindowLifecycle>().exit = Some(ApplicationExit {
+            main_window: handle,
+            close_main: std::rc::Rc::new(|_, _| {}),
+            waiting_for: Some(handle),
+            main_close_requested: false,
+            main_ready: false,
+            removal_scheduled: false,
+        });
+    });
+}
+
+fn assert_application_exit_cancelled(visual: &mut VisualTestContext) {
+    visual.update(|_, cx| {
+        assert!(cx.global::<ApplicationWindowLifecycle>().exit.is_none());
+    });
+}
+
 fn assert_prompt_open(fixture: &EditorFixture, visual: &VisualTestContext) {
     assert!(visual.has_pending_prompt());
     fixture.editor.read_with(visual, |editor, _| {
@@ -221,6 +244,7 @@ fn wait_for_write(fixture: &EditorFixture, visual: &mut VisualTestContext) {
 fn close_requires_an_answer_and_cancel_preserves_the_draft(cx: &mut TestAppContext) {
     let (fixture, visual) = open_editor(cx, false);
     edit_draft(&fixture, visual, "取消后保留的书名");
+    arm_application_exit(visual);
     request_close(&fixture, visual);
     assert_prompt_open(&fixture, visual);
     assert_eq!(persisted_document(&fixture), fixture.original);
@@ -230,6 +254,7 @@ fn close_requires_an_answer_and_cancel_preserves_the_draft(cx: &mut TestAppConte
     assert_prompt_open(&fixture, visual);
     visual.simulate_prompt_answer("取消");
     visual.run_until_parked();
+    assert_application_exit_cancelled(visual);
     assert!(!visual.has_pending_prompt());
     fixture.editor.read_with(visual, |editor, cx| {
         assert!(!editor.close_prompt_open);
@@ -268,9 +293,42 @@ fn close_without_saving_keeps_the_persisted_document(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn export_picker_cancels_application_exit_and_preserves_the_editor(cx: &mut TestAppContext) {
+    let (fixture, visual) = open_editor(cx, false);
+    edit_draft(&fixture, visual, "导出选择器打开时的草稿");
+    arm_application_exit(visual);
+    visual.update(|_, cx| {
+        fixture.editor.update(cx, |editor, _| {
+            editor.export_dialog_open = true;
+        });
+    });
+    request_close(&fixture, visual);
+    assert_application_exit_cancelled(visual);
+    assert!(!visual.has_pending_prompt());
+    fixture.editor.read_with(visual, |editor, cx| {
+        assert!(!editor.closing);
+        assert!(editor.active_write.is_none());
+        assert_eq!(
+            editor.title_input.read(cx).value(),
+            "导出选择器打开时的草稿"
+        );
+        assert!(
+            editor
+                .notice
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("导出文件选择器")
+        );
+    });
+    assert_eq!(persisted_document(&fixture), fixture.original);
+}
+
+#[gpui::test]
 fn save_and_close_waits_for_the_confirmed_background_commit(cx: &mut TestAppContext) {
     let (fixture, visual) = open_editor(cx, false);
     edit_draft(&fixture, visual, "确认后保存的书名");
+    arm_application_exit(visual);
     request_close(&fixture, visual);
     assert_eq!(persisted_document(&fixture), fixture.original);
 
@@ -283,6 +341,9 @@ fn save_and_close_waits_for_the_confirmed_background_commit(cx: &mut TestAppCont
     });
     visual.simulate_prompt_answer("保存并关闭");
     visual.run_until_parked();
+    visual.update(|_, cx| {
+        assert!(cx.global::<ApplicationWindowLifecycle>().exit.is_some());
+    });
     fixture.editor.read_with(visual, |editor, _| {
         assert!(!editor.closing);
         assert!(!editor.close_prompt_open);
@@ -314,9 +375,11 @@ fn save_and_close_waits_for_the_confirmed_background_commit(cx: &mut TestAppCont
 fn rejected_save_keeps_the_window_open_and_can_be_corrected(cx: &mut TestAppContext) {
     let (fixture, visual) = open_editor(cx, false);
     edit_draft(&fixture, visual, "");
+    arm_application_exit(visual);
     request_close(&fixture, visual);
     visual.simulate_prompt_answer("保存并关闭");
     visual.run_until_parked();
+    assert_application_exit_cancelled(visual);
     fixture.editor.read_with(visual, |editor, cx| {
         assert!(!editor.closing);
         assert!(!editor.close_prompt_open);
@@ -347,6 +410,7 @@ fn rejected_save_keeps_the_window_open_and_can_be_corrected(cx: &mut TestAppCont
 fn background_save_failure_keeps_the_draft_and_reopens_confirmation(cx: &mut TestAppContext) {
     let (fixture, visual) = open_editor(cx, false);
     edit_draft(&fixture, visual, "本窗口未保存的书名");
+    arm_application_exit(visual);
     let mut winner = fixture.original.clone();
     winner.title = "另一个窗口已经保存".into();
     let saved = fixture.services.runtime().block_on(async {
@@ -367,6 +431,7 @@ fn background_save_failure_keeps_the_draft_and_reopens_confirmation(cx: &mut Tes
     request_close(&fixture, visual);
     visual.simulate_prompt_answer("保存并关闭");
     wait_for_write(&fixture, visual);
+    assert_application_exit_cancelled(visual);
     fixture.editor.read_with(visual, |editor, cx| {
         assert!(!editor.closing);
         assert!(!editor.close_after_write);
@@ -1006,6 +1071,7 @@ fn rejected_rich_body_cannot_be_saved_by_an_unchanged_ack_and_can_be_corrected(
     // The browser already transmitted the edit and reset its dirty flag. Its
     // exact reply to a later confirmed close therefore has body=None, while
     // the protocol page still contains the rejected, unaccepted body.
+    arm_application_exit(visual);
     visual.update(|window, cx| {
         fixture.editor.update(cx, |editor, cx| {
             let active = editor.active_web_page.clone().unwrap();
@@ -1036,6 +1102,7 @@ fn rejected_rich_body_cannot_be_saved_by_an_unchanged_ack_and_can_be_corrected(
         });
     });
     visual.run_until_parked();
+    assert_application_exit_cancelled(visual);
     fixture.editor.read_with(visual, |editor, _| {
         assert!(!editor.closing);
         assert!(editor.active_write.is_none());

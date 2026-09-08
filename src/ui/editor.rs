@@ -2948,6 +2948,14 @@ impl EditorApp {
                     .is_some_and(|request| request.request_id == *request_id)
                 {
                     self.pending_ai_request = None;
+                    if self
+                        .pending_snapshot
+                        .as_ref()
+                        .is_some_and(|pending| pending.action == PendingEditorAction::Close)
+                        || self.pending_ready_action == Some(PendingEditorAction::Close)
+                    {
+                        cancel_application_exit(cx);
+                    }
                     self.pending_snapshot = None;
                     self.pending_ready_action = None;
                 }
@@ -3404,6 +3412,9 @@ impl EditorApp {
             if acknowledges_pending {
                 let action = self.pending_snapshot.take().map(|pending| pending.action);
                 self.pending_export_path = None;
+                if action == Some(PendingEditorAction::Close) {
+                    cancel_application_exit(cx);
+                }
                 if action == Some(PendingEditorAction::AskAi) {
                     self.fail_pending_ai("所选章节过大，无法安全冻结为 AI 引用。", cx);
                 }
@@ -3428,7 +3439,13 @@ impl EditorApp {
                     text: format!("无法解析富文本编辑结果：{error:#}"),
                     error: true,
                 });
-                self.pending_snapshot = None;
+                if self
+                    .pending_snapshot
+                    .take()
+                    .is_some_and(|pending| pending.action == PendingEditorAction::Close)
+                {
+                    cancel_application_exit(cx);
+                }
                 self.pending_export_path = None;
                 cx.notify();
                 return;
@@ -3644,6 +3661,9 @@ impl EditorApp {
             if let Err(error) = webview.read(cx).raw().evaluate_script(&script) {
                 self.pending_snapshot = None;
                 self.pending_export_path = None;
+                if action == PendingEditorAction::Close {
+                    cancel_application_exit(cx);
+                }
                 if action == PendingEditorAction::AskAi {
                     self.fail_pending_ai(format!("无法冻结当前章节供 AI 引用：{error}"), cx);
                 }
@@ -5120,7 +5140,11 @@ impl EditorApp {
                 Err(error) => {
                     let _ = view.update_in(cx, |this, _window, cx| {
                         this.cover_loading = false;
-                        if this.pending_cover_action.take() == Some(PendingEditorAction::Export) {
+                        let pending_action = this.pending_cover_action.take();
+                        if pending_action == Some(PendingEditorAction::Close) {
+                            cancel_application_exit(cx);
+                        }
+                        if pending_action == Some(PendingEditorAction::Export) {
                             this.pending_export_path = None;
                         }
                         this.notice = Some(Notice {
@@ -5156,6 +5180,9 @@ impl EditorApp {
                         }
                     }
                     Err(error) => {
+                        if pending_action == Some(PendingEditorAction::Close) {
+                            cancel_application_exit(cx);
+                        }
                         if pending_action == Some(PendingEditorAction::Export) {
                             this.pending_export_path = None;
                         }
@@ -5405,6 +5432,9 @@ impl EditorApp {
             return;
         }
         let Some((title, mut job)) = self.freeze_editor_write(cx) else {
+            if intent == EditorWriteIntent::Close {
+                cancel_application_exit(cx);
+            }
             return;
         };
         let target_display = export_target
@@ -5479,6 +5509,9 @@ impl EditorApp {
                     snapshot,
                     cx,
                 ) {
+                    if close_requested || operation.intent == EditorWriteIntent::Close {
+                        cancel_application_exit(cx);
+                    }
                     self.set_rich_text_write_locked(false, cx);
                     self.resume_close_confirmation(window, cx);
                     return;
@@ -5518,6 +5551,9 @@ impl EditorApp {
                     export_succeeded,
                 ) {
                     EditorWriteFollowUp::StayOpen => {
+                        if close_requested || operation.intent == EditorWriteIntent::Close {
+                            cancel_application_exit(cx);
+                        }
                         self.set_rich_text_write_locked(false, cx);
                         cx.notify();
                     }
@@ -5533,6 +5569,9 @@ impl EditorApp {
                 }
             }
             Ok(Err(error)) => {
+                if close_requested || operation.intent == EditorWriteIntent::Close {
+                    cancel_application_exit(cx);
+                }
                 self.set_rich_text_write_locked(false, cx);
                 self.notice = Some(Notice {
                     text: format!("保存失败，编辑器保持打开：{error:#}"),
@@ -5551,6 +5590,9 @@ impl EditorApp {
                 cx.notify();
             }
             Err(error) => {
+                if close_requested || operation.intent == EditorWriteIntent::Close {
+                    cancel_application_exit(cx);
+                }
                 self.set_rich_text_write_locked(false, cx);
                 self.notice = Some(Notice {
                     text: format!("保存任务异常停止，编辑器保持打开：{error}"),
@@ -5801,6 +5843,7 @@ impl EditorApp {
             return false;
         }
         if self.export_dialog_open {
+            cancel_application_exit(cx);
             self.notice = Some(Notice {
                 text: "请先关闭导出文件选择器，再关闭编辑器。".to_string(),
                 error: false,
@@ -5862,8 +5905,12 @@ impl EditorApp {
                             this.schedule_window_removal(window, cx);
                         }
                     }
-                    Ok(_) => cx.notify(),
+                    Ok(_) => {
+                        cancel_application_exit(cx);
+                        cx.notify();
+                    }
                     Err(_) => {
+                        cancel_application_exit(cx);
                         this.notice = Some(Notice {
                             text: "保存确认未完成，编辑器保持打开。请重试关闭。".to_string(),
                             error: true,

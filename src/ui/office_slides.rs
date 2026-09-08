@@ -15,6 +15,9 @@ pub(super) fn open_office_slides_window(
     library_view: Entity<EpubReaderApp>,
     cx: &mut App,
 ) -> Result<()> {
+    if application_is_exiting(cx) {
+        return Ok(());
+    }
     anyhow::ensure!(!book_id.trim().is_empty(), "图书 ID 不能为空");
     let pages = pages_from_persisted_pages(&book_id, pages)?;
     let options = WindowOptions {
@@ -46,7 +49,7 @@ pub(super) fn open_office_slides_window(
             )
         });
         let close_preview = preview.downgrade();
-        window.on_window_should_close(cx, move |_window, cx| {
+        on_window_close(window, cx, move |_window, cx| {
             close_preview
                 .update(cx, |preview, cx| preview.handle_window_close(cx))
                 .unwrap_or(true)

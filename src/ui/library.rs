@@ -477,6 +477,9 @@ fn resolve_search_hits(
 }
 
 fn open_pdf_reader_window(request: PdfReaderWindowRequest, cx: &mut App) {
+    if application_is_exiting(cx) {
+        return;
+    }
     let PdfReaderWindowRequest {
         record,
         book_incarnation,
@@ -541,7 +544,7 @@ fn open_pdf_reader_window(request: PdfReaderWindowRequest, cx: &mut App) {
                 // so final progress persistence and cancellation cannot be
                 // bypassed by this early-return error path.
                 let close_weak = reader.downgrade();
-                window.on_window_should_close(cx, move |window, cx| {
+                on_window_close(window, cx, move |window, cx| {
                     close_weak
                         .update(cx, |reader, cx| reader.handle_window_close(window, cx))
                         .unwrap_or(false)
@@ -659,7 +662,7 @@ fn open_pdf_reader_window(request: PdfReaderWindowRequest, cx: &mut App) {
             .detach();
 
         let close_weak = reader.downgrade();
-        window.on_window_should_close(cx, move |window, cx| {
+        on_window_close(window, cx, move |window, cx| {
             close_weak
                 .update(cx, |reader, cx| reader.handle_window_close(window, cx))
                 .unwrap_or(false)
@@ -1914,6 +1917,9 @@ impl EpubReaderApp {
                             app_id: Some("dev.moye.epub-editor.reader".to_string()),
                             ..Default::default()
                         };
+                        if application_is_exiting(cx) {
+                            return;
+                        }
                         let _ = cx.open_window(options, move |window, cx| {
                             let parent = match ParentWindowHandle::capture(window) {
                                 Ok(parent) => parent,
@@ -1944,7 +1950,7 @@ impl EpubReaderApp {
                                     // has a progress writer and AI session. The
                                     // normal close barrier remains mandatory.
                                     let close_weak = reader.downgrade();
-                                    window.on_window_should_close(cx, move |window, cx| {
+                                    on_window_close(window, cx, move |window, cx| {
                                         close_weak
                                             .update(cx, |reader, cx| {
                                                 reader.handle_window_close(window, cx)
@@ -2106,7 +2112,7 @@ impl EpubReaderApp {
 
                             // Persist the final reading position when the window closes.
                             let close_weak = reader.downgrade();
-                            window.on_window_should_close(cx, move |window, cx| {
+                            on_window_close(window, cx, move |window, cx| {
                                 close_weak
                                     .update(cx, |reader, cx| {
                                         reader.handle_window_close(window, cx)
@@ -2209,6 +2215,9 @@ impl EpubReaderApp {
                     app_id: Some("dev.moye.epub-editor.editor".to_string()),
                     ..Default::default()
                 };
+                if application_is_exiting(cx) {
+                    return;
+                }
                 let _ = cx.open_window(options, move |window, cx| {
                     let initial_chapter_html = chapters
                         .first()
@@ -2261,7 +2270,7 @@ impl EpubReaderApp {
                                 });
                             });
                             let close_weak = editor.downgrade();
-                            window.on_window_should_close(cx, move |window, cx| {
+                            on_window_close(window, cx, move |window, cx| {
                                 close_weak
                                     .update(cx, |editor, cx| editor.handle_window_close(window, cx))
                                     .unwrap_or(false)
@@ -2370,7 +2379,7 @@ impl EpubReaderApp {
                     // Rich-text close is vetoed until its explicit snapshot is
                     // acknowledged, saved, and the child WebView is released.
                     let close_weak = editor.downgrade();
-                    window.on_window_should_close(cx, move |window, cx| {
+                    on_window_close(window, cx, move |window, cx| {
                         close_weak
                             .update(cx, |editor, cx| editor.handle_window_close(window, cx))
                             .unwrap_or(false)
@@ -5147,32 +5156,28 @@ fn render_delete_confirm_body(
 
 fn schedule_library_window_removal(window_handle: gpui::AnyWindowHandle, cx: &mut gpui::AsyncApp) {
     if let Err(error) = window_handle.update(cx, |_, window, cx| {
-        remove_window_after_current_frame(window, cx, None);
+        finish_library_window_close(window, cx);
     }) {
         tracing::warn!(%error, "cannot schedule library window removal after mutation completion");
     }
 }
 
 pub fn wrap_root(app: Entity<EpubReaderApp>, window: &mut Window, cx: &mut Context<Root>) -> Root {
-    // Close only the library window. On Windows `App::quit()` posts WM_QUIT
-    // directly and bypasses child windows' close vetoes, which could destroy a
-    // parent HWND while a Reader/Editor WebView build still borrows it. Veto
-    // default WM_CLOSE as well: DefWindowProc would destroy the HWND before
-    // GPUI's own RevokeDragDrop/DestroyWindow teardown runs.
-    let close_requested = Cell::new(false);
+    // Confirm before changing any window state, then close children through
+    // their ordinary save/progress/WebView barriers. The library goes last.
     let close_app = app.downgrade();
-    window.on_window_should_close(cx, move |window, cx| {
-        window.minimize_window();
-        if !close_requested.replace(true) {
-            match close_app.update(cx, |app, cx| app.request_window_close(cx)) {
-                Ok(true) => remove_window_after_current_frame(window, cx, None),
-                Ok(false) => {}
-                Err(error) => {
-                    tracing::warn!(%error, "library state unavailable during close request");
-                    remove_window_after_current_frame(window, cx, None);
-                }
+    let close_main: WindowCloseHandler = Rc::new(move |window, cx| {
+        match close_app.update(cx, |app, cx| app.request_window_close(cx)) {
+            Ok(true) => finish_library_window_close(window, cx),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(%error, "library state unavailable during close request");
+                finish_library_window_close(window, cx);
             }
         }
+    });
+    window.on_window_should_close(cx, move |window, cx| {
+        request_application_exit(window, cx, Rc::clone(&close_main));
         false
     });
     Root::new(app, window, cx)

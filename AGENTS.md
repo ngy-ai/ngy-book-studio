@@ -503,9 +503,13 @@ EPUB/PDF/原件导出、重新打开及原件字节一致性。
    等待；确认框期间若旧请求开始写入，放弃关闭也须等其结果回填，不得另行触发保存。
    Reader/PDF Reader 还必须等最终稳定 locator 的阅读进度写入成功；写入失败时保持窗口
    打开并允许再次关闭重试，不能把“后台 worker 已退出”当作持久化成功。
-5. 图书库窗口关闭只关闭该窗口，不调用 `App::quit()`/`cx.quit()`；否则会绕过其它
-   Reader/Editor 的 close veto。若已有导入、创建、分组、移动或删除任务，先等待这些
-   已接受 mutation 完成再移除图书库窗口；最后一个窗口关闭后让 GPUI 自然退出。
+5. 图书库主窗口关闭先询问“退出软件 / 继续运行”；取消前不得最小化、取消 AI 或
+   改变窗口关闭状态。确认后通过 `on_window_close` 注册的原关闭回调逐个关闭子窗口，
+   编辑取消、快照/保存/阅读进度/学习持久化失败须调用 `cancel_application_exit` 撤销
+   本次退出。AI 设置已经开始保存时等待结果。子窗全部移除后，主窗口再等待已接受的
+   导入、创建、分组、移动或删除 mutation 完成，最后安全移除并让 GPUI 自然退出。
+   不调用 `App::quit()`/`cx.quit()` 绕过 close veto；`on_window_closed` 订阅保存在全局
+   协调器中并 defer 推进。实际开窗前检查退出状态，防止迟到的异步打开留下孤立窗口。
 6. EPUB 后续目录、上下章和搜索跳转在 `load_url` 前必须经过
    `OpenedBook::navigation_url_for_href`；Windows 不会自动复用 builder 阶段协议映射。
 7. Windows Debug 主线程只有约 1 MiB 栈。Editor 这类大型 GPUI `Render` 不得重新
@@ -551,7 +555,14 @@ EPUB/PDF/原件导出、重新打开及原件字节一致性。
 ## GUI 冒烟与完成标准
 
 Debug 构建支持 `MOYE_DATA_DIR`；Release 构建忽略它并访问真实 LocalAppData。人工
-GUI 验证必须使用唯一隔离目录：
+GUI 验证必须使用唯一隔离目录。
+
+全目标测试会因 dev-dependency 合并 GPUI 的 `test-support` 特性；不要直接用测试
+命令留下的产品 EXE 作最终 GUI 验收。先单独执行产品构建
+`cargo build --locked --bin moye-epub-editor` 或下方的产品 `cargo run`。
+GPUI 0.2.2 的测试执行器在真实 Windows
+dispatcher 上会直接拒绝带超时的等待，从而在退出时产生
+`timed out waiting on app_will_quit`；不能未经正常产品构建复测就将它认定为应用退出故障。
 
 ```powershell
 $env:MOYE_DATA_DIR = Join-Path ([System.IO.Path]::GetTempPath()) ("moye-agent-" + [guid]::NewGuid())
@@ -569,7 +580,8 @@ Office 相关改动要在安装和未安装 Office 的环境分别验证，并�
 AI 相关改动优先以 mock OpenAI-compatible 服务验证 SSE、工具、范围和取消；真实
 Ollama 冒烟不得自动启动服务或下载模型。媒体改动要覆盖 seek/Range 和缺失资产。
 
-关闭图书库但保留子窗口、再关闭最后一个窗口时，不应丢失保存内容，且
+关闭图书库时验证继续运行保留全部窗口、确认退出关闭全部窗口，以及编辑器取消/保存
+失败中止退出、再次关闭可重试；确认保存退出后重新打开应保留保存内容，且
 `RUST_LOG=error` 不应出现 HWND/WebView 错误。在非 100% DPI 下自动化时区分截图逻辑
 坐标与输入物理坐标，优先使用控件命中或 DPI 感知坐标。
 

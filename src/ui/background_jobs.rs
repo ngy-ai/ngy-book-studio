@@ -607,6 +607,9 @@ pub(super) fn open_background_jobs_window(
     scope_label: String,
     cx: &mut App,
 ) -> Result<()> {
+    if application_is_exiting(cx) {
+        return Ok(());
+    }
     let bounds = Bounds::centered(None, size(px(820.), px(720.)), cx);
     cx.open_window(
         WindowOptions {
@@ -623,6 +626,7 @@ pub(super) fn open_background_jobs_window(
             let jobs =
                 cx.new(|_| BackgroundJobsWindow::new(Arc::clone(&services), books, scope_label));
             jobs.update(cx, |jobs, cx| jobs.refresh(window, cx));
+            on_window_close(window, cx, |_, _| true);
             cx.new(|cx| Root::new(jobs, window, cx))
         },
     )
