@@ -5,7 +5,7 @@
 //! and schedules blocking library operations through [`AppServices::spawn_library`].
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -51,6 +51,7 @@ use crate::{
 const OBJECT_DIRECTORY: &str = "objects";
 const PROVIDER_SETTINGS_KEY: &str = "ai.openai_compatible.provider.v1";
 const CHAT_GENERATION_SETTINGS_KEY: &str = "ai.openai_compatible.chat_generation.v1";
+const ENDPOINT_ROUTING_SETTINGS_KEY: &str = "ai.openai_compatible.endpoint_routing.v1";
 const BACKGROUND_JOB_SETTINGS_KEY: &str = "background_jobs.preferences.v1";
 const WEB_SEARCH_CREDENTIAL_TARGET: &str = "ai.openai_compatible.web_search.v1";
 const MAX_MODEL_NAME_CHARS: usize = 256;
@@ -62,6 +63,88 @@ const MAX_LOADED_OFFICE_PAGE_BYTES: u64 = 512 * 1024 * 1024;
 pub const DEFAULT_CHAT_MODEL: &str = "qwen3.5:0.8b";
 pub const DEFAULT_EMBEDDING_MODEL: &str = "qwen3-embedding:0.6b";
 pub const DEFAULT_VISION_MODEL: &str = "qwen3.5:0.8b";
+pub const DEFAULT_ENDPOINT_ID: &str = "default";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelRole {
+    Chat,
+    Embedding,
+    Vision,
+}
+
+/// One independently authorized connection; credentials are stored by its
+/// canonical URL in the operating-system credential store.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointSettings {
+    pub id: String,
+    pub name: String,
+    pub base_url: String,
+    pub remote_content_confirmed: bool,
+    pub allow_insecure_remote_http: bool,
+    pub confirmed_remote_endpoint: String,
+    pub request_timeout_secs: u64,
+}
+
+impl EndpointSettings {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.id.is_empty()
+                && self.id.len() <= 128
+                && self
+                    .id
+                    .bytes()
+                    .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'-' | b'_')),
+            "Endpoint 标识无效"
+        );
+        ensure!(
+            !self.name.trim().is_empty()
+                && self.name.trim() == self.name
+                && self.name.chars().count() <= 80
+                && !self.name.chars().any(char::is_control),
+            "Endpoint 名称须为 1 至 80 个字符，且不能包含首尾空白或控制字符"
+        );
+        self.provider_config(None)
+            .validated_base_url()
+            .with_context(|| format!("Endpoint「{}」配置无效", self.name))?;
+        Ok(())
+    }
+
+    pub fn provider_config(&self, api_key: Option<String>) -> ProviderConfig {
+        let confirmation_matches = normalize_provider_base_url(&self.base_url)
+            .ok()
+            .is_some_and(|url| self.confirmed_remote_endpoint == url.as_str());
+        ProviderConfig {
+            base_url: self.base_url.clone(),
+            api_key,
+            remote_content_confirmed: self.remote_content_confirmed && confirmation_matches,
+            allow_insecure_remote_http: self.allow_insecure_remote_http && confirmation_matches,
+            request_timeout_secs: self.request_timeout_secs,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointRoutingSettings {
+    pub default_endpoint_name: String,
+    pub additional_endpoints: Vec<EndpointSettings>,
+    pub chat_endpoint_id: String,
+    pub embedding_endpoint_id: String,
+    pub vision_endpoint_id: String,
+}
+
+impl Default for EndpointRoutingSettings {
+    fn default() -> Self {
+        Self {
+            default_endpoint_name: "默认 Endpoint".into(),
+            additional_endpoints: Vec::new(),
+            chat_endpoint_id: DEFAULT_ENDPOINT_ID.into(),
+            embedding_endpoint_id: DEFAULT_ENDPOINT_ID.into(),
+            vision_endpoint_id: DEFAULT_ENDPOINT_ID.into(),
+        }
+    }
+}
 
 /// New derivative jobs start paused until the user opts into automatic
 /// execution in the AI settings window.
@@ -91,6 +174,9 @@ impl Default for PersistedBackgroundJobSettings {
 #[serde(deny_unknown_fields)]
 pub struct ProviderSettings {
     pub base_url: String,
+    /// Separate persistence keeps the established provider JSON unchanged.
+    #[serde(skip)]
+    pub endpoint_routing: EndpointRoutingSettings,
     pub chat_model: String,
     /// Stored under its own settings key and combined here for the UI/runtime.
     #[serde(skip)]
@@ -153,6 +239,7 @@ impl Default for ProviderSettings {
     fn default() -> Self {
         Self {
             base_url: DEFAULT_OLLAMA_OPENAI_BASE_URL.to_string(),
+            endpoint_routing: EndpointRoutingSettings::default(),
             chat_model: DEFAULT_CHAT_MODEL.to_string(),
             chat_generation: ChatGenerationSettings::default(),
             auto_run_background_jobs: default_auto_run_background_jobs(),
@@ -182,24 +269,55 @@ impl ProviderSettings {
         validate_model_name("embedding", &self.embedding_model)?;
         validate_model_name("vision", &self.vision_model)?;
         self.chat_generation.validate()?;
-        self.provider_config(None).validated_base_url()?;
+        let mut ids = BTreeSet::new();
+        let mut urls = BTreeSet::new();
+        for endpoint in self.endpoints() {
+            endpoint.validate()?;
+            ensure!(ids.insert(endpoint.id.clone()), "Endpoint 标识重复");
+            ensure!(
+                urls.insert(normalize_provider_base_url(&endpoint.base_url)?.to_string()),
+                "Endpoint 地址重复：请共用已有 Endpoint，并为各模型选择它"
+            );
+        }
+        for role in [ModelRole::Chat, ModelRole::Embedding, ModelRole::Vision] {
+            self.endpoint_for(role)?;
+        }
         // Validate the web endpoint eagerly so a malformed configuration is
         // caught at save time instead of silently disabling the fallback.
         self.web_search_config(None)?;
         Ok(())
     }
 
-    fn provider_config(&self, api_key: Option<String>) -> ProviderConfig {
-        let confirmation_matches = normalize_provider_base_url(&self.base_url)
-            .ok()
-            .is_some_and(|url| self.confirmed_remote_endpoint == url.as_str());
-        ProviderConfig {
+    pub fn endpoints(&self) -> Vec<EndpointSettings> {
+        let mut endpoints =
+            Vec::with_capacity(self.endpoint_routing.additional_endpoints.len() + 1);
+        endpoints.push(EndpointSettings {
+            id: DEFAULT_ENDPOINT_ID.into(),
+            name: self.endpoint_routing.default_endpoint_name.clone(),
             base_url: self.base_url.clone(),
-            api_key,
-            remote_content_confirmed: self.remote_content_confirmed && confirmation_matches,
-            allow_insecure_remote_http: self.allow_insecure_remote_http && confirmation_matches,
+            remote_content_confirmed: self.remote_content_confirmed,
+            allow_insecure_remote_http: self.allow_insecure_remote_http,
+            confirmed_remote_endpoint: self.confirmed_remote_endpoint.clone(),
             request_timeout_secs: self.request_timeout_secs,
-        }
+        });
+        endpoints.extend(self.endpoint_routing.additional_endpoints.iter().cloned());
+        endpoints
+    }
+
+    pub fn endpoint_by_id(&self, id: &str) -> Result<EndpointSettings> {
+        self.endpoints()
+            .into_iter()
+            .find(|endpoint| endpoint.id == id)
+            .context("模型绑定的 Endpoint 不存在，请重新选择")
+    }
+
+    pub fn endpoint_for(&self, role: ModelRole) -> Result<EndpointSettings> {
+        let id = match role {
+            ModelRole::Chat => &self.endpoint_routing.chat_endpoint_id,
+            ModelRole::Embedding => &self.endpoint_routing.embedding_endpoint_id,
+            ModelRole::Vision => &self.endpoint_routing.vision_endpoint_id,
+        };
+        self.endpoint_by_id(id)
     }
 
     /// Builds the validated web-search configuration, or `None` when the
@@ -309,7 +427,18 @@ pub struct OfficeEnhancedPage {
 struct AiServices {
     settings: ProviderSettings,
     provider: Arc<dyn OpenAiCompatibleProvider>,
+    embedding_provider: Arc<dyn OpenAiCompatibleProvider>,
+    vision_provider: Arc<dyn OpenAiCompatibleProvider>,
     search: Arc<SearchService>,
+}
+
+/// Immutable request view, captured before asynchronous selection or history
+/// preparation so saving settings cannot mix model, endpoint and search roles.
+#[derive(Clone)]
+pub(crate) struct AiRequestSnapshot {
+    pub settings: ProviderSettings,
+    pub provider: Arc<dyn OpenAiCompatibleProvider>,
+    pub search: Arc<SearchService>,
 }
 
 impl std::fmt::Debug for AiServices {
@@ -445,7 +574,8 @@ pub struct AppServices {
     formats: Arc<FormatRegistry>,
     chat: ChatRepository,
     credentials: Arc<dyn CredentialStore>,
-    ai: RwLock<AiServices>,
+    ai: Arc<RwLock<AiServices>>,
+    ai_configuration: Arc<tokio::sync::Mutex<()>>,
     office: Arc<dyn OfficeEnhancer>,
     indexing: Arc<IndexingCoordinator>,
     auto_run_background_jobs: Arc<AtomicBool>,
@@ -506,8 +636,8 @@ impl AppServices {
         let chat = ChatRepository::new(db_path.clone(), runtime.clone());
         let settings = load_provider_settings(&db_path)?;
         auto_run_background_jobs.store(settings.auto_run_background_jobs, Ordering::Release);
-        let api_key = credentials.api_key(&settings.base_url)?;
-        let ai = build_ai_services(&db_path, settings, api_key)?;
+        let api_keys = load_endpoint_api_keys(&settings, credentials.as_ref())?;
+        let ai = build_ai_services(&db_path, settings, &api_keys)?;
         let office: Arc<dyn OfficeEnhancer> = Arc::new(OfficeComWorker::start()?);
         let mut visual_renderers: Vec<Arc<dyn VisualRenderer>> =
             vec![Arc::new(StructuralPngRenderer)];
@@ -551,7 +681,8 @@ impl AppServices {
             runtime.handle(),
             &db_path,
             indexing_blobs,
-            Arc::clone(&ai.provider),
+            Arc::clone(&ai.embedding_provider),
+            Arc::clone(&ai.vision_provider),
             indexing_models,
         )?;
 
@@ -584,7 +715,8 @@ impl AppServices {
             formats,
             chat,
             credentials,
-            ai: RwLock::new(ai),
+            ai: Arc::new(RwLock::new(ai)),
+            ai_configuration: Arc::new(tokio::sync::Mutex::new(())),
             office,
             indexing,
             auto_run_background_jobs,
@@ -656,6 +788,18 @@ impl AppServices {
                 .map_err(|_| anyhow::anyhow!("AI service lock is poisoned"))?
                 .provider,
         ))
+    }
+
+    pub(crate) fn ai_request_snapshot(&self) -> Result<AiRequestSnapshot> {
+        let ai = self
+            .ai
+            .read()
+            .map_err(|_| anyhow::anyhow!("AI service lock is poisoned"))?;
+        Ok(AiRequestSnapshot {
+            settings: ai.settings.clone(),
+            provider: Arc::clone(&ai.provider),
+            search: Arc::clone(&ai.search),
+        })
     }
 
     /// Builds the host web-search backend from the persisted configuration, or
@@ -804,121 +948,169 @@ impl AppServices {
         })
     }
 
-    /// Persists non-secret model settings and updates the API key in the
-    /// credential backend. Both storage calls run on the I/O runtime.
+    /// Updates the default Endpoint key while preserving every other key.
     pub async fn configure_provider(
         &self,
         settings: ProviderSettings,
         api_key: ApiKeyUpdate,
     ) -> Result<()> {
+        self.configure_providers(
+            settings,
+            BTreeMap::from([(DEFAULT_ENDPOINT_ID.into(), api_key)]),
+        )
+        .await
+    }
+
+    /// Saves all Endpoint and role choices as one serialized transition. Once
+    /// accepted, the runtime completes or rolls back even if the UI is closed.
+    pub async fn configure_providers(
+        &self,
+        settings: ProviderSettings,
+        api_keys: BTreeMap<String, ApiKeyUpdate>,
+    ) -> Result<()> {
         settings.validate()?;
+        for (id, update) in &api_keys {
+            settings.endpoint_by_id(id)?;
+            if let ApiKeyUpdate::Set(value) = update {
+                ensure!(!value.is_empty(), "API key cannot be empty");
+            }
+        }
         let indexing_models = indexing_model_config(&settings)?;
-        let previous_settings = self.provider_settings()?;
         let db_path = self.db_path.clone();
         let credentials = Arc::clone(&self.credentials);
-        let settings_for_worker = settings.clone();
-        let (next, previous_key) = self
-            .runtime
-            .handle()
-            .spawn_blocking(move || {
-                let settings = settings_for_worker;
-                let previous_key = credentials.api_key(&settings.base_url)?;
-                let next_key = match &api_key {
-                    ApiKeyUpdate::Keep => previous_key.clone(),
-                    ApiKeyUpdate::Set(value) => {
-                        ensure!(!value.is_empty(), "API key cannot be empty");
-                        Some(value.clone())
+        let ai = Arc::clone(&self.ai);
+        let configuration = Arc::clone(&self.ai_configuration);
+        let indexing = Arc::clone(&self.indexing);
+        let auto_run = Arc::clone(&self.auto_run_background_jobs);
+        self.runtime
+            .spawn(async move {
+                let _transition = configuration.lock().await;
+                let previous_settings = ai
+                    .read()
+                    .map_err(|_| anyhow::anyhow!("AI service lock is poisoned"))?
+                    .settings
+                    .clone();
+                let worker_db = db_path.clone();
+                let worker_credentials = Arc::clone(&credentials);
+                let (next, previous_rows, previous_keys) = tokio::task::spawn_blocking(move || {
+                    let previous_rows = snapshot_ai_settings(&worker_db)?;
+                    let mut next_keys =
+                        load_endpoint_api_keys(&settings, worker_credentials.as_ref())?;
+                    let mut changes = BTreeMap::new();
+                    for endpoint in settings.endpoints() {
+                        let target = normalize_provider_base_url(&endpoint.base_url)?.to_string();
+                        let update = api_keys.get(&endpoint.id).unwrap_or(&ApiKeyUpdate::Keep);
+                        match update {
+                            ApiKeyUpdate::Keep => {}
+                            ApiKeyUpdate::Set(value) => {
+                                next_keys.insert(endpoint.id, Some(value.clone()));
+                                changes.insert(target, Some(value.clone()));
+                            }
+                            ApiKeyUpdate::Delete => {
+                                next_keys.insert(endpoint.id, None);
+                                changes.insert(target, None);
+                            }
+                        }
                     }
-                    ApiKeyUpdate::Delete => None,
-                };
-                let services = build_ai_services(&db_path, settings.clone(), next_key)?;
+                    let next_urls = settings
+                        .endpoints()
+                        .into_iter()
+                        .map(|endpoint| {
+                            normalize_provider_base_url(&endpoint.base_url)
+                                .map(|url| url.to_string())
+                        })
+                        .collect::<Result<BTreeSet<_>>>()?;
+                    for endpoint in previous_settings.endpoints() {
+                        let target = normalize_provider_base_url(&endpoint.base_url)?.to_string();
+                        if !next_urls.contains(&target) {
+                            changes.insert(target, None);
+                        }
+                    }
+                    // Construct every role before mutating durable settings or keys.
+                    let services = build_ai_services(&worker_db, settings.clone(), &next_keys)?;
+                    let previous_keys = changes
+                        .keys()
+                        .map(|target| {
+                            worker_credentials
+                                .api_key(target)
+                                .map(|key| (target.clone(), key))
+                        })
+                        .collect::<Result<BTreeMap<_, _>>>()?;
+                    let mutation = (|| {
+                        restore_endpoint_keys(worker_credentials.as_ref(), &changes)?;
+                        save_provider_settings(&worker_db, &settings)
+                    })();
+                    if let Err(error) = mutation {
+                        if let Err(rollback_error) =
+                            restore_endpoint_keys(worker_credentials.as_ref(), &previous_keys)
+                        {
+                            return Err(error.context(format!(
+                                "credential rollback also failed: {rollback_error:#}"
+                            )));
+                        }
+                        return Err(error);
+                    }
+                    Ok((services, previous_rows, previous_keys))
+                })
+                .await
+                .context("AI settings worker stopped")??;
 
-                match &api_key {
-                    ApiKeyUpdate::Keep => {}
-                    ApiKeyUpdate::Set(value) => {
-                        credentials.set_api_key(&settings.base_url, value)?;
-                    }
-                    ApiKeyUpdate::Delete => {
-                        credentials.delete_api_key(&settings.base_url)?;
-                    }
-                }
-                if let Err(error) = save_provider_settings(&db_path, &settings) {
-                    let rollback = match previous_key {
-                        Some(previous) => credentials.set_api_key(&settings.base_url, &previous),
-                        None => credentials.delete_api_key(&settings.base_url),
-                    };
+                if let Err(error) = indexing
+                    .reconfigure(
+                        Arc::clone(&next.embedding_provider),
+                        Arc::clone(&next.vision_provider),
+                        indexing_models,
+                    )
+                    .await
+                    .context("failed to reconfigure derived indexing")
+                {
+                    let rollback = tokio::task::spawn_blocking(move || {
+                        let settings_result = restore_ai_settings(&db_path, &previous_rows);
+                        let credential_result =
+                            restore_endpoint_keys(credentials.as_ref(), &previous_keys);
+                        match (settings_result, credential_result) {
+                            (Ok(()), Ok(())) => Ok(()),
+                            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+                            (Err(settings_error), Err(credential_error)) => Err(settings_error
+                                .context(format!(
+                                    "credential rollback also failed: {credential_error:#}"
+                                ))),
+                        }
+                    })
+                    .await
+                    .context("AI settings rollback worker stopped")?;
                     if let Err(rollback_error) = rollback {
                         return Err(error.context(format!(
-                            "credential rollback also failed: {rollback_error:#}"
+                            "persisted AI settings rollback also failed: {rollback_error:#}"
                         )));
                     }
                     return Err(error);
                 }
-                Ok((services, previous_key))
+
+                auto_run.store(next.settings.auto_run_background_jobs, Ordering::Release);
+                *ai.write().unwrap_or_else(|error| error.into_inner()) = next;
+                ai.clear_poison();
+                Ok(())
             })
             .await
-            .context("AI settings worker stopped")??;
-        let provider = Arc::clone(&next.provider);
-        if let Err(error) = self
-            .indexing
-            .reconfigure(provider, indexing_models)
-            .await
-            .context("failed to reconfigure derived indexing")
-        {
-            let rollback_db_path = self.db_path.clone();
-            let rollback_credentials = Arc::clone(&self.credentials);
-            let rollback_endpoint = settings.base_url.clone();
-            let rollback = self
-                .runtime
-                .handle()
-                .spawn_blocking(move || {
-                    let settings_result =
-                        save_provider_settings(&rollback_db_path, &previous_settings);
-                    let credential_result = match previous_key {
-                        Some(previous) => {
-                            rollback_credentials.set_api_key(&rollback_endpoint, &previous)
-                        }
-                        None => rollback_credentials.delete_api_key(&rollback_endpoint),
-                    };
-                    match (settings_result, credential_result) {
-                        (Ok(()), Ok(())) => Ok(()),
-                        (Err(settings_error), Ok(())) => Err(settings_error),
-                        (Ok(()), Err(credential_error)) => Err(credential_error),
-                        (Err(settings_error), Err(credential_error)) => Err(settings_error
-                            .context(format!(
-                                "credential rollback also failed: {credential_error:#}"
-                            ))),
-                    }
-                })
-                .await
-                .context("AI settings rollback worker stopped")?;
-            if let Err(rollback_error) = rollback {
-                return Err(error.context(format!(
-                    "persisted AI settings rollback also failed: {rollback_error:#}"
-                )));
-            }
-            return Err(error);
-        }
-
-        // The persisted settings and all derived job contracts now agree.
-        // Recovering a poisoned whole-value lock avoids reporting a failure
-        // after those durable commit points have already succeeded.
-        self.auto_run_background_jobs
-            .store(next.settings.auto_run_background_jobs, Ordering::Release);
-        let mut ai = self.ai.write().unwrap_or_else(|error| error.into_inner());
-        *ai = next;
-        drop(ai);
-        self.ai.clear_poison();
-        Ok(())
+            .context("AI configuration task stopped")?
     }
 
-    /// Queries `/v1/models` using the settings currently entered in the UI
-    /// without persisting them or replacing the active provider. Credential
-    /// lookup and provider construction stay off the GPUI thread, while the
-    /// HTTP request always runs on the application's Tokio runtime.
+    /// Probes only the default Endpoint, independently of model or web drafts.
     pub async fn probe_provider_models(
         &self,
         settings: ProviderSettings,
+        api_key: ApiKeyUpdate,
+    ) -> Result<Vec<ModelInfo>> {
+        self.probe_endpoint_models(settings.endpoint_by_id(DEFAULT_ENDPOINT_ID)?, api_key)
+            .await
+    }
+
+    /// Queries an existing or unsaved Endpoint without persisting it. Other
+    /// Endpoint, model and web-search drafts do not affect this operation.
+    pub async fn probe_endpoint_models(
+        &self,
+        endpoint: EndpointSettings,
         api_key: ApiKeyUpdate,
     ) -> Result<Vec<ModelInfo>> {
         let credentials = Arc::clone(&self.credentials);
@@ -926,21 +1118,20 @@ impl AppServices {
             .runtime
             .handle()
             .spawn_blocking(move || {
-                settings.validate()?;
+                endpoint.validate()?;
+                let target = normalize_provider_base_url(&endpoint.base_url)?;
                 let api_key = match api_key {
-                    ApiKeyUpdate::Keep => credentials.api_key(&settings.base_url)?,
+                    ApiKeyUpdate::Keep => credentials.api_key(target.as_str())?,
                     ApiKeyUpdate::Set(value) => {
                         ensure!(!value.is_empty(), "API key cannot be empty");
                         Some(value)
                     }
                     ApiKeyUpdate::Delete => None,
                 };
-                OpenAiHttpProvider::new(settings.provider_config(api_key))
+                OpenAiHttpProvider::new(endpoint.provider_config(api_key))
             })
             .await
             .context("AI provider probe setup worker stopped")??;
-
-        let provider: Arc<dyn OpenAiCompatibleProvider> = Arc::new(provider);
         self.runtime
             .spawn(async move { provider.models().await })
             .await
@@ -1538,21 +1729,109 @@ fn background_kind_order(kind: &str) -> u8 {
 fn build_ai_services(
     db_path: &Path,
     settings: ProviderSettings,
-    api_key: Option<String>,
+    api_keys: &BTreeMap<String, Option<String>>,
 ) -> Result<AiServices> {
     settings.validate()?;
-    let provider = Arc::new(OpenAiHttpProvider::new(settings.provider_config(api_key))?);
-    let provider_contract: Arc<dyn OpenAiCompatibleProvider> = provider;
-    let search = Arc::new(SearchService::new(
+    let build_role = |role| -> Result<Arc<dyn OpenAiCompatibleProvider>> {
+        let endpoint = settings.endpoint_for(role)?;
+        let api_key = api_keys.get(&endpoint.id).cloned().flatten();
+        Ok(Arc::new(OpenAiHttpProvider::new(
+            endpoint.provider_config(api_key),
+        )?))
+    };
+    let provider = build_role(ModelRole::Chat)?;
+    let embedding_provider = build_role(ModelRole::Embedding)?;
+    let vision_provider = build_role(ModelRole::Vision)?;
+    let search = Arc::new(SearchService::new_with_execution_identity(
         db_path,
-        Arc::clone(&provider_contract),
+        Arc::clone(&embedding_provider),
         &settings.embedding_model,
+        embedding_execution_identity(&settings)?,
     )?);
     Ok(AiServices {
         settings,
-        provider: provider_contract,
+        provider,
+        embedding_provider,
+        vision_provider,
         search,
     })
+}
+
+fn load_endpoint_api_keys(
+    settings: &ProviderSettings,
+    credentials: &dyn CredentialStore,
+) -> Result<BTreeMap<String, Option<String>>> {
+    settings
+        .endpoints()
+        .into_iter()
+        .map(|endpoint| {
+            let target = normalize_provider_base_url(&endpoint.base_url)?;
+            Ok((endpoint.id, credentials.api_key(target.as_str())?))
+        })
+        .collect()
+}
+
+/// Attempt every entry even when one credential operation fails, so rollback
+/// does not abandon independent keys after a single failure.
+fn restore_endpoint_keys(
+    credentials: &dyn CredentialStore,
+    values: &BTreeMap<String, Option<String>>,
+) -> Result<()> {
+    let mut failure = None;
+    for (target, value) in values {
+        let result = match value {
+            Some(value) => credentials.set_api_key(target, value),
+            None => credentials.delete_api_key(target),
+        };
+        if let Err(error) = result {
+            failure = Some(match failure {
+                Some(previous) => {
+                    error.context(format!("another credential operation failed: {previous:#}"))
+                }
+                None => error,
+            });
+        }
+    }
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+const AI_SETTINGS_KEYS: [&str; 4] = [
+    PROVIDER_SETTINGS_KEY,
+    CHAT_GENERATION_SETTINGS_KEY,
+    ENDPOINT_ROUTING_SETTINGS_KEY,
+    BACKGROUND_JOB_SETTINGS_KEY,
+];
+
+fn snapshot_ai_settings(db_path: &Path) -> Result<Vec<Option<db::settings::Setting>>> {
+    let mut conn = db::open_conn(db_path)?;
+    let tx = conn.transaction().context("无法读取 AI 设置备份")?;
+    let rows = AI_SETTINGS_KEYS
+        .iter()
+        .map(|key| db::settings::get(&tx, key))
+        .collect::<Result<_>>()?;
+    tx.commit().context("无法完成 AI 设置备份")?;
+    Ok(rows)
+}
+
+fn restore_ai_settings(db_path: &Path, rows: &[Option<db::settings::Setting>]) -> Result<()> {
+    ensure!(rows.len() == AI_SETTINGS_KEYS.len(), "AI 设置备份不完整");
+    let mut conn = db::open_conn(db_path)?;
+    let tx = conn.transaction().context("无法开始回滚 AI 设置")?;
+    for (key, row) in AI_SETTINGS_KEYS.iter().zip(rows) {
+        match row {
+            Some(row) => {
+                db::settings::upsert(&tx, row)?;
+            }
+            None => {
+                db::settings::delete(&tx, key)?;
+            }
+        }
+    }
+    tx.commit().context("无法提交 AI 设置回滚")?;
+    Ok(())
 }
 
 fn indexing_model_config(settings: &ProviderSettings) -> Result<IndexingModelConfig> {
@@ -1565,7 +1844,8 @@ fn indexing_model_config(settings: &ProviderSettings) -> Result<IndexingModelCon
 }
 
 fn vision_execution_identity(settings: &ProviderSettings) -> Result<String> {
-    let endpoint = normalize_provider_base_url(&settings.base_url)?;
+    let endpoint =
+        normalize_provider_base_url(&settings.endpoint_for(ModelRole::Vision)?.base_url)?;
     Ok(format!(
         "vision-v1:{}",
         blake3::hash(format!("{}\0{}", endpoint.as_str(), settings.vision_model).as_bytes())
@@ -1576,7 +1856,8 @@ fn vision_execution_identity(settings: &ProviderSettings) -> Result<String> {
 /// Non-secret identity for deciding whether persisted vector work is stale.
 /// Deliberately excludes chat/vision choices, request policy and credentials.
 fn embedding_execution_identity(settings: &ProviderSettings) -> Result<String> {
-    let endpoint = normalize_provider_base_url(&settings.base_url)?;
+    let endpoint =
+        normalize_provider_base_url(&settings.endpoint_for(ModelRole::Embedding)?.base_url)?;
     Ok(format!(
         "embedding-v1:{}",
         blake3::hash(format!("{}\0{}", endpoint.as_str(), settings.embedding_model).as_bytes())
@@ -1596,6 +1877,11 @@ fn load_provider_settings(db_path: &Path) -> Result<ProviderSettings> {
         Some(row) => serde_json::from_str::<ChatGenerationSettings>(&row.value_json)
             .context("保存的对话模型参数无效")?,
         None => ChatGenerationSettings::default(),
+    };
+    settings.endpoint_routing = match db::settings::get(&tx, ENDPOINT_ROUTING_SETTINGS_KEY)? {
+        Some(row) => serde_json::from_str::<EndpointRoutingSettings>(&row.value_json)
+            .context("保存的 Endpoint 与模型绑定设置无效")?,
+        None => EndpointRoutingSettings::default(),
     };
     settings.auto_run_background_jobs = match db::settings::get(&tx, BACKGROUND_JOB_SETTINGS_KEY)? {
         Some(row) => {
@@ -1644,6 +1930,12 @@ fn save_provider_settings(db_path: &Path, settings: &ProviderSettings) -> Result
         .context("无法序列化后台任务设置")?,
         updated_at,
     };
+    let routing = db::settings::Setting {
+        key: ENDPOINT_ROUTING_SETTINGS_KEY.to_string(),
+        value_json: serde_json::to_string(&settings.endpoint_routing)
+            .context("无法序列化 Endpoint 与模型绑定设置")?,
+        updated_at,
+    };
     let mut conn = db::open_conn(db_path)?;
     let tx = conn.transaction().context("无法开始保存 AI 设置")?;
     ensure!(
@@ -1657,6 +1949,10 @@ fn save_provider_settings(db_path: &Path, settings: &ProviderSettings) -> Result
     ensure!(
         db::settings::upsert(&tx, &background_jobs)? == 1,
         "后台任务设置未能保存"
+    );
+    ensure!(
+        db::settings::upsert(&tx, &routing)? == 1,
+        "Endpoint 与模型绑定设置未能保存"
     );
     tx.commit().context("无法提交 AI 设置")?;
     Ok(())
@@ -2470,7 +2766,14 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(
-            credentials.api_key(&settings.base_url).unwrap().as_deref(),
+            credentials
+                .api_key(
+                    normalize_provider_base_url(&settings.base_url)
+                        .unwrap()
+                        .as_str()
+                )
+                .unwrap()
+                .as_deref(),
             Some("credential-only-secret")
         );
 
@@ -2484,6 +2787,7 @@ mod tests {
         assert!(!row.value_json.to_ascii_lowercase().contains("api_key"));
         assert!(!row.value_json.contains("chat_generation"));
         assert!(!row.value_json.contains("auto_run_background_jobs"));
+        assert!(!row.value_json.contains("endpoint_routing"));
         let generation_row = db::settings::get(
             &db::open_conn(services.database_path()).unwrap(),
             CHAT_GENERATION_SETTINGS_KEY,
@@ -2510,6 +2814,311 @@ mod tests {
         let reopened = AppServices::open_with_credentials(temp.path(), credentials).unwrap();
         assert_eq!(reopened.provider_settings().unwrap(), settings);
         assert_eq!(reopened.search().unwrap().embedding_model(), "embed-test");
+    }
+
+    fn endpoint_fixture(id: &str, port: u16) -> EndpointSettings {
+        EndpointSettings {
+            id: id.into(),
+            name: format!("Endpoint {id}"),
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            remote_content_confirmed: false,
+            allow_insecure_remote_http: false,
+            confirmed_remote_endpoint: String::new(),
+            request_timeout_secs: 30,
+        }
+    }
+
+    fn routed_settings() -> ProviderSettings {
+        let mut settings = ProviderSettings::default();
+        settings.endpoint_routing.additional_endpoints = vec![
+            endpoint_fixture("embed", 21435),
+            endpoint_fixture("vision", 21436),
+        ];
+        settings.endpoint_routing.embedding_endpoint_id = "embed".into();
+        settings.endpoint_routing.vision_endpoint_id = "vision".into();
+        settings
+    }
+
+    #[test]
+    fn endpoint_routing_rejects_missing_duplicate_and_unconfirmed_endpoints() {
+        let settings = routed_settings();
+        settings.validate().unwrap();
+        assert_eq!(
+            settings.endpoint_for(ModelRole::Chat).unwrap().id,
+            DEFAULT_ENDPOINT_ID
+        );
+        assert_eq!(
+            settings.endpoint_for(ModelRole::Embedding).unwrap().id,
+            "embed"
+        );
+        assert_eq!(
+            settings.endpoint_for(ModelRole::Vision).unwrap().id,
+            "vision"
+        );
+
+        let mut dangling = settings.clone();
+        dangling.endpoint_routing.embedding_endpoint_id = "removed".into();
+        assert!(dangling.validate().is_err());
+        let mut duplicate_id = settings.clone();
+        duplicate_id.endpoint_routing.additional_endpoints[0].id = DEFAULT_ENDPOINT_ID.into();
+        assert!(duplicate_id.validate().is_err());
+        let mut duplicate_url = settings.clone();
+        duplicate_url.endpoint_routing.additional_endpoints[0].base_url =
+            settings.base_url.trim_end_matches('/').into();
+        assert!(
+            duplicate_url
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("地址重复")
+        );
+        let mut remote = settings.clone();
+        let endpoint = &mut remote.endpoint_routing.additional_endpoints[0];
+        endpoint.base_url = "https://models.example.test/v1".into();
+        endpoint.remote_content_confirmed = true;
+        endpoint.confirmed_remote_endpoint = "https://previous.example.test/v1/".into();
+        assert!(remote.validate().is_err());
+        remote.endpoint_routing.additional_endpoints[0].confirmed_remote_endpoint =
+            "https://models.example.test/v1/".into();
+        remote.validate().unwrap();
+    }
+
+    #[test]
+    fn routed_endpoint_identity_ignores_unrelated_chat_and_tracks_its_own_url() {
+        let settings = routed_settings();
+        let embedding = embedding_execution_identity(&settings).unwrap();
+        let vision = vision_execution_identity(&settings).unwrap();
+        let mut changed = settings.clone();
+        changed.base_url = "http://127.0.0.1:21437/v1/".into();
+        changed.chat_model = "changed-chat".into();
+        changed.endpoint_routing.default_endpoint_name = "Renamed".into();
+        assert_eq!(embedding_execution_identity(&changed).unwrap(), embedding);
+        assert_eq!(vision_execution_identity(&changed).unwrap(), vision);
+        changed.endpoint_routing.additional_endpoints[0].base_url =
+            "http://127.0.0.1:21438/v1".into();
+        assert_ne!(embedding_execution_identity(&changed).unwrap(), embedding);
+        assert_eq!(vision_execution_identity(&changed).unwrap(), vision);
+        changed.endpoint_routing.additional_endpoints[1].base_url =
+            "http://127.0.0.1:21439/v1".into();
+        assert_ne!(vision_execution_identity(&changed).unwrap(), vision);
+    }
+
+    #[test]
+    fn routing_and_independent_keys_survive_restart_without_copying_changed_urls() {
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = Arc::new(MemoryCredentialStore::default());
+        let services =
+            AppServices::open_with_credentials(temp.path(), credentials.clone()).unwrap();
+        let settings = routed_settings();
+        let updates = BTreeMap::from([
+            (
+                DEFAULT_ENDPOINT_ID.into(),
+                ApiKeyUpdate::Set("default-secret".into()),
+            ),
+            ("embed".into(), ApiKeyUpdate::Set("embed-secret".into())),
+            ("vision".into(), ApiKeyUpdate::Set("vision-secret".into())),
+        ]);
+        block_on_without_tokio(services.configure_providers(settings.clone(), updates)).unwrap();
+        for (id, expected) in [
+            (DEFAULT_ENDPOINT_ID, "default-secret"),
+            ("embed", "embed-secret"),
+            ("vision", "vision-secret"),
+        ] {
+            let endpoint = settings.endpoint_by_id(id).unwrap();
+            let target = normalize_provider_base_url(&endpoint.base_url).unwrap();
+            assert_eq!(
+                credentials.api_key(target.as_str()).unwrap().as_deref(),
+                Some(expected)
+            );
+        }
+        let rows = db::settings::list(&db::open_conn(services.database_path()).unwrap()).unwrap();
+        assert!(rows.iter().all(|row| !row.value_json.contains("-secret")));
+        assert!(
+            rows.iter()
+                .any(|row| row.key == ENDPOINT_ROUTING_SETTINGS_KEY)
+        );
+        drop(services);
+        let services =
+            AppServices::open_with_credentials(temp.path(), credentials.clone()).unwrap();
+        assert_eq!(services.provider_settings().unwrap(), settings);
+        let mut changed = settings.clone();
+        changed.endpoint_routing.additional_endpoints[0].base_url =
+            "http://127.0.0.1:21438/v1".into();
+        block_on_without_tokio(services.configure_providers(changed.clone(), BTreeMap::new()))
+            .unwrap();
+        assert!(
+            credentials
+                .api_key("http://127.0.0.1:21435/v1/")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            credentials
+                .api_key("http://127.0.0.1:21438/v1/")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            credentials
+                .api_key("http://127.0.0.1:21436/v1/")
+                .unwrap()
+                .as_deref(),
+            Some("vision-secret")
+        );
+        assert_eq!(
+            load_provider_settings(services.database_path()).unwrap(),
+            changed
+        );
+    }
+
+    #[test]
+    fn routing_save_failure_rolls_back_all_credentials_and_setting_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = Arc::new(MemoryCredentialStore::default());
+        let services =
+            AppServices::open_with_credentials(temp.path(), credentials.clone()).unwrap();
+        let previous = services.provider_settings().unwrap();
+        let conn = db::open_conn(services.database_path()).unwrap();
+        let previous_rows = db::settings::list(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER test_endpoint_routing_save_failure
+             BEFORE INSERT ON settings
+             WHEN NEW.key = 'ai.openai_compatible.endpoint_routing.v1'
+             BEGIN SELECT RAISE(ABORT, 'injected endpoint routing save failure'); END;",
+        )
+        .unwrap();
+        let next = routed_settings();
+        let updates = BTreeMap::from([
+            (
+                DEFAULT_ENDPOINT_ID.into(),
+                ApiKeyUpdate::Set("default-new-secret".into()),
+            ),
+            ("embed".into(), ApiKeyUpdate::Set("embed-new-secret".into())),
+            (
+                "vision".into(),
+                ApiKeyUpdate::Set("vision-new-secret".into()),
+            ),
+        ]);
+        assert!(
+            block_on_without_tokio(services.configure_providers(next.clone(), updates)).is_err()
+        );
+        assert_eq!(services.provider_settings().unwrap(), previous);
+        assert_eq!(db::settings::list(&conn).unwrap(), previous_rows);
+        for endpoint in next.endpoints() {
+            let target = normalize_provider_base_url(&endpoint.base_url).unwrap();
+            assert!(credentials.api_key(target.as_str()).unwrap().is_none());
+        }
+        conn.execute_batch("DROP TRIGGER test_endpoint_routing_save_failure")
+            .unwrap();
+    }
+
+    #[derive(Default)]
+    struct FailOnceCredentialStore {
+        memory: MemoryCredentialStore,
+        fail_next_write: AtomicBool,
+    }
+
+    impl CredentialStore for FailOnceCredentialStore {
+        fn set_api_key(&self, target: &str, value: &str) -> Result<()> {
+            if target == "http://127.0.0.1:21435/v1/"
+                && self.fail_next_write.swap(false, Ordering::SeqCst)
+            {
+                anyhow::bail!("injected credential backend failure");
+            }
+            self.memory.set_api_key(target, value)
+        }
+
+        fn api_key(&self, target: &str) -> Result<Option<String>> {
+            self.memory.api_key(target)
+        }
+
+        fn delete_api_key(&self, target: &str) -> Result<()> {
+            self.memory.delete_api_key(target)
+        }
+    }
+
+    #[test]
+    fn partial_credential_failure_restores_every_endpoint_and_keeps_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = Arc::new(FailOnceCredentialStore::default());
+        let services =
+            AppServices::open_with_credentials(temp.path(), credentials.clone()).unwrap();
+        let settings = routed_settings();
+        let updates = BTreeMap::from([
+            (
+                DEFAULT_ENDPOINT_ID.into(),
+                ApiKeyUpdate::Set("default-old-secret".into()),
+            ),
+            ("embed".into(), ApiKeyUpdate::Set("embed-old-secret".into())),
+            (
+                "vision".into(),
+                ApiKeyUpdate::Set("vision-old-secret".into()),
+            ),
+        ]);
+        block_on_without_tokio(services.configure_providers(settings.clone(), updates)).unwrap();
+        let before_rows =
+            db::settings::list(&db::open_conn(services.database_path()).unwrap()).unwrap();
+        credentials.fail_next_write.store(true, Ordering::SeqCst);
+        let mut changed = settings.clone();
+        changed.chat_model = "must-not-publish".into();
+        let updates = BTreeMap::from([
+            (
+                DEFAULT_ENDPOINT_ID.into(),
+                ApiKeyUpdate::Set("default-new-secret".into()),
+            ),
+            ("embed".into(), ApiKeyUpdate::Set("embed-new-secret".into())),
+            ("vision".into(), ApiKeyUpdate::Delete),
+        ]);
+        assert!(block_on_without_tokio(services.configure_providers(changed, updates)).is_err());
+        assert_eq!(services.provider_settings().unwrap(), settings);
+        assert_eq!(
+            db::settings::list(&db::open_conn(services.database_path()).unwrap()).unwrap(),
+            before_rows
+        );
+        for (id, expected) in [
+            (DEFAULT_ENDPOINT_ID, "default-old-secret"),
+            ("embed", "embed-old-secret"),
+            ("vision", "vision-old-secret"),
+        ] {
+            let target =
+                normalize_provider_base_url(&settings.endpoint_by_id(id).unwrap().base_url)
+                    .unwrap();
+            assert_eq!(
+                credentials.api_key(target.as_str()).unwrap().as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_persisted_routing_is_preserved_and_reported() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join(db::DATABASE_FILE);
+        let conn = db::open_or_recreate(&db_path).unwrap();
+        let dangling = EndpointRoutingSettings {
+            vision_endpoint_id: "missing".into(),
+            ..EndpointRoutingSettings::default()
+        };
+        let mut unknown = serde_json::to_value(EndpointRoutingSettings::default()).unwrap();
+        unknown["extra"] = serde_json::json!(true);
+        for value_json in [
+            "{".into(),
+            "{}".into(),
+            serde_json::to_string(&dangling).unwrap(),
+            unknown.to_string(),
+        ] {
+            let row = db::settings::Setting {
+                key: ENDPOINT_ROUTING_SETTINGS_KEY.into(),
+                value_json,
+                updated_at: 1,
+            };
+            db::settings::upsert(&conn, &row).unwrap();
+            assert!(load_provider_settings(&db_path).is_err());
+            assert_eq!(
+                db::settings::get(&conn, ENDPOINT_ROUTING_SETTINGS_KEY).unwrap(),
+                Some(row)
+            );
+        }
     }
 
     #[test]
@@ -2835,6 +3444,8 @@ mod tests {
         let vision_id = format!("vision:{}", source.id);
         let before_job = db::index_jobs::get(&conn, &vision_id).unwrap().unwrap();
         let previous = services.provider_settings().unwrap();
+        let previous_rows = db::settings::list(&conn).unwrap();
+        let previous_snapshot = services.ai_request_snapshot().unwrap();
         conn.execute_batch(
             "CREATE TRIGGER test_provider_reconfigure_failure
              BEFORE INSERT ON index_jobs
@@ -2846,21 +3457,45 @@ mod tests {
         )
         .unwrap();
 
-        let mut next = previous.clone();
+        let mut next = routed_settings();
         next.chat_model = "chat-rollback-test".to_string();
         next.chat_generation.max_output_tokens = 128;
         next.chat_generation.temperature = None;
         next.embedding_model = "embed-rollback-test".to_string();
         next.vision_model = "vision-rollback-test".to_string();
-        let result = block_on_without_tokio(services.configure_provider(
-            next,
-            ApiKeyUpdate::Set("temporary-rollback-secret".to_string()),
-        ));
+        let updates = BTreeMap::from([
+            (
+                DEFAULT_ENDPOINT_ID.into(),
+                ApiKeyUpdate::Set("default-rollback-secret".into()),
+            ),
+            (
+                "embed".into(),
+                ApiKeyUpdate::Set("embed-rollback-secret".into()),
+            ),
+            (
+                "vision".into(),
+                ApiKeyUpdate::Set("vision-rollback-secret".into()),
+            ),
+        ]);
+        let result = block_on_without_tokio(services.configure_providers(next.clone(), updates));
         assert!(result.is_err());
         assert_eq!(services.provider_settings().unwrap(), previous);
         let persisted = load_provider_settings(services.database_path()).unwrap();
         assert_eq!(persisted, previous);
-        assert!(credentials.api_key(&previous.base_url).unwrap().is_none());
+        assert_eq!(db::settings::list(&conn).unwrap(), previous_rows);
+        let restored_snapshot = services.ai_request_snapshot().unwrap();
+        assert!(Arc::ptr_eq(
+            &restored_snapshot.provider,
+            &previous_snapshot.provider
+        ));
+        assert!(Arc::ptr_eq(
+            &restored_snapshot.search,
+            &previous_snapshot.search
+        ));
+        for endpoint in next.endpoints() {
+            let target = normalize_provider_base_url(&endpoint.base_url).unwrap();
+            assert!(credentials.api_key(target.as_str()).unwrap().is_none());
+        }
         assert_eq!(
             db::index_jobs::get(&conn, &vision_id).unwrap().unwrap(),
             before_job

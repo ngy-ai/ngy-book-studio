@@ -1,6 +1,7 @@
 use super::*;
+use std::collections::BTreeMap;
 
-use gpui_component::checkbox::Checkbox;
+use gpui_component::{Selectable as _, checkbox::Checkbox};
 use moye_epub_editor::{
     ai::{
         ChatGenerationSettings, DEFAULT_AI_REQUEST_TIMEOUT_SECS, DEFAULT_CHAT_OUTPUT_TOKENS,
@@ -9,7 +10,8 @@ use moye_epub_editor::{
     },
     services::{
         ApiKeyUpdate, AppServices, DEFAULT_CHAT_MODEL, DEFAULT_EMBEDDING_MODEL,
-        DEFAULT_VISION_MODEL, ProviderSettings,
+        DEFAULT_VISION_MODEL, EndpointRoutingSettings, EndpointSettings, ModelRole,
+        ProviderSettings,
     },
 };
 
@@ -153,11 +155,60 @@ struct SettingsNotice {
     error: bool,
 }
 
+struct EndpointDraft {
+    id: String,
+    name_input: Entity<InputState>,
+    base_url_input: Entity<InputState>,
+    request_timeout_input: Entity<InputState>,
+    api_key_input: Entity<InputState>,
+    remote_content_confirmed: bool,
+    allow_insecure_remote_http: bool,
+    confirmed_remote_endpoint: String,
+    delete_api_key: bool,
+    observed_url: String,
+    detected_models: Option<Vec<String>>,
+    discovery_generation: u64,
+    api_key_subscription: Subscription,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl EndpointDraft {
+    fn invalidate_models(&mut self) {
+        self.detected_models = None;
+        self.discovery_generation = self.discovery_generation.wrapping_add(1);
+    }
+
+    fn entered(&self, cx: &App) -> Result<EndpointSettings> {
+        Ok(EndpointSettings {
+            id: self.id.clone(),
+            name: self.name_input.read(cx).value().trim().to_string(),
+            base_url: self.base_url_input.read(cx).value().trim().to_string(),
+            request_timeout_secs: parse_request_timeout_secs(
+                self.request_timeout_input.read(cx).value().as_ref(),
+            )?,
+            remote_content_confirmed: self.remote_content_confirmed,
+            allow_insecure_remote_http: self.allow_insecure_remote_http,
+            confirmed_remote_endpoint: self.confirmed_remote_endpoint.clone(),
+        })
+    }
+
+    fn api_key_update(&self, cx: &App) -> ApiKeyUpdate {
+        api_key_update_for_input(
+            self.api_key_input.read(cx).value().as_ref(),
+            self.delete_api_key,
+        )
+    }
+}
+
 /// Provider settings deliberately live in their own native window. It owns no
 /// model client and performs no network or credential work on the GPUI thread.
 pub(super) struct AiSettingsWindow {
     services: Arc<AppServices>,
-    base_url_input: Entity<InputState>,
+    endpoints: Vec<EndpointDraft>,
+    selected_endpoint_id: String,
+    chat_endpoint_id: String,
+    embedding_endpoint_id: String,
+    vision_endpoint_id: String,
     chat_model_input: Entity<InputState>,
     temperature_input: Entity<InputState>,
     top_p_input: Entity<InputState>,
@@ -166,15 +217,9 @@ pub(super) struct AiSettingsWindow {
     frequency_penalty_input: Entity<InputState>,
     embedding_model_input: Entity<InputState>,
     vision_model_input: Entity<InputState>,
-    request_timeout_input: Entity<InputState>,
-    api_key_input: Entity<InputState>,
     active_tab: SettingsTab,
     scroll_handles: [gpui::ScrollHandle; 4],
     window_handle: gpui::AnyWindowHandle,
-    remote_content_confirmed: bool,
-    allow_insecure_remote_http: bool,
-    confirmed_remote_endpoint: String,
-    delete_api_key: bool,
     // --- Host web-search fallback (opt-in) ---
     web_search_enabled: bool,
     web_search_url_input: Entity<InputState>,
@@ -190,10 +235,7 @@ pub(super) struct AiSettingsWindow {
     delete_web_search_api_key: bool,
     auto_run_background_jobs: bool,
     operation: PendingOperation,
-    detected_models: Vec<String>,
-    missing_models: Vec<String>,
     notice: Option<SettingsNotice>,
-    _subscriptions: Vec<Subscription>,
 }
 
 impl AiSettingsWindow {
@@ -203,11 +245,11 @@ impl AiSettingsWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let base_url_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .default_value(settings.base_url)
-                .placeholder(DEFAULT_OLLAMA_OPENAI_BASE_URL)
-        });
+        let endpoints = settings
+            .endpoints()
+            .into_iter()
+            .map(|endpoint| Self::new_endpoint_draft(endpoint, window, cx))
+            .collect();
         let chat_model_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .default_value(settings.chat_model)
@@ -234,17 +276,6 @@ impl AiSettingsWindow {
             InputState::new(window, cx)
                 .default_value(settings.vision_model)
                 .placeholder(DEFAULT_VISION_MODEL)
-        });
-        let request_timeout_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .default_value(settings.request_timeout_secs.to_string())
-                .placeholder(DEFAULT_AI_REQUEST_TIMEOUT_SECS.to_string())
-                .validate(|value, _| value.chars().all(|character| character.is_ascii_digit()))
-        });
-        let api_key_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .masked(true)
-                .placeholder("留空则保持现有密钥")
         });
         let web_search_url_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -286,12 +317,13 @@ impl AiSettingsWindow {
                 .placeholder(moye_epub_editor::web_search::MAX_WEB_SEARCH_RESULTS.to_string())
                 .validate(|value, _| value.chars().all(|character| character.is_ascii_digit()))
         });
-        let subscriptions =
-            vec![cx.subscribe_in(&base_url_input, window, Self::on_base_url_input_event)];
-
         Self {
             services,
-            base_url_input,
+            endpoints,
+            selected_endpoint_id: "default".into(),
+            chat_endpoint_id: settings.endpoint_routing.chat_endpoint_id,
+            embedding_endpoint_id: settings.endpoint_routing.embedding_endpoint_id,
+            vision_endpoint_id: settings.endpoint_routing.vision_endpoint_id,
             chat_model_input,
             temperature_input,
             top_p_input,
@@ -300,15 +332,9 @@ impl AiSettingsWindow {
             frequency_penalty_input,
             embedding_model_input,
             vision_model_input,
-            request_timeout_input,
-            api_key_input,
             active_tab: SettingsTab::default(),
             scroll_handles: std::array::from_fn(|_| gpui::ScrollHandle::new()),
             window_handle: gpui::Window::window_handle(window),
-            remote_content_confirmed: settings.remote_content_confirmed,
-            allow_insecure_remote_http: settings.allow_insecure_remote_http,
-            confirmed_remote_endpoint: settings.confirmed_remote_endpoint,
-            delete_api_key: false,
             web_search_enabled: settings.web_search_enabled,
             web_search_url_input,
             web_search_method_input,
@@ -323,10 +349,7 @@ impl AiSettingsWindow {
             delete_web_search_api_key: false,
             auto_run_background_jobs: settings.auto_run_background_jobs,
             operation: PendingOperation::Idle,
-            detected_models: Vec::new(),
-            missing_models: Vec::new(),
             notice: None,
-            _subscriptions: subscriptions,
         }
     }
 
@@ -338,8 +361,16 @@ impl AiSettingsWindow {
             self.presence_penalty_input.read(cx).value().as_ref(),
             self.frequency_penalty_input.read(cx).value().as_ref(),
         )?;
-        let request_timeout_secs =
-            parse_request_timeout_secs(self.request_timeout_input.read(cx).value().as_ref())?;
+        let mut endpoints = self
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.entered(cx))
+            .collect::<Result<Vec<_>>>()?;
+        let default_index = endpoints
+            .iter()
+            .position(|endpoint| endpoint.id == "default")
+            .context("缺少默认 Endpoint")?;
+        let default_endpoint = endpoints.remove(default_index);
         let web_search_timeout_secs =
             parse_web_search_timeout_secs(self.web_search_timeout_input.read(cx).value().as_ref())?;
         let web_search_max_results = parse_web_search_max_results(
@@ -364,7 +395,14 @@ impl AiSettingsWindow {
             }
         };
         let settings = ProviderSettings {
-            base_url: self.base_url_input.read(cx).value().trim().to_string(),
+            base_url: default_endpoint.base_url,
+            endpoint_routing: EndpointRoutingSettings {
+                default_endpoint_name: default_endpoint.name,
+                additional_endpoints: endpoints,
+                chat_endpoint_id: self.chat_endpoint_id.clone(),
+                embedding_endpoint_id: self.embedding_endpoint_id.clone(),
+                vision_endpoint_id: self.vision_endpoint_id.clone(),
+            },
             chat_model: self.chat_model_input.read(cx).value().trim().to_string(),
             chat_generation,
             embedding_model: self
@@ -374,10 +412,10 @@ impl AiSettingsWindow {
                 .trim()
                 .to_string(),
             vision_model: self.vision_model_input.read(cx).value().trim().to_string(),
-            remote_content_confirmed: self.remote_content_confirmed,
-            allow_insecure_remote_http: self.allow_insecure_remote_http,
-            confirmed_remote_endpoint: self.confirmed_remote_endpoint.clone(),
-            request_timeout_secs,
+            remote_content_confirmed: default_endpoint.remote_content_confirmed,
+            allow_insecure_remote_http: default_endpoint.allow_insecure_remote_http,
+            confirmed_remote_endpoint: default_endpoint.confirmed_remote_endpoint,
+            request_timeout_secs: default_endpoint.request_timeout_secs,
             web_search_enabled: self.web_search_enabled,
             web_search_url_template: self
                 .web_search_url_input
@@ -404,38 +442,237 @@ impl AiSettingsWindow {
         Ok(settings)
     }
 
-    fn on_base_url_input_event(
-        &mut self,
+    fn new_endpoint_draft(
+        endpoint: EndpointSettings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> EndpointDraft {
+        let observed_url = endpoint_draft_identity(&endpoint.base_url);
+        let name_input = cx.new(|cx| InputState::new(window, cx).default_value(endpoint.name));
+        let base_url_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(endpoint.base_url)
+                .placeholder(DEFAULT_OLLAMA_OPENAI_BASE_URL)
+        });
+        let request_timeout_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(endpoint.request_timeout_secs.to_string())
+                .placeholder(DEFAULT_AI_REQUEST_TIMEOUT_SECS.to_string())
+                .validate(|value, _| value.chars().all(|character| character.is_ascii_digit()))
+        });
+        let endpoint_id = endpoint.id.clone();
+        let url_subscription = cx.subscribe_in(
+            &base_url_input,
+            window,
+            move |this, input, event, window, cx| {
+                if !matches!(event, InputEvent::Change) {
+                    return;
+                }
+                let canonical = endpoint_draft_identity(input.read(cx).value().as_ref());
+                if let Some(endpoint) = this.endpoints.iter_mut().find(|e| e.id == endpoint_id)
+                    && canonical != endpoint.observed_url
+                {
+                    endpoint.observed_url = canonical;
+                    endpoint.remote_content_confirmed = false;
+                    endpoint.allow_insecure_remote_http = false;
+                    endpoint.confirmed_remote_endpoint.clear();
+                    endpoint.delete_api_key = false;
+                    // A different server must never inherit a key through input undo history.
+                    Self::reset_endpoint_key(endpoint, window, cx);
+                    endpoint.invalidate_models();
+                    this.notice = None;
+                    cx.notify();
+                }
+            },
+        );
+        let name_subscription = cx.subscribe(&name_input, |_, _, event, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
+        let api_key_input = Self::new_api_key_input(window, cx);
+        let api_key_subscription = Self::subscribe_endpoint_key(&api_key_input, &endpoint.id, cx);
+        EndpointDraft {
+            id: endpoint.id,
+            name_input,
+            base_url_input,
+            request_timeout_input,
+            api_key_input,
+            remote_content_confirmed: endpoint.remote_content_confirmed,
+            allow_insecure_remote_http: endpoint.allow_insecure_remote_http,
+            confirmed_remote_endpoint: endpoint.confirmed_remote_endpoint,
+            delete_api_key: false,
+            observed_url,
+            detected_models: None,
+            discovery_generation: 0,
+            api_key_subscription,
+            _subscriptions: vec![url_subscription, name_subscription],
+        }
+    }
+
+    fn new_api_key_input(window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
+        cx.new(|cx| {
+            InputState::new(window, cx)
+                .masked(true)
+                .placeholder("留空则保持当前 Endpoint 的现有密钥")
+        })
+    }
+
+    fn subscribe_endpoint_key(
         input: &Entity<InputState>,
-        event: &InputEvent,
-        _window: &mut Window,
+        endpoint_id: &str,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        let endpoint_id = endpoint_id.to_string();
+        cx.subscribe(input, move |this, _, event, cx| {
+            if matches!(event, InputEvent::Change)
+                && let Some(endpoint) = this
+                    .endpoints
+                    .iter_mut()
+                    .find(|endpoint| endpoint.id == endpoint_id)
+            {
+                endpoint.invalidate_models();
+                this.notice = None;
+                cx.notify();
+            }
+        })
+    }
+
+    fn reset_endpoint_key(
+        endpoint: &mut EndpointDraft,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !matches!(event, InputEvent::Change) {
-            return;
-        }
-        let entered = input.read(cx).value();
-        let canonical = normalize_provider_base_url(entered.trim())
-            .ok()
-            .map(|url| url.to_string());
-        if canonical.as_deref() != Some(self.confirmed_remote_endpoint.as_str()) {
-            self.remote_content_confirmed = false;
-            self.allow_insecure_remote_http = false;
-            self.confirmed_remote_endpoint.clear();
+        endpoint.api_key_input = Self::new_api_key_input(window, cx);
+        endpoint.api_key_subscription =
+            Self::subscribe_endpoint_key(&endpoint.api_key_input, &endpoint.id, cx);
+    }
+
+    fn set_delete_endpoint_key(
+        &mut self,
+        endpoint_id: &str,
+        delete: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(endpoint) = self
+            .endpoints
+            .iter_mut()
+            .find(|endpoint| endpoint.id == endpoint_id)
+        {
+            endpoint.delete_api_key = delete;
+            endpoint.invalidate_models();
+            if delete {
+                Self::reset_endpoint_key(endpoint, window, cx);
+            }
+            self.notice = None;
             cx.notify();
         }
     }
 
-    fn api_key_update(&self, cx: &App) -> ApiKeyUpdate {
-        api_key_update_for_input(
-            self.api_key_input.read(cx).value().as_ref(),
-            self.delete_api_key,
-        )
+    fn selected_endpoint(&self) -> &EndpointDraft {
+        self.endpoints
+            .iter()
+            .find(|endpoint| endpoint.id == self.selected_endpoint_id)
+            .expect("the selected endpoint remains in the draft registry")
     }
 
-    fn clear_entered_api_key(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let input = self.api_key_input.clone();
-        input.update(cx, |input, cx| input.set_value("", window, cx));
+    fn select_endpoint(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.operation.busy() || !self.endpoints.iter().any(|endpoint| endpoint.id == id) {
+            return;
+        }
+        window.blur();
+        self.selected_endpoint_id = id.to_string();
+        self.notice = None;
+        cx.notify();
+    }
+
+    fn add_endpoint(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.operation.busy() {
+            return;
+        }
+        let mut bytes = [0_u8; 16];
+        if getrandom::fill(&mut bytes).is_err() {
+            self.notice = Some(SettingsNotice {
+                text: "无法生成 Endpoint 标识，请重试。".into(),
+                error: true,
+            });
+            cx.notify();
+            return;
+        }
+        let id = format!(
+            "endpoint-{}",
+            bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        );
+        let endpoint = EndpointSettings {
+            id: id.clone(),
+            name: format!("Endpoint {}", self.endpoints.len() + 1),
+            base_url: String::new(),
+            remote_content_confirmed: false,
+            allow_insecure_remote_http: false,
+            confirmed_remote_endpoint: String::new(),
+            request_timeout_secs: DEFAULT_AI_REQUEST_TIMEOUT_SECS,
+        };
+        self.endpoints
+            .push(Self::new_endpoint_draft(endpoint, window, cx));
+        self.select_endpoint(&id, window, cx);
+    }
+
+    fn endpoint_is_bound(&self, id: &str) -> bool {
+        [
+            &self.chat_endpoint_id,
+            &self.embedding_endpoint_id,
+            &self.vision_endpoint_id,
+        ]
+        .into_iter()
+        .any(|bound| bound == id)
+    }
+
+    fn delete_selected_endpoint(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.operation.busy() || self.selected_endpoint_id == "default" {
+            return;
+        }
+        if self.endpoint_is_bound(&self.selected_endpoint_id) {
+            self.notice = Some(SettingsNotice {
+                text: "这个 Endpoint 仍被模型使用，请先在“对话模型”中重新选择对应 Endpoint。"
+                    .into(),
+                error: true,
+            });
+            cx.notify();
+            return;
+        }
+        self.endpoints
+            .retain(|endpoint| endpoint.id != self.selected_endpoint_id);
+        self.select_endpoint("default", window, cx);
+    }
+
+    fn endpoint_id_for(&self, role: ModelRole) -> &str {
+        match role {
+            ModelRole::Chat => &self.chat_endpoint_id,
+            ModelRole::Embedding => &self.embedding_endpoint_id,
+            ModelRole::Vision => &self.vision_endpoint_id,
+        }
+    }
+
+    fn assign_endpoint(&mut self, role: ModelRole, id: &str, cx: &mut Context<Self>) {
+        if self.operation.busy() || !self.endpoints.iter().any(|endpoint| endpoint.id == id) {
+            return;
+        }
+        match role {
+            ModelRole::Chat => self.chat_endpoint_id = id.to_string(),
+            ModelRole::Embedding => self.embedding_endpoint_id = id.to_string(),
+            ModelRole::Vision => self.vision_endpoint_id = id.to_string(),
+        }
+        self.notice = None;
+        cx.notify();
+    }
+
+    fn model_input_for(&self, role: ModelRole) -> &Entity<InputState> {
+        match role {
+            ModelRole::Chat => &self.chat_model_input,
+            ModelRole::Embedding => &self.embedding_model_input,
+            ModelRole::Vision => &self.vision_model_input,
+        }
     }
 
     fn web_api_key_update(&self, cx: &App) -> ApiKeyUpdate {
@@ -450,12 +687,25 @@ impl AiSettingsWindow {
         input.update(cx, |input, cx| input.set_value("", window, cx));
     }
 
-    fn detect_models(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn detect_models(&mut self, endpoint_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.operation.busy() {
             return;
         }
-        let settings = match self.entered_settings(cx) {
-            Ok(settings) => settings,
+        let Some(endpoint_index) = self
+            .endpoints
+            .iter()
+            .position(|endpoint| endpoint.id == endpoint_id)
+        else {
+            return;
+        };
+        self.endpoints[endpoint_index].invalidate_models();
+        let generation = self.endpoints[endpoint_index].discovery_generation;
+        let draft = &self.endpoints[endpoint_index];
+        let endpoint = match draft.entered(cx).and_then(|endpoint| {
+            endpoint.validate()?;
+            Ok(endpoint)
+        }) {
+            Ok(endpoint) => endpoint,
             Err(error) => {
                 self.notice = Some(SettingsNotice {
                     text: format!("AI Provider 设置无效：{error:#}"),
@@ -465,14 +715,10 @@ impl AiSettingsWindow {
                 return;
             }
         };
-        let key_update = self.api_key_update(cx);
-        self.clear_entered_api_key(window, cx);
-        self.switch_tab(SettingsTab::Models, window, cx);
+        let key_update = draft.api_key_update(cx);
         self.operation = PendingOperation::Detecting;
-        self.detected_models.clear();
-        self.missing_models.clear();
         self.notice = Some(SettingsNotice {
-            text: "正在连接 OpenAI-compatible endpoint 并读取模型…".to_string(),
+            text: format!("正在读取 {} 的模型…", endpoint.name),
             error: false,
         });
 
@@ -482,22 +728,26 @@ impl AiSettingsWindow {
             // its Tokio runtime. Keeping the Arc in this GPUI task prevents
             // AppServices from ever being last-dropped by its own worker.
             let outcome = services
-                .probe_provider_models(settings.clone(), key_update)
+                .probe_endpoint_models(endpoint.clone(), key_update)
                 .await;
             let _ = view.update(cx, |this, cx| {
                 this.operation = PendingOperation::Idle;
+                if !this.detection_matches(&endpoint, generation, cx) {
+                    this.notice = None;
+                    cx.notify();
+                    return;
+                }
                 match outcome {
-                    Ok(models) => this.apply_detected_models(&settings, models),
+                    Ok(models) => this.apply_detected_models(&endpoint, models),
                     Err(error) => {
                         this.notice = Some(SettingsNotice {
                             text: format!(
-                                "无法读取模型：{error:#}。墨页不会启动或管理 Ollama；若使用本地 Ollama，请确认服务已运行。"
+                                "无法读取 {} 的模型：{error:#}。若使用本地 Ollama，请确认服务已运行。", endpoint.name
                             ),
                             error: true,
                         });
                     }
                 }
-                this.scroll_handles[SettingsTab::Models as usize].scroll_to_bottom();
                 cx.notify();
             });
         })
@@ -505,31 +755,31 @@ impl AiSettingsWindow {
         cx.notify();
     }
 
-    fn apply_detected_models(&mut self, settings: &ProviderSettings, models: Vec<ModelInfo>) {
-        self.detected_models = models.into_iter().map(|model| model.id).collect();
-        self.missing_models = configured_models(settings)
-            .into_iter()
-            .filter(|model| !self.detected_models.iter().any(|found| found == model))
-            .map(str::to_string)
-            .collect();
-        self.missing_models.sort();
-        self.missing_models.dedup();
+    fn detection_matches(&self, endpoint: &EndpointSettings, generation: u64, cx: &App) -> bool {
+        self.endpoints.iter().any(|draft| {
+            draft.id == endpoint.id
+                && draft.discovery_generation == generation
+                && canonical_endpoint(draft.base_url_input.read(cx).value().as_ref())
+                    == canonical_endpoint(&endpoint.base_url)
+        })
+    }
+
+    fn apply_detected_models(&mut self, endpoint: &EndpointSettings, models: Vec<ModelInfo>) {
+        let detected_models: Vec<_> = models.into_iter().map(|model| model.id).collect();
+        let count = detected_models.len();
+        if let Some(draft) = self
+            .endpoints
+            .iter_mut()
+            .find(|draft| draft.id == endpoint.id)
+        {
+            draft.detected_models = Some(detected_models);
+        }
         self.notice = Some(SettingsNotice {
-            text: if self.detected_models.is_empty() {
-                "连接成功，但 endpoint 没有返回可用模型。".to_string()
-            } else if self.missing_models.is_empty() {
-                format!(
-                    "连接成功，已发现 {} 个模型，当前选择均可用。",
-                    self.detected_models.len()
-                )
-            } else {
-                format!(
-                    "连接成功，已发现 {} 个模型；{} 个当前选择未在列表中。",
-                    self.detected_models.len(),
-                    self.missing_models.len()
-                )
-            },
-            error: !self.missing_models.is_empty(),
+            text: format!(
+                "{} 连接成功，返回 {count} 个模型；可在各模型区域查看或选择。",
+                endpoint.name
+            ),
+            error: false,
         });
     }
 
@@ -548,10 +798,12 @@ impl AiSettingsWindow {
                 return;
             }
         };
-        let key_update = self.api_key_update(cx);
+        let key_updates: BTreeMap<_, _> = self
+            .endpoints
+            .iter()
+            .map(|endpoint| (endpoint.id.clone(), endpoint.api_key_update(cx)))
+            .collect();
         let web_key_update = self.web_api_key_update(cx);
-        self.clear_entered_api_key(window, cx);
-        self.clear_entered_web_api_key(window, cx);
         self.operation = PendingOperation::Saving;
         self.notice = Some(SettingsNotice {
             text: "正在安全保存 Provider 设置…".to_string(),
@@ -559,28 +811,25 @@ impl AiSettingsWindow {
         });
 
         let services = Arc::clone(&self.services);
-        let window_handle = self.window_handle.clone();
+        let window_handle = self.window_handle;
         cx.spawn_in(window, async move |view, cx| {
             // AppServices moves credential and SQLite work to its dedicated
             // runtime; this UI future only awaits and applies the result.
-            let outcome = services.configure_provider(settings, key_update).await;
-            let web_outcome = match &web_key_update {
+            let outcome = services.configure_providers(settings, key_updates).await;
+            let outcome = outcome.and_then(|()| match &web_key_update {
                 ApiKeyUpdate::Keep => Ok(()),
                 ApiKeyUpdate::Set(value) => services.set_web_search_api_key(value),
                 ApiKeyUpdate::Delete => services.delete_web_search_api_key(),
-            };
-            let outcome = outcome.and(web_outcome);
+            });
             let _ = view.update(cx, |this, cx| {
                 this.operation = PendingOperation::Idle;
                 match outcome {
                     Ok(()) => {
-                        this.delete_api_key = false;
                         this.notice = Some(SettingsNotice {
                             text: "Provider 设置已保存；新的搜索与问答请求会使用这些设置。"
                                 .to_string(),
                             error: false,
                         });
-                        let window_handle = window_handle.clone();
                         cx.spawn(async move |_entity, cx| {
                             let _ = window_handle.update(cx, |_, window, cx| {
                                 remove_window_after_current_frame(window, cx, None);
@@ -651,12 +900,28 @@ impl AiSettingsWindow {
         })
     }
 
-    fn render_model_detection(&self, cx: &App) -> Option<gpui::AnyElement> {
-        if self.detected_models.is_empty() && self.missing_models.is_empty() {
-            return None;
-        }
-        let endpoint = self.base_url_input.read(cx).value();
-        let commands = ollama_pull_commands(endpoint.trim(), &self.missing_models);
+    fn render_model_detection(
+        &self,
+        endpoint: &EndpointDraft,
+        role: Option<ModelRole>,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let models = endpoint.detected_models.as_ref()?;
+        let missing_models = role
+            .into_iter()
+            .map(|role| {
+                self.model_input_for(role)
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .to_string()
+            })
+            .filter(|model| !models.contains(model))
+            .collect::<Vec<_>>();
+        let commands = ollama_pull_commands(
+            endpoint.base_url_input.read(cx).value().as_ref(),
+            &missing_models,
+        );
         Some(
             div()
                 .v_flex()
@@ -672,8 +937,9 @@ impl AiSettingsWindow {
                         .font_semibold()
                         .text_color(rgb(INK))
                         .child(format!(
-                            "Endpoint 返回的模型（{}）",
-                            self.detected_models.len()
+                            "{} 返回的模型（{}）",
+                            endpoint.name_input.read(cx).value(),
+                            models.len()
                         )),
                 )
                 .child(
@@ -681,11 +947,39 @@ impl AiSettingsWindow {
                         .text_xs()
                         .line_height(gpui::relative(1.5))
                         .text_color(rgb(MUTED))
-                        .child(if self.detected_models.is_empty() {
+                        .child(if models.is_empty() {
                             "未返回模型".to_string()
                         } else {
-                            self.detected_models.join("、")
+                            "模型列表不标注能力，请选择支持当前用途的模型。".to_string()
                         }),
+                )
+                .when(!missing_models.is_empty(), |this| {
+                    this.child(div().text_xs().text_color(rgb(0x9f302c)).child(format!(
+                        "当前模型未在此 Endpoint 的列表中：{}",
+                        missing_models.join("、")
+                    )))
+                })
+                .child(
+                    div()
+                        .h_flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .children(models.iter().enumerate().map(|(index, model)| {
+                            let model = model.clone();
+                            let selected_role = role;
+                            Button::new(("ai-detected-model", index))
+                                .small()
+                                .label(model.clone())
+                                .disabled(self.operation.busy() || role.is_none())
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    if let Some(role) = selected_role {
+                                        this.model_input_for(role).update(cx, |input, cx| {
+                                            input.set_value(model.clone(), window, cx);
+                                        });
+                                        cx.notify();
+                                    }
+                                }))
+                        })),
                 )
                 .children(commands.into_iter().map(|command| {
                     div()
@@ -713,9 +1007,12 @@ impl AiSettingsWindow {
 
     #[inline(never)]
     fn render_endpoint_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let endpoint = self.selected_endpoint();
         let remote_view = cx.entity();
         let insecure_view = cx.entity();
-        let endpoint_for_confirmation = self.base_url_input.clone();
+        let endpoint_for_confirmation = endpoint.base_url_input.clone();
+        let remote_endpoint_id = endpoint.id.clone();
+        let insecure_endpoint_id = endpoint.id.clone();
         let busy = self.operation.busy();
 
         div()
@@ -726,29 +1023,42 @@ impl AiSettingsWindow {
             .border_1()
             .border_color(rgb(BORDER))
             .bg(rgb(SURFACE))
+            .child(self.render_endpoint_list(cx))
+            .child(self.render_input_field(
+                "Endpoint 名称",
+                "用于区分连接；各模型按此名称选择 Endpoint。",
+                &endpoint.name_input,
+            ))
             .child(self.render_input_field(
                 "Endpoint",
                 "默认使用本机 Ollama 的 http://127.0.0.1:11434/v1/；不会静默切换到云端。",
-                &self.base_url_input,
+                &endpoint.base_url_input,
             ))
             .child(
                 Checkbox::new("ai-confirm-remote")
-                    .checked(self.remote_content_confirmed)
+                    .checked(endpoint.remote_content_confirmed)
                     .disabled(busy)
                     .label("确认允许把图书内容发送到远程 endpoint")
                     .on_click(move |checked, _, cx| {
                         let checked = *checked;
                         remote_view.update(cx, |this, cx| {
+                            let Some(endpoint) = this
+                                .endpoints
+                                .iter_mut()
+                                .find(|endpoint| endpoint.id == remote_endpoint_id)
+                            else {
+                                return;
+                            };
                             if checked {
                                 let entered = endpoint_for_confirmation.read(cx).value();
                                 match normalize_provider_base_url(entered.trim()) {
                                     Ok(url) => {
-                                        this.remote_content_confirmed = true;
-                                        this.confirmed_remote_endpoint = url.to_string();
+                                        endpoint.remote_content_confirmed = true;
+                                        endpoint.confirmed_remote_endpoint = url.to_string();
                                     }
                                     Err(error) => {
-                                        this.remote_content_confirmed = false;
-                                        this.confirmed_remote_endpoint.clear();
+                                        endpoint.remote_content_confirmed = false;
+                                        endpoint.confirmed_remote_endpoint.clear();
                                         this.notice = Some(SettingsNotice {
                                             text: format!("Endpoint 无效，无法确认：{error:#}"),
                                             error: true,
@@ -756,9 +1066,9 @@ impl AiSettingsWindow {
                                     }
                                 }
                             } else {
-                                this.remote_content_confirmed = false;
-                                this.allow_insecure_remote_http = false;
-                                this.confirmed_remote_endpoint.clear();
+                                endpoint.remote_content_confirmed = false;
+                                endpoint.allow_insecure_remote_http = false;
+                                endpoint.confirmed_remote_endpoint.clear();
                             }
                             cx.notify();
                         });
@@ -766,13 +1076,19 @@ impl AiSettingsWindow {
             )
             .child(
                 Checkbox::new("ai-allow-insecure-http")
-                    .checked(self.allow_insecure_remote_http)
-                    .disabled(busy || !self.remote_content_confirmed)
+                    .checked(endpoint.allow_insecure_remote_http)
+                    .disabled(busy || !endpoint.remote_content_confirmed)
                     .label("额外允许非 HTTPS 的远程 endpoint（内容可能被窃听）")
                     .on_click(move |checked, _, cx| {
                         let checked = *checked;
                         insecure_view.update(cx, |this, cx| {
-                            this.allow_insecure_remote_http = checked;
+                            if let Some(endpoint) = this
+                                .endpoints
+                                .iter_mut()
+                                .find(|endpoint| endpoint.id == insecure_endpoint_id)
+                            {
+                                endpoint.allow_insecure_remote_http = checked;
+                            }
                             cx.notify();
                         });
                     }),
@@ -780,8 +1096,40 @@ impl AiSettingsWindow {
             .child(self.render_input_field(
                 "请求超时（秒）",
                 "单次 OpenAI-compatible HTTP 请求的总超时；可设置 1–600 秒，默认 120 秒。",
-                &self.request_timeout_input,
+                &endpoint.request_timeout_input,
             ))
+            .when_some(
+                self.render_model_detection(endpoint, None, cx),
+                |this, detection| this.child(detection),
+            )
+            .into_any_element()
+    }
+
+    #[inline(never)]
+    fn render_endpoint_list(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        div().v_flex().gap_2()
+            .child(div().h_flex().flex_wrap().gap_2().children(
+                self.endpoints.iter().enumerate().map(|(index, endpoint)| {
+                    let id = endpoint.id.clone();
+                    Button::new(("ai-endpoint-choice", index))
+                        .label(endpoint.name_input.read(cx).value())
+                        .selected(self.selected_endpoint_id == endpoint.id)
+                        .disabled(self.operation.busy())
+                        .debug_selector(move || format!("ai-endpoint-choice-{index}"))
+                        .on_click(cx.listener(move |this, _, window, cx| this.select_endpoint(&id, window, cx)))
+                }),
+            ))
+            .child(div().h_flex().gap_2()
+                .child(Button::new("ai-add-endpoint").label("新增 Endpoint")
+                    .disabled(self.operation.busy())
+                    .debug_selector(|| "ai-add-endpoint".into())
+                    .on_click(cx.listener(|this, _, window, cx| this.add_endpoint(window, cx))))
+                .child(Button::new("ai-delete-endpoint").label("删除 Endpoint")
+                    .disabled(self.operation.busy() || self.selected_endpoint_id == "default")
+                    .debug_selector(|| "ai-delete-endpoint".into())
+                    .on_click(cx.listener(|this, _, window, cx| this.delete_selected_endpoint(window, cx)))))
+            .child(div().text_xs().text_color(rgb(MUTED)).child(
+                "每个 Endpoint 独立保存连接、密钥和远程授权。模型使用中的 Endpoint 需先重新分配才能删除。"))
             .into_any_element()
     }
 
@@ -795,25 +1143,75 @@ impl AiSettingsWindow {
             .border_1()
             .border_color(rgb(BORDER))
             .bg(rgb(SURFACE))
-            .child(self.render_input_field(
-                "对话模型",
-                "用于流式问答和只读工具调用。",
-                &self.chat_model_input,
-            ))
+            .child(self.render_role_panel(ModelRole::Chat, cx))
+            .child(self.render_role_panel(ModelRole::Embedding, cx))
+            .child(self.render_role_panel(ModelRole::Vision, cx))
             .child(self.render_generation_panel(cx))
-            .child(self.render_input_field(
+            .into_any_element()
+    }
+
+    #[inline(never)]
+    fn render_role_panel(&self, role: ModelRole, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let (label, description, selector) = match role {
+            ModelRole::Chat => ("对话模型", "用于流式问答和只读工具调用。", "chat"),
+            ModelRole::Embedding => (
                 "Embedding 模型",
                 "用于向量索引；不可用时全文检索仍可工作。",
-                &self.embedding_model_input,
+                "embedding",
+            ),
+            ModelRole::Vision => ("视觉模型", "用于页面 OCR 与视觉说明任务。", "vision"),
+        };
+        let endpoint_id = self.endpoint_id_for(role).to_string();
+        let endpoint = self
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.id == endpoint_id);
+        div()
+            .id(SharedString::from(format!("ai-role-{selector}")))
+            .v_flex()
+            .gap_2()
+            .child(
+                div()
+                    .text_sm()
+                    .font_semibold()
+                    .child(format!("{label} · Endpoint")),
+            )
+            .child(div().h_flex().flex_wrap().gap_2().children(
+                self.endpoints.iter().enumerate().map(|(index, endpoint)| {
+                    let id = endpoint.id.clone();
+                    Button::new(("ai-role-endpoint", index))
+                        .label(endpoint.name_input.read(cx).value())
+                        .selected(endpoint_id == endpoint.id)
+                        .disabled(self.operation.busy())
+                        .debug_selector(move || format!("ai-{selector}-endpoint-{index}"))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            window.blur();
+                            this.assign_endpoint(role, &id, cx);
+                        }))
+                }),
             ))
-            .child(self.render_input_field(
-                "视觉模型",
-                "用于后续页面 OCR 与视觉说明任务。",
-                &self.vision_model_input,
-            ))
-            .when_some(self.render_model_detection(cx), |this, result| {
-                this.child(result)
+            .when_some(endpoint, |this, endpoint| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child(endpoint.base_url_input.read(cx).value()),
+                )
             })
+            .child(self.render_input_field(label, description, self.model_input_for(role)))
+            .child(
+                Button::new("ai-role-detect-models")
+                    .label("检测此 Endpoint 的模型")
+                    .disabled(self.operation.busy())
+                    .debug_selector(move || format!("ai-detect-{selector}-models"))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.detect_models(&endpoint_id, window, cx);
+                    })),
+            )
+            .when_some(
+                endpoint.and_then(|endpoint| self.render_model_detection(endpoint, Some(role), cx)),
+                |this, detection| this.child(detection),
+            )
             .into_any_element()
     }
 
@@ -910,6 +1308,8 @@ impl AiSettingsWindow {
 
     #[inline(never)]
     fn render_api_key_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let endpoint = self.selected_endpoint();
+        let endpoint_id = endpoint.id.clone();
         let delete_view = cx.entity();
         let busy = self.operation.busy();
 
@@ -929,9 +1329,9 @@ impl AiSettingsWindow {
                     .child("API key"),
             )
             .child(
-                Input::new(&self.api_key_input)
+                Input::new(&endpoint.api_key_input)
                     .mask_toggle()
-                    .disabled(busy || self.delete_api_key),
+                    .disabled(busy || endpoint.delete_api_key),
             )
             .child(
                 div()
@@ -942,17 +1342,13 @@ impl AiSettingsWindow {
             )
             .child(
                 Checkbox::new("ai-delete-api-key")
-                    .checked(self.delete_api_key)
+                    .checked(endpoint.delete_api_key)
                     .disabled(busy)
                     .label("删除这个 endpoint 已保存的 API key")
                     .on_click(move |checked, window, cx| {
                         let checked = *checked;
                         delete_view.update(cx, |this, cx| {
-                            this.delete_api_key = checked;
-                            if checked {
-                                this.clear_entered_api_key(window, cx);
-                            }
-                            cx.notify();
+                            this.set_delete_endpoint_key(&endpoint_id, checked, window, cx);
                         });
                     }),
             )
@@ -1304,32 +1700,26 @@ impl Render for AiSettingsWindow {
                         div()
                             .h_flex()
                             .gap_2()
-                            .when(
-                                matches!(
-                                    self.active_tab,
-                                    SettingsTab::Endpoint | SettingsTab::Models
-                                ),
-                                |this| {
-                                    this.child(
-                                        Button::new("ai-detect-models")
-                                            .outline()
-                                            .icon(IconName::Search)
-                                            .label(
-                                                if self.operation == PendingOperation::Detecting {
-                                                    "正在检测…"
-                                                } else {
-                                                    "检测模型"
-                                                },
-                                            )
-                                            .disabled(busy)
-                                            .on_click(move |_, window, cx| {
-                                                detect_view.update(cx, |this, cx| {
-                                                    this.detect_models(window, cx)
-                                                });
-                                            }),
-                                    )
-                                },
-                            )
+                            .when(self.active_tab == SettingsTab::Endpoint, |this| {
+                                this.child(
+                                    Button::new("ai-detect-models")
+                                        .debug_selector(|| "ai-detect-models".into())
+                                        .outline()
+                                        .icon(IconName::Search)
+                                        .label(if self.operation == PendingOperation::Detecting {
+                                            "正在检测…"
+                                        } else {
+                                            "检测模型"
+                                        })
+                                        .disabled(busy)
+                                        .on_click(move |_, window, cx| {
+                                            detect_view.update(cx, |this, cx| {
+                                                let endpoint_id = this.selected_endpoint_id.clone();
+                                                this.detect_models(&endpoint_id, window, cx)
+                                            });
+                                        }),
+                                )
+                            })
                             .child(
                                 Button::new("ai-save-settings")
                                     .debug_selector(|| "ai-save-settings".into())
@@ -1529,12 +1919,14 @@ fn parse_web_search_max_results(value: &str) -> Result<usize> {
     Ok(count)
 }
 
-fn configured_models(settings: &ProviderSettings) -> [&str; 3] {
-    [
-        settings.chat_model.as_str(),
-        settings.embedding_model.as_str(),
-        settings.vision_model.as_str(),
-    ]
+fn canonical_endpoint(endpoint: &str) -> Option<String> {
+    normalize_provider_base_url(endpoint.trim())
+        .ok()
+        .map(|url| url.to_string())
+}
+
+fn endpoint_draft_identity(endpoint: &str) -> String {
+    canonical_endpoint(endpoint).unwrap_or_else(|| endpoint.trim().to_string())
 }
 
 fn ollama_pull_commands(endpoint: &str, missing_models: &[String]) -> Vec<String> {
@@ -1596,7 +1988,7 @@ mod tests {
             settings_view = Some(view.clone());
             Root::new(view, window, cx)
         });
-        visual.simulate_resize(size(px(1080.), px(1000.)));
+        visual.simulate_resize(size(px(1080.), px(1400.)));
         redraw(visual);
         (directory, settings_view.unwrap(), visual)
     }
@@ -1643,13 +2035,22 @@ mod tests {
     #[gpui::test]
     fn tab_clicks_preserve_unsaved_inputs_and_blur_hidden_fields(cx: &mut TestAppContext) {
         let (_directory, settings, visual) = open_settings(cx);
-        let [endpoint, api_key, model, web_url] = settings.read_with(visual, |view, _| {
+        let [endpoint, _api_key, model, web_url] = settings.read_with(visual, |view, _| {
             [
-                view.base_url_input.clone(),
-                view.api_key_input.clone(),
+                view.selected_endpoint().base_url_input.clone(),
+                view.selected_endpoint().api_key_input.clone(),
                 view.chat_model_input.clone(),
                 view.web_search_url_input.clone(),
             ]
+        });
+        let endpoint_draft = "http://127.0.0.1:18081/v1/";
+        let model_draft = "draft-chat-model";
+        let web_draft = "http://127.0.0.1:18082/search?q={query}&format=json";
+        let key_draft = "fixture-only-unsaved-key";
+
+        edit_input(visual, &endpoint, endpoint_draft);
+        let api_key = settings.read_with(visual, |view, _| {
+            view.selected_endpoint().api_key_input.clone()
         });
         let original_ids = [
             endpoint.entity_id(),
@@ -1657,12 +2058,6 @@ mod tests {
             model.entity_id(),
             web_url.entity_id(),
         ];
-        let endpoint_draft = "http://127.0.0.1:18081/v1/";
-        let model_draft = "draft-chat-model";
-        let web_draft = "http://127.0.0.1:18082/search?q={query}&format=json";
-        let key_draft = "fixture-only-unsaved-key";
-
-        edit_input(visual, &endpoint, endpoint_draft);
         edit_input(visual, &api_key, key_draft);
         click_tab(visual, SettingsTab::Models);
         settings.read_with(visual, |view, _| {
@@ -1683,7 +2078,6 @@ mod tests {
             assert_eq!(view.active_tab, SettingsTab::BackgroundJobs);
             assert!(!view.auto_run_background_jobs);
         });
-        assert!(visual.debug_bounds("ai-detect-models").is_none());
         let auto_run = visual
             .debug_bounds("ai-auto-run-background-jobs")
             .expect("background-job auto-run checkbox must be rendered");
@@ -1714,8 +2108,8 @@ mod tests {
                 assert_eq!(view.active_tab, tab);
                 assert_eq!(
                     [
-                        view.base_url_input.entity_id(),
-                        view.api_key_input.entity_id(),
+                        view.selected_endpoint().base_url_input.entity_id(),
+                        view.selected_endpoint().api_key_input.entity_id(),
                         view.chat_model_input.entity_id(),
                         view.web_search_url_input.entity_id(),
                     ],
@@ -1727,7 +2121,10 @@ mod tests {
                 assert_eq!(entered.web_search_url_template, web_draft);
                 assert!(!entered.web_search_enabled);
                 assert!(entered.auto_run_background_jobs);
-                assert_eq!(view.api_key_update(cx), ApiKeyUpdate::Set(key_draft.into()));
+                assert_eq!(
+                    view.selected_endpoint().api_key_update(cx),
+                    ApiKeyUpdate::Set(key_draft.into())
+                );
                 assert_eq!(
                     view.services.provider_settings().unwrap().base_url,
                     DEFAULT_OLLAMA_OPENAI_BASE_URL,
@@ -1738,9 +2135,230 @@ mod tests {
     }
 
     #[gpui::test]
+    fn endpoint_switches_preserve_drafts_and_role_bindings_block_deletion(cx: &mut TestAppContext) {
+        let (_directory, settings, visual) = open_settings(cx);
+        visual.simulate_resize(size(px(1080.), px(1400.)));
+        redraw(visual);
+        let default_key = settings.read_with(visual, |view, _| {
+            view.selected_endpoint().api_key_input.clone()
+        });
+        edit_input(visual, &default_key, "fixture-default-key");
+        let add = visual.debug_bounds("ai-add-endpoint").unwrap();
+        visual.simulate_click(add.center(), Modifiers::none());
+        redraw(visual);
+        assert_hidden_input_does_not_receive_text(visual, &default_key, "fixture-default-key");
+        let (extra_id, extra_url) = settings.read_with(visual, |view, cx| {
+            let endpoint = view.selected_endpoint();
+            assert_ne!(endpoint.id, "default");
+            assert!(!endpoint.remote_content_confirmed);
+            assert!(!endpoint.allow_insecure_remote_http);
+            assert_eq!(endpoint.api_key_update(cx), ApiKeyUpdate::Keep);
+            (endpoint.id.clone(), endpoint.base_url_input.clone())
+        });
+        edit_input(visual, &extra_url, "http://127.0.0.1:18082/v1/");
+        let extra_key = settings.read_with(visual, |view, _| {
+            view.selected_endpoint().api_key_input.clone()
+        });
+        edit_input(visual, &extra_key, "fixture-extra-key");
+        click_tab(visual, SettingsTab::Models);
+        let embedding_choice = visual.debug_bounds("ai-embedding-endpoint-1").unwrap();
+        visual.simulate_click(embedding_choice.center(), Modifiers::none());
+        redraw(visual);
+        settings.read_with(visual, |view, cx| {
+            let entered = view.entered_settings(cx).unwrap();
+            assert_eq!(entered.endpoint_routing.chat_endpoint_id, "default");
+            assert_eq!(entered.endpoint_routing.embedding_endpoint_id, extra_id);
+            assert_eq!(entered.endpoint_routing.vision_endpoint_id, "default");
+            assert_eq!(
+                entered.endpoint_for(ModelRole::Embedding).unwrap().base_url,
+                "http://127.0.0.1:18082/v1/"
+            );
+            assert_eq!(
+                view.services.provider_settings().unwrap().endpoints().len(),
+                1
+            );
+        });
+        click_tab(visual, SettingsTab::Endpoint);
+        let delete = visual.debug_bounds("ai-delete-endpoint").unwrap();
+        visual.simulate_click(delete.center(), Modifiers::none());
+        redraw(visual);
+        settings.read_with(visual, |view, cx| {
+            assert_eq!(view.endpoints.len(), 2);
+            assert!(view.notice.as_ref().unwrap().error);
+            assert_eq!(
+                view.selected_endpoint().api_key_update(cx),
+                ApiKeyUpdate::Set("fixture-extra-key".into())
+            );
+        });
+        let default_choice = visual.debug_bounds("ai-endpoint-choice-0").unwrap();
+        visual.simulate_click(default_choice.center(), Modifiers::none());
+        redraw(visual);
+        settings.read_with(visual, |view, cx| {
+            assert_eq!(
+                view.selected_endpoint().api_key_input.entity_id(),
+                default_key.entity_id()
+            );
+            assert_eq!(
+                view.selected_endpoint().api_key_update(cx),
+                ApiKeyUpdate::Set("fixture-default-key".into())
+            );
+            assert_eq!(
+                view.endpoints[1].api_key_input.entity_id(),
+                extra_key.entity_id()
+            );
+        });
+        visual.update(|window, cx| {
+            settings.update(cx, |view, cx| {
+                view.assign_endpoint(ModelRole::Embedding, "default", cx);
+                view.select_endpoint(&extra_id, window, cx);
+                view.delete_selected_endpoint(window, cx);
+                assert_eq!(view.endpoints.len(), 1);
+                assert_eq!(view.selected_endpoint_id, "default");
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn endpoint_url_change_resets_only_its_authorization_key_and_detection(
+        cx: &mut TestAppContext,
+    ) {
+        let (_directory, settings, visual) = open_settings(cx);
+        let (url_input, original_key, original_endpoint) =
+            settings.read_with(visual, |view, cx| {
+                let endpoint = view.selected_endpoint();
+                (
+                    endpoint.base_url_input.clone(),
+                    endpoint.api_key_input.clone(),
+                    endpoint.entered(cx).unwrap(),
+                )
+            });
+        visual.update(|_, cx| {
+            settings.update(cx, |view, cx| {
+                let endpoint = &mut view.endpoints[0];
+                endpoint.remote_content_confirmed = true;
+                endpoint.allow_insecure_remote_http = true;
+                endpoint.confirmed_remote_endpoint =
+                    canonical_endpoint(&original_endpoint.base_url).unwrap();
+                endpoint.delete_api_key = true;
+                endpoint.detected_models = Some(vec!["old-server-model".into()]);
+                cx.notify();
+            });
+        });
+        edit_input(visual, &url_input, "http://127.0.0.1:18083/v1/");
+        settings.read_with(visual, |view, cx| {
+            let endpoint = view.selected_endpoint();
+            assert!(!endpoint.remote_content_confirmed);
+            assert!(!endpoint.allow_insecure_remote_http);
+            assert!(endpoint.confirmed_remote_endpoint.is_empty());
+            assert!(!endpoint.delete_api_key);
+            assert!(endpoint.detected_models.is_none());
+            assert_ne!(endpoint.api_key_input.entity_id(), original_key.entity_id());
+            assert_eq!(endpoint.api_key_update(cx), ApiKeyUpdate::Keep);
+            assert!(!view.detection_matches(&original_endpoint, 0, cx));
+        });
+        visual.update(|window, cx| {
+            settings.update(cx, |view, cx| {
+                view.max_output_tokens_input
+                    .update(cx, |input, cx| input.set_value("0", window, cx));
+                assert!(view.entered_settings(cx).is_err());
+                // Detecting the selected connection does not parse unrelated model parameters.
+                view.selected_endpoint()
+                    .entered(cx)
+                    .unwrap()
+                    .validate()
+                    .unwrap();
+                let endpoint = view.selected_endpoint().entered(cx).unwrap();
+                assert!(view.detection_matches(
+                    &endpoint,
+                    view.selected_endpoint().discovery_generation,
+                    cx
+                ));
+                view.apply_detected_models(&endpoint, vec![]);
+                assert_eq!(view.selected_endpoint().detected_models, Some(vec![]));
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn changing_endpoint_keys_or_retrying_detection_invalidates_only_its_models(
+        cx: &mut TestAppContext,
+    ) {
+        let (_directory, settings, visual) = open_settings(cx);
+        visual.simulate_resize(size(px(1080.), px(1600.)));
+        let (key_input, endpoint, generation) = visual.update(|window, cx| {
+            settings.update(cx, |view, cx| {
+                let endpoint = view.selected_endpoint().entered(cx).unwrap();
+                let other = EndpointSettings {
+                    id: "second-endpoint".into(),
+                    name: "另一个服务".into(),
+                    base_url: "http://127.0.0.1:18084/v1/".into(),
+                    ..endpoint.clone()
+                };
+                view.endpoints
+                    .push(AiSettingsWindow::new_endpoint_draft(other, window, cx));
+                view.endpoints[0].detected_models = Some(vec!["account-a-model".into()]);
+                view.endpoints[1].detected_models = Some(vec!["other-server-model".into()]);
+                cx.notify();
+                (
+                    view.endpoints[0].api_key_input.clone(),
+                    endpoint,
+                    view.endpoints[0].discovery_generation,
+                )
+            })
+        });
+        redraw(visual);
+        edit_input(visual, &key_input, "fixture-account-b-key");
+        settings.read_with(visual, |view, cx| {
+            assert!(view.endpoints[0].detected_models.is_none());
+            assert_eq!(
+                view.endpoints[0].api_key_input.entity_id(),
+                key_input.entity_id()
+            );
+            assert!(!view.detection_matches(&endpoint, generation, cx));
+            assert_eq!(
+                view.endpoints[1].detected_models,
+                Some(vec!["other-server-model".into()])
+            );
+        });
+        let replacement_key = visual.update(|window, cx| {
+            settings.update(cx, |view, cx| {
+                view.endpoints[0].detected_models = Some(vec!["account-b-model".into()]);
+                view.set_delete_endpoint_key("default", true, window, cx);
+                assert!(view.endpoints[0].detected_models.is_none());
+                view.endpoints[0].detected_models = Some(vec!["anonymous-model".into()]);
+                view.set_delete_endpoint_key("default", false, window, cx);
+                assert!(view.endpoints[0].detected_models.is_none());
+                view.endpoints[0].detected_models = Some(vec!["cached-after-reset".into()]);
+                view.endpoints[0].api_key_input.clone()
+            })
+        });
+        redraw(visual);
+        edit_input(visual, &replacement_key, "fixture-account-c-key");
+        settings.read_with(visual, |view, _| {
+            assert!(view.endpoints[0].detected_models.is_none())
+        });
+        visual.update(|window, cx| {
+            settings.update(cx, |view, cx| {
+                view.endpoints[0].detected_models = Some(vec!["cached-before-failure".into()]);
+                view.endpoints[0]
+                    .request_timeout_input
+                    .update(cx, |input, cx| input.set_value("0", window, cx));
+                view.detect_models("default", window, cx);
+                assert_eq!(view.operation, PendingOperation::Idle);
+                assert!(view.notice.as_ref().unwrap().error);
+                assert!(view.endpoints[0].detected_models.is_none());
+                assert_eq!(
+                    view.endpoints[1].detected_models,
+                    Some(vec!["other-server-model".into()])
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
     fn generation_drafts_survive_tabs_and_invalid_save_then_reset(cx: &mut TestAppContext) {
         let (_directory, settings, visual) = open_settings(cx);
-        visual.simulate_resize(size(px(1080.), px(1500.)));
+        visual.simulate_resize(size(px(1080.), px(2200.)));
         redraw(visual);
         click_tab(visual, SettingsTab::Models);
         let inputs = settings.read_with(visual, |view, _| {
@@ -1935,15 +2553,6 @@ mod tests {
                 "{invalid:?} should be rejected"
             );
         }
-    }
-
-    #[test]
-    fn default_models_feed_detection_in_role_order() {
-        let settings = ProviderSettings::default();
-        assert_eq!(
-            configured_models(&settings),
-            ["qwen3.5:0.8b", "qwen3-embedding:0.6b", "qwen3.5:0.8b"]
-        );
     }
 
     #[test]

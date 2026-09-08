@@ -439,6 +439,17 @@ EPUB/PDF/原件导出、重新打开及原件字节一致性。
   此类 locator。PPTX 独立逐页图片路径必须保留精确的幻灯片 locator 与内容单元归属。
 - OpenAI-compatible 默认端点固定为本机 Ollama，不得静默切云。非回环端点发送内容
   前要求确认，非 HTTPS 远程端点还要单独允许；密钥只进 Windows Credential Manager。
+- 多 Endpoint 的附加端点、名称和三类模型绑定存于独立的
+  `ai.openai_compatible.endpoint_routing.v1` settings key，与 Provider、对话参数和后台
+  偏好在同一事务提交。默认端点继续使用 Provider 字段，不增加旧字段回退；端点 ID
+  唯一，规范化 URL 不得重复，模型绑定必须存在。每个端点独立校验远程授权和超时，
+  URL 改变时清除授权及密钥草稿；密钥按规范化 URL 隔离，保存失败需回滚所有已修改密钥。
+  问答注册时在同一锁内固定 Provider、模型、参数与 SearchService；查询 Embedding、
+  后台 Embedding 和视觉请求分别使用自己的端点，修改对话端点不得重建派生索引。
+  语义 KNN 在同一 SQL 读取中校验源任务的 Embedding 执行身份；旧请求快照不得将
+  旧端点的查询向量匹配到新端点的同名模型索引，身份不符时降级为作用域内 FTS。
+  `tests/multi_endpoint_flow.rs` 使用多个本机 mock 服务验证重启、三类路由、密钥隔离、
+  实际后台任务和问答准备期间切换端点。
 - 对话生成参数与 Provider 配置一并校验和保存，使用独立 settings key 并在同一事务
   提交，不扩展旧 Provider JSON 契约或增加旧字段回退。Temperature 可空且范围为
   0..=2（默认 0.1），Top P 可空且范围为 0..=1，Presence/Frequency penalty 可空且

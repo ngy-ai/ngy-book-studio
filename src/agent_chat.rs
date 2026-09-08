@@ -21,7 +21,7 @@ use crate::{
     agent_runtime::{
         AgentCancellation, AgentQuestion, AgentRequestCancelled, AgentRunEvent, AgentRuntime,
     },
-    ai::{ChatGenerationSettings, ChatMessage, ChatRole},
+    ai::{ChatMessage, ChatRole},
     ai_diagnostics::error_kind,
     chat::{
         ChatRepository, ChatScope, ChatSession, ChatThread, ChatWindowKind, NewChatCitation,
@@ -29,7 +29,7 @@ use crate::{
     },
     document::{DocumentLocator, SourceLocator},
     library::LibraryStore,
-    services::AppServices,
+    services::{AiRequestSnapshot, AppServices},
 };
 
 const HISTORY_MESSAGES: usize = 96;
@@ -231,13 +231,13 @@ pub struct ConversationAnswer {
 ///
 /// Keeping this value alive makes the request visible to [`AgentConversation::cancel`]
 /// while editor references are still being frozen. Dropping it cancels and
-/// unregisters only this exact request generation. Sampling controls are frozen
-/// here so saving settings during preparation affects only subsequent requests.
+/// unregisters only this exact request generation. Model routes and sampling
+/// controls are frozen so settings changes affect only subsequent requests.
 #[must_use = "a prepared AI request must be executed or explicitly dropped"]
 pub struct PreparedAgentRequest {
     request_id: u64,
     cancellation: AgentCancellation,
-    chat_generation: ChatGenerationSettings,
+    ai_snapshot: AiRequestSnapshot,
     active: Arc<Mutex<HashMap<u64, AgentCancellation>>>,
 }
 
@@ -660,7 +660,7 @@ impl AgentConversation {
             !active.contains_key(&request_id),
             "request ID is already active"
         );
-        let chat_generation = self.services.provider_settings()?.chat_generation;
+        let ai_snapshot = self.services.ai_request_snapshot()?;
         active.insert(request_id, cancellation.clone());
         drop(active);
         tracing::debug!(
@@ -674,7 +674,7 @@ impl AgentConversation {
         Ok(PreparedAgentRequest {
             request_id,
             cancellation,
-            chat_generation,
+            ai_snapshot,
             active: Arc::clone(&self.active),
         })
     }
@@ -726,7 +726,7 @@ impl AgentConversation {
                 request,
                 events,
                 prepared.cancellation.clone(),
-                prepared.chat_generation.clone(),
+                prepared.ai_snapshot.clone(),
             )
             .await
         })
@@ -739,7 +739,7 @@ impl AgentConversation {
         request: ConversationQuestion,
         events: Option<mpsc::UnboundedSender<AgentRunEvent>>,
         cancellation: AgentCancellation,
-        chat_generation: ChatGenerationSettings,
+        ai_snapshot: AiRequestSnapshot,
     ) -> Result<ConversationAnswer> {
         let scope = conversation_stage("authorize_scope", async {
             ensure_request_not_cancelled(&cancellation)?;
@@ -800,19 +800,17 @@ impl AgentConversation {
         ensure_request_not_cancelled(&cancellation)?;
 
         let (settings, runtime) = conversation_stage("configure_runtime", async {
-            let settings = self.services.provider_settings()?;
-            let provider = self.services.provider()?;
-            let search = self.services.search()?;
-            let search_backend: Arc<dyn SearchBackend> = search;
+            let settings = ai_snapshot.settings;
+            let search_backend: Arc<dyn SearchBackend> = ai_snapshot.search;
             let web_search = self.services.web_search_backend()?;
             let runtime = AgentRuntime::for_database(
-                provider,
+                ai_snapshot.provider,
                 search_backend,
                 self.services.database_path(),
                 settings.chat_model.clone(),
                 web_search,
             )?
-            .with_chat_generation(chat_generation)?;
+            .with_chat_generation(settings.chat_generation.clone())?;
             Ok((settings, runtime))
         })
         .await?;

@@ -109,7 +109,8 @@ impl IndexingModelConfig {
 
 #[derive(Clone)]
 struct ModelServices {
-    provider: Arc<dyn OpenAiCompatibleProvider>,
+    embedding_provider: Arc<dyn OpenAiCompatibleProvider>,
+    vision_provider: Arc<dyn OpenAiCompatibleProvider>,
     config: IndexingModelConfig,
 }
 
@@ -150,7 +151,8 @@ impl IndexingCoordinator {
         runtime: Handle,
         db_path: impl Into<PathBuf>,
         blobs: Arc<dyn BlobStore>,
-        provider: Arc<dyn OpenAiCompatibleProvider>,
+        embedding_provider: Arc<dyn OpenAiCompatibleProvider>,
+        vision_provider: Arc<dyn OpenAiCompatibleProvider>,
         config: IndexingModelConfig,
     ) -> Result<Arc<Self>> {
         let db_path = db_path.into();
@@ -183,7 +185,11 @@ impl IndexingCoordinator {
                 runtime: runtime.clone(),
                 db_path,
                 blobs,
-                models: RwLock::new(ModelServices { provider, config }),
+                models: RwLock::new(ModelServices {
+                    embedding_provider,
+                    vision_provider,
+                    config,
+                }),
                 transitions: AsyncMutex::new(()),
                 wake: Notify::new(),
                 shutdown: AtomicBool::new(false),
@@ -320,7 +326,8 @@ impl IndexingCoordinator {
     /// clears model-derived page descriptions.
     pub async fn reconfigure(
         &self,
-        provider: Arc<dyn OpenAiCompatibleProvider>,
+        embedding_provider: Arc<dyn OpenAiCompatibleProvider>,
+        vision_provider: Arc<dyn OpenAiCompatibleProvider>,
         config: IndexingModelConfig,
     ) -> Result<()> {
         let _transition = self.inner.transitions.lock().await;
@@ -357,7 +364,11 @@ impl IndexingCoordinator {
             .models
             .write()
             .unwrap_or_else(|error| error.into_inner());
-        *models = ModelServices { provider, config };
+        *models = ModelServices {
+            embedding_provider,
+            vision_provider,
+            config,
+        };
         drop(models);
         self.inner.models.clear_poison();
         self.wake();
@@ -766,7 +777,7 @@ async fn run_embedding(
             );
             inputs.push(input);
         }
-        let request = models.provider.embeddings(EmbeddingRequest {
+        let request = models.embedding_provider.embeddings(EmbeddingRequest {
             model: models.config.embedding_model.clone(),
             input: inputs,
         });
@@ -1041,13 +1052,17 @@ async fn run_vision(
             BASE64_STANDARD.encode(&bytes)
         );
         let request = vision_request(&models.config.vision_model, image_url);
-        let stream =
-            match await_provider_step(inner, job, &cursor, models.provider.chat_stream(request))
-                .await?
-            {
-                Controlled::Value(stream) => stream,
-                Controlled::Interrupted(outcome) => return Ok(outcome),
-            };
+        let stream = match await_provider_step(
+            inner,
+            job,
+            &cursor,
+            models.vision_provider.chat_stream(request),
+        )
+        .await?
+        {
+            Controlled::Value(stream) => stream,
+            Controlled::Interrupted(outcome) => return Ok(outcome),
+        };
         let response = match collect_vision_response(inner, job, &cursor, stream).await? {
             Controlled::Value(response) => response,
             Controlled::Interrupted(outcome) => return Ok(outcome),
@@ -2080,13 +2095,21 @@ mod tests {
         }
 
         fn coordinator(&self, provider: Arc<MockProvider>) -> Arc<IndexingCoordinator> {
-            let provider: Arc<dyn OpenAiCompatibleProvider> = provider;
+            self.coordinator_with_providers(provider.clone(), provider)
+        }
+
+        fn coordinator_with_providers(
+            &self,
+            embedding_provider: Arc<dyn OpenAiCompatibleProvider>,
+            vision_provider: Arc<dyn OpenAiCompatibleProvider>,
+        ) -> Arc<IndexingCoordinator> {
             let blobs: Arc<dyn BlobStore> = self.blobs.clone();
             IndexingCoordinator::start(
                 self.runtime.handle(),
                 &self.db_path,
                 blobs,
-                provider,
+                embedding_provider,
+                vision_provider,
                 test_model_config(
                     "embed-test",
                     "embedding-endpoint-a:embed-test",
@@ -2104,7 +2127,8 @@ mod tests {
                 db_path: self.db_path.clone(),
                 blobs: self.blobs.clone(),
                 models: RwLock::new(ModelServices {
-                    provider,
+                    embedding_provider: provider.clone(),
+                    vision_provider: provider,
                     config: test_model_config(
                         "embed-test",
                         "embedding-endpoint-a:embed-test",
@@ -2116,6 +2140,39 @@ mod tests {
                 wake: Notify::new(),
                 shutdown: AtomicBool::new(false),
             })
+        }
+
+        fn wait_for_post_vision_embedding(
+            &self,
+            coordinator: &IndexingCoordinator,
+            embedding_identity: &str,
+            vision_identity: &str,
+        ) {
+            // Vision queues a separate embedding phase before it succeeds;
+            // the canonical text embedding job can already be complete.
+            let jobs = self
+                .runtime
+                .block_on(coordinator.jobs_for_book(&self.book_id))
+                .unwrap();
+            let post_vision = jobs
+                .iter()
+                .find(|job| {
+                    job.kind == "embedding"
+                        && job.source_id.as_deref() == Some(self.source_id.as_str())
+                        && serde_json::from_str::<JobCursor>(&job.cursor_json).is_ok_and(|cursor| {
+                            cursor.execution_identity.as_deref() == Some(embedding_identity)
+                                && cursor.input_execution_identity.as_deref()
+                                    == Some(vision_identity)
+                        })
+                })
+                .expect("successful vision must queue matching embedding work");
+            self.runtime
+                .block_on(coordinator.wait_for_state(
+                    &post_vision.id,
+                    IndexingJobStatus::Succeeded,
+                    Duration::from_secs(5),
+                ))
+                .unwrap();
         }
 
         fn publish_test_visual_page(&self) {
@@ -2164,6 +2221,56 @@ mod tests {
                 &[page],
             )
             .unwrap();
+        }
+    }
+
+    #[test]
+    fn embedding_and_vision_jobs_use_their_assigned_providers() {
+        let fixture = Fixture::new();
+        fixture.publish_test_visual_page();
+        let embedding_provider = Arc::new(MockProvider::default());
+        embedding_provider
+            .embedding_marker
+            .store(7, Ordering::SeqCst);
+        let vision_provider = Arc::new(MockProvider::default());
+        let coordinator =
+            fixture.coordinator_with_providers(embedding_provider.clone(), vision_provider.clone());
+        for kind in ["vision", "embedding"] {
+            fixture
+                .runtime
+                .block_on(coordinator.wait_for_state(
+                    &format!("{kind}:{}", fixture.source_id),
+                    IndexingJobStatus::Succeeded,
+                    Duration::from_secs(5),
+                ))
+                .unwrap();
+        }
+        fixture.wait_for_post_vision_embedding(
+            &coordinator,
+            "embedding-endpoint-a:embed-test",
+            "vision-endpoint-a:vision-test",
+        );
+        assert!(embedding_provider.embedding_calls.load(Ordering::SeqCst) > 0);
+        assert_eq!(
+            embedding_provider.vision_png_calls.load(Ordering::SeqCst),
+            0
+        );
+        assert_eq!(vision_provider.embedding_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(vision_provider.vision_png_calls.load(Ordering::SeqCst), 1);
+
+        let conn = db::open_conn(&fixture.db_path).unwrap();
+        let chunks = db::search_chunks::list_for_source(&conn, &fixture.source_id).unwrap();
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.id.starts_with("vision-chunk-"))
+        );
+        for chunk in chunks {
+            let (_, vector) =
+                db::embeddings::get_f32_for_chunk_model(&conn, &chunk.id, "embed-test")
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(vector[0], 7.0);
         }
     }
 
@@ -3134,6 +3241,7 @@ mod tests {
         fixture
             .runtime
             .block_on(coordinator.reconfigure(
+                provider_for_reconfigure.clone(),
                 provider_for_reconfigure,
                 test_model_config(
                     "embed-test",
@@ -3202,6 +3310,7 @@ mod tests {
         fixture
             .runtime
             .block_on(coordinator.reconfigure(
+                provider.clone(),
                 provider,
                 test_model_config(
                     "embed-test",
@@ -3232,6 +3341,7 @@ mod tests {
         fixture
             .runtime
             .block_on(coordinator.reconfigure(
+                provider.clone(),
                 provider,
                 test_model_config(
                     "embed-next",
@@ -3267,6 +3377,7 @@ mod tests {
         fixture
             .runtime
             .block_on(coordinator.reconfigure(
+                provider.clone(),
                 provider,
                 test_model_config(
                     "embed-next",
@@ -3285,6 +3396,7 @@ mod tests {
         fixture
             .runtime
             .block_on(coordinator.reconfigure(
+                provider.clone(),
                 provider,
                 test_model_config(
                     "embed-next",
@@ -3322,6 +3434,7 @@ mod tests {
         fixture
             .runtime
             .block_on(coordinator.reconfigure(
+                provider.clone(),
                 provider,
                 test_model_config(
                     "embed-next",
@@ -3453,10 +3566,13 @@ mod tests {
     #[test]
     fn endpoint_switch_while_provider_is_running_uses_new_generation() {
         let fixture = Fixture::new();
+        fixture.publish_test_visual_page();
         let old_provider = Arc::new(MockProvider::default());
         old_provider.block_embeddings.store(true, Ordering::SeqCst);
         old_provider.embedding_marker.store(2, Ordering::SeqCst);
-        let coordinator = fixture.coordinator(old_provider.clone());
+        let vision_provider = Arc::new(MockProvider::default());
+        let coordinator =
+            fixture.coordinator_with_providers(old_provider.clone(), vision_provider.clone());
         let job_id = format!("embedding:{}", fixture.source_id);
         fixture
             .runtime
@@ -3482,6 +3598,7 @@ mod tests {
             .runtime
             .block_on(coordinator.reconfigure(
                 next_provider,
+                vision_provider.clone(),
                 test_model_config(
                     "embed-test",
                     "embedding-endpoint-b:embed-test",
@@ -3500,6 +3617,26 @@ mod tests {
             ))
             .unwrap();
         assert!(new_provider.embedding_calls.load(Ordering::SeqCst) > 0);
+        fixture
+            .runtime
+            .block_on(coordinator.wait_for_state(
+                &format!("vision:{}", fixture.source_id),
+                IndexingJobStatus::Succeeded,
+                Duration::from_secs(5),
+            ))
+            .unwrap();
+        assert_eq!(new_provider.vision_png_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(old_provider.vision_png_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(vision_provider.embedding_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(vision_provider.vision_png_calls.load(Ordering::SeqCst), 1);
+        fixture
+            .runtime
+            .block_on(coordinator.wait_for_state(
+                &job_id,
+                IndexingJobStatus::Succeeded,
+                Duration::from_secs(5),
+            ))
+            .unwrap();
         let cursor: JobCursor = serde_json::from_str(&completed.cursor_json).unwrap();
         assert_eq!(
             cursor.execution_identity.as_deref(),
@@ -3521,6 +3658,100 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn vision_endpoint_switch_uses_new_provider_and_preserves_embedding_route() {
+        let fixture = Fixture::new();
+        fixture.publish_test_visual_page();
+        let embedding_provider = Arc::new(MockProvider::default());
+        let old_vision_provider = Arc::new(MockProvider::default());
+        old_vision_provider
+            .vision_delay_ms
+            .store(60_000, Ordering::SeqCst);
+        let coordinator = fixture
+            .coordinator_with_providers(embedding_provider.clone(), old_vision_provider.clone());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while old_vision_provider.vision_png_calls.load(Ordering::SeqCst) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "old vision request did not start"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let new_vision_provider = Arc::new(MockProvider::default());
+        fixture
+            .runtime
+            .block_on(coordinator.reconfigure(
+                embedding_provider.clone(),
+                new_vision_provider.clone(),
+                test_model_config(
+                    "embed-test",
+                    "embedding-endpoint-a:embed-test",
+                    "vision-test",
+                    "vision-endpoint-b:vision-test",
+                ),
+            ))
+            .unwrap();
+        let vision_job_id = format!("vision:{}", fixture.source_id);
+        let completed = fixture
+            .runtime
+            .block_on(coordinator.wait_for_state(
+                &vision_job_id,
+                IndexingJobStatus::Succeeded,
+                Duration::from_secs(5),
+            ))
+            .unwrap();
+        fixture
+            .runtime
+            .block_on(coordinator.wait_for_state(
+                &format!("embedding:{}", fixture.source_id),
+                IndexingJobStatus::Succeeded,
+                Duration::from_secs(5),
+            ))
+            .unwrap();
+        fixture.wait_for_post_vision_embedding(
+            &coordinator,
+            "embedding-endpoint-a:embed-test",
+            "vision-endpoint-b:vision-test",
+        );
+        let cursor: JobCursor = serde_json::from_str(&completed.cursor_json).unwrap();
+        assert_eq!(
+            cursor.execution_identity.as_deref(),
+            Some("vision-endpoint-b:vision-test")
+        );
+        assert_eq!(
+            new_vision_provider.vision_png_calls.load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            new_vision_provider.embedding_calls.load(Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            old_vision_provider.embedding_calls.load(Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            embedding_provider.vision_png_calls.load(Ordering::SeqCst),
+            0
+        );
+        assert!(embedding_provider.embedding_calls.load(Ordering::SeqCst) > 0);
+        let conn = db::open_conn(&fixture.db_path).unwrap();
+        let visual_chunks = db::search_chunks::list_for_source(&conn, &fixture.source_id)
+            .unwrap()
+            .into_iter()
+            .filter(|chunk| chunk.id.starts_with("vision-chunk-"))
+            .collect::<Vec<_>>();
+        assert!(!visual_chunks.is_empty());
+        for chunk in visual_chunks {
+            assert!(
+                db::embeddings::get_f32_for_chunk_model(&conn, &chunk.id, "embed-test")
+                    .unwrap()
+                    .is_some()
+            );
+        }
     }
 
     #[test]
@@ -3572,6 +3803,7 @@ mod tests {
             fixture.runtime.handle(),
             &fixture.db_path,
             blobs,
+            provider.clone(),
             provider,
             test_model_config(
                 "embed-test",
@@ -3684,6 +3916,7 @@ mod tests {
         fixture
             .runtime
             .block_on(coordinator.reconfigure(
+                provider.clone(),
                 provider,
                 test_model_config(
                     "embed-test",
@@ -3836,6 +4069,7 @@ mod tests {
             fixture
                 .runtime
                 .block_on(coordinator.reconfigure(
+                    provider.clone(),
                     provider,
                     test_model_config(
                         "embed-next",
@@ -3886,6 +4120,7 @@ mod tests {
         fixture
             .runtime
             .block_on(coordinator.reconfigure(
+                provider.clone(),
                 provider,
                 test_model_config(
                     "embed-next",
@@ -4153,6 +4388,7 @@ mod tests {
         fixture
             .runtime
             .block_on(coordinator.reconfigure(
+                provider_for_reconfigure.clone(),
                 provider_for_reconfigure,
                 test_model_config(
                     "embed-test",

@@ -114,6 +114,20 @@ pub(crate) fn exact_knn_scoped(
     allowed_book_ids: &[String],
     limit: usize,
 ) -> Result<Vec<VectorMatch>> {
+    exact_knn_scoped_for_execution(conn, model, None, query_vector, allowed_book_ids, limit)
+}
+
+/// The source's canonical job and vectors are read by one SQLite statement.
+/// Reconfiguration replaces that cursor and invalidates vectors in one
+/// transaction, so an old provider snapshot cannot search a new vector space.
+pub(crate) fn exact_knn_scoped_for_execution(
+    conn: &Connection,
+    model: &str,
+    execution_identity: Option<&str>,
+    query_vector: &[f32],
+    allowed_book_ids: &[String],
+    limit: usize,
+) -> Result<Vec<VectorMatch>> {
     if allowed_book_ids.is_empty() || limit == 0 {
         return Ok(Vec::new());
     }
@@ -128,6 +142,29 @@ pub(crate) fn exact_knn_scoped(
         Value::Integer(dimensions as i64),
         Value::Blob(query_vector),
     ];
+    let execution_filter = if let Some(identity) = execution_identity {
+        if identity.trim().is_empty() {
+            bail!("向量执行身份不能为空");
+        }
+        values.push(Value::Text(identity.to_string()));
+        format!(
+            "AND EXISTS (
+                 SELECT 1 FROM index_jobs j
+                 WHERE j.id = 'embedding:' || c.source_id
+                   AND j.kind = 'embedding'
+                   AND j.source_id = c.source_id
+                   AND j.book_id = c.book_id
+                   AND CASE WHEN json_valid(j.cursor_json)
+                            THEN json_extract(j.cursor_json, '$.model') = ?1
+                             AND json_extract(j.cursor_json, '$.execution_identity') = ?{}
+                            ELSE 0
+                       END
+             )",
+            values.len()
+        )
+    } else {
+        String::new()
+    };
     let scope_parameters = allowed_book_ids
         .iter()
         .map(|book_id| {
@@ -146,6 +183,7 @@ pub(crate) fn exact_knn_scoped(
          WHERE e.model = ?1
            AND e.dimensions = ?2
            AND c.book_id IN ({scope_parameters})
+           {execution_filter}
            AND CASE WHEN json_valid(c.locator_json)
                     THEN COALESCE(json_extract(c.locator_json, '$.source.type'), '')
                          <> 'office_rendered_page'

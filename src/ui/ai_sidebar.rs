@@ -8,6 +8,7 @@ use moye_epub_editor::{
     agent::AgentAnswerSourceStatus,
     ai::normalize_provider_base_url,
     document::{BookDocument, ContentUnit, DocumentLocator, Revision, SourceLocator},
+    services::{ModelRole, ProviderSettings},
 };
 use serde::Serialize;
 use std::net::IpAddr;
@@ -97,8 +98,33 @@ impl AiEndpointStatus {
     fn current(services: &AppServices) -> Self {
         services
             .provider_settings()
-            .map(|settings| Self::from_base_url(&settings.base_url))
+            .map(|settings| Self::from_settings(&settings))
             .unwrap_or(Self::Unavailable)
+    }
+
+    fn from_settings(settings: &ProviderSettings) -> Self {
+        let mut remote = Vec::new();
+        for (role, label) in [
+            (ModelRole::Chat, "对话"),
+            (ModelRole::Embedding, "Embedding"),
+            (ModelRole::Vision, "视觉"),
+        ] {
+            let Ok(endpoint) = settings.endpoint_for(role) else {
+                return Self::Unavailable;
+            };
+            match Self::from_base_url(&endpoint.base_url) {
+                Self::Local => {}
+                Self::Remote { hostname } => remote.push(format!("{label}：{hostname}")),
+                Self::Unavailable => return Self::Unavailable,
+            }
+        }
+        if remote.is_empty() {
+            Self::Local
+        } else {
+            Self::Remote {
+                hostname: remote.join("；"),
+            }
+        }
     }
 
     fn label(&self) -> String {
@@ -1958,7 +1984,7 @@ impl AiSidebar {
             (rgb(0xe3efe5), rgb(0x376441), IconName::CircleCheck)
         };
         div()
-            .h_flex()
+            .v_flex()
             .min_h(px(34.))
             .flex_none()
             .items_center()
@@ -1981,8 +2007,7 @@ impl AiSidebar {
             )
             .child(
                 div()
-                    .max_w(px(185.))
-                    .truncate()
+                    .w_full()
                     .font_semibold()
                     .child(self.endpoint_status.label()),
             )
@@ -2985,6 +3010,29 @@ mod tests {
             }
         );
         assert!(private_network.is_warning());
+    }
+
+    #[test]
+    fn endpoint_status_reports_remote_embedding_with_local_chat() {
+        let mut settings = ProviderSettings::default();
+        let mut endpoint = settings.endpoint_for(ModelRole::Chat).unwrap();
+        endpoint.id = "remote-embedding".into();
+        endpoint.name = "远程向量".into();
+        endpoint.base_url = "https://vectors.example.test/v1".into();
+        settings.endpoint_routing.embedding_endpoint_id = endpoint.id.clone();
+        settings
+            .endpoint_routing
+            .additional_endpoints
+            .push(endpoint);
+        let status = AiEndpointStatus::from_settings(&settings);
+        assert!(status.is_warning());
+        assert!(status.label().contains("Embedding：vectors.example.test"));
+        assert!(!status.label().contains("对话："));
+        settings.endpoint_routing.vision_endpoint_id = "missing".into();
+        assert_eq!(
+            AiEndpointStatus::from_settings(&settings),
+            AiEndpointStatus::Unavailable
+        );
     }
 
     #[test]

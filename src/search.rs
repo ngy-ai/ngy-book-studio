@@ -62,6 +62,20 @@ pub trait VectorIndex: Send + Sync {
         allowed_book_ids: &[String],
         limit: usize,
     ) -> Result<Vec<VectorHit>>;
+
+    /// Must enforce the model execution identity in the same snapshot as the
+    /// vectors. Indices without that capability safely trigger FTS fallback.
+    fn exact_search_for_execution(
+        &self,
+        _db_path: &Path,
+        _model: &str,
+        _execution_identity: &str,
+        _query_vector: &[f32],
+        _allowed_book_ids: &[String],
+        _limit: usize,
+    ) -> Result<Vec<VectorHit>> {
+        bail!("vector index does not support execution identity checks")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -120,6 +134,35 @@ impl VectorIndex for SqliteVectorIndex {
             },
         )
     }
+
+    fn exact_search_for_execution(
+        &self,
+        db_path: &Path,
+        model: &str,
+        execution_identity: &str,
+        query_vector: &[f32],
+        allowed_book_ids: &[String],
+        limit: usize,
+    ) -> Result<Vec<VectorHit>> {
+        let conn = connection::open_conn(db_path)?;
+        embeddings::exact_knn_scoped_for_execution(
+            &conn,
+            model,
+            Some(execution_identity),
+            query_vector,
+            allowed_book_ids,
+            limit,
+        )
+        .map(|matches| {
+            matches
+                .into_iter()
+                .map(|hit| VectorHit {
+                    search_chunk_id: hit.search_chunk_id,
+                    distance: hit.distance,
+                })
+                .collect()
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -127,6 +170,7 @@ pub struct SearchService {
     db_path: PathBuf,
     embedding_provider: Arc<dyn OpenAiCompatibleProvider>,
     embedding_model: String,
+    embedding_execution_identity: Option<String>,
     vector_index: Arc<dyn VectorIndex>,
 }
 
@@ -154,6 +198,21 @@ impl SearchService {
         )
     }
 
+    pub fn new_with_execution_identity(
+        db_path: impl Into<PathBuf>,
+        embedding_provider: Arc<dyn OpenAiCompatibleProvider>,
+        embedding_model: impl Into<String>,
+        embedding_execution_identity: impl Into<String>,
+    ) -> Result<Self> {
+        let identity = embedding_execution_identity.into();
+        if identity.trim().is_empty() || identity.trim() != identity {
+            bail!("embedding execution identity is required");
+        }
+        let mut service = Self::new(db_path, embedding_provider, embedding_model)?;
+        service.embedding_execution_identity = Some(identity);
+        Ok(service)
+    }
+
     pub fn with_vector_index(
         db_path: impl Into<PathBuf>,
         embedding_provider: Arc<dyn OpenAiCompatibleProvider>,
@@ -168,6 +227,7 @@ impl SearchService {
             db_path: db_path.into(),
             embedding_provider,
             embedding_model,
+            embedding_execution_identity: None,
             vector_index,
         })
     }
@@ -332,13 +392,23 @@ impl SearchService {
         limit: usize,
     ) -> Result<Vec<RankedPassage>> {
         let query_vector = self.embed_query(query.to_string()).await?;
-        let hits = self.vector_index.exact_search(
-            &self.db_path,
-            &self.embedding_model,
-            &query_vector,
-            allowed_book_ids,
-            limit,
-        )?;
+        let hits = match self.embedding_execution_identity.as_deref() {
+            Some(identity) => self.vector_index.exact_search_for_execution(
+                &self.db_path,
+                &self.embedding_model,
+                identity,
+                &query_vector,
+                allowed_book_ids,
+                limit,
+            )?,
+            None => self.vector_index.exact_search(
+                &self.db_path,
+                &self.embedding_model,
+                &query_vector,
+                allowed_book_ids,
+                limit,
+            )?,
+        };
         if hits.is_empty() {
             return Ok(Vec::new());
         }
@@ -508,6 +578,7 @@ mod tests {
     struct MockProvider {
         calls: AtomicUsize,
         vector: Vec<f32>,
+        response_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     }
 
     impl MockProvider {
@@ -515,6 +586,7 @@ mod tests {
             Self {
                 calls: AtomicUsize::new(0),
                 vector,
+                response_gate: None,
             }
         }
     }
@@ -531,7 +603,12 @@ mod tests {
         fn embeddings(&self, request: EmbeddingRequest) -> BoxFuture<'_, Result<EmbeddingBatch>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let vector = self.vector.clone();
+            let response_gate = self.response_gate.clone();
             async move {
+                if let Some((entered, release)) = response_gate {
+                    entered.notify_one();
+                    release.notified().await;
+                }
                 Ok(EmbeddingBatch {
                     model: request.model,
                     vectors: vec![vector],
@@ -626,6 +703,37 @@ mod tests {
             drop(conn);
             Self { _temp: temp, path }
         }
+
+        fn set_embedding_execution(&self, identity: &str) {
+            let mut conn = connection::open_conn(&self.path).unwrap();
+            let source = crate::db::book_sources::get(&conn, "book-a-source")
+                .unwrap()
+                .unwrap();
+            crate::db::transactions::reconcile_current_embedding_job(
+                &mut conn,
+                &source,
+                "mock-model",
+                identity,
+                "vision-endpoint",
+                10,
+            )
+            .unwrap();
+        }
+
+        fn put_semantic_only_hit(&self) {
+            SqliteVectorIndex
+                .upsert(
+                    &self.path,
+                    &ChunkEmbedding {
+                        id: "semantic-hit".to_string(),
+                        search_chunk_id: "book-a-chunk-1".to_string(),
+                        model: "mock-model".to_string(),
+                        vector: vec![1.0, 0.0],
+                        created_at: 11,
+                    },
+                )
+                .unwrap();
+        }
     }
 
     fn insert_book(conn: &Connection, book_id: &str, title: &str, bodies: &[&str]) {
@@ -692,6 +800,99 @@ mod tests {
             book_ids: book_ids.into_iter().map(str::to_string).collect(),
             mode,
             limit: 10,
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_switch_during_query_embedding_falls_back_to_scoped_fts() {
+        let fixture = Fixture::new();
+        fixture.set_embedding_execution("endpoint-a:mock-model");
+        fixture.put_semantic_only_hit();
+        let mut query = request(SearchMode::Semantic, vec!["book-a"]);
+        query.query = "alpha".to_string();
+        let current = SearchService::new_with_execution_identity(
+            &fixture.path,
+            Arc::new(MockProvider::new(vec![1.0, 0.0])),
+            "mock-model",
+            "endpoint-a:mock-model",
+        )
+        .unwrap();
+        let hits = current.search(query.clone()).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].passage_id, "book-a-chunk-1");
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut provider = MockProvider::new(vec![1.0, 0.0]);
+        provider.response_gate = Some((entered.clone(), release.clone()));
+        let snapshot = SearchService::new_with_execution_identity(
+            &fixture.path,
+            Arc::new(provider),
+            "mock-model",
+            "endpoint-a:mock-model",
+        )
+        .unwrap();
+        let pending_query = query.clone();
+        let pending = tokio::spawn(async move { snapshot.search(pending_query).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+
+        // Same model name and dimensions, but the endpoint's vector space has
+        // changed while the old snapshot's provider response was pending.
+        fixture.set_embedding_execution("endpoint-b:mock-model");
+        fixture.put_semantic_only_hit();
+        release.notify_one();
+        let hits = tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].passage_id, "book-a-chunk-0");
+        assert_eq!(hits[0].book_id, "book-a");
+
+        let replacement = SearchService::new_with_execution_identity(
+            &fixture.path,
+            Arc::new(MockProvider::new(vec![1.0, 0.0])),
+            "mock-model",
+            "endpoint-b:mock-model",
+        )
+        .unwrap();
+        let hits = replacement.search(query).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].passage_id, "book-a-chunk-1");
+    }
+
+    #[test]
+    fn sqlite_execution_identity_filter_rejects_unbound_and_malformed_jobs() {
+        let fixture = Fixture::new();
+        fixture.put_semantic_only_hit();
+        let lookup = || {
+            SqliteVectorIndex
+                .exact_search_for_execution(
+                    &fixture.path,
+                    "mock-model",
+                    "endpoint-a:mock-model",
+                    &[1.0, 0.0],
+                    &["book-a".to_string()],
+                    10,
+                )
+                .unwrap()
+        };
+        assert!(lookup().is_empty());
+        fixture.set_embedding_execution("endpoint-a:mock-model");
+        fixture.put_semantic_only_hit();
+        assert_eq!(lookup().len(), 1);
+        let conn = connection::open_conn(&fixture.path).unwrap();
+        for cursor in ["null", "{"] {
+            conn.execute(
+                "UPDATE index_jobs SET cursor_json = ?1
+                 WHERE id = 'embedding:book-a-source'",
+                [cursor],
+            )
+            .unwrap();
+            assert!(lookup().is_empty());
         }
     }
 
