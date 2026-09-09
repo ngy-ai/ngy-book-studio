@@ -17,6 +17,7 @@ use std::{
 };
 
 use crate::{
+    annotations::{Annotation, AnnotationDraft, AnnotationOverview, TextAnchor},
     db,
     document::{
         AssetRef as DocumentAsset, AssetRole, Block, BlockDocument, BookDocument, BookFormat,
@@ -717,6 +718,188 @@ impl LibraryStore {
         BuiltinDocumentExporter
             .export_bytes(&document, ExportFormat::Epub, &resolver)
             .context("无法生成结构化阅读预览")
+    }
+
+    /// Checks against the exact EPUB chapter served to the reading WebView,
+    /// including original EPUB markup and headings added by normalized export.
+    /// Call on a background worker because resource parsing performs I/O.
+    pub fn validate_annotation_anchor(
+        &self,
+        book_id: &str,
+        content_unit_id: &str,
+        document_revision: u64,
+        unit_revision: u64,
+        anchor: &TextAnchor,
+    ) -> Result<()> {
+        ensure!(anchor.start < anchor.end, "请选择非空文本后添加笔记");
+        ensure!(
+            anchor.quote.len() <= crate::annotations::MAX_ANNOTATION_QUOTE_BYTES,
+            "所选文本过长，请缩小笔记范围"
+        );
+        ensure!(
+            !crate::annotations::compact_text(&anchor.quote).is_empty(),
+            "请选择非空文本后添加笔记"
+        );
+        let document = self.document(book_id)?;
+        ensure!(
+            document.revision.get() == document_revision,
+            "图书已更新，请重新打开章节后添加笔记"
+        );
+        let (ordinal, unit) = document
+            .units
+            .iter()
+            .enumerate()
+            .find(|(_, unit)| unit.id == content_unit_id)
+            .context("笔记章节不属于当前图书")?;
+        ensure!(
+            unit.revision.get() == unit_revision,
+            "章节已更新，请重新打开后添加笔记"
+        );
+        let opened = crate::reader::OpenedBook::open_bytes(self.reader_epub_bytes(book_id)?)?;
+        ensure!(
+            opened.spine.len() == document.units.len(),
+            "阅读章节与图书结构不一致，请重新打开图书"
+        );
+        let href = &opened.spine[ordinal].href;
+        let response = crate::reader::load_resource(&opened.epub, href)?;
+        let html = std::str::from_utf8(&response.bytes).context("无法解码笔记所在章节")?;
+        let text = crate::annotations::reader_body_text(html);
+        crate::annotations::validate_anchor(&text, anchor)
+    }
+
+    /// All marks and both kinds of thought share one persisted notes table.
+    /// A mark replaces the style of the same exact selection, retaining its
+    /// identity; repeating the existing style leaves the note unchanged.
+    pub fn create_annotation(
+        &mut self,
+        book_id: &str,
+        draft: &AnnotationDraft,
+    ) -> Result<Annotation> {
+        crate::annotations::validate_draft(draft)?;
+        self.validate_annotation_anchor(
+            book_id,
+            &draft.content_unit_id,
+            draft.document_revision,
+            draft.unit_revision,
+            &draft.anchor,
+        )?;
+        let now = now_secs();
+        let note = Annotation {
+            id: deterministic_id("annotation", format!("{book_id}\0{}", now_nanos())),
+            book_id: book_id.to_string(),
+            content_unit_id: draft.content_unit_id.clone(),
+            document_revision: draft.document_revision,
+            unit_revision: draft.unit_revision,
+            anchor: draft.anchor.clone(),
+            kind: draft.kind,
+            comment: draft.comment.clone(),
+            created_at: now,
+            updated_at: now,
+            stale: false,
+        };
+        let mut conn = db::open_conn(&self.db_path)?;
+        db::transactions::insert_annotation(&mut conn, &note)
+    }
+
+    pub fn list_annotations(
+        &self,
+        book_id: &str,
+        content_unit_id: Option<&str>,
+    ) -> Result<Vec<Annotation>> {
+        let conn = db::open_conn(&self.db_path)?;
+        let book = db::books::get(&conn, book_id)?.context("图书不存在")?;
+        let source = db::book_sources::get_revision(&conn, book_id, book.revision)?
+            .context("当前图书来源不存在")?;
+        let units = db::content_units::list_for_source(&conn, &source.id)?
+            .into_iter()
+            .map(|unit| (unit.id, unit.revision))
+            .collect::<HashMap<_, _>>();
+        let mut notes = db::annotations::list(&conn, book_id, content_unit_id)?;
+        for note in &mut notes {
+            note.stale = note.document_revision != book.revision
+                || units.get(&note.content_unit_id) != Some(&note.unit_revision);
+        }
+        Ok(notes)
+    }
+
+    /// Reads notes for one book, or the entire library, newest update first.
+    /// Queries current catalog metadata directly without loading chapter bodies
+    /// or relying on this store clone's cached book projection.
+    pub fn annotation_overview(&self, book_id: Option<&str>) -> Result<Vec<AnnotationOverview>> {
+        let conn = db::open_conn(&self.db_path)?;
+        if let Some(book_id) = book_id {
+            db::books::get(&conn, book_id)?.context("图书不存在")?;
+        }
+        db::annotations::overview(&conn, book_id)
+    }
+
+    /// Only the body of a human thought is editable. Its author kind, quote,
+    /// and original location cannot be changed through this operation.
+    pub fn update_human_comment(
+        &mut self,
+        book_id: &str,
+        id: &str,
+        comment: &str,
+    ) -> Result<Annotation> {
+        crate::annotations::validate_comment(
+            comment,
+            crate::annotations::AnnotationKind::HumanComment,
+        )?;
+        let conn = db::open_conn(&self.db_path)?;
+        let mut existing = self
+            .list_annotations(book_id, None)?
+            .into_iter()
+            .find(|note| note.id == id)
+            .context("笔记不存在或不属于当前图书")?;
+        ensure!(
+            existing.kind == crate::annotations::AnnotationKind::HumanComment,
+            "只能编辑人工想法，AI 想法保留原始来源"
+        );
+        let updated_at = now_secs().max(existing.updated_at);
+        ensure!(
+            db::annotations::update_human_comment(&conn, book_id, id, comment, updated_at)? == 1,
+            "笔记已被删除，无法保存想法"
+        );
+        existing.comment = Some(comment.to_string());
+        existing.updated_at = updated_at;
+        Ok(existing)
+    }
+
+    pub fn delete_annotation(&mut self, book_id: &str, id: &str) -> Result<()> {
+        let conn = db::open_conn(&self.db_path)?;
+        ensure!(
+            db::annotations::delete(&conn, book_id, id)? == 1,
+            "笔记不存在或不属于当前图书"
+        );
+        Ok(())
+    }
+
+    /// Removes only the mark on this exact selection. Thoughts and other
+    /// occurrences of the same quote are retained; an unmarked range succeeds.
+    pub fn delete_annotation_marks(
+        &mut self,
+        book_id: &str,
+        content_unit_id: &str,
+        document_revision: u64,
+        unit_revision: u64,
+        anchor: &TextAnchor,
+    ) -> Result<()> {
+        self.validate_annotation_anchor(
+            book_id,
+            content_unit_id,
+            document_revision,
+            unit_revision,
+            anchor,
+        )?;
+        let mut conn = db::open_conn(&self.db_path)?;
+        db::transactions::delete_annotation_marks(
+            &mut conn,
+            book_id,
+            content_unit_id,
+            document_revision,
+            unit_revision,
+            anchor,
+        )
     }
 
     pub fn cover_bytes(&self, book_id: &str) -> Result<Option<Arc<Vec<u8>>>> {
@@ -2390,7 +2573,519 @@ fn now_nanos() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::annotations::AnnotationKind;
     use crate::editing::{DocumentEditor, NewContentUnit};
+
+    fn initial_note_draft(
+        library: &LibraryStore,
+        book_id: &str,
+        kind: AnnotationKind,
+    ) -> AnnotationDraft {
+        let document = library.document(book_id).unwrap();
+        AnnotationDraft {
+            content_unit_id: document.units[0].id.clone(),
+            document_revision: document.revision.get(),
+            unit_revision: document.units[0].revision.get(),
+            anchor: TextAnchor {
+                quote: "第一章".into(),
+                start: 0,
+                end: 3,
+            },
+            kind,
+            comment: kind.is_comment().then(|| "对这一段的想法".to_string()),
+        }
+    }
+
+    #[test]
+    fn annotations_share_storage_reopen_and_preserve_human_ai_authorship() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut library = LibraryStore::load_from(temp.path().into()).unwrap();
+        let book = library.create_book("阅读笔记", "作者").unwrap();
+        let other = library.create_book("另一书", "作者").unwrap();
+        let mut ids = Vec::new();
+        for kind in [
+            AnnotationKind::Highlight,
+            AnnotationKind::HumanComment,
+            AnnotationKind::AiComment,
+        ] {
+            let draft = initial_note_draft(&library, &book.id, kind);
+            ids.push(library.create_annotation(&book.id, &draft).unwrap().id);
+        }
+        assert!(
+            library
+                .list_annotations(&other.id, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(library.delete_annotation(&other.id, &ids[0]).is_err());
+        assert!(
+            library
+                .update_human_comment(&book.id, &ids[2], "伪成人工")
+                .is_err()
+        );
+        assert!(
+            library
+                .update_human_comment(&other.id, &ids[1], "跨书修改")
+                .is_err()
+        );
+        let edited = library
+            .update_human_comment(&book.id, &ids[1], "人工修改后的想法")
+            .unwrap();
+        assert_eq!(edited.kind, AnnotationKind::HumanComment);
+        assert_eq!(edited.comment.as_deref(), Some("人工修改后的想法"));
+        drop(library);
+
+        let mut reopened = LibraryStore::load_from(temp.path().into()).unwrap();
+        let notes = reopened.list_annotations(&book.id, None).unwrap();
+        assert_eq!(notes.len(), 3);
+        assert!(notes.iter().all(|note| !note.stale));
+        assert_eq!(
+            notes.iter().find(|note| note.id == ids[2]).unwrap().kind,
+            AnnotationKind::AiComment
+        );
+        reopened.delete_annotation(&book.id, &ids[0]).unwrap();
+        assert_eq!(reopened.list_annotations(&book.id, None).unwrap().len(), 2);
+        reopened.remove_book(&book.id).unwrap();
+        let conn = db::open_conn(reopened.database_path()).unwrap();
+        assert!(
+            db::annotations::list(&conn, &book.id, None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn annotations_reject_wrong_book_quote_revision_and_survive_document_changes_as_stale() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut library = LibraryStore::load_from(temp.path().into()).unwrap();
+        let book = library.create_book("阅读笔记", "作者").unwrap();
+        let other = library.create_book("另一书", "作者").unwrap();
+        let draft = initial_note_draft(&library, &book.id, AnnotationKind::HumanComment);
+        assert!(library.create_annotation(&other.id, &draft).is_err());
+        let mut wrong = draft.clone();
+        wrong.anchor.quote = "不存在".into();
+        assert!(library.create_annotation(&book.id, &wrong).is_err());
+        wrong = draft.clone();
+        wrong.unit_revision += 1;
+        assert!(library.create_annotation(&book.id, &wrong).is_err());
+        wrong = draft.clone();
+        wrong.document_revision += 1;
+        assert!(library.create_annotation(&book.id, &wrong).is_err());
+        let note = library.create_annotation(&book.id, &draft).unwrap();
+        library
+            .update_content_unit_source(
+                &book.id,
+                &draft.content_unit_id,
+                "<h1>新章</h1><p>正文已经改变</p>",
+            )
+            .unwrap();
+        assert!(library.create_annotation(&book.id, &draft).is_err());
+        drop(library);
+        let mut reopened = LibraryStore::load_from(temp.path().into()).unwrap();
+        let notes = reopened.list_annotations(&book.id, None).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].stale);
+        assert_eq!(notes[0].anchor.quote, "第一章");
+        let edited = reopened
+            .update_human_comment(&book.id, &note.id, "仍可整理旧版想法")
+            .unwrap();
+        assert!(edited.stale);
+    }
+
+    #[test]
+    fn annotations_replace_exclusive_marks_and_delete_only_the_exact_range() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut library = LibraryStore::load_from(temp.path().into()).unwrap();
+        let (book, first_id, second_id) = create_two_unit_book(&mut library);
+        let mut editor = DocumentEditor::new(library.document(&book.id).unwrap()).unwrap();
+        editor
+            .update_unit_source(&first_id, "<h1>第一章</h1><p>第一章</p>")
+            .unwrap();
+        editor
+            .update_unit_identity(&second_id, "第一章", ContentUnitKind::Chapter)
+            .unwrap();
+        editor
+            .update_unit_source(&second_id, "<h1>第一章</h1>")
+            .unwrap();
+        library.apply_document(editor.into_document()).unwrap();
+        let other = library.create_book("其他图书", "作者").unwrap();
+        for kind in [AnnotationKind::HumanComment, AnnotationKind::AiComment] {
+            let draft = initial_note_draft(&library, &book.id, kind);
+            library.create_annotation(&book.id, &draft).unwrap();
+        }
+
+        let mut draft = initial_note_draft(&library, &book.id, AnnotationKind::Highlight);
+        let first_mark = library.create_annotation(&book.id, &draft).unwrap();
+        for kind in [
+            AnnotationKind::Wavy,
+            AnnotationKind::Underline,
+            AnnotationKind::Highlight,
+        ] {
+            draft.kind = kind;
+            let mark = library.create_annotation(&book.id, &draft).unwrap();
+            assert_eq!(mark.id, first_mark.id);
+            assert_eq!(mark.kind, kind);
+            assert_eq!(library.create_annotation(&book.id, &draft).unwrap(), mark);
+            let notes = library.list_annotations(&book.id, None).unwrap();
+            assert_eq!(notes.len(), 3);
+            assert_eq!(notes.iter().filter(|note| note.kind.is_mark()).count(), 1);
+            assert_eq!(
+                notes
+                    .iter()
+                    .filter(|note| note.kind == AnnotationKind::HumanComment)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                notes
+                    .iter()
+                    .filter(|note| note.kind == AnnotationKind::AiComment)
+                    .count(),
+                1
+            );
+        }
+        // The SQLite constraint independently prevents two mark styles at the
+        // same range, while the human/AI thoughts above share that range.
+        let conn = db::open_conn(library.database_path()).unwrap();
+        let mut duplicate = first_mark.clone();
+        duplicate.id.push_str("-conflict");
+        duplicate.kind = AnnotationKind::Wavy;
+        let error = db::annotations::insert(&conn, &duplicate).unwrap_err();
+        assert!(format!("{error:#}").contains("UNIQUE constraint failed"));
+        assert!(
+            conn.execute(
+                "UPDATE annotations SET kind = 'strikethrough' WHERE id = ?1",
+                [&first_mark.id]
+            )
+            .is_err()
+        );
+        drop(conn);
+
+        let mut duplicate_quote = draft.clone();
+        duplicate_quote.anchor.start = 3;
+        duplicate_quote.anchor.end = 6;
+        let duplicate_mark = library
+            .create_annotation(&book.id, &duplicate_quote)
+            .unwrap();
+        let mut other_chapter = draft.clone();
+        other_chapter.content_unit_id = second_id;
+        let other_chapter_mark = library.create_annotation(&book.id, &other_chapter).unwrap();
+        let other_draft = initial_note_draft(&library, &other.id, AnnotationKind::Underline);
+        let other_book_mark = library.create_annotation(&other.id, &other_draft).unwrap();
+
+        assert!(
+            library
+                .delete_annotation_marks(
+                    &other.id,
+                    &draft.content_unit_id,
+                    other_draft.document_revision,
+                    other_draft.unit_revision,
+                    &draft.anchor
+                )
+                .is_err()
+        );
+        let mut wrong_anchor = draft.anchor.clone();
+        wrong_anchor.quote = "不存在".into();
+        assert!(
+            library
+                .delete_annotation_marks(
+                    &book.id,
+                    &draft.content_unit_id,
+                    draft.document_revision,
+                    draft.unit_revision,
+                    &wrong_anchor
+                )
+                .is_err()
+        );
+        for _ in 0..2 {
+            library
+                .delete_annotation_marks(
+                    &book.id,
+                    &draft.content_unit_id,
+                    draft.document_revision,
+                    draft.unit_revision,
+                    &draft.anchor,
+                )
+                .unwrap();
+        }
+        let notes = library.list_annotations(&book.id, None).unwrap();
+        let range_notes = notes
+            .iter()
+            .filter(|note| {
+                note.content_unit_id == draft.content_unit_id
+                    && note.anchor.start == draft.anchor.start
+                    && note.anchor.end == draft.anchor.end
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(range_notes.len(), 2);
+        assert!(range_notes.iter().all(|note| note.kind.is_comment()));
+        assert!(notes.iter().any(|note| note.id == duplicate_mark.id));
+        assert!(notes.iter().any(|note| note.id == other_chapter_mark.id));
+        assert_eq!(
+            library.list_annotations(&other.id, None).unwrap(),
+            vec![other_book_mark]
+        );
+
+        // Late requests cannot erase marks anchored in another revision.
+        let document = library.document(&book.id).unwrap();
+        library.apply_document(document).unwrap();
+        assert!(
+            library
+                .delete_annotation_marks(
+                    &book.id,
+                    &duplicate_quote.content_unit_id,
+                    duplicate_quote.document_revision,
+                    duplicate_quote.unit_revision,
+                    &duplicate_quote.anchor
+                )
+                .is_err()
+        );
+        let mut conn = db::open_conn(library.database_path()).unwrap();
+        assert!(
+            db::transactions::delete_annotation_marks(
+                &mut conn,
+                &book.id,
+                &duplicate_quote.content_unit_id,
+                duplicate_quote.document_revision,
+                duplicate_quote.unit_revision,
+                &duplicate_quote.anchor
+            )
+            .is_err()
+        );
+        drop(conn);
+        drop(library);
+        let reopened = LibraryStore::load_from(temp.path().into()).unwrap();
+        let notes = reopened.list_annotations(&book.id, None).unwrap();
+        assert_eq!(notes.len(), 4);
+        assert!(notes.iter().all(|note| note.stale));
+        assert!(notes.iter().any(|note| note.id == duplicate_mark.id));
+    }
+
+    #[test]
+    fn annotations_verify_duplicate_offsets_unicode_and_exported_heading() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut library = LibraryStore::load_from(temp.path().into()).unwrap();
+        let book = library.create_book("定位", "作者").unwrap();
+        let unit_id = library.document(&book.id).unwrap().units[0].id.clone();
+        library
+            .update_content_unit_source(&book.id, &unit_id, "<p>甲😀重复</p><p>乙重复</p>")
+            .unwrap();
+        let document = library.document(&book.id).unwrap();
+        let mut draft = AnnotationDraft {
+            content_unit_id: unit_id,
+            document_revision: document.revision.get(),
+            unit_revision: document.units[0].revision.get(),
+            anchor: TextAnchor {
+                quote: "重 复".into(),
+                start: 9,
+                end: 11,
+            },
+            kind: AnnotationKind::Highlight,
+            comment: None,
+        };
+        let note = library.create_annotation(&book.id, &draft).unwrap();
+        assert_eq!(note.anchor.start, 9);
+        draft.anchor.start = 8;
+        draft.anchor.end = 10;
+        assert!(library.create_annotation(&book.id, &draft).is_err());
+        draft.anchor = TextAnchor {
+            quote: "😀".into(),
+            start: 4,
+            end: 6,
+        };
+        library.create_annotation(&book.id, &draft).unwrap();
+        draft.anchor.end = 5;
+        assert!(library.create_annotation(&book.id, &draft).is_err());
+    }
+
+    #[test]
+    fn annotations_retain_deleted_chapter_and_transaction_rejects_late_old_revision() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut library = LibraryStore::load_from(temp.path().into()).unwrap();
+        let (book, first_unit_id, _) = create_two_unit_book(&mut library);
+        let draft = initial_note_draft(&library, &book.id, AnnotationKind::HumanComment);
+        let note = library.create_annotation(&book.id, &draft).unwrap();
+        let mut editor = DocumentEditor::new(library.document(&book.id).unwrap()).unwrap();
+        editor.remove_unit(&first_unit_id).unwrap();
+        library.apply_document(editor.into_document()).unwrap();
+        let mut conn = db::open_conn(library.database_path()).unwrap();
+        let mut late_note = note.clone();
+        late_note.id.push_str("-late");
+        assert!(db::transactions::insert_annotation(&mut conn, &late_note).is_err());
+        drop(conn);
+        drop(library);
+        let reopened = LibraryStore::load_from(temp.path().into()).unwrap();
+        let notes = reopened.list_annotations(&book.id, None).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].stale);
+        assert_eq!(notes[0].content_unit_id, first_unit_id);
+        assert_eq!(notes[0].comment, note.comment);
+    }
+
+    #[test]
+    fn annotation_overview_reads_all_books_and_chapters_with_current_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut library = LibraryStore::load_from(temp.path().into()).unwrap();
+        assert!(library.annotation_overview(None).unwrap().is_empty());
+        let (book, first_unit, second_unit) = create_two_unit_book(&mut library);
+        let empty = library.create_book("没有笔记", "作者").unwrap();
+        let old_projection = library.clone();
+        let other = library.create_book("另一书", "作者").unwrap();
+        assert!(
+            old_projection
+                .books()
+                .iter()
+                .all(|item| item.id != other.id)
+        );
+
+        for kind in [AnnotationKind::Highlight, AnnotationKind::HumanComment] {
+            let draft = initial_note_draft(&library, &book.id, kind);
+            library.create_annotation(&book.id, &draft).unwrap();
+        }
+        let document = library.document(&book.id).unwrap();
+        let mut ai_draft = initial_note_draft(&library, &book.id, AnnotationKind::AiComment);
+        ai_draft.content_unit_id = second_unit.clone();
+        ai_draft.unit_revision = document.units[1].revision.get();
+        ai_draft.anchor.quote = "第二章".into();
+        let ai_note = library.create_annotation(&book.id, &ai_draft).unwrap();
+        let mut other_draft = initial_note_draft(&library, &other.id, AnnotationKind::Wavy);
+        library.create_annotation(&other.id, &other_draft).unwrap();
+        other_draft.kind = AnnotationKind::Underline;
+        other_draft.anchor.quote = "第一".into();
+        other_draft.anchor.end = 2;
+        library.create_annotation(&other.id, &other_draft).unwrap();
+
+        // Deterministic timestamps exercise both newest-first order and ties.
+        let conn = db::open_conn(library.database_path()).unwrap();
+        conn.execute(
+            "UPDATE annotations SET updated_at = (SELECT MAX(created_at) + 1 FROM annotations)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE annotations SET updated_at = updated_at + 1 WHERE id = ?1",
+            [&ai_note.id],
+        )
+        .unwrap();
+        drop(conn);
+        let notes = old_projection.annotation_overview(None).unwrap();
+        assert_eq!(notes.len(), 5);
+        assert_eq!(notes[0].annotation.id, ai_note.id);
+        assert!(
+            notes[1..]
+                .windows(2)
+                .all(|pair| { pair[0].annotation.id < pair[1].annotation.id })
+        );
+        assert!(notes.iter().all(|note| !note.annotation.stale));
+        for kind in [
+            AnnotationKind::Highlight,
+            AnnotationKind::Wavy,
+            AnnotationKind::Underline,
+            AnnotationKind::HumanComment,
+            AnnotationKind::AiComment,
+        ] {
+            assert!(notes.iter().any(|note| note.annotation.kind == kind));
+        }
+        let scoped = old_projection.annotation_overview(Some(&book.id)).unwrap();
+        assert_eq!(scoped.len(), 3);
+        assert!(
+            scoped.iter().all(|note| {
+                note.annotation.book_id == book.id && note.book_title == book.title
+            })
+        );
+        assert_eq!(scoped[0].chapter_title.as_deref(), Some("第二章"));
+        assert_eq!(scoped[0].chapter_index, Some(1));
+        assert!(scoped[1..].iter().all(|note| {
+            note.chapter_title.as_deref() == Some("第一章") && note.chapter_index == Some(0)
+        }));
+        assert!(
+            library
+                .annotation_overview(Some(&empty.id))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(library.annotation_overview(Some("missing-book")).is_err());
+
+        let mut editor = DocumentEditor::new(document).unwrap();
+        editor
+            .set_metadata("更新后的书名", vec!["作者".into()], None, None)
+            .unwrap();
+        editor
+            .update_unit_identity(&first_unit, "改名的第一章", ContentUnitKind::Chapter)
+            .unwrap();
+        editor.remove_unit(&second_unit).unwrap();
+        library.apply_document(editor.into_document()).unwrap();
+        let scoped = old_projection.annotation_overview(Some(&book.id)).unwrap();
+        assert_eq!(scoped.len(), 3);
+        assert!(
+            scoped
+                .iter()
+                .all(|note| note.annotation.stale && note.book_title == "更新后的书名")
+        );
+        let deleted_chapter = &scoped[0];
+        assert_eq!(deleted_chapter.annotation.id, ai_note.id);
+        assert_eq!(deleted_chapter.annotation.anchor, ai_note.anchor);
+        assert_eq!(deleted_chapter.annotation.comment, ai_note.comment);
+        assert_eq!(deleted_chapter.chapter_title, None);
+        assert_eq!(deleted_chapter.chapter_index, None);
+        assert!(scoped[1..].iter().all(|note| {
+            note.chapter_title.as_deref() == Some("改名的第一章") && note.chapter_index == Some(0)
+        }));
+        library.remove_book(&other.id).unwrap();
+        assert_eq!(old_projection.annotation_overview(None).unwrap().len(), 3);
+        assert!(old_projection.annotation_overview(Some(&other.id)).is_err());
+    }
+
+    #[test]
+    fn annotation_overview_never_uses_foreign_book_or_source_chapter_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut library = LibraryStore::load_from(temp.path().into()).unwrap();
+        let book = library.create_book("阅读笔记", "作者").unwrap();
+        let other = library.create_book("另一书", "作者").unwrap();
+        let draft = initial_note_draft(&library, &book.id, AnnotationKind::HumanComment);
+        let mut note = library.create_annotation(&book.id, &draft).unwrap();
+        note.id.push_str("-foreign-unit");
+        note.content_unit_id = library.document(&other.id).unwrap().units[0].id.clone();
+        // Fault-injected persisted row bypasses the host's ownership checks.
+        let conn = db::open_conn(library.database_path()).unwrap();
+        db::annotations::insert(&conn, &note).unwrap();
+        let overview = library.annotation_overview(Some(&book.id)).unwrap();
+        let foreign = overview
+            .iter()
+            .find(|entry| entry.annotation.id == note.id)
+            .unwrap();
+        assert!(foreign.annotation.stale);
+        assert_eq!(foreign.chapter_title, None);
+        assert_eq!(foreign.chapter_index, None);
+        assert_eq!(foreign.book_title, book.title);
+        assert!(
+            library
+                .annotation_overview(Some(&other.id))
+                .unwrap()
+                .is_empty()
+        );
+        let other_source = db::book_sources::get_revision(&conn, &other.id, other.revision)
+            .unwrap()
+            .unwrap();
+        conn.execute(
+            "UPDATE content_units SET source_id = ?1,
+                ordinal = (SELECT COALESCE(MAX(ordinal), -1) + 1 FROM content_units WHERE source_id = ?1)
+             WHERE id = ?2",
+            rusqlite::params![other_source.id, draft.content_unit_id],
+        )
+        .unwrap();
+        assert!(
+            library
+                .annotation_overview(Some(&book.id))
+                .unwrap()
+                .iter()
+                .all(|entry| {
+                    entry.annotation.stale
+                        && entry.chapter_title.is_none()
+                        && entry.chapter_index.is_none()
+                })
+        );
+    }
 
     #[test]
     fn failed_object_reset_discards_the_fresh_database_and_retries_next_start() {

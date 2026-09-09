@@ -3,6 +3,7 @@ pub mod agent_chat;
 pub mod agent_runtime;
 pub mod ai;
 pub mod ai_diagnostics;
+pub mod annotations;
 pub mod chat;
 pub mod credentials;
 mod db;

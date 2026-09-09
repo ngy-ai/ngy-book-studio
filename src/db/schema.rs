@@ -6,7 +6,7 @@ use crate::document::{DocumentLocator, SourceLocator};
 /// Identifies SQLite files owned by this application (ASCII "MOYE").
 pub(super) const APPLICATION_ID: i64 = 0x4D4F_5945;
 /// Development schemas are deliberately rebuilt instead of migrated.
-pub(super) const SCHEMA_VERSION: i64 = 10;
+pub(super) const SCHEMA_VERSION: i64 = 12;
 
 #[derive(Clone, Copy)]
 struct ColumnSpec {
@@ -259,6 +259,20 @@ const CHAT_CITATION_COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("source_title", "TEXT", false, 0),
     ColumnSpec::new("created_at", "INTEGER", true, 0),
 ];
+const ANNOTATION_COLUMNS: &[ColumnSpec] = &[
+    ColumnSpec::new("id", "TEXT", false, 1),
+    ColumnSpec::new("book_id", "TEXT", true, 0),
+    ColumnSpec::new("content_unit_id", "TEXT", true, 0),
+    ColumnSpec::new("document_revision", "INTEGER", true, 0),
+    ColumnSpec::new("unit_revision", "INTEGER", true, 0),
+    ColumnSpec::new("quote", "TEXT", true, 0),
+    ColumnSpec::new("start_offset", "INTEGER", true, 0),
+    ColumnSpec::new("end_offset", "INTEGER", true, 0),
+    ColumnSpec::new("kind", "TEXT", true, 0),
+    ColumnSpec::new("comment", "TEXT", false, 0),
+    ColumnSpec::new("created_at", "INTEGER", true, 0),
+    ColumnSpec::new("updated_at", "INTEGER", true, 0),
+];
 const SETTING_COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("key", "TEXT", false, 1),
     ColumnSpec::new("value_json", "TEXT", true, 0),
@@ -272,6 +286,10 @@ const SEARCH_FTS_COLUMNS: &[ColumnSpec] = &[
 ];
 
 const TABLE_SPECS: &[TableSpec] = &[
+    TableSpec {
+        name: "annotations",
+        columns: ANNOTATION_COLUMNS,
+    },
     TableSpec {
         name: "groups",
         columns: GROUP_COLUMNS,
@@ -354,7 +372,16 @@ const TABLE_SPECS: &[TableSpec] = &[
     },
 ];
 
+// These specifications describe full-table indexes. The partial
+// idx_annotations_one_mark_per_anchor index, including its predicate, is
+// checked by schema_objects_match_canonical against the complete canonical DDL.
 const INDEX_SPECS: &[IndexSpec] = &[
+    IndexSpec {
+        table: "annotations",
+        name: "idx_annotations_book_unit",
+        columns: &["book_id", "content_unit_id", "created_at"],
+        unique: false,
+    },
     IndexSpec {
         table: "groups",
         name: "idx_groups_parent",
@@ -908,6 +935,27 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
          CREATE UNIQUE INDEX idx_chat_citations_message_ordinal ON chat_citations(message_id, ordinal);
          CREATE INDEX idx_chat_citations_content_unit ON chat_citations(content_unit_id);
          CREATE INDEX idx_chat_citations_search_chunk ON chat_citations(search_chunk_id);
+         CREATE TABLE annotations (
+             id TEXT PRIMARY KEY,
+             book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+             content_unit_id TEXT NOT NULL CHECK(length(content_unit_id) > 0),
+             document_revision INTEGER NOT NULL CHECK(document_revision >= 0),
+             unit_revision INTEGER NOT NULL CHECK(unit_revision >= 0),
+             quote TEXT NOT NULL CHECK(length(CAST(quote AS BLOB)) BETWEEN 1 AND 32768),
+             start_offset INTEGER NOT NULL CHECK(start_offset BETWEEN 0 AND 4294967295),
+             end_offset INTEGER NOT NULL CHECK(end_offset > start_offset AND end_offset <= 4294967295),
+             kind TEXT NOT NULL CHECK(kind IN ('highlight', 'wavy', 'underline', 'human_comment', 'ai_comment')),
+             comment TEXT,
+             created_at INTEGER NOT NULL CHECK(created_at >= 0),
+             updated_at INTEGER NOT NULL CHECK(updated_at >= created_at),
+             CHECK((kind = 'human_comment' AND comment IS NOT NULL AND length(trim(comment)) > 0 AND length(CAST(comment AS BLOB)) <= 65536)
+                OR (kind = 'ai_comment' AND comment IS NOT NULL AND length(trim(comment)) > 0 AND length(CAST(comment AS BLOB)) <= 1048576)
+                OR (kind NOT IN ('human_comment', 'ai_comment') AND comment IS NULL))
+         );
+         CREATE INDEX idx_annotations_book_unit ON annotations(book_id, content_unit_id, created_at);
+         CREATE UNIQUE INDEX idx_annotations_one_mark_per_anchor
+             ON annotations(book_id, content_unit_id, document_revision, unit_revision, start_offset, end_offset)
+             WHERE kind IN ('highlight', 'wavy', 'underline');
          CREATE TABLE settings (
              key TEXT PRIMARY KEY,
              value_json TEXT NOT NULL,
@@ -1342,6 +1390,14 @@ fn document_relations_are_valid(conn: &Connection) -> Result<bool> {
                  SELECT 1 FROM progress p JOIN content_units u ON u.id = p.content_unit_id
                  WHERE u.book_id <> p.book_id
                  UNION ALL
+                 SELECT 1 FROM annotations a JOIN books b ON b.id = a.book_id
+                 LEFT JOIN content_units u ON u.id = a.content_unit_id
+                 WHERE a.document_revision > b.revision
+                    OR (u.id IS NOT NULL AND u.book_id <> a.book_id)
+                    OR (a.document_revision = b.revision AND (
+                        u.id IS NULL OR a.unit_revision <> u.revision
+                    ))
+                 UNION ALL
                  SELECT 1 FROM content_units u
                  LEFT JOIN book_sources s ON s.id = u.source_id
                  WHERE s.id IS NULL OR s.book_id <> u.book_id
@@ -1618,6 +1674,34 @@ mod tests {
     fn legacy_chapter_source_kind_rebuilds_same_version_database() {
         assert_schema_mutation_triggers_rebuild(
             "ALTER TABLE content_units ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'markdown';",
+        );
+    }
+
+    #[test]
+    fn missing_annotation_index_rebuilds_same_version_database() {
+        assert_schema_mutation_triggers_rebuild("DROP INDEX idx_annotations_book_unit;");
+    }
+
+    #[test]
+    fn missing_or_modified_exclusive_annotation_index_rebuilds_database() {
+        assert_schema_mutation_triggers_rebuild("DROP INDEX idx_annotations_one_mark_per_anchor;");
+        assert_schema_mutation_triggers_rebuild(
+            "DROP INDEX idx_annotations_one_mark_per_anchor;
+             CREATE UNIQUE INDEX idx_annotations_one_mark_per_anchor
+                 ON annotations(book_id, content_unit_id, document_revision, unit_revision, start_offset, end_offset)
+                 WHERE kind = 'highlight';",
+        );
+    }
+
+    #[test]
+    fn annotation_cross_book_unit_triggers_rebuild() {
+        assert_cross_book_source_triggers_rebuild(
+            "INSERT INTO content_units(id, book_id, source_id, ordinal, kind,
+                source_locator_json, block_json, revision, created_at, updated_at)
+             VALUES ('unit-b', 'book-b', 'source-b', 0, 'chapter', '{}', '{}', 1, 1, 1);
+             INSERT INTO annotations(id, book_id, content_unit_id, document_revision, unit_revision,
+                quote, start_offset, end_offset, kind, created_at, updated_at)
+             VALUES ('note', 'book-a', 'unit-b', 1, 1, 'text', 0, 4, 'highlight', 1, 1);",
         );
     }
 

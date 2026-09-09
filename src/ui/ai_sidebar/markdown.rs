@@ -4,7 +4,7 @@
 
 use ::markdown::{ParseOptions, mdast::Node, to_mdast};
 
-pub(super) fn assistant_display_markdown(content: &str) -> String {
+pub(in crate::ui) fn assistant_display_markdown(content: &str) -> String {
     let Ok(tree) = to_mdast(content, &ParseOptions::gfm()) else {
         return literal_message(content);
     };

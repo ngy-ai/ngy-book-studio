@@ -5,6 +5,7 @@ mod background_jobs;
 mod editor;
 mod learning;
 mod library;
+mod notes;
 mod office_slides;
 mod pdf_reader;
 mod reader;
@@ -26,6 +27,7 @@ use editor::{
     suggested_epub_filename,
 };
 use learning::open_learning_window;
+use notes::open_notes_window;
 use office_slides::open_office_slides_window;
 use pdf_reader::{PdfReaderApp, PdfReaderInit, PdfReaderPage, build_pdf_reader_webview};
 use reader::{ReaderApp, ReaderWebViewBuildGate, build_reader_webview};
@@ -556,6 +558,118 @@ fn close_book_windows(book_id: &str, cx: &mut App) {
     }
 }
 
+/// Windows that must stay unique within their scope.
+///
+/// A second reader, editor or notes window for the same book would own a second
+/// progress writer, a second unsaved draft or a second independent query, so a
+/// repeat request activates the live window instead of opening a duplicate.
+#[derive(Default)]
+struct SingletonWindowRegistry {
+    /// Open requests that passed the duplicate check but have not created their
+    /// window yet. Every book open builds its document asynchronously first.
+    pending: HashSet<String>,
+    windows: BTreeMap<String, AnyWindowHandle>,
+    /// Live reader entities keyed by their reader scope, so a repeat open can
+    /// activate the window and navigate it instead of opening a duplicate.
+    readers: BTreeMap<String, WeakEntity<ReaderApp>>,
+    pdf_readers: BTreeMap<String, WeakEntity<PdfReaderApp>>,
+}
+
+impl gpui::Global for SingletonWindowRegistry {}
+
+enum SingletonWindowReservation {
+    /// A live window already owns this key; activate it instead of opening one.
+    Activate(AnyWindowHandle),
+    /// Reserved for the caller, which must complete or release it exactly once.
+    Reserved,
+    /// Another open for this key is still in flight.
+    InFlight,
+}
+
+fn singleton_window_key(kind: &str, scope: &str) -> String {
+    format!("{kind}:{scope}")
+}
+
+fn reserve_singleton_window(key: &str, cx: &mut App) -> SingletonWindowReservation {
+    if !cx.has_global::<SingletonWindowRegistry>() {
+        cx.set_global(SingletonWindowRegistry::default());
+    }
+    if let Some(handle) = cx
+        .global::<SingletonWindowRegistry>()
+        .windows
+        .get(key)
+        .copied()
+    {
+        if cx.windows().contains(&handle) {
+            return SingletonWindowReservation::Activate(handle);
+        }
+        cx.global_mut::<SingletonWindowRegistry>()
+            .windows
+            .remove(key);
+    }
+    let registry = cx.global_mut::<SingletonWindowRegistry>();
+    if registry.pending.contains(key) {
+        return SingletonWindowReservation::InFlight;
+    }
+    registry.pending.insert(key.to_string());
+    SingletonWindowReservation::Reserved
+}
+
+fn complete_singleton_window(key: &str, window: AnyWindowHandle, cx: &mut App) {
+    if !cx.has_global::<SingletonWindowRegistry>() {
+        return;
+    }
+    let registry = cx.global_mut::<SingletonWindowRegistry>();
+    registry.pending.remove(key);
+    registry.windows.insert(key.to_string(), window);
+}
+
+/// Give up a reservation whose window never appeared, so a later request is not
+/// blocked forever by a failed or cancelled open.
+fn release_singleton_window(key: &str, cx: &mut App) {
+    if cx.has_global::<SingletonWindowRegistry>() {
+        cx.global_mut::<SingletonWindowRegistry>()
+            .pending
+            .remove(key);
+    }
+}
+
+fn activate_singleton_window(handle: AnyWindowHandle, cx: &mut App) {
+    let _ = handle.update(cx, |_, window, _| window.activate_window());
+}
+
+fn register_singleton_reader(key: &str, reader: WeakEntity<ReaderApp>, cx: &mut App) {
+    if !cx.has_global::<SingletonWindowRegistry>() {
+        return;
+    }
+    cx.global_mut::<SingletonWindowRegistry>()
+        .readers
+        .insert(key.to_string(), reader);
+}
+
+fn register_singleton_pdf_reader(key: &str, reader: WeakEntity<PdfReaderApp>, cx: &mut App) {
+    if !cx.has_global::<SingletonWindowRegistry>() {
+        return;
+    }
+    cx.global_mut::<SingletonWindowRegistry>()
+        .pdf_readers
+        .insert(key.to_string(), reader);
+}
+
+fn existing_singleton_reader(key: &str, cx: &mut App) -> Option<Entity<ReaderApp>> {
+    cx.global::<SingletonWindowRegistry>()
+        .readers
+        .get(key)
+        .and_then(WeakEntity::upgrade)
+}
+
+fn existing_singleton_pdf_reader(key: &str, cx: &mut App) -> Option<Entity<PdfReaderApp>> {
+    cx.global::<SingletonWindowRegistry>()
+        .pdf_readers
+        .get(key)
+        .and_then(WeakEntity::upgrade)
+}
+
 struct Notice {
     text: String,
     error: bool,
@@ -646,5 +760,66 @@ mod book_window_tests {
             vec!["book-a".to_string(), "book-b".to_string()]
         );
         assert!(!cx.windows().contains(&second));
+    }
+}
+
+#[cfg(test)]
+mod singleton_window_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    struct TrackedWindow;
+
+    impl Render for TrackedWindow {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    #[gpui::test]
+    fn a_reserved_window_is_reused_until_it_closes(cx: &mut TestAppContext) {
+        let window: AnyWindowHandle = cx.add_window(|_, _| TrackedWindow).into();
+        let key = singleton_window_key("reader", "book-a");
+        // The asynchronous document load must not let a second request through.
+        cx.update(|cx| {
+            assert!(matches!(
+                reserve_singleton_window(&key, cx),
+                SingletonWindowReservation::Reserved
+            ));
+            assert!(matches!(
+                reserve_singleton_window(&key, cx),
+                SingletonWindowReservation::InFlight
+            ));
+            complete_singleton_window(&key, window, cx);
+        });
+        let reservation = cx.update(|cx| reserve_singleton_window(&key, cx));
+        match reservation {
+            SingletonWindowReservation::Activate(handle) => assert!(handle == window),
+            _ => panic!("已经打开的窗口应当被激活，而不是再开一个"),
+        }
+    }
+
+    #[gpui::test]
+    fn closed_and_failed_windows_free_their_scope(cx: &mut TestAppContext) {
+        let window: AnyWindowHandle = cx.add_window(|_, _| TrackedWindow).into();
+        let key = singleton_window_key("editor", "book-a");
+        cx.update(|cx| complete_singleton_window(&key, window, cx));
+        cx.update_window(window, |_, window, _| window.remove_window())
+            .expect("测试窗口仍然存在");
+        assert!(!cx.windows().contains(&window));
+
+        cx.update(|cx| {
+            assert!(matches!(
+                reserve_singleton_window(&key, cx),
+                SingletonWindowReservation::Reserved
+            ));
+            // A failed open hands the reservation back instead of blocking the
+            // book forever.
+            release_singleton_window(&key, cx);
+            assert!(matches!(
+                reserve_singleton_window(&key, cx),
+                SingletonWindowReservation::Reserved
+            ));
+        });
     }
 }

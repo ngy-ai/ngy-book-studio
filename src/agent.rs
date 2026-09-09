@@ -146,6 +146,9 @@ impl AllowedBookScope {
 
 #[derive(Clone, Debug)]
 pub struct AgentLimits {
+    /// Maximum individual tool calls per question, including invalid arguments.
+    /// The historical name does not mean model responses: a response may ask
+    /// for several calls, and each consumes this same budget.
     pub max_tool_rounds: usize,
     pub max_results_per_call: usize,
     pub max_context_bytes: usize,
@@ -882,6 +885,10 @@ where
         self.rounds_used
     }
 
+    pub fn remaining_tool_calls(&self) -> usize {
+        self.limits.max_tool_rounds.saturating_sub(self.rounds_used)
+    }
+
     pub fn context_bytes_used(&self) -> usize {
         self.context_bytes_used + self.snapshot_bytes
     }
@@ -1002,11 +1009,11 @@ where
             ));
         }
         validate_identifier("tool_call_id", &call.id)?;
-        if self.rounds_used >= self.limits.max_tool_rounds {
+        if self.remaining_tool_calls() == 0 {
             return Err(AgentError::LimitExceeded("tool round"));
         }
         // Invalid calls are charged too, preventing an endpoint from bypassing
-        // the round limit by repeatedly sending malformed arguments.
+        // the call budget by repeatedly sending malformed arguments.
         self.rounds_used += 1;
 
         let remaining = self
@@ -2279,6 +2286,34 @@ mod tests {
             }
             .boxed()
         }
+    }
+
+    #[tokio::test]
+    async fn invalid_tool_arguments_still_consume_the_call_budget() {
+        let limits = AgentLimits {
+            max_tool_rounds: 1,
+            ..Default::default()
+        };
+        let mut agent =
+            ReadOnlyAgent::new(MockSearch::default(), MockBooks::default(), scope(), limits)
+                .unwrap();
+        assert_eq!(agent.remaining_tool_calls(), 1);
+        assert!(matches!(
+            agent
+                .execute_tool(&tool_call(SEARCH_BOOKS_TOOL, json!({"query": ""})))
+                .await,
+            Err(AgentError::InvalidArguments(_))
+        ));
+        assert_eq!(agent.rounds_used(), 1);
+        assert_eq!(agent.remaining_tool_calls(), 0);
+        assert_eq!(
+            agent
+                .execute_tool(&tool_call(SEARCH_BOOKS_TOOL, json!({"query": "valid"})))
+                .await
+                .unwrap_err(),
+            AgentError::LimitExceeded("tool round")
+        );
+        assert_eq!(agent.remaining_tool_calls(), 0);
     }
 
     #[tokio::test]

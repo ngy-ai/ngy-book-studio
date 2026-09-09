@@ -1,3 +1,4 @@
+pub(crate) mod annotations;
 pub(crate) mod asset_refs;
 pub(crate) mod assets;
 pub(crate) mod blobs;

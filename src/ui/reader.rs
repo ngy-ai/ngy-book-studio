@@ -17,7 +17,10 @@ use moye_epub_editor::{
     },
     services::AppServices,
 };
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+mod annotations;
+use annotations::{AnnotationAction, ReaderAnnotations};
 
 #[cfg(target_os = "windows")]
 mod selection_menu;
@@ -45,8 +48,22 @@ const READER_INITIALIZATION_SCRIPT: &str = r#"
     );
   };
 
+  const isChapterNode = (node) => node && node.getRootNode() === document &&
+    document.body?.contains(node);
+
   const boundedSelection = () => {
-    const value = (window.getSelection()?.toString() || "")
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || selection.rangeCount !== 1) return "";
+    // Notes live in a closed shadow root outside body. Their text (including
+    // an identical quote) is never a chapter selection or an AI reference.
+    const range = selection.getRangeAt(0);
+    if (range.collapsed || ![selection.anchorNode, selection.focusNode,
+        range.startContainer, range.endContainer].every(isChapterNode)) return "";
+    // Focusing a notes input can leave the previous body Range in Selection.
+    const active = document.activeElement;
+    if (active && (!isChapterNode(active) ||
+        active.matches("input,textarea,select,[contenteditable='true']"))) return "";
+    const value = range.toString()
       .replace(/\s+/gu, " ")
       .trim();
     if (!value) return "";
@@ -81,6 +98,13 @@ const READER_INITIALIZATION_SCRIPT: &str = r#"
     window.clearTimeout(timer);
     timer = window.setTimeout(send, 80);
   });
+  // focusin is composed, unlike a textarea's own selectionchange in a closed
+  // shadow root. Clear the old transient highlight before a queued send fires.
+  document.addEventListener("focusin", () => {
+    const active = document.activeElement;
+    if (active && (!isChapterNode(active) ||
+        active.matches("input,textarea,select,[contenteditable='true']"))) send();
+  }, true);
   window.addEventListener("pagehide", () => window.clearTimeout(timer), { once: true });
 })();
 "#;
@@ -88,6 +112,10 @@ const READER_INITIALIZATION_SCRIPT: &str = r#"
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ReaderIpcMessage {
+    AnnotationAction {
+        #[serde(flatten)]
+        action: AnnotationAction,
+    },
     SelectionChanged {
         selected_text: String,
     },
@@ -101,6 +129,11 @@ enum ReaderIpcMessage {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ReaderWebEvent {
+    AnnotationNavigationBlocked,
+    AnnotationAction {
+        url: String,
+        action: AnnotationAction,
+    },
     PageLoaded(String),
     ExplainSelection {
         url: String,
@@ -471,6 +504,10 @@ pub struct ReaderApp {
     search_query: String,
     search_results: Vec<SearchHit>,
     selected_text: Option<String>,
+    annotations: ReaderAnnotations,
+    _annotation_ai_subscription: Subscription,
+    _annotation_ai_submit_subscription: Subscription,
+    _annotation_ai_failure_subscription: Subscription,
     citation_request_id: u64,
     pending_citation_navigation: Option<PendingReaderCitationNavigation>,
     _search_subscription: Subscription,
@@ -500,12 +537,14 @@ pub(super) struct ReaderWebViewBuildGate {
 #[derive(Clone, Debug)]
 pub(super) struct ReaderProtocolGate {
     open: Arc<Mutex<bool>>,
+    annotation_navigation_blocked: Arc<AtomicBool>,
 }
 
 impl ReaderProtocolGate {
     fn new() -> Self {
         Self {
             open: Arc::new(Mutex::new(true)),
+            annotation_navigation_blocked: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -582,6 +621,8 @@ pub(super) async fn build_reader_webview(
     let (event_sender, event_receiver) = async_channel::unbounded::<ReaderWebEvent>();
     let ipc_sender = event_sender.clone();
     let page_sender = event_sender.clone();
+    let navigation_sender = event_sender.clone();
+    let navigation_gate = protocol_gate.clone();
 
     let raw_webview = gpui_component::wry::WebViewBuilder::new()
         .with_asynchronous_custom_protocol(
@@ -641,7 +682,14 @@ pub(super) async fn build_reader_webview(
                 });
             },
         )
-        .with_navigation_handler(|url| {
+        .with_navigation_handler(move |url| {
+            if navigation_gate
+                .annotation_navigation_blocked
+                .load(Ordering::SeqCst)
+            {
+                let _ = navigation_sender.try_send(ReaderWebEvent::AnnotationNavigationBlocked);
+                return false;
+            }
             url.starts_with("epubreader://book/")
                 || url.starts_with("http://epubreader.book/")
                 || url.starts_with("https://epubreader.book/")
@@ -653,6 +701,7 @@ pub(super) async fn build_reader_webview(
             let _ = ipc_sender.try_send(event);
         })
         .with_initialization_script(READER_INITIALIZATION_SCRIPT)
+        .with_initialization_script(include_str!("reader/annotations.js"))
         .with_new_window_req_handler(|_, _| gpui_component::wry::NewWindowResponse::Deny)
         .with_on_page_load_handler(move |event, url| {
             if matches!(event, gpui_component::wry::PageLoadEvent::Finished) {
@@ -751,10 +800,16 @@ fn reader_owned_response(
 }
 
 fn reader_ipc_event(uri: &gpui_component::wry::http::Uri, body: &str) -> Option<ReaderWebEvent> {
-    if body.len() > MAX_READER_SELECTION_BYTES + 1024 || !is_reader_document_uri(uri) {
+    if body.len() > 128 * 1024 || !is_reader_document_uri(uri) {
         return None;
     }
     match serde_json::from_str::<ReaderIpcMessage>(body).ok()? {
+        ReaderIpcMessage::AnnotationAction { action } => {
+            action.valid().then(|| ReaderWebEvent::AnnotationAction {
+                url: uri.to_string(),
+                action,
+            })
+        }
         ReaderIpcMessage::SelectionChanged { selected_text } => {
             let selected_text = normalize_reader_selection(&selected_text)?;
             Some(ReaderWebEvent::SelectionChanged {
@@ -846,6 +901,7 @@ impl Render for ReaderApp {
 
         let previous_view = view.clone();
         let next_view = view.clone();
+        let notes_view = view.clone();
         let toolbar = div()
             .v_flex()
             .bg(rgb(SURFACE))
@@ -906,6 +962,30 @@ impl Render for ReaderApp {
                         div()
                             .h_flex()
                             .gap_2()
+                            .child(
+                                Button::new("reader-book-notes")
+                                    .ghost()
+                                    .icon(IconName::Menu)
+                                    .label("本书笔记")
+                                    .on_click(move |_, _, cx| {
+                                        notes_view.update(cx, |this, cx| {
+                                            if let Err(error) = open_notes_window(
+                                                Arc::clone(&this.services),
+                                                this.library_view.clone(),
+                                                Some((
+                                                    this.book_id.clone(),
+                                                    this.book.title.clone(),
+                                                )),
+                                                cx,
+                                            ) {
+                                                this.set_error(
+                                                    format!("无法打开本书笔记：{error:#}"),
+                                                    cx,
+                                                );
+                                            }
+                                        });
+                                    }),
+                            )
                             .child(div().mr_2().text_xs().text_color(rgb(MUTED)).child(format!(
                                 "{} / {}",
                                 current + 1,
@@ -1179,6 +1259,7 @@ impl ReaderApp {
         book: OpenedBook,
         current_spine: usize,
         progress_locators: Vec<DocumentLocator>,
+        annotation_revisions: (u64, Vec<u64>),
         initial_citation: Option<ReflowableCitationTarget>,
         library: LibraryStore,
         services: Arc<AppServices>,
@@ -1226,6 +1307,12 @@ impl ReaderApp {
         )
         .expect("reader AI scope is valid");
         let _ai_subscription = cx.subscribe_in(&ai_sidebar, window, Self::on_ai_sidebar_event);
+        let _annotation_ai_subscription =
+            cx.subscribe(&ai_sidebar, Self::on_annotation_ai_completed);
+        let _annotation_ai_submit_subscription =
+            cx.subscribe(&ai_sidebar, Self::on_annotation_ai_submitted);
+        let _annotation_ai_failure_subscription =
+            cx.subscribe(&ai_sidebar, Self::on_annotation_ai_failed);
         let ai_sidebar_collapsed = ai_sidebar.read(cx).is_collapsed();
         let pane_layout = ReaderPaneLayout::new(ai_sidebar.read(cx).expanded_width());
         let _ai_layout_subscription = cx.observe(&ai_sidebar, |this, sidebar, cx| {
@@ -1267,6 +1354,10 @@ impl ReaderApp {
             search_query: String::new(),
             search_results: Vec::new(),
             selected_text: None,
+            annotations: ReaderAnnotations::new(annotation_revisions),
+            _annotation_ai_subscription,
+            _annotation_ai_submit_subscription,
+            _annotation_ai_failure_subscription,
             citation_request_id: u64::from(pending_citation_navigation.is_some()),
             pending_citation_navigation,
             _search_subscription,
@@ -1535,6 +1626,12 @@ impl ReaderApp {
 
     pub(super) fn sync_web_event(&mut self, event: ReaderWebEvent, cx: &mut Context<Self>) {
         match event {
+            ReaderWebEvent::AnnotationNavigationBlocked => {
+                self.annotation_navigation_blocked(cx);
+            }
+            ReaderWebEvent::AnnotationAction { url, action } => {
+                self.handle_annotation_action(&url, action, cx)
+            }
             ReaderWebEvent::PageLoaded(url) => self.sync_loaded_page(&url, cx),
             ReaderWebEvent::ExplainSelection { url, selected_text } => {
                 self.explain_selection(&url, &selected_text, cx);
@@ -1549,6 +1646,7 @@ impl ReaderApp {
                 reason,
             } => self.finish_citation_navigation(&url, request_id, found, &reason, cx),
         }
+        self.refresh_note_navigation_gate();
     }
 
     fn sync_loaded_page(&mut self, url: &str, cx: &mut Context<Self>) {
@@ -1569,6 +1667,7 @@ impl ReaderApp {
         self.notice = None;
         self.queue_current_progress(cx);
         self.run_pending_citation_navigation(url, cx);
+        self.configure_annotations(cx);
         cx.notify();
     }
 
@@ -1652,26 +1751,26 @@ impl ReaderApp {
         if self.closing || self.webview_build_gate.close_requested {
             return;
         }
-        let Some(reference) = reader_explanation_reference(
-            &self.book_id,
-            &self.book,
-            &self.progress_locators,
-            self.current_spine,
-            url,
-            selected_text,
-        ) else {
+        if self.book.spine_index_for_url(url) != Some(self.current_spine) {
             self.set_error(
                 "所选文本已失效，请在当前章节重新选择后解释。".to_string(),
                 cx,
             );
             return;
-        };
-        self.ai_controller
-            .explain_selection(reference, self.ai_sidebar.clone(), cx);
+        }
+        if let Some(webview) = self.webview.as_ref() {
+            let script = format!(
+                "window.moyeAnnotations?.explainSelection({});",
+                serde_json::json!(selected_text)
+            );
+            if let Err(error) = webview.read(cx).raw().evaluate_script(&script) {
+                self.set_error(format!("无法读取笔记选区：{error}"), cx);
+            }
+        }
     }
 
     fn go_to_toc(&mut self, toc_index: usize, cx: &mut Context<Self>) {
-        if self.closing {
+        if self.closing || self.annotation_navigation_blocked(cx) {
             return;
         }
         let Some(item) = self.book.toc.get(toc_index) else {
@@ -1713,8 +1812,8 @@ impl ReaderApp {
         self.navigate_to_spine(next as usize, cx);
     }
 
-    fn navigate_to_spine(&mut self, spine_index: usize, cx: &mut Context<Self>) {
-        if self.closing {
+    pub(super) fn navigate_to_spine(&mut self, spine_index: usize, cx: &mut Context<Self>) {
+        if self.closing || self.annotation_navigation_blocked(cx) {
             return;
         }
         let Some(spine) = self.book.spine.get(spine_index) else {
@@ -1745,8 +1844,12 @@ impl ReaderApp {
         cx.notify();
     }
 
-    fn navigate_to_citation(&mut self, target: ReflowableCitationTarget, cx: &mut Context<Self>) {
-        if self.closing {
+    pub(super) fn navigate_to_citation(
+        &mut self,
+        target: ReflowableCitationTarget,
+        cx: &mut Context<Self>,
+    ) {
+        if self.closing || self.annotation_navigation_blocked(cx) {
             return;
         }
         let Some(webview) = self.webview.as_ref() else {
@@ -1985,6 +2088,10 @@ impl ReaderApp {
         cx: &mut Context<Self>,
     ) -> bool {
         if self.closing {
+            return false;
+        }
+        if self.annotation_navigation_blocked(cx) {
+            cancel_application_exit(cx);
             return false;
         }
         if self.webview_build_gate.request_close() {

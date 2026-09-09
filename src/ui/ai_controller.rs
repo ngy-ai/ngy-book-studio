@@ -191,7 +191,12 @@ impl AiSidebarController {
                     }
                 }
                 Err(error) => {
-                    sidebar.fail_session_operation(format!("无法新建 AI 会话：{error}"), cx)
+                    let error = format!("无法新建 AI 会话：{error}");
+                    if explanation.is_some() {
+                        sidebar.fail_selection_explanation_session(error, cx);
+                    } else {
+                        sidebar.fail_session_operation(error, cx);
+                    }
                 }
             });
         }));
@@ -576,8 +581,9 @@ impl AiSidebarController {
                                             cx,
                                         );
                                     }
-                                    sidebar.finish_answer(
+                                    sidebar.finish_persisted_answer(
                                         request_id,
+                                        answer.answer.stored_message.content,
                                         answer.sources,
                                         answer.source_status,
                                         cx,

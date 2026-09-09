@@ -675,7 +675,7 @@ impl PdfReaderApp {
         cx.notify();
     }
 
-    fn request_page(&mut self, page_number: u32, cx: &mut Context<Self>) {
+    pub(super) fn request_page(&mut self, page_number: u32, cx: &mut Context<Self>) {
         if self.closing || !self.pdf_ready {
             return;
         }

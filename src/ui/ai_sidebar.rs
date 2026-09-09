@@ -13,7 +13,7 @@ use moye_epub_editor::{
 use serde::Serialize;
 use std::net::IpAddr;
 
-mod markdown;
+pub(super) mod markdown;
 #[cfg(test)]
 mod markdown_ui_tests;
 
@@ -759,6 +759,29 @@ pub(super) enum AiSidebarEvent {
     OpenSource(AiSourceLink),
 }
 
+/// Published once for an accepted current request after the backend has
+/// committed the final answer to the conversation store. Consumers must match
+/// `request_id` against their own frozen action before creating derived data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct AiAnswerCompleted {
+    pub request_id: u64,
+    pub markdown: String,
+}
+
+/// Binds an explanation's frozen selection to its exact request generation.
+/// Emitted immediately before the ordinary `AiSidebarEvent::Submit` event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct AiExplanationSubmitted {
+    pub request_id: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct AiExplanationFailed {
+    /// `None` means the fresh explanation session failed before submission.
+    pub request_id: Option<u64>,
+    pub error: String,
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AiMessageRole {
@@ -1481,6 +1504,7 @@ impl ResponsiveSidebar {
 pub(super) struct AiSidebar {
     conversation: ConversationState,
     sessions: SessionPickerState,
+    selection_explanation_request: Option<u64>,
     pending_scope_sync: bool,
     layout: ResponsiveSidebar,
     expanded_width: Pixels,
@@ -1491,6 +1515,9 @@ pub(super) struct AiSidebar {
 }
 
 impl EventEmitter<AiSidebarEvent> for AiSidebar {}
+impl EventEmitter<AiAnswerCompleted> for AiSidebar {}
+impl EventEmitter<AiExplanationSubmitted> for AiSidebar {}
+impl EventEmitter<AiExplanationFailed> for AiSidebar {}
 
 impl AiSidebar {
     pub(super) fn new(
@@ -1534,6 +1561,7 @@ impl AiSidebar {
         Self {
             conversation: ConversationState::new(scope),
             sessions: SessionPickerState::default(),
+            selection_explanation_request: None,
             pending_scope_sync: false,
             layout: ResponsiveSidebar::new(window.viewport_size().width),
             expanded_width: px(AI_SIDEBAR_WIDTH),
@@ -1634,15 +1662,62 @@ impl AiSidebar {
             || self.sessions.busy
             || self.pending_scope_sync
         {
-            self.show_explanation_error("AI 图书范围正在更新，请更新完成后再次使用 AI 解释。", cx);
+            self.reject_selection_explanation(
+                "AI 图书范围正在更新，请更新完成后再次使用 AI 解释。",
+                cx,
+            );
             return;
         }
         let Some(request) = self.conversation.begin_selection_explanation(reference) else {
-            self.show_explanation_error("所选文本已不在当前 AI 范围内，请重新选择后再试。", cx);
+            self.reject_selection_explanation(
+                "所选文本已不在当前 AI 范围内，请重新选择后再试。",
+                cx,
+            );
             return;
         };
+        self.selection_explanation_request = Some(request.request_id);
+        cx.emit(AiExplanationSubmitted {
+            request_id: request.request_id,
+        });
         cx.emit(AiSidebarEvent::Submit(request));
         cx.notify();
+    }
+
+    fn reject_selection_explanation(&mut self, error: impl Into<String>, cx: &mut Context<Self>) {
+        let error = error.into();
+        self.show_explanation_error(error.clone(), cx);
+        cx.emit(AiExplanationFailed {
+            request_id: None,
+            error,
+        });
+    }
+
+    pub(super) fn fail_selection_explanation_session(
+        &mut self,
+        error: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let error = error.into();
+        self.fail_session_operation(error.clone(), cx);
+        cx.emit(AiExplanationFailed {
+            request_id: None,
+            error,
+        });
+    }
+
+    fn fail_selection_explanation_request(
+        &mut self,
+        request_id: u64,
+        error: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selection_explanation_request == Some(request_id) {
+            self.selection_explanation_request = None;
+            cx.emit(AiExplanationFailed {
+                request_id: Some(request_id),
+                error,
+            });
+        }
     }
 
     fn begin_scope_sync(&mut self, cx: &mut Context<Self>) {
@@ -1799,16 +1874,25 @@ impl AiSidebar {
         changed
     }
 
-    #[allow(dead_code)]
-    pub(super) fn finish_answer(
+    /// The caller supplies the already-persisted final Markdown, never a
+    /// provisional stream buffer or an answer awaiting citation validation.
+    pub(super) fn finish_persisted_answer(
         &mut self,
         request_id: u64,
+        markdown: String,
         sources: Vec<AiSourceLink>,
         source_status: AgentAnswerSourceStatus,
         cx: &mut Context<Self>,
     ) -> bool {
         let changed = self.conversation.finish(request_id, sources, source_status);
         if changed {
+            if self.selection_explanation_request == Some(request_id) {
+                self.selection_explanation_request = None;
+            }
+            cx.emit(AiAnswerCompleted {
+                request_id,
+                markdown,
+            });
             cx.notify();
         }
         self.resume_pending_scope_sync(cx);
@@ -1822,8 +1906,10 @@ impl AiSidebar {
         error: impl Into<String>,
         cx: &mut Context<Self>,
     ) -> bool {
-        let changed = self.conversation.fail(request_id, error);
+        let error = error.into();
+        let changed = self.conversation.fail(request_id, error.clone());
         if changed {
+            self.fail_selection_explanation_request(request_id, error, cx);
             cx.notify();
         }
         self.resume_pending_scope_sync(cx);
@@ -1837,6 +1923,7 @@ impl AiSidebar {
         let request_id = self.conversation.cancel();
         if let Some(request_id) = request_id {
             cx.emit(AiSidebarEvent::Cancel { request_id });
+            self.fail_selection_explanation_request(request_id, "本次 AI 解释已取消。".into(), cx);
             cx.notify();
             Some(request_id)
         } else {
@@ -1875,6 +1962,7 @@ impl AiSidebar {
             return;
         };
         cx.emit(AiSidebarEvent::Cancel { request_id });
+        self.fail_selection_explanation_request(request_id, "本次 AI 解释已取消。".into(), cx);
         cx.notify();
     }
 
@@ -2789,12 +2877,170 @@ impl Render for AiSidebar {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{AppContext, TestAppContext};
+    use gpui_component::Root;
     use moye_epub_editor::document::{
         Block, BlockDocument, ContentUnit, ContentUnitKind, NormalizedRect,
     };
+    use std::{cell::RefCell, rc::Rc};
 
     fn book(id: &str) -> AiBookOption {
         AiBookOption::new(id, format!("Book {id}"))
+    }
+
+    #[gpui::test]
+    fn explanation_events_publish_only_current_persisted_answers_and_report_recoverable_failures(
+        cx: &mut TestAppContext,
+    ) {
+        fn begin(sidebar: &mut AiSidebar, cx: &mut Context<AiSidebar>) -> u64 {
+            assert!(sidebar.begin_selection_explanation(cx));
+            let mut reference = AiReferenceHint::chapter("book", "unit", 0, "Chapter");
+            reference.frozen_text = Some("frozen selected words".to_string());
+            sidebar.complete_selection_explanation(Vec::new(), reference, cx);
+            let RequestState::Sending { request_id } = sidebar.conversation.request else {
+                panic!("explanation should submit a new request")
+            };
+            request_id
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let services = Arc::new(AppServices::open(temp.path()).unwrap());
+        cx.update(gpui_component::init);
+        let mut sidebar = None;
+        let (_, visual) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| {
+                AiSidebar::new(
+                    AiSidebarScope::book(book("book"), Vec::new()),
+                    Arc::clone(&services),
+                    window,
+                    cx,
+                )
+            });
+            sidebar = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let sidebar = sidebar.unwrap();
+        let submission_order = Rc::new(RefCell::new(Vec::new()));
+        let recorded = Rc::clone(&submission_order);
+        let _explanation_subscription = sidebar.update(visual, |_, cx| {
+            cx.subscribe(&sidebar, move |_, _, event: &AiExplanationSubmitted, _| {
+                recorded
+                    .borrow_mut()
+                    .push(("explanation", event.request_id));
+            })
+        });
+        let recorded = Rc::clone(&submission_order);
+        let _submission_subscription = sidebar.update(visual, |_, cx| {
+            cx.subscribe(&sidebar, move |_, _, event: &AiSidebarEvent, _| {
+                if let AiSidebarEvent::Submit(request) = event {
+                    recorded.borrow_mut().push(("submit", request.request_id));
+                }
+            })
+        });
+        let completed = Rc::new(RefCell::new(Vec::new()));
+        let recorded = Rc::clone(&completed);
+        let _completion_subscription = sidebar.update(visual, |_, cx| {
+            cx.subscribe(&sidebar, move |_, _, event: &AiAnswerCompleted, _| {
+                recorded.borrow_mut().push(event.clone());
+            })
+        });
+        let failed = Rc::new(RefCell::new(Vec::new()));
+        let recorded = Rc::clone(&failed);
+        let _failure_subscription = sidebar.update(visual, |_, cx| {
+            cx.subscribe(&sidebar, move |_, _, event: &AiExplanationFailed, _| {
+                recorded.borrow_mut().push(event.clone());
+            })
+        });
+        let failed_id = sidebar.update(visual, |sidebar, cx| {
+            let request_id = begin(sidebar, cx);
+            sidebar.append_answer_delta(request_id, "uncommitted provisional answer", cx);
+            assert!(sidebar.fail_answer(request_id, "fixture persistence failure", cx));
+            assert!(!sidebar.finish_persisted_answer(
+                request_id,
+                "late failed answer".into(),
+                Vec::new(),
+                AgentAnswerSourceStatus::NoVerifiedSources,
+                cx,
+            ));
+            request_id
+        });
+        let cancelled_id = sidebar.update(visual, |sidebar, cx| {
+            let request_id = begin(sidebar, cx);
+            sidebar.append_answer_delta(request_id, "cancelled provisional answer", cx);
+            assert_eq!(sidebar.cancel_for_window_close(cx), Some(request_id));
+            request_id
+        });
+        visual.run_until_parked();
+        assert!(completed.borrow().is_empty());
+        assert_eq!(failed.borrow()[0].request_id, Some(failed_id));
+        assert_eq!(failed.borrow()[1].request_id, Some(cancelled_id));
+        assert_eq!(failed.borrow().len(), 2);
+
+        let successful_id = sidebar.update(visual, |sidebar, cx| {
+            let request_id = begin(sidebar, cx);
+            assert!(!sidebar.finish_persisted_answer(
+                cancelled_id,
+                "old generation".into(),
+                Vec::new(),
+                AgentAnswerSourceStatus::NoVerifiedSources,
+                cx,
+            ));
+            sidebar.append_answer_delta(request_id, "stream projection", cx);
+            assert!(sidebar.finish_persisted_answer(
+                request_id,
+                "## Final persisted Markdown\n\n**final answer**".into(),
+                Vec::new(),
+                AgentAnswerSourceStatus::NoVerifiedSources,
+                cx,
+            ));
+            assert!(!sidebar.finish_persisted_answer(
+                request_id,
+                "duplicate result".into(),
+                Vec::new(),
+                AgentAnswerSourceStatus::NoVerifiedSources,
+                cx,
+            ));
+            request_id
+        });
+        visual.run_until_parked();
+        assert_eq!(
+            *completed.borrow(),
+            vec![AiAnswerCompleted {
+                request_id: successful_id,
+                markdown: "## Final persisted Markdown\n\n**final answer**".into(),
+            }]
+        );
+        assert_eq!(failed.borrow().len(), 2);
+
+        sidebar.update(visual, |sidebar, cx| {
+            sidebar.fail_session_operation("ordinary session failure", cx);
+            let ordinary = sidebar.conversation.begin("ordinary question").unwrap();
+            assert!(sidebar.fail_answer(ordinary.request_id, "ordinary answer failure", cx));
+        });
+        visual.run_until_parked();
+        assert_eq!(
+            failed.borrow().len(),
+            2,
+            "ordinary chat is not an explanation"
+        );
+        sidebar.update(visual, |sidebar, cx| {
+            sidebar.fail_selection_explanation_session("fresh session failed", cx);
+            let reference = AiReferenceHint::chapter("book", "unit", 0, "missing selection");
+            sidebar.complete_selection_explanation(Vec::new(), reference, cx);
+        });
+        visual.run_until_parked();
+        assert_eq!(failed.borrow().len(), 4);
+        assert_eq!(failed.borrow()[2].request_id, None);
+        assert_eq!(failed.borrow()[3].request_id, None);
+        assert_eq!(completed.borrow().len(), 1);
+        assert_eq!(
+            *submission_order.borrow(),
+            [failed_id, cancelled_id, successful_id]
+                .into_iter()
+                .flat_map(|id| [("explanation", id), ("submit", id)])
+                .collect::<Vec<_>>(),
+            "the exact explanation generation is bound before submission"
+        );
     }
 
     fn cited_document() -> (BookDocument, AiSourceLink) {

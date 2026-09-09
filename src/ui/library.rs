@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use moye_epub_editor::{
     agent::PassageRecord,
+    annotations::Annotation,
     document::{BookDocument, BookFormat, BookSource as CanonicalBookSource, DocumentLocator},
     office_com::OfficeCancellation,
     preview::VisualJobState,
@@ -15,6 +16,25 @@ const LIBRARY_SEARCH_LIMIT: usize = 200;
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(180);
 const OFFICE_PREVIEW_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
 const OFFICE_PREVIEW_POLL_INTERVAL: Duration = Duration::from_millis(100);
+type AnnotationOpenError = Rc<dyn Fn(String, &mut App)>;
+
+fn current_annotation_unit_index(note: &Annotation, document: &BookDocument) -> Result<usize> {
+    ensure!(note.book_id == document.id, "笔记不属于当前图书");
+    ensure!(
+        !note.stale && note.document_revision == document.revision.0,
+        "笔记对应的正文已更新，请刷新笔记列表"
+    );
+    let index = document
+        .units
+        .iter()
+        .position(|unit| unit.id == note.content_unit_id)
+        .context("笔记所在章节已删除")?;
+    ensure!(
+        document.units[index].revision.0 == note.unit_revision,
+        "笔记所在章节已更新"
+    );
+    Ok(index)
+}
 
 #[derive(Clone, Debug)]
 struct OfficePreviewRun {
@@ -305,6 +325,7 @@ enum OpenReaderPayload {
         initial_spine: usize,
         initial_citation: Option<reader::ReflowableCitationTarget>,
         progress_locators: Vec<DocumentLocator>,
+        annotation_revisions: (u64, Vec<u64>),
     },
 }
 
@@ -336,6 +357,8 @@ struct PdfReaderWindowRequest {
     library_view: Entity<EpubReaderApp>,
     persist_progress: bool,
     preview_label: String,
+    /// Set when this window is the book's single reading window.
+    singleton_key: Option<String>,
 }
 
 impl LibraryExportKind {
@@ -477,9 +500,6 @@ fn resolve_search_hits(
 }
 
 fn open_pdf_reader_window(request: PdfReaderWindowRequest, cx: &mut App) {
-    if application_is_exiting(cx) {
-        return;
-    }
     let PdfReaderWindowRequest {
         record,
         book_incarnation,
@@ -491,7 +511,14 @@ fn open_pdf_reader_window(request: PdfReaderWindowRequest, cx: &mut App) {
         library_view,
         persist_progress,
         preview_label,
+        singleton_key,
     } = request;
+    if application_is_exiting(cx) {
+        if let Some(key) = singleton_key {
+            release_singleton_window(&key, cx);
+        }
+        return;
+    }
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
             None,
@@ -513,7 +540,8 @@ fn open_pdf_reader_window(request: PdfReaderWindowRequest, cx: &mut App) {
         app_id: Some("dev.moye.epub-editor.pdf-reader".to_string()),
         ..Default::default()
     };
-    let _ = cx.open_window(options, move |window, cx| {
+    let register_key = singleton_key.clone();
+    let opened = cx.open_window(options, move |window, cx| {
         let parent = match ParentWindowHandle::capture(window) {
             Ok(parent) => parent,
             Err(error) => {
@@ -544,6 +572,9 @@ fn open_pdf_reader_window(request: PdfReaderWindowRequest, cx: &mut App) {
                 // so final progress persistence and cancellation cannot be
                 // bypassed by this early-return error path.
                 let close_weak = reader.downgrade();
+                if let Some(key) = &register_key {
+                    register_singleton_pdf_reader(key, close_weak.clone(), cx);
+                }
                 on_window_close(window, cx, move |window, cx| {
                     close_weak
                         .update(cx, |reader, cx| reader.handle_window_close(window, cx))
@@ -585,6 +616,9 @@ fn open_pdf_reader_window(request: PdfReaderWindowRequest, cx: &mut App) {
             )
         });
         let weak = reader.downgrade();
+        if let Some(key) = &register_key {
+            register_singleton_pdf_reader(key, weak.clone(), cx);
+        }
         let title = record.title.clone();
         let removed_weak = weak.clone();
         register_book_window(
@@ -669,6 +703,11 @@ fn open_pdf_reader_window(request: PdfReaderWindowRequest, cx: &mut App) {
         });
         cx.new(|cx| Root::new(reader, window, cx))
     });
+    match (opened, singleton_key) {
+        (Ok(handle), Some(key)) => complete_singleton_window(&key, handle.into(), cx),
+        (Err(_), Some(key)) => release_singleton_window(&key, cx),
+        _ => {}
+    }
 }
 
 impl EpubReaderApp {
@@ -826,6 +865,12 @@ impl EpubReaderApp {
     fn open_learning(&mut self, cx: &mut Context<Self>) {
         if let Err(error) = open_learning_window(Arc::clone(&self.services), cx) {
             self.set_error(format!("无法打开学习中心：{error:#}"), cx);
+        }
+    }
+
+    fn open_all_notes(&mut self, cx: &mut Context<Self>) {
+        if let Err(error) = open_notes_window(Arc::clone(&self.services), cx.entity(), None, cx) {
+            self.set_error(format!("无法打开全部笔记：{error:#}"), cx);
         }
     }
 
@@ -1724,7 +1769,7 @@ impl EpubReaderApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_book_request(book_id, requested_spine, None, window, cx);
+        self.open_book_request(book_id, requested_spine, None, None, window, cx);
     }
 
     pub(super) fn open_book_at_source(
@@ -1738,6 +1783,24 @@ impl EpubReaderApp {
             source.book_id.clone(),
             requested_spine,
             Some(source),
+            None,
+            window,
+            cx,
+        );
+    }
+
+    pub(super) fn open_book_at_annotation(
+        &mut self,
+        note: Annotation,
+        on_error: impl Fn(String, &mut App) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_book_request(
+            note.book_id.clone(),
+            None,
+            None,
+            Some((note, Rc::new(on_error))),
             window,
             cx,
         );
@@ -1748,16 +1811,39 @@ impl EpubReaderApp {
         book_id: String,
         requested_spine: Option<usize>,
         source: Option<AiSourceLink>,
+        annotation: Option<(Annotation, AnnotationOpenError)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // One reading window per book: a second PDF or reflowable reader would
+        // keep a second progress writer and AI session for the same document.
+        // An already-open window is activated and navigated to the target once
+        // the asynchronous document load resolves it.
+        let reader_key = singleton_window_key("reader", &book_id);
+        let existing = match reserve_singleton_window(&reader_key, cx) {
+            SingletonWindowReservation::Activate(handle) => Some(handle),
+            SingletonWindowReservation::InFlight => return,
+            SingletonWindowReservation::Reserved => None,
+        };
         let services = Arc::clone(&self.services);
+        let (annotation, annotation_error): (Option<_>, Option<_>) = annotation.unzip();
         let task = services.spawn_library_read(move |library| {
             let record = library.book_record(&book_id)?;
             let book_incarnation = library
                 .progress_incarnation(&book_id)
                 .context("图书阅读实例已失效")?;
             let document = library.document(&book_id)?;
+            let annotation_index = annotation
+                .as_ref()
+                .map(|note| {
+                    let current = library
+                        .list_annotations(&book_id, Some(&note.content_unit_id))?
+                        .into_iter()
+                        .find(|current| current.id == note.id)
+                        .context("笔记已被删除，请刷新笔记列表")?;
+                    current_annotation_unit_index(&current, &document)
+                })
+                .transpose()?;
             let source_index = source
                 .as_ref()
                 .map(|source| {
@@ -1768,6 +1854,7 @@ impl EpubReaderApp {
             if let (Some(requested), Some(exact)) = (requested_spine, source_index) {
                 ensure!(requested == exact, "引用内容单元与请求的阅读位置不匹配");
             }
+            let requested_spine = annotation_index.or(requested_spine);
             if record.format == "pdf" {
                 let pages = document
                     .units
@@ -1843,6 +1930,10 @@ impl EpubReaderApp {
                 initial_spine,
                 initial_citation,
                 progress_locators,
+                annotation_revisions: (
+                    document.revision.0,
+                    document.units.iter().map(|unit| unit.revision.0).collect(),
+                ),
             })
         });
         cx.spawn_in(window, async move |view, cx| {
@@ -1863,9 +1954,32 @@ impl EpubReaderApp {
                             )
                         }) {
                             Ok(values) => values,
-                            Err(_) => return,
+                            Err(_) => {
+                                let key = reader_key.clone();
+                                let _ = cx.update(move |_, cx| release_singleton_window(&key, cx));
+                                return;
+                            }
                         };
                     let _ = cx.update(move |_, cx| {
+                        if let Some(handle) = existing {
+                            if let Some(reader) = existing_singleton_pdf_reader(&reader_key, cx) {
+                                let _ = reader.update(cx, |reader, cx| {
+                                    reader.request_page(initial_page, cx)
+                                });
+                                activate_singleton_window(handle, cx);
+                                return;
+                            }
+                            // The reader closed while the document loaded:
+                            // reserve again and open a fresh window.
+                            match reserve_singleton_window(&reader_key, cx) {
+                                SingletonWindowReservation::Activate(handle) => {
+                                    activate_singleton_window(handle, cx);
+                                    return;
+                                }
+                                SingletonWindowReservation::InFlight => return,
+                                SingletonWindowReservation::Reserved => {}
+                            }
+                        }
                         open_pdf_reader_window(
                             PdfReaderWindowRequest {
                                 record,
@@ -1878,6 +1992,7 @@ impl EpubReaderApp {
                                 library_view,
                                 persist_progress: true,
                                 preview_label: "PDF".to_string(),
+                                singleton_key: Some(reader_key),
                             },
                             cx,
                         );
@@ -1890,8 +2005,10 @@ impl EpubReaderApp {
                     initial_spine: current_spine,
                     initial_citation,
                     progress_locators,
+                    annotation_revisions,
                 })) => {
                     let title = record.title.clone();
+                    let release_key = reader_key.clone();
                     let (library, services, library_view) = match view.update(cx, |this, cx| {
                         (
                             this.library.clone(),
@@ -1900,9 +2017,13 @@ impl EpubReaderApp {
                         )
                     }) {
                         Ok(values) => values,
-                        Err(_) => return,
+                        Err(_) => {
+                            let key = release_key;
+                            let _ = cx.update(move |_, cx| release_singleton_window(&key, cx));
+                            return;
+                        }
                     };
-                    let _ = cx.update(move |_, cx| {
+                    let applied = cx.update(move |_, cx| {
                         let options = WindowOptions {
                             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                                 None,
@@ -1918,9 +2039,35 @@ impl EpubReaderApp {
                             ..Default::default()
                         };
                         if application_is_exiting(cx) {
+                            release_singleton_window(&reader_key, cx);
                             return;
                         }
-                        let _ = cx.open_window(options, move |window, cx| {
+                        if let Some(handle) = existing {
+                            if let Some(reader) = existing_singleton_reader(&reader_key, cx) {
+                                let citation = initial_citation.clone();
+                                let spine = current_spine;
+                                let _ = reader.update(cx, |reader, cx| {
+                                    match citation {
+                                        Some(target) => reader.navigate_to_citation(target, cx),
+                                        None => reader.navigate_to_spine(spine, cx),
+                                    }
+                                });
+                                activate_singleton_window(handle, cx);
+                                return;
+                            }
+                            // The reader closed while the document loaded:
+                            // reserve again and open a fresh window.
+                            match reserve_singleton_window(&reader_key, cx) {
+                                SingletonWindowReservation::Activate(handle) => {
+                                    activate_singleton_window(handle, cx);
+                                    return;
+                                }
+                                SingletonWindowReservation::InFlight => return,
+                                SingletonWindowReservation::Reserved => {}
+                            }
+                        }
+                        let register_key = reader_key.clone();
+                        let opened = cx.open_window(options, move |window, cx| {
                             let parent = match ParentWindowHandle::capture(window) {
                                 Ok(parent) => parent,
                                 Err(error) => {
@@ -1933,6 +2080,7 @@ impl EpubReaderApp {
                                             opened,
                                             current_spine,
                                             progress_locators,
+                                            annotation_revisions,
                                             initial_citation,
                                             library.clone(),
                                             Arc::clone(&services),
@@ -1950,6 +2098,7 @@ impl EpubReaderApp {
                                     // has a progress writer and AI session. The
                                     // normal close barrier remains mandatory.
                                     let close_weak = reader.downgrade();
+                                    register_singleton_reader(&register_key, close_weak.clone(), cx);
                                     on_window_close(window, cx, move |window, cx| {
                                         close_weak
                                             .update(cx, |reader, cx| {
@@ -1981,6 +2130,7 @@ impl EpubReaderApp {
                                     opened.clone(),
                                     current_spine,
                                     progress_locators.clone(),
+                                    annotation_revisions.clone(),
                                     initial_citation.clone(),
                                     library.clone(),
                                     Arc::clone(&services),
@@ -1991,6 +2141,7 @@ impl EpubReaderApp {
                                 )
                             });
                             let weak = reader.downgrade();
+                            register_singleton_reader(&register_key, weak.clone(), cx);
                             let removed_weak = weak.clone();
                             register_book_window(
                                 record.id.clone(),
@@ -2125,14 +2276,33 @@ impl EpubReaderApp {
                             // when painting, and would panic without it.
                             cx.new(|cx| Root::new(reader, window, cx))
                         });
+                        match opened {
+                            Ok(handle) => complete_singleton_window(&reader_key, handle.into(), cx),
+                            Err(error) => {
+                                tracing::error!(%error, "cannot open reader window");
+                                release_singleton_window(&reader_key, cx);
+                            }
+                        }
                     });
+                    if applied.is_err() {
+                        let key = release_key.clone();
+                        let _ = cx.update(move |_, cx| release_singleton_window(&key, cx));
+                    }
                 }
                 Ok(Err(error)) => {
+                    let _ = cx.update(move |_, cx| release_singleton_window(&reader_key, cx));
+                    if let Some(on_error) = annotation_error.as_ref() {
+                        let _ = cx.update(|_, cx| on_error(format!("无法打开笔记所在章节：{error:#}"), cx));
+                    }
                     let _ = view.update(cx, |this, cx| {
                         this.set_error(format!("无法打开图书：{error:#}"), cx);
                     });
                 }
                 Err(error) => {
+                    let _ = cx.update(move |_, cx| release_singleton_window(&reader_key, cx));
+                    if let Some(on_error) = annotation_error.as_ref() {
+                        let _ = cx.update(|_, cx| on_error(format!("打开章节后台任务异常停止：{error}"), cx));
+                    }
                     let _ = view.update(cx, |this, cx| {
                         this.set_error(format!("打开图书后台任务异常停止：{error}"), cx);
                     });
@@ -2143,6 +2313,17 @@ impl EpubReaderApp {
     }
 
     fn open_book_editor(&mut self, book_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        // One editing window per book: a second editor would keep a second
+        // unsaved draft for the same document.
+        let editor_key = singleton_window_key("editor", &book_id);
+        match reserve_singleton_window(&editor_key, cx) {
+            SingletonWindowReservation::Activate(handle) => {
+                activate_singleton_window(handle, cx);
+                return;
+            }
+            SingletonWindowReservation::InFlight => return,
+            SingletonWindowReservation::Reserved => {}
+        }
         let services = Arc::clone(&self.services);
         let task = services.spawn_library_read(move |library| {
             let record = library.book_record(&book_id)?;
@@ -2173,15 +2354,18 @@ impl EpubReaderApp {
         });
 
         cx.spawn_in(window, async move |view, cx| {
+            let release_key = editor_key.clone();
             let (record, cover, chapters, document, web_state) = match task.await {
                 Ok(Ok(editor_data)) => editor_data,
                 Ok(Err(error)) => {
+                    let _ = cx.update(move |_, cx| release_singleton_window(&release_key, cx));
                     let _ = view.update(cx, |this, cx| {
                         this.set_error(format!("无法打开编辑器：{error:#}"), cx);
                     });
                     return;
                 }
                 Err(error) => {
+                    let _ = cx.update(move |_, cx| release_singleton_window(&release_key, cx));
                     let _ = view.update(cx, |this, cx| {
                         this.set_error(format!("编辑器后台任务异常停止：{error}"), cx);
                     });
@@ -2197,10 +2381,14 @@ impl EpubReaderApp {
                     )
                 }) {
                     Ok(values) => values,
-                    Err(_) => return,
+                    Err(_) => {
+                        let key = release_key;
+                        let _ = cx.update(move |_, cx| release_singleton_window(&key, cx));
+                        return;
+                    }
                 };
             let library_view = view.clone();
-            let _ = cx.update(move |_, cx| {
+            let applied = cx.update(move |_, cx| {
                 let options = WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                         None,
@@ -2216,9 +2404,10 @@ impl EpubReaderApp {
                     ..Default::default()
                 };
                 if application_is_exiting(cx) {
+                    release_singleton_window(&editor_key, cx);
                     return;
                 }
-                let _ = cx.open_window(options, move |window, cx| {
+                let opened = cx.open_window(options, move |window, cx| {
                     let initial_chapter_html = chapters
                         .first()
                         .map(|chapter| chapter.html.clone())
@@ -2390,7 +2579,18 @@ impl EpubReaderApp {
                     // when painting and would panic without it.
                     cx.new(|cx| Root::new(editor, window, cx))
                 });
+                match opened {
+                    Ok(handle) => complete_singleton_window(&editor_key, handle.into(), cx),
+                    Err(error) => {
+                        tracing::error!(%error, "cannot open editor window");
+                        release_singleton_window(&editor_key, cx);
+                    }
+                }
             });
+            if applied.is_err() {
+                let key = release_key.clone();
+                let _ = cx.update(move |_, cx| release_singleton_window(&key, cx));
+            }
         })
         .detach();
     }
@@ -3429,6 +3629,17 @@ impl EpubReaderApp {
                 .on_click({
                     let view = view.clone();
                     move |_, _, cx| view.update(cx, |this, cx| this.open_learning(cx))
+                })
+                .into_any_element(),
+            Button::new("open-all-notes")
+                .ghost()
+                .icon(IconName::Menu)
+                .label("全部笔记")
+                .tooltip("查看所有图书的划线、人工想法和 AI 想法")
+                .w_full()
+                .on_click({
+                    let view = view.clone();
+                    move |_, _, cx| view.update(cx, |this, cx| this.open_all_notes(cx))
                 })
                 .into_any_element(),
             div()
@@ -5366,6 +5577,55 @@ mod tests {
             current_canonical_source_unit_index(&wrong_type, &corrupt_document).is_err(),
             "library cross-book dispatch must reject a canonical unit locator whose type conflicts with the target book"
         );
+    }
+
+    #[test]
+    fn annotation_navigation_uses_stable_unit_identity_and_rejects_stale_notes() {
+        use moye_epub_editor::annotations::{AnnotationKind, TextAnchor};
+        let mut document = BookDocument::created("book-notes", "笔记测试");
+        for id in ["first", "second"] {
+            document.units.push(ContentUnit::new(
+                id,
+                ContentUnitKind::Chapter,
+                id,
+                "<p>重复文字</p>",
+                BlockDocument::default(),
+            ));
+        }
+        let note = Annotation {
+            id: "note".into(),
+            book_id: document.id.clone(),
+            content_unit_id: "second".into(),
+            document_revision: document.revision.0,
+            unit_revision: document.units[1].revision.0,
+            anchor: TextAnchor {
+                quote: "重复文字".into(),
+                start: 0,
+                end: 4,
+            },
+            kind: AnnotationKind::HumanComment,
+            comment: Some("想法".into()),
+            created_at: 1,
+            updated_at: 1,
+            stale: false,
+        };
+        assert_eq!(current_annotation_unit_index(&note, &document).unwrap(), 1);
+        document.units.swap(0, 1);
+        assert_eq!(current_annotation_unit_index(&note, &document).unwrap(), 0);
+        let mut invalid = note.clone();
+        invalid.book_id = "another-book".into();
+        assert!(current_annotation_unit_index(&invalid, &document).is_err());
+        invalid = note.clone();
+        invalid.stale = true;
+        assert!(current_annotation_unit_index(&invalid, &document).is_err());
+        invalid = note.clone();
+        invalid.document_revision += 1;
+        assert!(current_annotation_unit_index(&invalid, &document).is_err());
+        invalid = note.clone();
+        invalid.unit_revision += 1;
+        assert!(current_annotation_unit_index(&invalid, &document).is_err());
+        document.units.remove(0);
+        assert!(current_annotation_unit_index(&note, &document).is_err());
     }
 
     #[test]

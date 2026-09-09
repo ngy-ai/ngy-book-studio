@@ -48,6 +48,17 @@ const CITATION_MARKER_PREFIX: &str = "[[moye-source:";
 const CITATION_MARKER_SUFFIX: &str = "]]";
 const MAX_CITATION_MARKERS: usize = 256;
 const MAX_CONTEXT_RETRIES: usize = 3;
+const TOOL_BUDGET_FINAL_GUIDANCE: &str = concat!(
+    "\nThe host's tool-call budget for this question is exhausted. No tools are available. ",
+    "Give the final answer now using the sources already returned or the host-validated ",
+    "frozen selections. A tool_budget_exhausted result means that call was not executed ",
+    "and supplies no source. If the available evidence is insufficient, say so plainly; ",
+    "do not claim that an unexecuted search found or ruled out information. ",
+    "Keep all existing citation and authorization rules."
+);
+// Host control data, not a successful retrieval result. Keep every assistant
+// call paired even when a batch contains more calls than the remaining budget.
+const TOOL_BUDGET_EXHAUSTED_RESULT: &str = r#"{"error":"tool_budget_exhausted","message":"This call was not executed. No tool calls remain; answer using the evidence already available and state any limitations."}"#;
 const TOOL_ARGUMENT_RECOVERY_GUIDANCE: &str = concat!(
     "\nThe previous generation was rejected because tool arguments were incomplete JSON. ",
     "Generate at most one tool call at a time, with a short, complete JSON object matching ",
@@ -385,7 +396,16 @@ impl AgentRuntime {
             context.round = round + 1;
             mark_stage(stage, "stream_start");
             let round_started = Instant::now();
-            let tools_offered = has_authorized_books && round < self.limits.max_tool_rounds;
+            let remaining_tool_calls = agent.remaining_tool_calls();
+            let tools_offered = has_authorized_books && remaining_tool_calls > 0;
+            if has_authorized_books && remaining_tool_calls == 0 {
+                if let Some(MessageContent::Text(policy)) = messages[0].content.as_mut() {
+                    policy.push_str(TOOL_BUDGET_FINAL_GUIDANCE);
+                }
+                tracing::info!(target: "moye_ai", round = context.round,
+                    tool_calls_used = agent.rounds_used(), remaining_tool_calls,
+                    "AI tool budget exhausted; requesting final answer");
+            }
             let mut request = ChatRequest {
                 model: self.chat_model.clone(),
                 messages: messages.clone(),
@@ -524,9 +544,27 @@ impl AgentRuntime {
             };
             messages.push(assistant);
             for (index, call) in turn.tool_calls.iter().enumerate() {
+                if cancellation.is_cancelled() {
+                    bail!(AgentRequestCancelled);
+                }
+                if agent.remaining_tool_calls() == 0 {
+                    messages.push(ChatMessage {
+                        role: ChatRole::Tool,
+                        content: Some(TOOL_BUDGET_EXHAUSTED_RESULT.into()),
+                        name: Some(call.function.name.clone()),
+                        tool_call_id: Some(call.id.clone()),
+                        tool_calls: Vec::new(),
+                    });
+                    tracing::debug!(target: "moye_ai", round = context.round,
+                        tool_index = index, tool = tool_label(&call.function.name),
+                        tool_calls_used = agent.rounds_used(),
+                        "AI tool skipped because the call budget is exhausted");
+                    continue;
+                }
                 mark_stage(stage, "tool_execution");
                 let tool_started = Instant::now();
                 tracing::debug!(target: "moye_ai", round = context.round, tool_index = index, tool = tool_label(&call.function.name),
+                    tool_calls_used = agent.rounds_used(), remaining_tool_calls = agent.remaining_tool_calls(),
                     arguments = ?ToolArgumentsSummary::new(&call.function.arguments), "AI tool started");
                 if let Some(sender) = events.as_ref() {
                     let _ = sender.send(AgentRunEvent::ToolStarted {
@@ -2442,8 +2480,105 @@ mod tests {
         assert_eq!(requests[0].tools, expected_tools);
         assert_eq!(requests[1].tools, agent_tool_definitions());
         assert!(requests[2].tools.is_empty());
+        assert!(matches!(
+            requests[2].messages[0].content.as_ref(),
+            Some(MessageContent::Text(policy)) if policy.ends_with(TOOL_BUDGET_FINAL_GUIDANCE)
+        ));
         for request in requests.iter() {
             assert_custom_generation(request);
+        }
+    }
+
+    #[tokio::test]
+    async fn exhausted_batch_keeps_only_executed_sources_and_validates_the_final_answer() {
+        for (marker, succeeds) in [
+            ("passage:passage-1", true),
+            ("passage:never-executed", false),
+        ] {
+            let mut batch = search_tool_turn("call-1", "first");
+            batch[0].tool_call_deltas.push(ToolCallDelta {
+                index: 1,
+                id: Some("call-2".into()),
+                name: Some("search_books".into()),
+                arguments_delta: Some("{\"query\":\"not executed\"}".into()),
+            });
+            let provider = MockProvider {
+                turns: Arc::new(Mutex::new(VecDeque::from([
+                    batch,
+                    answer_turn(&format!("From evidence. [[moye-source:{marker}]]")),
+                ]))),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            };
+            let requests = Arc::clone(&provider.requests);
+            let runtime = AgentRuntime::new(
+                Arc::new(provider),
+                Arc::new(MockSearch),
+                Arc::new(MockBooks),
+                "chat-model",
+                AgentLimits {
+                    max_tool_rounds: 1,
+                    ..AgentLimits::default()
+                },
+            )
+            .unwrap();
+            let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+            let result = runtime
+                .answer(
+                    AgentQuestion {
+                        question: "What is verified?".into(),
+                        allowed_book_ids: vec!["book-1".into()],
+                        book_titles: Vec::new(),
+                        history: Vec::new(),
+                        snapshots: Vec::new(),
+                    },
+                    Some(events_tx),
+                    AgentCancellation::default(),
+                )
+                .await;
+            if succeeds {
+                let answer = result.unwrap();
+                assert_eq!(answer.markdown, "From evidence. ");
+                assert_eq!(answer.citations.len(), 1);
+            } else {
+                assert!(result.is_err(), "an unserved source must remain invalid");
+            }
+            let mut events = Vec::new();
+            while let Some(event) = events_rx.recv().await {
+                events.push(event);
+            }
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, AgentRunEvent::ToolStarted { .. }))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, AgentRunEvent::ToolFinished { .. }))
+                    .count(),
+                1
+            );
+            assert_eq!(events.contains(&AgentRunEvent::AnswerCommitted), succeeds);
+            if !succeeds {
+                assert_eq!(events.last(), Some(&AgentRunEvent::AnswerReset));
+            }
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(requests[1].tools.is_empty());
+            let tool_messages = requests[1]
+                .messages
+                .iter()
+                .filter(|message| message.role == ChatRole::Tool)
+                .collect::<Vec<_>>();
+            assert_eq!(tool_messages.len(), 2);
+            assert_eq!(tool_messages[0].tool_call_id.as_deref(), Some("call-1"));
+            assert_eq!(tool_messages[1].tool_call_id.as_deref(), Some("call-2"));
+            assert_eq!(
+                tool_messages[1].content,
+                Some(TOOL_BUDGET_EXHAUSTED_RESULT.into())
+            );
         }
     }
 
