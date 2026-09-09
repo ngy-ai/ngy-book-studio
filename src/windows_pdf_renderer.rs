@@ -444,7 +444,6 @@ mod tests {
     use crate::{
         document::{
             AssetRef, AssetRole, Block, BlockDocument, BookDocument, ContentUnit, ContentUnitKind,
-            SourceKind,
         },
         preview::{PreviewFuture, VisualDocumentSource},
     };
@@ -609,7 +608,6 @@ mod tests {
                 format!("unit-{page}"),
                 ContentUnitKind::Page,
                 format!("Page {page}"),
-                SourceKind::Markdown,
                 format!("Page {page}"),
                 BlockDocument::new(vec![Block::paragraph(
                     format!("block-{page}"),

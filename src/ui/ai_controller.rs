@@ -1151,8 +1151,7 @@ mod tests {
     use gpui::{AppContext, TestAppContext};
     use gpui_component::Root;
     use moye_epub_editor::document::{
-        Block, BlockDocument, BookDocument, ContentUnit, ContentUnitKind, DocumentLocator,
-        Revision, SourceKind,
+        Block, BlockDocument, BookDocument, ContentUnit, ContentUnitKind, DocumentLocator, Revision,
     };
     use moye_epub_editor::{
         agent::AgentCitationSourceKind,
@@ -1601,8 +1600,7 @@ mod tests {
             "unit-1",
             ContentUnitKind::Chapter,
             "One",
-            SourceKind::Markdown,
-            "body",
+            "<p>body</p>",
             BlockDocument::new(vec![Block::paragraph("block-1", "body")]),
         );
         let mut document = BookDocument::created("book-a", "Book");

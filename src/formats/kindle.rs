@@ -4,7 +4,7 @@ use anyhow::{Context as _, Result, bail};
 
 use crate::{
     document::{
-        AssetRole, BookDocument, BookFormat, BookSource, ContentUnit, ContentUnitKind, SourceKind,
+        AssetRole, BookDocument, BookFormat, BookSource, ContentUnit, ContentUnitKind,
         SourceLocator, TocNode, TocTarget, deterministic_id,
     },
     formats::{
@@ -185,15 +185,13 @@ impl DocumentImporter for KindleImporter {
                 &section.full_path,
                 &asset_ids_by_href,
             )?;
-            let normalized =
-                crate::markup::parse_source_for_unit(SourceKind::Html, &rewritten, &unit_id)
-                    .with_context(|| format!("failed to normalize Kindle section {}", index + 1))?;
+            let normalized = crate::markup::parse_source_for_unit(&rewritten, &unit_id)
+                .with_context(|| format!("failed to normalize Kindle section {}", index + 1))?;
             units.push(
                 ContentUnit::new(
                     unit_id.clone(),
                     ContentUnitKind::Chapter,
                     section_title,
-                    SourceKind::Html,
                     normalized.canonical_source,
                     normalized.document,
                 )

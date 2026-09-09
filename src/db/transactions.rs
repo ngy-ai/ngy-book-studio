@@ -2222,12 +2222,11 @@ mod tests {
                     parent_id: None,
                     ordinal: 2,
                     kind: "chapter".to_string(),
-                    source_kind: "xhtml".to_string(),
                     href: Some("EPUB/chapter.xhtml".to_string()),
                     source_locator_json: r#"{"href":"EPUB/chapter.xhtml"}"#.to_string(),
                     title: Some("第一章".to_string()),
-                    media_type: Some("application/xhtml+xml".to_string()),
-                    source_text: Some("searchable document body".to_string()),
+                    media_type: Some("text/html".to_string()),
+                    source_text: Some("<p>searchable document body</p>".to_string()),
                     block_json: serde_json::to_string(&BlockDocument::new(vec![
                         crate::document::Block::paragraph("block-1", "searchable document body"),
                     ]))

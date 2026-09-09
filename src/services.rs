@@ -3845,8 +3845,7 @@ mod tests {
             .update_content_unit_source(
                 &book.id,
                 &unit_id,
-                crate::document::SourceKind::Markdown,
-                "# Normalized\n\nEdited PDF content",
+                "<h1>Normalized</h1><p>Edited PDF content</p>",
             )
             .unwrap();
         let normalized_source = db::book_sources::get_revision(

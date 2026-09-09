@@ -15,7 +15,7 @@ use html5ever::{parse_document, tendril::TendrilSink as _};
 use markup5ever_rcdom::{NodeData, RcDom};
 use serde::{Deserialize, Serialize};
 
-pub const DOCUMENT_SCHEMA_VERSION: u32 = 1;
+pub const DOCUMENT_SCHEMA_VERSION: u32 = 2;
 pub const BLOCK_SCHEMA_VERSION: u32 = 1;
 /// Visual coordinates are normalized to this inclusive upper bound so a
 /// persisted locator does not depend on the renderer's pixel dimensions.
@@ -139,13 +139,6 @@ impl BookSource {
             original_file_name,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SourceKind {
-    Markdown,
-    Html,
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
@@ -298,9 +291,8 @@ pub struct ContentUnit {
     pub revision: Revision,
     pub kind: ContentUnitKind,
     pub title: String,
-    pub source_kind: SourceKind,
     pub source_locator: Option<SourceLocator>,
-    /// The current Markdown or HTML projection. Importers may preserve the
+    /// The current HTML projection. Importers may preserve the
     /// original spelling until the first semantic block edit.
     pub source: String,
     /// The semantic editing and indexing representation for `source`.
@@ -312,7 +304,6 @@ impl ContentUnit {
         id: impl Into<String>,
         kind: ContentUnitKind,
         title: impl Into<String>,
-        source_kind: SourceKind,
         source: impl Into<String>,
         document: BlockDocument,
     ) -> Self {
@@ -321,27 +312,14 @@ impl ContentUnit {
             revision: Revision::INITIAL,
             kind,
             title: title.into(),
-            source_kind,
             source_locator: None,
             source: source.into(),
             document,
         }
     }
 
-    pub fn empty(
-        id: impl Into<String>,
-        kind: ContentUnitKind,
-        title: impl Into<String>,
-        source_kind: SourceKind,
-    ) -> Self {
-        Self::new(
-            id,
-            kind,
-            title,
-            source_kind,
-            String::new(),
-            BlockDocument::default(),
-        )
+    pub fn empty(id: impl Into<String>, kind: ContentUnitKind, title: impl Into<String>) -> Self {
+        Self::new(id, kind, title, String::new(), BlockDocument::default())
     }
 
     pub fn plain_text(&self) -> String {
@@ -2386,8 +2364,7 @@ mod tests {
             "unit-1",
             ContentUnitKind::Chapter,
             "第一章",
-            SourceKind::Markdown,
-            "# 第一章",
+            "<h1>第一章</h1>",
             BlockDocument::new(blocks),
         )
         .with_source_locator(SourceLocator::epub("OEBPS/chapter-1.xhtml"));
@@ -2422,9 +2399,18 @@ mod tests {
         let decoded: BookDocument = serde_json::from_str(&json).expect("deserialize book");
 
         assert_eq!(decoded, book);
+        assert!(!json.contains("source_kind"));
+        assert_eq!(decoded.schema_version, 2);
         assert!(json.contains(r#""type": "imported""#));
         assert!(json.contains(r#""type": "video""#));
         assert_eq!(decoded.document_hash(), book.document_hash());
+    }
+
+    #[test]
+    fn previous_document_schema_is_rejected() {
+        let mut book = sample_book();
+        book.schema_version = DOCUMENT_SCHEMA_VERSION - 1;
+        assert!(book.validate().is_err());
     }
 
     #[test]

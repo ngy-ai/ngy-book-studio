@@ -781,12 +781,8 @@ mod tests {
         assert!(!rewritten.contains("tracker.png"));
         assert!(!rewritten.contains("not-in-manifest.png"));
 
-        let parsed = crate::markup::parse_source_for_unit(
-            crate::document::SourceKind::Html,
-            &rewritten,
-            "imported-unit",
-        )
-        .expect("parse rewritten HTML into the canonical AST");
+        let parsed = crate::markup::parse_source_for_unit(&rewritten, "imported-unit")
+            .expect("parse rewritten HTML into the canonical AST");
         let mut referenced = parsed.document.referenced_asset_ids();
         referenced.sort_unstable();
         assert_eq!(

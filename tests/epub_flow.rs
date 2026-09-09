@@ -7,7 +7,7 @@ use std::{
 
 use image::ImageEncoder as _;
 use moye_epub_editor::{
-    document::{AssetRef, AssetRole, SourceKind},
+    document::{AssetRef, AssetRole},
     library::{CoverDraft, ImportOutcome, LibraryStore},
     media::MediaService,
     reader::{OpenedBook, ReaderResourceAuthorizations, load_resource, load_resource_with_range},
@@ -172,7 +172,7 @@ fn imported_media_survives_canonical_edit_epub_export_and_reopen() {
     let unit_id = unit.id.clone();
     let edited_source = format!("{}<p>EditedMediaRoundTrip</p>", unit.source);
     library
-        .update_content_unit_source(&imported.id, &unit_id, SourceKind::Html, &edited_source)
+        .update_content_unit_source(&imported.id, &unit_id, &edited_source)
         .unwrap();
 
     let normalized_path = temp.path().join("normalized.epub");
@@ -323,7 +323,7 @@ fn reader_media_ranges_are_manifest_scoped_and_read_from_the_owned_object() {
     let unit = &document.units[0];
     let edited_source = format!("{}<p>range route revision</p>", unit.source);
     library
-        .update_content_unit_source(&imported.id, &unit.id, SourceKind::Html, &edited_source)
+        .update_content_unit_source(&imported.id, &unit.id, &edited_source)
         .unwrap();
     let normalized =
         OpenedBook::open_bytes(library.reader_epub_bytes(&imported.id).unwrap()).unwrap();

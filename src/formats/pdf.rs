@@ -2,8 +2,8 @@ use anyhow::{Context as _, Result, bail};
 
 use crate::{
     document::{
-        BookDocument, BookFormat, BookSource, ContentUnit, ContentUnitKind, SourceKind,
-        SourceLocator, TocNode, TocTarget, deterministic_id,
+        BookDocument, BookFormat, BookSource, ContentUnit, ContentUnitKind, SourceLocator, TocNode,
+        TocTarget, deterministic_id,
     },
     formats::{
         AssetBudget, DocumentImporter, ImportLimits, ImportSource, ImportedBook,
@@ -73,25 +73,30 @@ impl DocumentImporter for PdfImporter {
             if text.len() > limits.max_unit_text_bytes {
                 bail!("PDF page {page_number} exceeds the text safety limit");
             }
-            total_text_bytes = total_text_bytes
-                .checked_add(text.len())
-                .context("total imported PDF text size overflowed")?;
-            if total_text_bytes > limits.max_total_text_bytes {
-                bail!("PDF exceeds the total text safety limit at page {page_number}");
-            }
             let unit_id = deterministic_id(
                 "unit",
                 format!("{book_id}\0pdf-page\0{page_number}").as_bytes(),
             );
             let page_title = format!("Page {}", ordinal + 1);
+            let page_document = text_block_document(&unit_id, &text);
+            let html = crate::markup::serialize_source(&page_document)
+                .with_context(|| format!("failed to normalize PDF page {page_number} as HTML"))?;
+            if html.len() > limits.max_unit_text_bytes {
+                bail!("PDF page {page_number} exceeds the text safety limit");
+            }
+            total_text_bytes = total_text_bytes
+                .checked_add(html.len())
+                .context("total imported PDF text size overflowed")?;
+            if total_text_bytes > limits.max_total_text_bytes {
+                bail!("PDF exceeds the total text safety limit at page {page_number}");
+            }
             units.push(
                 ContentUnit::new(
                     unit_id.clone(),
                     ContentUnitKind::Page,
                     page_title.clone(),
-                    SourceKind::Markdown,
-                    text.clone(),
-                    text_block_document(&unit_id, &text),
+                    html,
+                    page_document,
                 )
                 .with_source_locator(SourceLocator::pdf_page(page_number)),
             );
@@ -183,16 +188,42 @@ mod tests {
             bytes: Arc::new(pdf_with_text_pages(&["first-page", "second-page"])),
         };
         let limits = ImportLimits {
-            max_unit_text_bytes: 64,
-            max_total_text_bytes: 12,
+            max_unit_text_bytes: "<p>second-page</p>".len(),
+            max_total_text_bytes: "<p>first-page</p><p>second-page</p>".len(),
             ..ImportLimits::default()
         };
+        let imported = PdfImporter
+            .import(&source, &limits)
+            .expect("canonical HTML fits the exact unit and aggregate budgets");
+        assert_eq!(imported.document.units[0].source, "<p>first-page</p>");
+        assert_eq!(imported.document.units[1].source, "<p>second-page</p>");
 
         let error = PdfImporter
-            .import(&source, &limits)
+            .import(
+                &source,
+                &ImportLimits {
+                    max_total_text_bytes: limits.max_total_text_bytes - 1,
+                    ..limits
+                },
+            )
             .expect_err("the second page must cross the aggregate text budget");
         assert!(error.to_string().contains("total text safety limit"));
         assert!(error.to_string().contains("page 2"));
+
+        let error = PdfImporter
+            .import(
+                &source,
+                &ImportLimits {
+                    max_unit_text_bytes: limits.max_unit_text_bytes - 1,
+                    ..limits
+                },
+            )
+            .expect_err("the second page must cross the canonical HTML unit budget");
+        assert!(
+            error
+                .to_string()
+                .contains("page 2 exceeds the text safety limit")
+        );
     }
 
     fn pdf_with_text_pages(texts: &[&str]) -> Vec<u8> {

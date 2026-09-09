@@ -5,8 +5,8 @@ use office_oxide::{Document, DocumentFormat, DocumentIR};
 
 use crate::{
     document::{
-        AssetRole, Block, BookDocument, BookFormat, BookSource, ContentUnit, ContentUnitKind,
-        SourceKind, SourceLocator, TocNode, TocTarget, deterministic_id,
+        AssetRole, Block, BlockDocument, BookDocument, BookFormat, BookSource, ContentUnit,
+        ContentUnitKind, SourceLocator, TocNode, TocTarget, deterministic_id,
     },
     formats::{
         AssetBudget, DocumentImporter, ImportLimits, ImportSource, ImportedAsset, ImportedBook,
@@ -113,42 +113,50 @@ impl DocumentImporter for OfficeImporter {
         let title = safe_title(ir.metadata.title.as_deref(), source.stem().as_str());
 
         let mut units = Vec::new();
+        let mut total_text_bytes = 0;
         let mut imported_assets = vec![original.clone()];
         if ir.sections.is_empty() {
-            let markdown = parsed.to_markdown();
+            let html = parsed.to_html();
             push_office_units(
                 &book_id,
                 format,
                 1,
                 None,
-                &markdown,
+                &html,
                 Vec::new(),
                 None,
                 limits,
+                &mut total_text_bytes,
                 &mut units,
             )?;
         } else {
             for (section_index, section) in ir.sections.iter().enumerate() {
-                let one_section = DocumentIR {
+                let mut one_section = DocumentIR {
                     metadata: ir.metadata.clone(),
                     sections: vec![section.clone()],
                 };
-                let (markdown, worksheet_range) = if format == BookFormat::Xlsx {
+                if matches!(format, BookFormat::Doc | BookFormat::Docx) {
+                    // Word section titles repeat the first body heading in the
+                    // parser IR. Keep them as fallback metadata; rendering an
+                    // extra h2 would duplicate content and create a false split.
+                    one_section.sections[0].title = None;
+                }
+                let (html, worksheet_range) = if format == BookFormat::Xlsx {
                     if let Some(xlsx) = parsed.as_xlsx() {
                         if let Some(worksheet) = xlsx.worksheets.get(section_index) {
                             let used_range = worksheet_used_range(worksheet, xlsx);
                             (
-                                worksheet_grid_markdown(worksheet, xlsx, used_range, limits)?,
+                                worksheet_grid_html(worksheet, xlsx, used_range, limits)?,
                                 used_range.map(|range| range.to_a1()),
                             )
                         } else {
-                            (one_section.to_markdown(), None)
+                            (one_section.to_html(), None)
                         }
                     } else {
-                        (one_section.to_markdown(), None)
+                        (one_section.to_html(), None)
                     }
                 } else {
-                    (one_section.to_markdown(), None)
+                    (one_section.to_html(), None)
                 };
                 let image_assets = extract_section_images(
                     &book_id,
@@ -162,10 +170,11 @@ impl DocumentImporter for OfficeImporter {
                     format,
                     section_index + 1,
                     section.title.as_deref(),
-                    &markdown,
+                    &html,
                     image_assets,
                     worksheet_range.as_deref(),
                     limits,
+                    &mut total_text_bytes,
                     &mut units,
                 )?;
             }
@@ -173,13 +182,8 @@ impl DocumentImporter for OfficeImporter {
         if units.is_empty() {
             let unit_id = deterministic_id("unit", format!("{book_id}\0empty").as_bytes());
             units.push(
-                ContentUnit::empty(
-                    unit_id,
-                    unit_kind(format),
-                    title.clone(),
-                    SourceKind::Markdown,
-                )
-                .with_source_locator(source_locator(format, 1, None, None)),
+                ContentUnit::empty(unit_id, unit_kind(format), title.clone())
+                    .with_source_locator(source_locator(format, 1, None, None)),
             );
         }
 
@@ -361,113 +365,120 @@ fn worksheet_used_range(
     range
 }
 
-fn worksheet_grid_markdown(
+fn worksheet_grid_html(
     worksheet: &office_oxide::xlsx::Worksheet,
     workbook: &office_oxide::xlsx::XlsxDocument,
     range: Option<WorksheetRange>,
     limits: &ImportLimits,
 ) -> Result<String> {
-    let Some(range) = range else {
-        return Ok(String::new());
-    };
-    let rows = range.row_count();
-    let columns = range.column_count();
-    if range.end_col >= MAX_XLSX_COLUMNS || range.end_row >= MAX_XLSX_ROWS {
-        bail!("XLSX used range exceeds the supported worksheet boundary");
-    }
-    if rows > MAX_XLSX_GRID_ROWS {
-        bail!("XLSX used range exceeds the {MAX_XLSX_GRID_ROWS} row safety limit");
-    }
-    let cells = u64::from(rows)
-        .checked_mul(u64::from(columns))
-        .context("XLSX used range size overflowed")?;
-    if cells > MAX_XLSX_GRID_CELLS {
-        bail!("XLSX used range exceeds the {MAX_XLSX_GRID_CELLS} cell safety limit");
-    }
+    let mut html = String::new();
+    if let Some(range) = range {
+        let rows = range.row_count();
+        let columns = range.column_count();
+        if range.end_col >= MAX_XLSX_COLUMNS || range.end_row >= MAX_XLSX_ROWS {
+            bail!("XLSX used range exceeds the supported worksheet boundary");
+        }
+        if rows > MAX_XLSX_GRID_ROWS {
+            bail!("XLSX used range exceeds the {MAX_XLSX_GRID_ROWS} row safety limit");
+        }
+        let cells = u64::from(rows)
+            .checked_mul(u64::from(columns))
+            .context("XLSX used range size overflowed")?;
+        if cells > MAX_XLSX_GRID_CELLS {
+            bail!("XLSX used range exceeds the {MAX_XLSX_GRID_CELLS} cell safety limit");
+        }
 
-    let mut values = HashMap::new();
-    for row in &worksheet.rows {
-        for cell in &row.cells {
-            if cell.reference.row < range.start_row
-                || cell.reference.row > range.end_row
-                || cell.reference.col < range.start_col
-                || cell.reference.col > range.end_col
-            {
-                continue;
-            }
-            let mut value = workbook.format_cell_value(cell);
-            if value.trim().is_empty()
-                && let Some(formula) = cell
-                    .formula
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|formula| !formula.is_empty())
-            {
-                value = format!("={formula}");
-            }
-            if !value.is_empty() {
-                values.insert((cell.reference.row, cell.reference.col), value);
+        let mut values = HashMap::new();
+        for row in &worksheet.rows {
+            for cell in &row.cells {
+                if cell.reference.row < range.start_row
+                    || cell.reference.row > range.end_row
+                    || cell.reference.col < range.start_col
+                    || cell.reference.col > range.end_col
+                {
+                    continue;
+                }
+                let mut value = workbook.format_cell_value(cell);
+                if value.trim().is_empty()
+                    && let Some(formula) = cell
+                        .formula
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|formula| !formula.is_empty())
+                {
+                    value = format!("={formula}");
+                }
+                if !value.is_empty() {
+                    values.insert((cell.reference.row, cell.reference.col), value);
+                }
             }
         }
-    }
 
-    let mut markdown = String::new();
-    for row in range.start_row..=range.end_row {
-        push_worksheet_markdown_row(&mut markdown, row, range, &values);
-        if row == range.start_row {
-            markdown.push('|');
-            for _ in range.start_col..=range.end_col {
-                markdown.push_str(" --- |");
+        html.push_str("<table><thead>");
+        push_worksheet_html_row(&mut html, range.start_row, range, &values, "th");
+        html.push_str("</thead><tbody>");
+        for row in range.start_row + 1..=range.end_row {
+            push_worksheet_html_row(&mut html, row, range, &values, "td");
+            if html.len() > limits.max_unit_text_bytes {
+                bail!("Office content unit exceeds the text safety limit");
             }
-            markdown.push('\n');
         }
-        if markdown.len() > limits.max_unit_text_bytes {
-            bail!("Office content unit exceeds the text safety limit");
-        }
-    }
-    if markdown.ends_with('\n') {
-        markdown.pop();
+        html.push_str("</tbody></table>");
     }
     for shape in &worksheet.text_shapes {
         let text = shape.text.trim();
         if text.is_empty() {
             continue;
         }
-        if !markdown.is_empty() {
-            markdown.push_str("\n\n");
-        }
-        markdown.push_str(text);
-        if markdown.len() > limits.max_unit_text_bytes {
+        html.push_str("<p>");
+        push_escaped_html_text(&mut html, text);
+        html.push_str("</p>");
+        if html.len() > limits.max_unit_text_bytes {
             bail!("Office content unit exceeds the text safety limit");
         }
     }
-    Ok(markdown)
+    if html.len() > limits.max_unit_text_bytes {
+        bail!("Office content unit exceeds the text safety limit");
+    }
+    Ok(html)
 }
 
-fn push_worksheet_markdown_row(
+fn push_worksheet_html_row(
     output: &mut String,
     row: u32,
     range: WorksheetRange,
     values: &HashMap<(u32, u32), String>,
+    cell_tag: &str,
 ) {
-    output.push('|');
+    output.push_str("<tr>");
     for col in range.start_col..=range.end_col {
-        output.push(' ');
+        output.push('<');
+        output.push_str(cell_tag);
+        output.push('>');
         if let Some(value) = values.get(&(row, col)) {
-            push_escaped_table_cell(output, value);
+            push_escaped_html_text(output, value);
         }
-        output.push_str(" |");
+        output.push_str("</");
+        output.push_str(cell_tag);
+        output.push('>');
     }
-    output.push('\n');
+    output.push_str("</tr>");
 }
 
-fn push_escaped_table_cell(output: &mut String, value: &str) {
-    for character in value.chars() {
+fn push_escaped_html_text(output: &mut String, value: &str) {
+    let mut characters = value.chars().peekable();
+    while let Some(character) = characters.next() {
         match character {
-            '\\' => output.push_str("\\\\"),
-            '|' => output.push_str("\\|"),
-            '\r' => {}
-            '\n' => output.push_str("  "),
+            '&' => output.push_str("&amp;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            '\r' => {
+                if characters.peek() == Some(&'\n') {
+                    characters.next();
+                }
+                output.push_str("<br>");
+            }
+            '\n' => output.push_str("<br>"),
             _ => output.push(character),
         }
     }
@@ -479,37 +490,53 @@ fn push_office_units(
     format: BookFormat,
     section_index: usize,
     native_title: Option<&str>,
-    markdown: &str,
+    html: &str,
     image_assets: Vec<String>,
     worksheet_range: Option<&str>,
     limits: &ImportLimits,
+    total_text_bytes: &mut usize,
     units: &mut Vec<ContentUnit>,
 ) -> Result<()> {
+    if html.len()
+        > limits
+            .max_total_text_bytes
+            .saturating_sub(*total_text_bytes)
+    {
+        bail!("Office document exceeds the total text safety limit");
+    }
+    if !matches!(format, BookFormat::Doc | BookFormat::Docx)
+        && html.len() > limits.max_unit_text_bytes
+    {
+        bail!("Office content unit exceeds the text safety limit");
+    }
+    // Section-scoped IDs remain unique when one Word section is split into
+    // several chapters. Splitting the AST also keeps literal '#' characters,
+    // heading markup and nested table/list content intact.
+    let section_id = deterministic_id(
+        "office-section",
+        format!("{book_id}\0{section_index}").as_bytes(),
+    );
+    let parsed = crate::markup::parse_source_for_unit(html, &section_id)
+        .context("failed to normalize Office HTML")?;
     let chunks = if matches!(format, BookFormat::Doc | BookFormat::Docx) {
-        split_word_markdown(markdown, native_title)
+        split_word_document(parsed.document, native_title)
     } else {
         vec![(
             safe_title(
                 native_title,
                 &format!("{} {section_index}", unit_label(format)),
             ),
-            markdown.to_string(),
+            parsed.document,
         )]
     };
-    for (chunk_index, (title, source)) in chunks.into_iter().enumerate() {
+    for (chunk_index, (title, mut document)) in chunks.into_iter().enumerate() {
         if units.len() >= limits.max_units {
             bail!("Office document contains too many content units");
-        }
-        if source.len() > limits.max_unit_text_bytes {
-            bail!("Office content unit exceeds the text safety limit");
         }
         let unit_id = deterministic_id(
             "unit",
             format!("{book_id}\0{section_index}\0{chunk_index}\0{title}").as_bytes(),
         );
-        let parsed = crate::markup::parse_source_for_unit(SourceKind::Markdown, &source, &unit_id)
-            .context("failed to normalize Office Markdown")?;
-        let mut document = parsed.document;
         if chunk_index == 0 {
             document.blocks.extend(image_assets.iter().enumerate().map(
                 |(image_index, asset_id)| Block::Image {
@@ -524,57 +551,73 @@ fn push_office_units(
                 },
             ));
         }
-        let source = crate::markup::serialize_source(&document, SourceKind::Markdown)
+        let source = crate::markup::serialize_source(&document)
             .context("failed to serialize normalized Office content")?;
+        if source.len() > limits.max_unit_text_bytes {
+            bail!("Office content unit exceeds the text safety limit");
+        }
+        if source.len()
+            > limits
+                .max_total_text_bytes
+                .saturating_sub(*total_text_bytes)
+        {
+            bail!("Office document exceeds the total text safety limit");
+        }
+        // Chapter boundaries establish the final unit identity. Normalize every
+        // block, including appended images, with that same seed used by future
+        // source edits so an unchanged save keeps block IDs stable.
+        let parsed = crate::markup::parse_source_for_unit(&source, &unit_id)
+            .context("failed to normalize final Office content unit")?;
+        let source = parsed.canonical_source;
+        let document = parsed.document;
+        if source.len() > limits.max_unit_text_bytes {
+            bail!("Office content unit exceeds the text safety limit");
+        }
+        *total_text_bytes = total_text_bytes
+            .checked_add(source.len())
+            .context("total Office text size overflowed")?;
+        if *total_text_bytes > limits.max_total_text_bytes {
+            bail!("Office document exceeds the total text safety limit");
+        }
         units.push(
-            ContentUnit::new(
-                unit_id,
-                unit_kind(format),
-                title,
-                SourceKind::Markdown,
-                source,
-                document,
-            )
-            .with_source_locator(source_locator(
-                format,
-                section_index,
-                native_title,
-                worksheet_range,
-            )),
+            ContentUnit::new(unit_id, unit_kind(format), title, source, document)
+                .with_source_locator(source_locator(
+                    format,
+                    section_index,
+                    native_title,
+                    worksheet_range,
+                )),
         );
     }
     Ok(())
 }
 
-fn split_word_markdown(markdown: &str, native_title: Option<&str>) -> Vec<(String, String)> {
+fn split_word_document(
+    document: BlockDocument,
+    native_title: Option<&str>,
+) -> Vec<(String, BlockDocument)> {
     let mut result = Vec::new();
     let mut current_title = safe_title(native_title, "Introduction");
-    let mut current = String::new();
-    for line in markdown.lines() {
-        let trimmed = line.trim_start();
-        let hashes = trimmed.bytes().take_while(|byte| *byte == b'#').count();
-        let is_heading = (1..=3).contains(&hashes)
-            && trimmed
-                .as_bytes()
-                .get(hashes)
-                .is_some_and(u8::is_ascii_whitespace);
-        if is_heading {
-            if !current.trim().is_empty() {
-                result.push((current_title, current.trim().to_string()));
-                current = String::new();
+    let mut current = Vec::new();
+    for block in document.blocks {
+        if matches!(&block, Block::Heading { level: 1..=3, .. }) {
+            if !current.is_empty() {
+                result.push((
+                    current_title,
+                    BlockDocument::new(std::mem::take(&mut current)),
+                ));
             }
-            current_title = trimmed[hashes..].trim().to_string();
+            current_title = safe_title(Some(&block.plain_text()), "Section");
         }
-        current.push_str(line);
-        current.push('\n');
+        current.push(block);
     }
-    if !current.trim().is_empty() {
-        result.push((current_title, current.trim().to_string()));
+    if !current.is_empty() {
+        result.push((current_title, BlockDocument::new(current)));
     }
     if result.is_empty() {
         result.push((
             safe_title(native_title, "Section 1"),
-            markdown.trim().to_string(),
+            BlockDocument::default(),
         ));
     }
     result
@@ -662,7 +705,10 @@ mod tests {
     use std::io::Write as _;
 
     use super::*;
-    use office_oxide::xlsx::write::{CellData, XlsxWriter};
+    use office_oxide::{
+        docx::write::DocxWriter,
+        xlsx::write::{CellData, XlsxWriter},
+    };
     use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
     fn office_archive_with_media(
@@ -706,10 +752,127 @@ mod tests {
 
     #[test]
     fn word_sections_split_at_headings() {
-        let chunks = split_word_markdown("intro\n\n# One\nbody\n\n## Two\nmore", None);
+        let parsed = crate::markup::parse_source_for_unit(
+            "<p>intro</p><h1>One</h1><p>body</p><h2>Two</h2><p>more</p>",
+            "word-section",
+        )
+        .unwrap();
+        let chunks = split_word_document(parsed.document, None);
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[1].0, "One");
         assert_eq!(chunks[2].0, "Two");
+    }
+
+    #[test]
+    fn word_heading_split_preserves_inline_markup_and_literal_markdown() {
+        let parsed = crate::markup::parse_source_for_unit(
+            "<p># literal **text**</p><h1>One &amp; <strong>two</strong></h1>
+             <h4>Detail</h4><pre><code>## code</code></pre><h2>Next</h2>",
+            "word-section",
+        )
+        .unwrap();
+        let original_blocks = parsed.document.blocks.clone();
+        let chunks = split_word_document(parsed.document, None);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[1].0, "One & two");
+        assert_eq!(chunks[1].1.blocks.len(), 3);
+        assert_eq!(chunks[0].1.plain_text(), "# literal **text**");
+        assert_eq!(chunks[2].0, "Next");
+        let split_blocks: Vec<_> = chunks
+            .into_iter()
+            .flat_map(|(_, document)| document.blocks)
+            .collect();
+        assert_eq!(
+            split_blocks, original_blocks,
+            "splitting must preserve every typed block and its ID"
+        );
+    }
+
+    #[test]
+    fn docx_native_html_keeps_literal_markdown_and_heading_boundaries() {
+        let mut writer = DocxWriter::new();
+        // Keep XML entity decoding outside this regression: office_oxide
+        // 0.1.9 already drops entity events before creating its IR. Our HTML
+        // escaping is covered directly at the parsed grid/AST boundary below.
+        writer
+            .add_paragraph("# literal **not emphasis** text")
+            .add_heading("One", 1)
+            .add_paragraph("[literal](not-a-link)")
+            .add_heading("Detail", 4)
+            .add_paragraph("detail body")
+            .add_heading("Next", 2)
+            .add_paragraph("last body");
+        let mut output = Cursor::new(Vec::new());
+        writer.write_to(&mut output).unwrap();
+        let source = ImportSource {
+            file_name: Some("native.docx".to_string()),
+            bytes: Arc::new(output.into_inner()),
+        };
+        let imported = OfficeImporter
+            .import(&source, &ImportLimits::default())
+            .unwrap();
+        imported.validate(&ImportLimits::default()).unwrap();
+        let units = &imported.document.units;
+        assert_eq!(units.len(), 3);
+        assert_eq!(units[0].plain_text(), "# literal **not emphasis** text");
+        assert_eq!(units[1].title, "One");
+        assert!(units[1].source.contains("<h4>Detail</h4>"));
+        assert!(units[1].plain_text().contains("[literal](not-a-link)"));
+        assert!(!units[1].source.contains("<a "));
+        assert_eq!(units[2].title, "Next");
+        for unit in units {
+            let parsed = crate::markup::parse_source_for_unit(&unit.source, &unit.id).unwrap();
+            assert_eq!(
+                parsed.document, unit.document,
+                "unchanged HTML must retain block IDs"
+            );
+        }
+    }
+
+    #[test]
+    fn office_html_text_budget_is_enforced_before_section_parsing() {
+        let limits = ImportLimits {
+            max_total_text_bytes: 8,
+            ..ImportLimits::default()
+        };
+        let mut units = Vec::new();
+        let error = push_office_units(
+            "book-office",
+            BookFormat::Docx,
+            1,
+            None,
+            "\0".repeat(9).as_str(),
+            Vec::new(),
+            None,
+            &limits,
+            &mut 0,
+            &mut units,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("total text safety limit"));
+        assert!(units.is_empty());
+        let error = push_office_units(
+            "book-office",
+            BookFormat::Docx,
+            2,
+            None,
+            "<p>x</p>",
+            Vec::new(),
+            None,
+            &limits,
+            &mut 1,
+            &mut units,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("total text safety limit"));
+        assert!(units.is_empty());
+    }
+
+    #[test]
+    fn worksheet_html_text_escapes_markup_and_preserves_line_breaks() {
+        let mut html = String::new();
+        push_escaped_html_text(&mut html, "A & <tag> | \\\r\nB\rC\nD");
+        assert_eq!(html, "A &amp; &lt;tag&gt; | \\<br>B<br>C<br>D");
     }
 
     #[test]
@@ -793,17 +956,18 @@ mod tests {
     }
 
     #[test]
-    fn office_markdown_ast_and_source_keep_extracted_images_in_sync() {
+    fn office_html_ast_and_source_keep_extracted_images_in_sync() {
         let mut units = Vec::new();
         push_office_units(
             "book-office",
             BookFormat::Docx,
             1,
             Some("Section"),
-            "# Heading\n\nParagraph with **formatting**.",
+            "<h1>Heading</h1><p>Paragraph with <strong>formatting</strong>.</p>",
             vec!["office-image-id".to_string()],
             None,
             &ImportLimits::default(),
+            &mut 0,
             &mut units,
         )
         .unwrap();
@@ -816,12 +980,8 @@ mod tests {
                 .referenced_asset_ids()
                 .contains(&"office-image-id")
         );
-        let reparsed = crate::markup::parse_source_for_unit(
-            SourceKind::Markdown,
-            &units[0].source,
-            &units[0].id,
-        )
-        .unwrap();
+        let reparsed =
+            crate::markup::parse_source_for_unit(&units[0].source, &units[0].id).unwrap();
         assert!(
             reparsed
                 .document
@@ -829,6 +989,44 @@ mod tests {
                 .contains(&"office-image-id")
         );
         assert!(reparsed.document.plain_text().contains("formatting"));
+        assert_eq!(
+            reparsed.document, units[0].document,
+            "unchanged HTML must retain text and image block IDs"
+        );
+    }
+
+    #[test]
+    fn worksheet_html_grid_preserves_escaped_values_from_parser_boundary() {
+        let mut writer = XlsxWriter::new();
+        writer
+            .add_sheet("Escaping")
+            .set_cell(1, 1, CellData::String("seed".into()));
+        let mut output = Cursor::new(Vec::new());
+        writer.write_to(&mut output).unwrap();
+        let mut workbook =
+            office_oxide::xlsx::XlsxDocument::from_reader(Cursor::new(output.into_inner()))
+                .unwrap();
+        let value = "A & <script>literal</script> | \\ path\r\nnext\rthird";
+        // Supply parsed text directly: pinned office_oxide 0.1.9 loses XML
+        // entity events, a parser issue preceding the HTML conversion tested here.
+        workbook.worksheets[0].rows[0].cells[0].value =
+            office_oxide::xlsx::CellValue::String(value.into());
+        let worksheet = &workbook.worksheets[0];
+        let range = worksheet_used_range(worksheet, &workbook);
+        assert_eq!(range.unwrap().to_a1(), "B2:B2");
+        let html =
+            worksheet_grid_html(worksheet, &workbook, range, &ImportLimits::default()).unwrap();
+        assert!(html.contains("&amp; &lt;script&gt;literal&lt;/script&gt;"));
+        assert!(!html.contains("<script>"));
+        let parsed = crate::markup::parse_source_for_unit(&html, "worksheet").unwrap();
+        let Block::Table { header, rows, .. } = &parsed.document.blocks[0] else {
+            panic!("HTML grid must retain typed cells");
+        };
+        assert!(rows.is_empty());
+        assert_eq!(
+            header.as_ref().unwrap().cells[0].plain_text(),
+            "A & <script>literal</script> | \\ path\nnext\nthird"
+        );
     }
 
     #[test]
@@ -837,6 +1035,8 @@ mod tests {
         {
             let mut sheet = writer.add_sheet("Sparse");
             sheet.set_cell(1, 1, CellData::String("top-left".to_string()));
+            sheet.set_cell(2, 2, CellData::String("first\nsecond".to_string()));
+            sheet.set_cell(3, 3, CellData::Formula("SUM(B2:C3)".to_string()));
             sheet.set_cell(4, 4, CellData::String("bottom-right".to_string()));
         }
         let mut output = Cursor::new(Vec::new());
@@ -864,8 +1064,13 @@ mod tests {
         else {
             panic!("sparse worksheet should normalize to a table");
         };
-        assert_eq!(header.as_ref().expect("table header").cells.len(), 4);
+        let header = header.as_ref().expect("table header");
+        assert_eq!(header.cells.len(), 4);
+        assert_eq!(header.cells[0].plain_text(), "top-left");
+        assert_eq!(header.cells[1].plain_text(), "");
         assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].cells[1].plain_text(), "first\nsecond");
+        assert_eq!(rows[1].cells[2].plain_text(), "=SUM(B2:C3)");
         assert_eq!(rows[2].cells[3].plain_text(), "bottom-right");
     }
 }

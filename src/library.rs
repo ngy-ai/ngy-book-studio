@@ -21,7 +21,7 @@ use crate::{
     document::{
         AssetRef as DocumentAsset, AssetRole, Block, BlockDocument, BookDocument, BookFormat,
         BookSource as DocumentSource, ContentUnit as DocumentUnit, ContentUnitKind,
-        DocumentLocator, Revision, SourceKind, SourceLocator, TocNode, TocTarget, deterministic_id,
+        DocumentLocator, Revision, SourceLocator, TocNode, TocTarget, deterministic_id,
     },
     export::{BuiltinDocumentExporter, ExportFormat},
     formats::{FormatRegistry, ImportLimits, ImportedAsset, ImportedBook},
@@ -634,7 +634,7 @@ impl LibraryStore {
         ImportOutcome::Added(record)
     }
 
-    /// Creates an editable book with one Markdown chapter. A generated EPUB is
+    /// Creates an editable book with one HTML chapter. A generated EPUB is
     /// kept as its current view/export projection; it is not treated as an
     /// imported original.
     pub fn create_book(&mut self, title: &str, author: &str) -> Result<BookRecord> {
@@ -643,7 +643,6 @@ impl LibraryStore {
         let now = now_nanos();
         let book_id = deterministic_id("book", format!("created\0{title}\0{now}").as_bytes());
         let unit_id = deterministic_id("unit", format!("{book_id}\0chapter-1").as_bytes());
-        let source = format!("# 第一章\n\n开始写作……\n");
         let document = BlockDocument::new(vec![
             Block::heading(
                 deterministic_id("block", format!("{unit_id}\0heading").as_bytes()),
@@ -655,11 +654,11 @@ impl LibraryStore {
                 "开始写作……",
             ),
         ]);
+        let source = crate::markup::serialize_source(&document)?;
         let unit = DocumentUnit::new(
             unit_id.clone(),
             ContentUnitKind::Chapter,
             "第一章",
-            SourceKind::Markdown,
             source,
             document,
         )
@@ -952,17 +951,16 @@ impl LibraryStore {
     }
 
     /// Parses and cleans a source edit before atomically publishing the next
-    /// canonical revision. Invalid Markdown/HTML never reaches SQLite.
+    /// canonical revision. Invalid HTML never reaches SQLite.
     pub fn update_content_unit_source(
         &mut self,
         book_id: &str,
         unit_id: &str,
-        source_kind: SourceKind,
         source: &str,
     ) -> Result<BookRecord> {
         let document = self.document(book_id)?;
         let mut editor = crate::editing::DocumentEditor::new(document)?;
-        editor.update_unit_source(unit_id, source_kind, source)?;
+        editor.update_unit_source(unit_id, source)?;
         self.apply_document(editor.into_document())
     }
 
@@ -996,7 +994,7 @@ impl LibraryStore {
             .unwrap_or_default();
         let block = media_block(&draft, block_id, asset_id.clone(), caption);
         unit.document.blocks.insert(position, block);
-        unit.source = crate::markup::serialize_source(&unit.document, unit.source_kind)?;
+        unit.source = crate::markup::serialize_source(&unit.document)?;
         document.validate()?;
         self.apply_document_with_assets(document, HashMap::from([(asset_id, draft.bytes.clone())]))
     }
@@ -1025,7 +1023,7 @@ impl LibraryStore {
         let replaced =
             replace_media_in_blocks(&mut unit.document.blocks, block_id, &draft, &asset_id);
         ensure!(replaced, "媒体块不存在");
-        unit.source = crate::markup::serialize_source(&unit.document, unit.source_kind)?;
+        unit.source = crate::markup::serialize_source(&unit.document)?;
         prune_unreferenced_assets(&mut document);
         document.validate()?;
         self.apply_document_with_assets(document, HashMap::from([(asset_id, draft.bytes.clone())]))
@@ -1047,7 +1045,7 @@ impl LibraryStore {
             delete_media_from_blocks(&mut unit.document.blocks, block_id),
             "媒体块不存在"
         );
-        unit.source = crate::markup::serialize_source(&unit.document, unit.source_kind)?;
+        unit.source = crate::markup::serialize_source(&unit.document)?;
         prune_unreferenced_assets(&mut document);
         document.validate()?;
         self.apply_document(document)
@@ -1743,17 +1741,10 @@ fn db_unit(
         parent_id: None,
         ordinal,
         kind: unit_kind(unit.kind).to_string(),
-        source_kind: source_kind_name(unit.source_kind).to_string(),
         href: unit_href(unit),
         source_locator_json: serde_json::to_string(&unit.source_locator)?,
         title: Some(unit.title.clone()),
-        media_type: Some(
-            match unit.source_kind {
-                SourceKind::Html => "application/xhtml+xml",
-                SourceKind::Markdown => "text/markdown",
-            }
-            .to_string(),
-        ),
+        media_type: Some("text/html".to_string()),
         source_text: Some(unit.source.clone()),
         block_json: serde_json::to_string(&unit.document)?,
         revision,
@@ -1952,7 +1943,6 @@ fn document_unit_from_row(row: db::content_units::ContentUnit) -> Result<Documen
         revision: Revision::new(row.revision),
         kind: parse_unit_kind(&row.kind)?,
         title: row.title.unwrap_or_else(|| "未命名单元".to_string()),
-        source_kind: parse_source_kind(&row.source_kind)?,
         source_locator: serde_json::from_str(&row.source_locator_json)?,
         source: row.source_text.unwrap_or_default(),
         document: serde_json::from_str(&row.block_json)?,
@@ -2296,21 +2286,6 @@ fn parse_unit_kind(value: &str) -> Result<ContentUnitKind> {
     })
 }
 
-fn source_kind_name(kind: SourceKind) -> &'static str {
-    match kind {
-        SourceKind::Markdown => "markdown",
-        SourceKind::Html => "html",
-    }
-}
-
-fn parse_source_kind(value: &str) -> Result<SourceKind> {
-    match value {
-        "markdown" => Ok(SourceKind::Markdown),
-        "html" => Ok(SourceKind::Html),
-        _ => bail!("未知正文源码类型：{value}"),
-    }
-}
-
 fn imported_source_name(document: &BookDocument) -> Option<String> {
     match &document.source {
         DocumentSource::Imported {
@@ -2456,7 +2431,7 @@ mod tests {
         let first_unit_id = document.units[0].id.clone();
         let mut editor = DocumentEditor::new(document).unwrap();
         let second_unit_id = editor
-            .add_unit(NewContentUnit::markdown_chapter("第二章", 1))
+            .add_unit(NewContentUnit::html_chapter("第二章", 1))
             .unwrap();
         let updated = library.apply_document(editor.into_document()).unwrap();
         (updated, first_unit_id, second_unit_id)
@@ -2485,7 +2460,6 @@ mod tests {
             "unit-locators",
             ContentUnitKind::Chapter,
             "定位测试",
-            SourceKind::Markdown,
             "",
             BlockDocument::new(vec![first, second]),
         )
@@ -2530,7 +2504,16 @@ mod tests {
         let restored = LibraryStore::load_from(temp.path().join("library")).unwrap();
         assert_eq!(restored.books().len(), 1);
         let document = restored.document(&book.id).unwrap();
-        assert_eq!(document.units[0].source_kind, SourceKind::Markdown);
+        assert_eq!(document.units[0].source, "<h1>第一章</h1><p>开始写作……</p>");
+        let conn = db::open_conn(restored.database_path()).unwrap();
+        let stored = db::content_units::get(&conn, &document.units[0].id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.media_type.as_deref(), Some("text/html"));
+        assert_eq!(
+            stored.source_text.as_deref(),
+            Some(document.units[0].source.as_str())
+        );
         assert!(matches!(document.source, DocumentSource::Created));
     }
 
@@ -2621,8 +2604,7 @@ mod tests {
         editor
             .update_unit_source(
                 &unit_id,
-                SourceKind::Markdown,
-                "# 已提交\n\n即使提交后读回失败，这一版也应成功。",
+                "<h1>已提交</h1><p>即使提交后读回失败，这一版也应成功。</p>",
             )
             .unwrap();
         document = editor.into_document();
@@ -2691,8 +2673,7 @@ mod tests {
             .update_content_unit_source(
                 &book.id,
                 &unit_id,
-                SourceKind::Markdown,
-                "# 新标题\n\n正文<script>alert(1)</script>",
+                "<h1>新标题</h1><p>正文<script>alert(1)</script></p>",
             )
             .unwrap();
 
@@ -2860,8 +2841,7 @@ mod tests {
             .update_content_unit_source(
                 &created.id,
                 &unit_id,
-                SourceKind::Markdown,
-                "# 已保存标题\n\n已提交的正文",
+                "<h1>已保存标题</h1><p>已提交的正文</p>",
             )
             .expect("a cover cache failure must not report the committed save as failed");
 
@@ -3100,12 +3080,7 @@ mod tests {
         let mut stale_unit_reader = writer.clone();
 
         let updated = writer
-            .update_content_unit_source(
-                &book.id,
-                &unit_id,
-                SourceKind::Markdown,
-                "# 新版本\n\n正文",
-            )
+            .update_content_unit_source(&book.id, &unit_id, "<h1>新版本</h1><p>正文</p>")
             .unwrap();
         assert!(updated.revision > book.revision);
 
@@ -3370,20 +3345,10 @@ mod tests {
         let unit_id = library.document(&book.id).unwrap().units[0].id.clone();
 
         library
-            .update_content_unit_source(
-                &book.id,
-                &unit_id,
-                SourceKind::Markdown,
-                "# 第二版\n\n正文二",
-            )
+            .update_content_unit_source(&book.id, &unit_id, "<h1>第二版</h1><p>正文二</p>")
             .unwrap();
         let latest = library
-            .update_content_unit_source(
-                &book.id,
-                &unit_id,
-                SourceKind::Markdown,
-                "# 第三版\n\n正文三",
-            )
+            .update_content_unit_source(&book.id, &unit_id, "<h1>第三版</h1><p>正文三</p>")
             .unwrap();
 
         let conn = db::open_conn(library.database_path()).unwrap();

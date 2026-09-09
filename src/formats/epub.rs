@@ -5,7 +5,7 @@ use rbook::Epub;
 
 use crate::{
     document::{
-        AssetRole, BookDocument, BookFormat, BookSource, ContentUnit, ContentUnitKind, SourceKind,
+        AssetRole, BookDocument, BookFormat, BookSource, ContentUnit, ContentUnitKind,
         SourceLocator, TocNode, TocTarget, deterministic_id,
     },
     formats::{
@@ -174,14 +174,12 @@ impl DocumentImporter for EpubImporter {
                 .cloned()
                 .unwrap_or_else(|| title_from_href(&href, index));
             let rewritten = rewrite_imported_html_assets(&html, &href, &asset_ids_by_href)?;
-            let parsed =
-                crate::markup::parse_source_for_unit(SourceKind::Html, &rewritten, &unit_id)
-                    .with_context(|| format!("failed to normalize EPUB chapter {href}"))?;
+            let parsed = crate::markup::parse_source_for_unit(&rewritten, &unit_id)
+                .with_context(|| format!("failed to normalize EPUB chapter {href}"))?;
             let unit = ContentUnit::new(
                 unit_id.clone(),
                 ContentUnitKind::Chapter,
                 chapter_title,
-                SourceKind::Html,
                 parsed.canonical_source,
                 parsed.document,
             )

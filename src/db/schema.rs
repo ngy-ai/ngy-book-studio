@@ -6,7 +6,7 @@ use crate::document::{DocumentLocator, SourceLocator};
 /// Identifies SQLite files owned by this application (ASCII "MOYE").
 pub(super) const APPLICATION_ID: i64 = 0x4D4F_5945;
 /// Development schemas are deliberately rebuilt instead of migrated.
-pub(super) const SCHEMA_VERSION: i64 = 9;
+pub(super) const SCHEMA_VERSION: i64 = 10;
 
 #[derive(Clone, Copy)]
 struct ColumnSpec {
@@ -98,7 +98,6 @@ const CONTENT_UNIT_COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("parent_id", "TEXT", false, 0),
     ColumnSpec::new("ordinal", "INTEGER", true, 0),
     ColumnSpec::new("kind", "TEXT", true, 0),
-    ColumnSpec::new("source_kind", "TEXT", true, 0),
     ColumnSpec::new("href", "TEXT", false, 0),
     ColumnSpec::new("source_locator_json", "TEXT", true, 0),
     ColumnSpec::new("title", "TEXT", false, 0),
@@ -686,7 +685,6 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
              parent_id TEXT REFERENCES content_units(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
              ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
              kind TEXT NOT NULL,
-             source_kind TEXT NOT NULL,
              href TEXT,
              source_locator_json TEXT NOT NULL,
              title TEXT,
@@ -1586,9 +1584,9 @@ mod tests {
                                       object_key, created_at)
                  VALUES ('source', 'book', 1, 'epub', 'original', 'objects/source', 1);
              INSERT INTO content_units(
-                 id, book_id, source_id, ordinal, kind, source_kind,
+                 id, book_id, source_id, ordinal, kind,
                  source_locator_json, block_json, revision, created_at, updated_at)
-                 VALUES ('unit', 'book', 'source', 0, 'chapter', 'markdown',
+                 VALUES ('unit', 'book', 'source', 0, 'chapter',
                          '{}', '{\"schema_version\":1,\"blocks\":[]}', 1, 1, 1);
              INSERT INTO search_chunks(
                  id, book_id, source_id, content_unit_id, ordinal, heading, body,
@@ -1613,6 +1611,13 @@ mod tests {
             BOOK_COLUMNS
                 .iter()
                 .all(|column| !matches!(column.name, "epub_data" | "cover_bytes"))
+        );
+    }
+
+    #[test]
+    fn legacy_chapter_source_kind_rebuilds_same_version_database() {
+        assert_schema_mutation_triggers_rebuild(
+            "ALTER TABLE content_units ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'markdown';",
         );
     }
 
@@ -1739,10 +1744,10 @@ mod tests {
     fn cross_book_content_unit_source_rebuilds_same_version_database() {
         assert_cross_book_source_triggers_rebuild(
             "INSERT INTO content_units(
-                 id, book_id, source_id, ordinal, kind, source_kind,
+                 id, book_id, source_id, ordinal, kind,
                  source_locator_json, block_json, revision, created_at, updated_at)
              VALUES (
-                 'unit-a', 'book-a', 'source-b', 0, 'chapter', 'markdown',
+                 'unit-a', 'book-a', 'source-b', 0, 'chapter',
                  '{\"type\":\"created\"}', '{\"schema_version\":1,\"blocks\":[]}',
                  1, 1, 1
              );",

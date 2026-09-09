@@ -9,7 +9,6 @@ pub(crate) struct ContentUnit {
     pub(crate) parent_id: Option<String>,
     pub(crate) ordinal: usize,
     pub(crate) kind: String,
-    pub(crate) source_kind: String,
     pub(crate) href: Option<String>,
     pub(crate) source_locator_json: String,
     pub(crate) title: Option<String>,
@@ -21,7 +20,7 @@ pub(crate) struct ContentUnit {
     pub(crate) updated_at: u64,
 }
 
-const SELECT: &str = "SELECT id, book_id, source_id, parent_id, ordinal, kind, source_kind,
+const SELECT: &str = "SELECT id, book_id, source_id, parent_id, ordinal, kind,
     href, source_locator_json, title, media_type, source_text, block_json, revision, created_at, updated_at
     FROM content_units";
 
@@ -56,9 +55,9 @@ pub(crate) fn count_for_source(conn: &Connection, source_id: &str) -> Result<usi
 pub(crate) fn insert(conn: &Connection, unit: &ContentUnit) -> Result<usize> {
     conn.execute(
         "INSERT INTO content_units
-         (id, book_id, source_id, parent_id, ordinal, kind, source_kind, href,
+         (id, book_id, source_id, parent_id, ordinal, kind, href,
           source_locator_json, title, media_type, source_text, block_json, revision, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             unit.id,
             unit.book_id,
@@ -66,7 +65,6 @@ pub(crate) fn insert(conn: &Connection, unit: &ContentUnit) -> Result<usize> {
             unit.parent_id,
             unit.ordinal as i64,
             unit.kind,
-            unit.source_kind,
             unit.href,
             unit.source_locator_json,
             unit.title,
@@ -83,15 +81,14 @@ pub(crate) fn insert(conn: &Connection, unit: &ContentUnit) -> Result<usize> {
 
 pub(crate) fn update_content(conn: &Connection, unit: &ContentUnit) -> Result<usize> {
     conn.execute(
-        "UPDATE content_units SET parent_id = ?2, ordinal = ?3, kind = ?4, source_kind = ?5,
-         href = ?6, source_locator_json = ?7, title = ?8, media_type = ?9,
-         source_text = ?10, block_json = ?11, revision = ?12, updated_at = ?13 WHERE id = ?1",
+        "UPDATE content_units SET parent_id = ?2, ordinal = ?3, kind = ?4,
+         href = ?5, source_locator_json = ?6, title = ?7, media_type = ?8,
+         source_text = ?9, block_json = ?10, revision = ?11, updated_at = ?12 WHERE id = ?1",
         params![
             unit.id,
             unit.parent_id,
             unit.ordinal as i64,
             unit.kind,
-            unit.source_kind,
             unit.href,
             unit.source_locator_json,
             unit.title,
@@ -121,15 +118,14 @@ fn unit_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContentUnit> {
         parent_id: row.get(3)?,
         ordinal: row.get::<_, i64>(4)? as usize,
         kind: row.get(5)?,
-        source_kind: row.get(6)?,
-        href: row.get(7)?,
-        source_locator_json: row.get(8)?,
-        title: row.get(9)?,
-        media_type: row.get(10)?,
-        source_text: row.get(11)?,
-        block_json: row.get(12)?,
-        revision: row.get::<_, i64>(13)? as u64,
-        created_at: row.get::<_, i64>(14)? as u64,
-        updated_at: row.get::<_, i64>(15)? as u64,
+        href: row.get(6)?,
+        source_locator_json: row.get(7)?,
+        title: row.get(8)?,
+        media_type: row.get(9)?,
+        source_text: row.get(10)?,
+        block_json: row.get(11)?,
+        revision: row.get::<_, i64>(12)? as u64,
+        created_at: row.get::<_, i64>(13)? as u64,
+        updated_at: row.get::<_, i64>(14)? as u64,
     })
 }

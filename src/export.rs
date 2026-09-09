@@ -1349,8 +1349,8 @@ mod tests {
 
     use super::*;
     use crate::document::{
-        AssetRef, BlockDocument, BookFormat, ContentUnit, ContentUnitKind, SourceKind, TableCell,
-        TocNode, TocTarget,
+        AssetRef, BlockDocument, BookFormat, ContentUnit, ContentUnitKind, TableCell, TocNode,
+        TocTarget,
     };
 
     #[derive(Default)]
@@ -1406,8 +1406,7 @@ mod tests {
             "unit-1",
             ContentUnitKind::Chapter,
             "第一章",
-            SourceKind::Markdown,
-            "# 第一章",
+            "<h1>第一章</h1>",
             BlockDocument::new(vec![paragraph, raw]),
         );
         let mut document = BookDocument::new(
@@ -1691,7 +1690,6 @@ mod tests {
             "unit-1",
             ContentUnitKind::Chapter,
             "第一章",
-            SourceKind::Markdown,
         ));
         let error = BuiltinDocumentExporter
             .export_bytes(&document, ExportFormat::Original, &MemoryAssets::default())

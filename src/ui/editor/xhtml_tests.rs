@@ -41,7 +41,7 @@ fn media_document(book_id: &str) -> (BookDocument, HashMap<String, Arc<Vec<u8>>>
          <div class=\"original-fragment\">保留&nbsp;空格<br>原始片段</div>",
         assets[0].id, assets[1].id, assets[2].id, assets[0].id,
     );
-    let parsed = parse_source_for_unit(SourceKind::Html, &source, UNIT_ID).unwrap();
+    let parsed = parse_source_for_unit(&source, UNIT_ID).unwrap();
     assert!(
         parsed
             .document
@@ -55,7 +55,6 @@ fn media_document(book_id: &str) -> (BookDocument, HashMap<String, Arc<Vec<u8>>>
             UNIT_ID,
             ContentUnitKind::Chapter,
             CHAPTER_TITLE,
-            SourceKind::Html,
             source,
             parsed.document,
         )
@@ -203,7 +202,7 @@ fn referenced_ids(document: &BookDocument) -> BTreeSet<String> {
 fn canonical_media_projection_is_strict_xhtml_and_preserves_original_html_source() {
     let (document, _) = media_document("book-xhtml");
     let original = document.clone();
-    let legacy = serialize_source(&document.units[0].document, SourceKind::Html).unwrap();
+    let legacy = serialize_source(&document.units[0].document).unwrap();
     assert!(
         roxmltree::Document::parse(&editor_document_shell(CHAPTER_TITLE, &legacy)).is_err(),
         "fixture must exercise the ordinary HTML/XML boundary"
@@ -219,7 +218,6 @@ fn canonical_media_projection_is_strict_xhtml_and_preserves_original_html_source
         );
     }
     assert_eq!(document, original);
-    assert_eq!(document.units[0].source_kind, SourceKind::Html);
 }
 
 #[test]
@@ -227,19 +225,11 @@ fn ordinary_html_source_preview_and_rich_source_response_are_strict_and_origin_s
     let (document, _) = media_document("book-xhtml");
     let chapters = editor_chapters_from_document(&document).unwrap();
     let unit = &document.units[0];
-    let (preview, canonical_source, blocks) = preview_document_from_source(
-        &chapters[0].html,
-        &unit.title,
-        &unit.id,
-        unit.source_kind,
-        &unit.source,
-    )
-    .unwrap();
+    let (preview, canonical_source, blocks) =
+        preview_document_from_source(&chapters[0].html, &unit.title, &unit.id, &unit.source)
+            .unwrap();
     assert_media_xhtml(&preview);
-    assert_eq!(
-        canonical_source,
-        serialize_source(&blocks, SourceKind::Html).unwrap()
-    );
+    assert_eq!(canonical_source, serialize_source(&blocks).unwrap());
     assert_eq!(
         blocks
             .referenced_asset_ids()
@@ -312,7 +302,7 @@ fn ordinary_html_source_preview_and_rich_source_response_are_strict_and_origin_s
 }
 
 #[test]
-fn rich_text_ipc_save_and_reopen_preserve_html_kind_content_and_media_ids() {
+fn rich_text_ipc_save_and_reopen_preserve_html_content_and_media_ids() {
     let directory = tempfile::tempdir().unwrap();
     let mut library = LibraryStore::load_from(directory.path().to_path_buf()).unwrap();
     let record = library.create_book("XHTML 持久化", "测试").unwrap();
@@ -341,7 +331,6 @@ fn rich_text_ipc_save_and_reopen_preserve_html_kind_content_and_media_ids() {
     assert!(!update.html.contains("http://epubeditor.content"));
     let parsed = parse_rich_text_snapshot(&update.html, UNIT_ID).unwrap();
     let mut changed = original.clone();
-    changed.units[0].source_kind = SourceKind::Html;
     changed.units[0].source = parsed.canonical_source;
     changed.units[0].document = parsed.document;
     assert_eq!(referenced_ids(&changed), referenced_ids(&original));
@@ -350,7 +339,6 @@ fn rich_text_ipc_save_and_reopen_preserve_html_kind_content_and_media_ids() {
     drop(library);
     let reopened = LibraryStore::load_from(directory.path().to_path_buf()).unwrap();
     let saved = reopened.document(&record.id).unwrap();
-    assert_eq!(saved.units[0].source_kind, SourceKind::Html);
     assert_eq!(referenced_ids(&saved), referenced_ids(&original));
     assert_eq!(saved.assets, original.assets);
     assert_eq!(saved.toc, original.toc);
@@ -419,14 +407,9 @@ fn external_sample_editor_xhtml_audit() {
     let mut normalized = original.clone();
     for (index, (unit, chapter)) in original.units.iter().zip(&chapters).enumerate() {
         audit_write(&directory, index, "projection", &chapter.html, &unit.title);
-        let (preview, _, _) = preview_document_from_source(
-            &chapter.html,
-            &unit.title,
-            &unit.id,
-            unit.source_kind,
-            &unit.source,
-        )
-        .unwrap();
+        let (preview, _, _) =
+            preview_document_from_source(&chapter.html, &unit.title, &unit.id, &unit.source)
+                .unwrap();
         audit_write(&directory, index, "source-preview", &preview, &unit.title);
         let state = source_state(&original, chapter, &unit.id);
         let response = editor_protocol_response(
@@ -445,7 +428,6 @@ fn external_sample_editor_xhtml_audit() {
             &unit.title,
         );
         let parsed = parse_rich_text_snapshot(&update.html, &unit.id).unwrap();
-        normalized.units[index].source_kind = SourceKind::Html;
         normalized.units[index].source = parsed.canonical_source;
         normalized.units[index].document = parsed.document;
     }

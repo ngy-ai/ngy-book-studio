@@ -763,11 +763,11 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO content_units
-             (id, book_id, source_id, parent_id, ordinal, kind, source_kind, href,
+             (id, book_id, source_id, parent_id, ordinal, kind, href,
               source_locator_json, title, media_type, source_text, block_json,
               revision, created_at, updated_at)
-             VALUES (?1, ?2, ?3, NULL, 0, 'chapter', 'html', 'chapter.xhtml',
-                     '{}', 'Chapter', 'application/xhtml+xml', '', '{}', 1, 1, 1)",
+             VALUES (?1, ?2, ?3, NULL, 0, 'chapter', 'chapter.xhtml',
+                     '{}', 'Chapter', 'text/html', '', '{}', 1, 1, 1)",
             params![unit_id, book_id, source_id],
         )
         .unwrap();

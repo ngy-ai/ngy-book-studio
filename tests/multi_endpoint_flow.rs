@@ -48,6 +48,9 @@ impl MockEndpoint {
                     }
                     Err(error) => panic!("mock accept: {error}"),
                 };
+                // Windows accepted sockets inherit the listener's nonblocking
+                // mode; the HTTP reader requires blocking reads with a timeout.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
@@ -116,7 +119,13 @@ impl MockEndpoint {
 impl Drop for MockEndpoint {
     fn drop(&mut self) {
         self.stopped.store(true, Ordering::Release);
-        self.worker.take().unwrap().join().unwrap();
+        // Preserve a worker failure without aborting on a second panic while
+        // the test is already unwinding from its original failure.
+        if let Err(payload) = self.worker.take().unwrap().join()
+            && !thread::panicking()
+        {
+            std::panic::resume_unwind(payload);
+        }
     }
 }
 

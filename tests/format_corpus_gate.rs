@@ -12,7 +12,7 @@
 use std::{env, fs, io::Cursor, path::Path, sync::Arc};
 
 use moye_epub_editor::{
-    document::{BookFormat, BookSource, SourceKind},
+    document::{BookFormat, BookSource},
     formats::{FormatRegistry, ImportLimits, ImportSource, ProbeConfidence},
     library::{ImportOutcome, LibraryStore},
 };
@@ -117,8 +117,7 @@ fn validate_sample(
         .update_content_unit_source(
             &record.id,
             &first_unit.id,
-            SourceKind::Markdown,
-            &format!("# Corpus edit\n\n{edited_token}"),
+            &format!("<h1>Corpus edit</h1><p>{edited_token}</p>"),
         )
         .unwrap_or_else(|error| panic!("cannot edit {file_name}: {error:#}"));
     assert_eq!(updated.revision, record.revision + 1);

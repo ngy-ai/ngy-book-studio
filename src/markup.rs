@@ -1,4 +1,4 @@
-//! Parsing and canonical serialization for editable Markdown and HTML sources.
+//! Parsing and canonical serialization for editable HTML sources.
 //!
 //! A source edit is not publishable until it passes through this module.  The
 //! returned source is normalized and every raw HTML fragment has been cleaned;
@@ -13,57 +13,44 @@ use html5ever::{
     tendril::TendrilSink as _,
 };
 use markup5ever_rcdom::{Handle, NodeData, RcDom, SerializableHandle};
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 use crate::document::{
-    Block, BlockDocument, Inline, ListItem, MAX_DOCUMENT_DEPTH, SourceKind, TableCell, TableRow,
+    Block, BlockDocument, Inline, ListItem, MAX_DOCUMENT_DEPTH, TableCell, TableRow,
     deterministic_id, raw_html_plain_text,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParsedSource {
-    pub source_kind: SourceKind,
     pub canonical_source: String,
     pub document: BlockDocument,
 }
 
 /// Parses, cleans and normalizes an editable source using a content-derived ID
 /// seed. Use [`parse_source_for_unit`] when a stable unit ID is available.
-pub fn parse_source(source_kind: SourceKind, source: &str) -> Result<ParsedSource> {
+pub fn parse_source(source: &str) -> Result<ParsedSource> {
     let seed = deterministic_id("source", source.as_bytes());
-    parse_source_for_unit(source_kind, source, &seed)
+    parse_source_for_unit(source, &seed)
 }
 
 /// Parses, cleans and normalizes an editable source.  `unit_id` is used only
 /// for deterministic block IDs and never appears in the serialized source.
-pub fn parse_source_for_unit(
-    source_kind: SourceKind,
-    source: &str,
-    unit_id: &str,
-) -> Result<ParsedSource> {
+pub fn parse_source_for_unit(source: &str, unit_id: &str) -> Result<ParsedSource> {
     if source.contains('\0') {
         bail!("正文不能包含 NUL 字符");
     }
-    let document = match source_kind {
-        SourceKind::Markdown => parse_markdown(source, unit_id)?,
-        SourceKind::Html => parse_html(source, unit_id)?,
-    };
+    let document = parse_html(source, unit_id)?;
     document.validate().context("正文块结构无效")?;
-    let canonical_source = serialize_source(&document, source_kind)?;
+    let canonical_source = serialize_source(&document)?;
     Ok(ParsedSource {
-        source_kind,
         canonical_source,
         document,
     })
 }
 
-pub fn serialize_source(document: &BlockDocument, source_kind: SourceKind) -> Result<String> {
+pub fn serialize_source(document: &BlockDocument) -> Result<String> {
     document.validate().context("无法序列化无效的正文块结构")?;
     let mut output = String::new();
-    match source_kind {
-        SourceKind::Markdown => write_markdown_blocks(&document.blocks, 0, &mut output),
-        SourceKind::Html => write_html_blocks(&document.blocks, &mut output),
-    }
+    write_html_blocks(&document.blocks, &mut output);
     Ok(output.trim().to_string())
 }
 
@@ -71,7 +58,7 @@ pub fn serialize_source(document: &BlockDocument, source_kind: SourceKind) -> Re
 /// HTML: normalize its already-cleaned DOM only at the XML display boundary,
 /// including documents persisted before this projection was introduced.
 pub fn serialize_xhtml(document: &BlockDocument) -> Result<String> {
-    let html = serialize_source(document, SourceKind::Html)?;
+    let html = serialize_source(document)?;
     ensure_xml_characters(&html)?;
     let dom = parse_fragment(
         RcDom::default(),
@@ -224,7 +211,11 @@ pub fn sanitize_html(source: &str) -> String {
             "figure",
             "figcaption",
             "track",
+            "input",
         ])
+        .add_tag_attributes("input", ["checked"])
+        .set_tag_attribute_value("input", "type", "checkbox")
+        .set_tag_attribute_value("input", "disabled", "")
         .add_generic_attributes([
             "class", "id", "title", "alt", "src", "href", "poster", "controls", "width", "height",
             "colspan", "rowspan", "preload", "kind", "srclang", "label",
@@ -248,10 +239,7 @@ fn parse_html(source: &str, unit_id: &str) -> Result<BlockDocument> {
         unit_id,
         block_index: 0,
     };
-    let mut blocks = Vec::new();
-    for child in body.children.borrow().iter() {
-        parser.push_block(child, &mut blocks, 0)?;
-    }
+    let blocks = parser.children(&body, 0)?;
     Ok(BlockDocument::new(blocks))
 }
 
@@ -261,6 +249,56 @@ struct HtmlAstParser<'a> {
 }
 
 impl HtmlAstParser<'_> {
+    fn children(&mut self, node: &Handle, depth: usize) -> Result<Vec<Block>> {
+        let mut blocks = Vec::new();
+        let mut inlines = Vec::new();
+        for child in node.children.borrow().iter() {
+            let inline = match &child.data {
+                NodeData::Text { .. } => true,
+                NodeData::Element { name, .. } => matches!(
+                    name.local.as_ref(),
+                    "a" | "em"
+                        | "i"
+                        | "strong"
+                        | "b"
+                        | "s"
+                        | "del"
+                        | "strike"
+                        | "code"
+                        | "br"
+                        | "span"
+                        | "sub"
+                        | "sup"
+                        | "input"
+                ),
+                _ => false,
+            };
+            if inline {
+                collect_html_inline(child, &mut inlines, depth)?;
+            } else {
+                self.flush_inlines(&mut inlines, &mut blocks);
+                self.push_block(child, &mut blocks, depth)?;
+            }
+        }
+        self.flush_inlines(&mut inlines, &mut blocks);
+        Ok(blocks)
+    }
+
+    fn flush_inlines(&mut self, inlines: &mut Vec<Inline>, blocks: &mut Vec<Block>) {
+        coalesce_inline_text(inlines);
+        if inlines
+            .iter()
+            .any(|inline| !matches!(inline, Inline::Text { value } if value.trim().is_empty()))
+        {
+            blocks.push(Block::Paragraph {
+                id: self.next_block_id("paragraph"),
+                content: std::mem::take(inlines),
+            });
+        } else {
+            inlines.clear();
+        }
+    }
+
     fn next_block_id(&mut self, kind: &str) -> String {
         let index = self.block_index;
         self.block_index += 1;
@@ -318,6 +356,111 @@ impl HtmlAstParser<'_> {
                     "hr" => output.push(Block::ThematicBreak {
                         id: self.next_block_id("break"),
                     }),
+                    "blockquote" => {
+                        let id = self.next_block_id("quote");
+                        let blocks = self.children(node, depth + 1)?;
+                        if blocks.is_empty() {
+                            self.push_raw_html(node, output)?;
+                        } else {
+                            output.push(Block::BlockQuote { id, blocks });
+                        }
+                    }
+                    "ul" | "ol" => {
+                        if node
+                            .children
+                            .borrow()
+                            .iter()
+                            .any(|child| match &child.data {
+                                NodeData::Text { contents } => !contents.borrow().trim().is_empty(),
+                                NodeData::Element { .. } => {
+                                    !has_html_tag(child, "li") || has_html_attribute(child, "value")
+                                }
+                                _ => false,
+                            })
+                        {
+                            self.push_raw_html(node, output)?;
+                            return Ok(());
+                        }
+                        let id = self.next_block_id("list");
+                        let mut items = Vec::new();
+                        for child in node.children.borrow().iter() {
+                            if !has_html_tag(child, "li") {
+                                continue;
+                            }
+                            let marker = html_task_marker(child);
+                            let mut blocks = self.children(child, depth + 2)?;
+                            if blocks.is_empty() {
+                                blocks.push(Block::Paragraph {
+                                    id: self.next_block_id("paragraph"),
+                                    content: Vec::new(),
+                                });
+                            }
+                            items.push(ListItem {
+                                checked: marker,
+                                blocks,
+                            });
+                        }
+                        let start = html_attribute(node, "start")
+                            .and_then(|value| value.parse::<u64>().ok());
+                        if items.is_empty()
+                            || (tag == "ol"
+                                && has_html_attribute(node, "start")
+                                && start.is_none_or(|value| value == 0))
+                        {
+                            self.push_raw_html(node, output)?;
+                        } else if tag == "ul" {
+                            output.push(Block::BulletList { id, items });
+                        } else {
+                            output.push(Block::OrderedList {
+                                id,
+                                start: start.unwrap_or(1),
+                                items,
+                            });
+                        }
+                    }
+                    "pre" => {
+                        let code =
+                            first_descendant(node, &["code"])?.unwrap_or_else(|| node.clone());
+                        let mut pending = vec![node.clone()];
+                        let mut plain_code = true;
+                        while let Some(parent) = pending.pop() {
+                            for child in parent.children.borrow().iter() {
+                                if matches!(&child.data, NodeData::Element { .. }) {
+                                    plain_code &= has_html_tag(child, "code");
+                                    pending.push(child.clone());
+                                }
+                            }
+                        }
+                        if !plain_code {
+                            self.push_raw_html(node, output)?;
+                            return Ok(());
+                        }
+                        output.push(Block::CodeBlock {
+                            id: self.next_block_id("code"),
+                            language: html_attribute(&code, "class").and_then(|classes| {
+                                classes.split_whitespace().find_map(|class| {
+                                    class
+                                        .strip_prefix("language-")
+                                        .filter(|value| !value.is_empty())
+                                        .map(str::to_owned)
+                                })
+                            }),
+                            // Text outside the optional code wrapper is visible
+                            // preformatted content too and must survive saving.
+                            code: html_text(node, depth)?,
+                        });
+                    }
+                    "table" => {
+                        if let Some((header, rows)) = html_table(node, depth)? {
+                            output.push(Block::Table {
+                                id: self.next_block_id("table"),
+                                header,
+                                rows,
+                            });
+                        } else {
+                            self.push_raw_html(node, output)?;
+                        }
+                    }
                     _ => self.push_raw_html(node, output)?,
                 }
             }
@@ -344,6 +487,87 @@ impl HtmlAstParser<'_> {
         }
         Ok(())
     }
+}
+
+fn has_html_tag(node: &Handle, tag: &str) -> bool {
+    matches!(&node.data, NodeData::Element { name, .. } if name.local.as_ref() == tag)
+}
+
+fn has_html_attribute(node: &Handle, attribute: &str) -> bool {
+    matches!(&node.data, NodeData::Element { attrs, .. } if attrs.borrow().iter().any(|item| item.name.local.as_ref() == attribute))
+}
+
+fn html_task_marker(item: &Handle) -> Option<bool> {
+    item.children.borrow().iter().find_map(|child| {
+        if has_html_tag(child, "input") {
+            Some(has_html_attribute(child, "checked"))
+        } else if has_html_tag(child, "p") {
+            child.children.borrow().iter().find_map(|inline| {
+                has_html_tag(inline, "input").then(|| has_html_attribute(inline, "checked"))
+            })
+        } else {
+            None
+        }
+    })
+}
+
+fn html_table(node: &Handle, depth: usize) -> Result<Option<(Option<TableRow>, Vec<TableRow>)>> {
+    // The model has one optional header row and unmerged inline cells. Preserve
+    // richer tables as cleaned HTML instead of discarding spans or nested blocks.
+    let mut pending = vec![(node.clone(), depth)];
+    let mut header = None;
+    let mut rows = Vec::new();
+    while let Some((node, depth)) = pending.pop() {
+        ensure_html_depth(depth)?;
+        if has_html_tag(&node, "tr") {
+            let mut cells = Vec::new();
+            let mut header_cells = 0;
+            for cell in node.children.borrow().iter() {
+                if !(has_html_tag(cell, "td") || has_html_tag(cell, "th")) {
+                    continue;
+                }
+                if ["colspan", "rowspan"].iter().any(|attribute| {
+                    html_attribute(cell, attribute).is_some_and(|value| value != "1")
+                }) {
+                    return Ok(None);
+                }
+                if first_descendant(cell, &["table", "ul", "ol", "pre", "blockquote"])?.is_some() {
+                    return Ok(None);
+                }
+                header_cells += usize::from(has_html_tag(cell, "th"));
+                cells.push(TableCell::new(html_inlines(cell, depth + 1)?));
+            }
+            if cells.is_empty() {
+                continue;
+            }
+            if header_cells > 0 {
+                if header_cells != cells.len() || header.is_some() || !rows.is_empty() {
+                    return Ok(None);
+                }
+                header = Some(TableRow::new(cells));
+            } else {
+                rows.push(TableRow::new(cells));
+            }
+        } else {
+            for child in node.children.borrow().iter().rev() {
+                if has_html_tag(child, "caption")
+                    || has_html_tag(child, "colgroup")
+                    || has_html_tag(child, "tfoot")
+                {
+                    return Ok(None);
+                }
+                pending.push((child.clone(), depth + 1));
+            }
+        }
+    }
+    let width = header
+        .as_ref()
+        .or_else(|| rows.first())
+        .map_or(0, |row| row.cells.len());
+    if width == 0 || rows.iter().any(|row| row.cells.len() != width) {
+        return Ok(None);
+    }
+    Ok(Some((header, rows)))
 }
 
 fn find_html_element(node: &Handle, tag: &str) -> Option<Handle> {
@@ -499,84 +723,102 @@ fn html_media_block(node: &Handle, id: String, depth: usize) -> Result<Option<Bl
 }
 
 fn html_inlines(node: &Handle, depth: usize) -> Result<Vec<Inline>> {
-    fn collect(node: &Handle, output: &mut Vec<Inline>, depth: usize) -> Result<()> {
-        ensure_html_depth(depth)?;
-        for child in node.children.borrow().iter() {
-            match &child.data {
-                NodeData::Text { contents } => {
-                    output.push(Inline::text(contents.borrow().to_string()))
-                }
-                NodeData::Element { name, .. } => {
-                    let tag = name.local.as_ref();
-                    match tag {
-                        "em" | "i" => output.push(Inline::Emphasis {
-                            content: nested(child, depth + 1)?,
-                        }),
-                        "strong" | "b" => output.push(Inline::Strong {
-                            content: nested(child, depth + 1)?,
-                        }),
-                        "s" | "del" | "strike" => output.push(Inline::Strikethrough {
-                            content: nested(child, depth + 1)?,
-                        }),
-                        "code" => output.push(Inline::Code {
-                            value: html_text(child, depth + 1)?,
-                        }),
-                        "a" => {
-                            let content = nested(child, depth + 1)?;
-                            if let Some(href) =
-                                html_attribute(child, "href").filter(|href| safe_link(href))
-                            {
-                                output.push(Inline::Link {
-                                    href,
-                                    title: html_attribute(child, "title"),
-                                    content,
-                                });
-                            } else {
-                                output.extend(content);
-                            }
-                        }
-                        "br" => output.push(Inline::HardBreak),
-                        "img" => {
-                            let asset_id = html_attribute(child, "src")
-                                .as_deref()
-                                .and_then(asset_id_from_href);
-                            if let Some(asset_id) = asset_id {
-                                output.push(Inline::Image {
-                                    asset_id,
-                                    alt: html_attribute(child, "alt").unwrap_or_default(),
-                                    title: html_attribute(child, "title"),
-                                });
-                            } else if let Some(alt) = html_attribute(child, "alt") {
-                                output.push(Inline::text(alt));
-                            }
-                        }
-                        _ => {
-                            let source = sanitize_html(&serialize_html_node(child)?);
-                            if !source.trim().is_empty() {
-                                output.push(Inline::RawHtml {
-                                    plain_text: raw_html_plain_text(&source)
-                                        .context("HTML nesting exceeds the document limit")?,
-                                    source,
-                                });
-                            }
-                        }
+    let mut output = Vec::new();
+    for child in node.children.borrow().iter() {
+        collect_html_inline(child, &mut output, depth + 1)?;
+    }
+    coalesce_inline_text(&mut output);
+    Ok(output)
+}
+
+fn coalesce_inline_text(inlines: &mut Vec<Inline>) {
+    let mut merged = Vec::with_capacity(inlines.len());
+    for inline in std::mem::take(inlines) {
+        if let Inline::Text { value } = inline {
+            if value.is_empty() {
+                continue;
+            }
+            if let Some(Inline::Text { value: previous }) = merged.last_mut() {
+                previous.push_str(&value);
+            } else {
+                merged.push(Inline::text(value));
+            }
+        } else {
+            merged.push(inline);
+        }
+    }
+    *inlines = merged;
+}
+
+fn collect_html_inline(node: &Handle, output: &mut Vec<Inline>, depth: usize) -> Result<()> {
+    ensure_html_depth(depth)?;
+    match &node.data {
+        NodeData::Text { contents } => output.push(Inline::text(contents.borrow().to_string())),
+        NodeData::Element { name, .. } => {
+            let tag = name.local.as_ref();
+            match tag {
+                "em" | "i" => output.push(Inline::Emphasis {
+                    content: html_inlines(node, depth)?,
+                }),
+                "strong" | "b" => output.push(Inline::Strong {
+                    content: html_inlines(node, depth)?,
+                }),
+                "s" | "del" | "strike" => output.push(Inline::Strikethrough {
+                    content: html_inlines(node, depth)?,
+                }),
+                "code" => output.push(Inline::Code {
+                    value: html_text(node, depth)?,
+                }),
+                "a" => {
+                    let content = html_inlines(node, depth)?;
+                    if let Some(href) = html_attribute(node, "href").filter(|href| safe_link(href))
+                    {
+                        output.push(Inline::Link {
+                            href,
+                            title: html_attribute(node, "title"),
+                            content,
+                        });
+                    } else {
+                        output.extend(content);
                     }
                 }
-                _ => {}
+                "br" => output.push(Inline::HardBreak),
+                "input" => {}
+                "p" => {
+                    if !output.is_empty() {
+                        output.push(Inline::HardBreak);
+                    }
+                    output.extend(html_inlines(node, depth)?);
+                }
+                "img" => {
+                    let asset_id = html_attribute(node, "src")
+                        .as_deref()
+                        .and_then(asset_id_from_href);
+                    if let Some(asset_id) = asset_id {
+                        output.push(Inline::Image {
+                            asset_id,
+                            alt: html_attribute(node, "alt").unwrap_or_default(),
+                            title: html_attribute(node, "title"),
+                        });
+                    } else if let Some(alt) = html_attribute(node, "alt") {
+                        output.push(Inline::text(alt));
+                    }
+                }
+                _ => {
+                    let source = sanitize_html(&serialize_html_node(node)?);
+                    if !source.trim().is_empty() {
+                        output.push(Inline::RawHtml {
+                            plain_text: raw_html_plain_text(&source)
+                                .context("HTML nesting exceeds the document limit")?,
+                            source,
+                        });
+                    }
+                }
             }
         }
-        Ok(())
+        _ => {}
     }
-
-    fn nested(node: &Handle, depth: usize) -> Result<Vec<Inline>> {
-        let mut output = Vec::new();
-        collect(node, &mut output, depth)?;
-        Ok(output)
-    }
-
-    let mut output = Vec::new();
-    collect(node, &mut output, depth)?;
-    Ok(output)
+    Ok(())
 }
 
 fn html_text(node: &Handle, depth: usize) -> Result<String> {
@@ -600,757 +842,6 @@ fn html_text(node: &Handle, depth: usize) -> Result<String> {
     Ok(output)
 }
 
-fn parse_markdown(source: &str, unit_id: &str) -> Result<BlockDocument> {
-    let mut options = Options::empty();
-    options.insert(Options::ENABLE_TABLES);
-    options.insert(Options::ENABLE_TASKLISTS);
-    options.insert(Options::ENABLE_STRIKETHROUGH);
-    let events = Parser::new_ext(source, options).collect::<Vec<_>>();
-    let mut parser = MarkdownAstParser {
-        events,
-        cursor: 0,
-        unit_id,
-        block_index: 0,
-    };
-    let mut blocks = parser.parse_blocks(None, 0)?;
-    if parser.cursor != parser.events.len() {
-        bail!("Markdown 解析没有完整消费输入");
-    }
-    apply_gfm_autolink_literals(&mut blocks);
-    Ok(BlockDocument::new(blocks))
-}
-
-fn apply_gfm_autolink_literals(blocks: &mut [Block]) {
-    for block in blocks {
-        match block {
-            Block::Paragraph { content, .. } | Block::Heading { content, .. } => {
-                autolink_inlines(content);
-            }
-            Block::BlockQuote { blocks, .. } => apply_gfm_autolink_literals(blocks),
-            Block::BulletList { items, .. } | Block::OrderedList { items, .. } => {
-                for item in items {
-                    apply_gfm_autolink_literals(&mut item.blocks);
-                }
-            }
-            Block::Table { header, rows, .. } => {
-                for row in header.iter_mut().chain(rows.iter_mut()) {
-                    for cell in &mut row.cells {
-                        autolink_inlines(&mut cell.content);
-                    }
-                }
-            }
-            Block::Image { caption, .. }
-            | Block::Audio { caption, .. }
-            | Block::Video { caption, .. } => autolink_inlines(caption),
-            Block::CodeBlock { .. } | Block::ThematicBreak { .. } | Block::RawHtml { .. } => {}
-        }
-    }
-}
-
-fn autolink_inlines(inlines: &mut Vec<Inline>) {
-    let mut linked = Vec::with_capacity(inlines.len());
-    let mut adjacent_text = String::new();
-    for mut inline in std::mem::take(inlines) {
-        match &mut inline {
-            Inline::Text { value } => {
-                adjacent_text.push_str(value);
-                continue;
-            }
-            Inline::Emphasis { content }
-            | Inline::Strong { content }
-            | Inline::Strikethrough { content } => autolink_inlines(content),
-            // A link label is normalized but never autolinked: GFM autolinks
-            // must not create nested links inside explicit Markdown links.
-            Inline::Link { content, .. } => coalesce_inline_text(content),
-            Inline::Code { .. }
-            | Inline::HardBreak
-            | Inline::SoftBreak
-            | Inline::Image { .. }
-            | Inline::RawHtml { .. } => {}
-        }
-        if !adjacent_text.is_empty() {
-            linked.extend(split_gfm_autolink_text(&adjacent_text));
-            adjacent_text.clear();
-        }
-        linked.push(inline);
-    }
-    if !adjacent_text.is_empty() {
-        linked.extend(split_gfm_autolink_text(&adjacent_text));
-    }
-    *inlines = linked;
-}
-
-fn coalesce_inline_text(inlines: &mut Vec<Inline>) {
-    let mut normalized = Vec::with_capacity(inlines.len());
-    let mut adjacent_text = String::new();
-    for mut inline in std::mem::take(inlines) {
-        match &mut inline {
-            Inline::Text { value } => {
-                adjacent_text.push_str(value);
-                continue;
-            }
-            Inline::Emphasis { content }
-            | Inline::Strong { content }
-            | Inline::Strikethrough { content }
-            | Inline::Link { content, .. } => coalesce_inline_text(content),
-            Inline::Code { .. }
-            | Inline::HardBreak
-            | Inline::SoftBreak
-            | Inline::Image { .. }
-            | Inline::RawHtml { .. } => {}
-        }
-        if !adjacent_text.is_empty() {
-            normalized.push(Inline::text(std::mem::take(&mut adjacent_text)));
-        }
-        normalized.push(inline);
-    }
-    if !adjacent_text.is_empty() {
-        normalized.push(Inline::text(adjacent_text));
-    }
-    *inlines = normalized;
-}
-
-fn split_gfm_autolink_text(text: &str) -> Vec<Inline> {
-    let mut output = Vec::new();
-    let mut emitted = 0;
-    let mut search_cursor = 0;
-    while let Some((start, scheme_len, add_http_scheme)) = next_gfm_url(text, search_cursor) {
-        let token_end = text[start..]
-            .char_indices()
-            .find_map(|(offset, character)| {
-                (character.is_whitespace()
-                    || matches!(
-                        character,
-                        '<' | '>' | '"' | '\'' | '`' | '。' | '，' | '：' | '；' | '！' | '？'
-                    ))
-                .then_some(start + offset)
-            })
-            .unwrap_or(text.len());
-        let end = trim_gfm_url_end(text, start, token_end);
-        if end <= start + scheme_len {
-            search_cursor = start + scheme_len;
-            continue;
-        }
-        if start > emitted {
-            output.push(Inline::text(&text[emitted..start]));
-        }
-        let label = &text[start..end];
-        let href = if add_http_scheme {
-            format!("http://{label}")
-        } else {
-            label.to_string()
-        };
-        output.push(Inline::Link {
-            href,
-            title: None,
-            content: vec![Inline::text(label)],
-        });
-        emitted = end;
-        search_cursor = end;
-    }
-    if emitted < text.len() {
-        output.push(Inline::text(&text[emitted..]));
-    }
-    if output.is_empty() {
-        output.push(Inline::text(text));
-    }
-    output
-}
-
-fn next_gfm_url(text: &str, cursor: usize) -> Option<(usize, usize, bool)> {
-    for (offset, _) in text[cursor..].char_indices() {
-        let start = cursor + offset;
-        let preceding_is_word = text[..start]
-            .chars()
-            .next_back()
-            .is_some_and(|character| character.is_alphanumeric() || matches!(character, '_' | '@'));
-        if preceding_is_word {
-            continue;
-        }
-        let remaining = &text[start..];
-        if remaining
-            .get(..8)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
-        {
-            return Some((start, 8, false));
-        }
-        if remaining
-            .get(..7)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
-        {
-            return Some((start, 7, false));
-        }
-        if remaining
-            .get(..4)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("www."))
-        {
-            return Some((start, 4, true));
-        }
-    }
-    None
-}
-
-fn trim_gfm_url_end(text: &str, start: usize, mut end: usize) -> usize {
-    while end > start {
-        let candidate = &text[start..end];
-        let last = candidate
-            .chars()
-            .next_back()
-            .expect("non-empty URL candidate");
-        let trim = matches!(
-            last,
-            '.' | ',' | ':' | ';' | '!' | '?' | '。' | '，' | '：' | '；' | '！' | '？'
-        ) || (last == ')'
-            && candidate.matches(')').count() > candidate.matches('(').count())
-            || (last == ']' && candidate.matches(']').count() > candidate.matches('[').count())
-            || (last == '}' && candidate.matches('}').count() > candidate.matches('{').count());
-        if !trim {
-            break;
-        }
-        end -= last.len_utf8();
-    }
-    end
-}
-
-struct MarkdownAstParser<'a> {
-    events: Vec<Event<'a>>,
-    cursor: usize,
-    unit_id: &'a str,
-    block_index: usize,
-}
-
-impl MarkdownAstParser<'_> {
-    fn next_block_id(&mut self, kind: &str) -> String {
-        let index = self.block_index;
-        self.block_index += 1;
-        deterministic_id(
-            "block",
-            format!("{}\0{kind}\0{index}", self.unit_id).as_bytes(),
-        )
-    }
-
-    fn parse_blocks(&mut self, expected_end: Option<TagEnd>, depth: usize) -> Result<Vec<Block>> {
-        ensure_markdown_depth(depth)?;
-        let mut blocks = Vec::new();
-        while self.cursor < self.events.len() {
-            match self.events[self.cursor].clone() {
-                Event::End(end) => {
-                    if expected_end.as_ref() == Some(&end) {
-                        self.cursor += 1;
-                        return Ok(blocks);
-                    }
-                    bail!("Markdown 块结束标记不匹配: {end:?}");
-                }
-                Event::Start(tag) => {
-                    self.cursor += 1;
-                    match tag {
-                        Tag::Paragraph => {
-                            let content = self.parse_inlines(TagEnd::Paragraph, depth + 1)?;
-                            blocks.push(Block::Paragraph {
-                                id: self.next_block_id("paragraph"),
-                                content,
-                            });
-                        }
-                        Tag::Heading { level, .. } => {
-                            let content = self.parse_inlines(TagEnd::Heading(level), depth + 1)?;
-                            blocks.push(Block::Heading {
-                                id: self.next_block_id("heading"),
-                                level: heading_level(level),
-                                content,
-                            });
-                        }
-                        Tag::BlockQuote(kind) => {
-                            let children =
-                                self.parse_blocks(Some(TagEnd::BlockQuote(kind)), depth + 1)?;
-                            blocks.push(Block::BlockQuote {
-                                id: self.next_block_id("quote"),
-                                blocks: children,
-                            });
-                        }
-                        Tag::List(start) => blocks.push(self.parse_list(start, depth)?),
-                        Tag::CodeBlock(kind) => blocks.push(self.parse_code_block(kind)?),
-                        Tag::HtmlBlock => blocks.push(self.parse_html_block(depth)?),
-                        Tag::Table(_) => blocks.push(self.parse_table(depth)?),
-                        unsupported => {
-                            let end = unsupported.to_end();
-                            let content = self.parse_visible_until(end, depth + 1)?;
-                            if !content.trim().is_empty() {
-                                blocks.push(Block::paragraph(
-                                    self.next_block_id("fallback"),
-                                    content,
-                                ));
-                            }
-                        }
-                    }
-                }
-                Event::Rule => {
-                    self.cursor += 1;
-                    blocks.push(Block::ThematicBreak {
-                        id: self.next_block_id("rule"),
-                    });
-                }
-                Event::Html(html) | Event::InlineHtml(html) => {
-                    self.cursor += 1;
-                    let source = sanitize_html(&html);
-                    if !source.trim().is_empty() {
-                        blocks.push(Block::RawHtml {
-                            id: self.next_block_id("html"),
-                            plain_text: raw_html_plain_text(&source)
-                                .context("HTML nesting exceeds the document limit")?,
-                            source,
-                        });
-                    }
-                }
-                Event::Text(text) | Event::Code(text) => {
-                    self.cursor += 1;
-                    blocks.push(Block::paragraph(
-                        self.next_block_id("text"),
-                        text.into_string(),
-                    ));
-                }
-                Event::SoftBreak | Event::HardBreak | Event::TaskListMarker(_) => {
-                    self.cursor += 1;
-                }
-                Event::InlineMath(text)
-                | Event::DisplayMath(text)
-                | Event::FootnoteReference(text) => {
-                    self.cursor += 1;
-                    blocks.push(Block::paragraph(
-                        self.next_block_id("text"),
-                        text.into_string(),
-                    ));
-                }
-            }
-        }
-        if expected_end.is_some() {
-            bail!("Markdown 块缺少结束标记");
-        }
-        Ok(blocks)
-    }
-
-    fn parse_list(&mut self, start: Option<u64>, depth: usize) -> Result<Block> {
-        let list_end = TagEnd::List(start.is_some());
-        let mut items = Vec::new();
-        while self.cursor < self.events.len() {
-            match self.events[self.cursor].clone() {
-                Event::End(end) if end == list_end => {
-                    self.cursor += 1;
-                    break;
-                }
-                Event::Start(Tag::Item) => {
-                    self.cursor += 1;
-                    let checked = self.task_marker_before_item_end();
-                    // CommonMark omits Paragraph tags in a tight list. Treat
-                    // the direct inline event stream as one semantic paragraph.
-                    let blocks = if self
-                        .events
-                        .get(self.cursor)
-                        .is_some_and(event_begins_tight_inline)
-                    {
-                        let content = self.parse_inlines(TagEnd::Item, depth + 1)?;
-                        vec![Block::Paragraph {
-                            id: self.next_block_id("paragraph"),
-                            content,
-                        }]
-                    } else {
-                        self.parse_blocks(Some(TagEnd::Item), depth + 1)?
-                    };
-                    items.push(ListItem { checked, blocks });
-                }
-                other => bail!("列表中出现了无效事件: {other:?}"),
-            }
-        }
-        let id = self.next_block_id("list");
-        Ok(match start {
-            Some(start) => Block::OrderedList { id, start, items },
-            None => Block::BulletList { id, items },
-        })
-    }
-
-    fn task_marker_before_item_end(&self) -> Option<bool> {
-        let mut depth = 0_usize;
-        for event in &self.events[self.cursor..] {
-            match event {
-                Event::Start(Tag::Item) => depth += 1,
-                Event::End(TagEnd::Item) if depth == 0 => break,
-                Event::End(TagEnd::Item) => depth = depth.saturating_sub(1),
-                Event::TaskListMarker(value) if depth == 0 => return Some(*value),
-                _ => {}
-            }
-        }
-        None
-    }
-
-    fn parse_code_block(&mut self, kind: CodeBlockKind<'_>) -> Result<Block> {
-        let language = match kind {
-            CodeBlockKind::Indented => None,
-            CodeBlockKind::Fenced(value) => value
-                .split_ascii_whitespace()
-                .next()
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned),
-        };
-        let mut code = String::new();
-        while self.cursor < self.events.len() {
-            match self.events[self.cursor].clone() {
-                Event::End(TagEnd::CodeBlock) => {
-                    self.cursor += 1;
-                    return Ok(Block::CodeBlock {
-                        id: self.next_block_id("code"),
-                        language,
-                        code,
-                    });
-                }
-                Event::Text(text) | Event::Code(text) => {
-                    self.cursor += 1;
-                    code.push_str(&text);
-                }
-                Event::SoftBreak | Event::HardBreak => {
-                    self.cursor += 1;
-                    code.push('\n');
-                }
-                other => bail!("代码块中出现了无效事件: {other:?}"),
-            }
-        }
-        bail!("代码块缺少结束标记")
-    }
-
-    fn parse_html_block(&mut self, depth: usize) -> Result<Block> {
-        let mut html = String::new();
-        while self.cursor < self.events.len() {
-            match self.events[self.cursor].clone() {
-                Event::End(TagEnd::HtmlBlock) => {
-                    self.cursor += 1;
-                    let source = sanitize_html(&html);
-                    let dom =
-                        parse_document(RcDom::default(), Default::default()).one(source.clone());
-                    let body = find_html_element(&dom.document, "body")
-                        .unwrap_or_else(|| dom.document.clone());
-                    ensure_html_dom_depth(&body)?;
-                    let significant = body
-                        .children
-                        .borrow()
-                        .iter()
-                        .filter(|node| match &node.data {
-                            NodeData::Text { contents } => !contents.borrow().trim().is_empty(),
-                            NodeData::Comment { .. } => false,
-                            _ => true,
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    if significant.len() == 1
-                        && let Some(media) =
-                            html_media_block(&significant[0], self.next_block_id("media"), depth)?
-                    {
-                        return Ok(media);
-                    }
-                    return Ok(Block::RawHtml {
-                        id: self.next_block_id("html"),
-                        plain_text: raw_html_plain_text(&source)
-                            .context("HTML nesting exceeds the document limit")?,
-                        source,
-                    });
-                }
-                Event::Html(value) | Event::InlineHtml(value) | Event::Text(value) => {
-                    self.cursor += 1;
-                    html.push_str(&value);
-                }
-                Event::SoftBreak | Event::HardBreak => {
-                    self.cursor += 1;
-                    html.push('\n');
-                }
-                other => bail!("HTML 块中出现了无效事件: {other:?}"),
-            }
-        }
-        bail!("HTML 块缺少结束标记")
-    }
-
-    fn parse_table(&mut self, depth: usize) -> Result<Block> {
-        let mut header = None;
-        let mut rows = Vec::new();
-        while self.cursor < self.events.len() {
-            match self.events[self.cursor].clone() {
-                Event::Start(Tag::TableHead) => {
-                    self.cursor += 1;
-                    header = Some(self.parse_table_head(depth)?);
-                }
-                Event::Start(Tag::TableRow) => {
-                    self.cursor += 1;
-                    let row = self.parse_table_row(depth)?;
-                    rows.push(row);
-                }
-                Event::End(TagEnd::Table) => {
-                    self.cursor += 1;
-                    return Ok(Block::Table {
-                        id: self.next_block_id("table"),
-                        header,
-                        rows,
-                    });
-                }
-                other => bail!("表格中出现了无效事件: {other:?}"),
-            }
-        }
-        bail!("表格缺少结束标记")
-    }
-
-    fn parse_table_head(&mut self, depth: usize) -> Result<TableRow> {
-        let mut cells = Vec::new();
-        while self.cursor < self.events.len() {
-            match self.events[self.cursor].clone() {
-                Event::Start(Tag::TableCell) => {
-                    self.cursor += 1;
-                    cells.push(TableCell::new(
-                        self.parse_inlines(TagEnd::TableCell, depth + 1)?,
-                    ));
-                }
-                Event::End(TagEnd::TableHead) => {
-                    self.cursor += 1;
-                    return Ok(TableRow::new(cells));
-                }
-                other => bail!("表头中出现了无效事件: {other:?}"),
-            }
-        }
-        bail!("表头缺少结束标记")
-    }
-
-    fn parse_table_row(&mut self, depth: usize) -> Result<TableRow> {
-        let mut cells = Vec::new();
-        while self.cursor < self.events.len() {
-            match self.events[self.cursor].clone() {
-                Event::Start(Tag::TableCell) => {
-                    self.cursor += 1;
-                    cells.push(TableCell::new(
-                        self.parse_inlines(TagEnd::TableCell, depth + 1)?,
-                    ));
-                }
-                Event::End(TagEnd::TableRow) => {
-                    self.cursor += 1;
-                    return Ok(TableRow::new(cells));
-                }
-                other => bail!("表格行中出现了无效事件: {other:?}"),
-            }
-        }
-        bail!("表格行缺少结束标记")
-    }
-
-    fn parse_inlines(&mut self, expected_end: TagEnd, depth: usize) -> Result<Vec<Inline>> {
-        ensure_markdown_depth(depth)?;
-        let mut output = Vec::new();
-        while self.cursor < self.events.len() {
-            match self.events[self.cursor].clone() {
-                Event::End(end) if end == expected_end => {
-                    self.cursor += 1;
-                    return Ok(output);
-                }
-                Event::End(end) => bail!("Markdown 行内结束标记不匹配: {end:?}"),
-                Event::Start(Tag::Emphasis) => {
-                    self.cursor += 1;
-                    output.push(Inline::Emphasis {
-                        content: self.parse_inlines(TagEnd::Emphasis, depth + 1)?,
-                    });
-                }
-                Event::Start(Tag::Strong) => {
-                    self.cursor += 1;
-                    output.push(Inline::Strong {
-                        content: self.parse_inlines(TagEnd::Strong, depth + 1)?,
-                    });
-                }
-                Event::Start(Tag::Strikethrough) => {
-                    self.cursor += 1;
-                    output.push(Inline::Strikethrough {
-                        content: self.parse_inlines(TagEnd::Strikethrough, depth + 1)?,
-                    });
-                }
-                Event::Start(Tag::Link {
-                    dest_url, title, ..
-                }) => {
-                    self.cursor += 1;
-                    let content = self.parse_inlines(TagEnd::Link, depth + 1)?;
-                    let href = dest_url.into_string();
-                    if safe_link(&href) {
-                        output.push(Inline::Link {
-                            href,
-                            title: non_empty(title.as_ref()),
-                            content,
-                        });
-                    } else {
-                        output.extend(content);
-                    }
-                }
-                Event::Start(Tag::Image {
-                    dest_url, title, ..
-                }) => {
-                    self.cursor += 1;
-                    let alt_nodes = self.parse_inlines(TagEnd::Image, depth + 1)?;
-                    let alt = inline_text(&alt_nodes);
-                    let href = dest_url.into_string();
-                    if let Some(asset_id) = asset_id_from_href(&href) {
-                        output.push(Inline::Image {
-                            asset_id,
-                            alt,
-                            title: non_empty(title.as_ref()),
-                        });
-                    } else if safe_link(&href) {
-                        let title = non_empty(title.as_ref());
-                        let mut raw = format!(
-                            "<img src=\"{}\" alt=\"{}\"",
-                            escape_html(&href),
-                            escape_html(&alt)
-                        );
-                        if let Some(title) = title {
-                            raw.push_str(&format!(" title=\"{}\"", escape_html(&title)));
-                        }
-                        raw.push_str(" />");
-                        let source = sanitize_html(&raw);
-                        output.push(Inline::RawHtml {
-                            plain_text: raw_html_plain_text(&source)
-                                .context("HTML nesting exceeds the document limit")?,
-                            source,
-                        });
-                    } else {
-                        output.push(Inline::text(alt));
-                    }
-                }
-                Event::Text(text) => {
-                    self.cursor += 1;
-                    output.push(Inline::text(text.into_string()));
-                }
-                Event::Code(text) => {
-                    self.cursor += 1;
-                    output.push(Inline::Code {
-                        value: text.into_string(),
-                    });
-                }
-                Event::SoftBreak => {
-                    self.cursor += 1;
-                    output.push(Inline::SoftBreak);
-                }
-                Event::HardBreak => {
-                    self.cursor += 1;
-                    output.push(Inline::HardBreak);
-                }
-                Event::TaskListMarker(_) => self.cursor += 1,
-                Event::InlineHtml(html) | Event::Html(html) => {
-                    self.cursor += 1;
-                    let source = sanitize_html(&html);
-                    if !source.is_empty() {
-                        output.push(Inline::RawHtml {
-                            plain_text: raw_html_plain_text(&source)
-                                .context("HTML nesting exceeds the document limit")?,
-                            source,
-                        });
-                    }
-                }
-                Event::InlineMath(text)
-                | Event::DisplayMath(text)
-                | Event::FootnoteReference(text) => {
-                    self.cursor += 1;
-                    output.push(Inline::text(text.into_string()));
-                }
-                Event::Rule => {
-                    self.cursor += 1;
-                    output.push(Inline::text("---"));
-                }
-                Event::Start(other) => {
-                    self.cursor += 1;
-                    let content = self.parse_visible_until(other.to_end(), depth + 1)?;
-                    output.push(Inline::text(content));
-                }
-            }
-        }
-        bail!("Markdown 行内内容缺少结束标记")
-    }
-
-    fn parse_visible_until(&mut self, expected_end: TagEnd, base_depth: usize) -> Result<String> {
-        ensure_markdown_depth(base_depth)?;
-        let mut text = String::new();
-        let mut depth = 0_usize;
-        while self.cursor < self.events.len() {
-            match self.events[self.cursor].clone() {
-                Event::Start(_) => {
-                    ensure_markdown_depth(base_depth + depth + 1)?;
-                    depth += 1;
-                    self.cursor += 1;
-                }
-                Event::End(end) if depth == 0 && end == expected_end => {
-                    self.cursor += 1;
-                    return Ok(text);
-                }
-                Event::End(_) => {
-                    depth = depth.saturating_sub(1);
-                    self.cursor += 1;
-                }
-                Event::Text(value)
-                | Event::Code(value)
-                | Event::InlineMath(value)
-                | Event::DisplayMath(value)
-                | Event::FootnoteReference(value) => {
-                    self.cursor += 1;
-                    text.push_str(&value);
-                }
-                Event::SoftBreak | Event::HardBreak => {
-                    self.cursor += 1;
-                    text.push('\n');
-                }
-                Event::Html(value) | Event::InlineHtml(value) => {
-                    self.cursor += 1;
-                    let source = sanitize_html(&value);
-                    text.push_str(
-                        &raw_html_plain_text(&source)
-                            .context("HTML nesting exceeds the document limit")?,
-                    );
-                }
-                Event::Rule => {
-                    self.cursor += 1;
-                    text.push_str("---");
-                }
-                Event::TaskListMarker(checked) => {
-                    self.cursor += 1;
-                    text.push_str(if checked { "[x] " } else { "[ ] " });
-                }
-            }
-        }
-        bail!("Markdown 内容缺少结束标记")
-    }
-}
-
-fn ensure_markdown_depth(depth: usize) -> Result<()> {
-    if depth > MAX_DOCUMENT_DEPTH {
-        bail!("Markdown nesting exceeds {MAX_DOCUMENT_DEPTH}");
-    }
-    Ok(())
-}
-
-fn heading_level(level: HeadingLevel) -> u8 {
-    match level {
-        HeadingLevel::H1 => 1,
-        HeadingLevel::H2 => 2,
-        HeadingLevel::H3 => 3,
-        HeadingLevel::H4 => 4,
-        HeadingLevel::H5 => 5,
-        HeadingLevel::H6 => 6,
-    }
-}
-
-fn event_begins_tight_inline(event: &Event<'_>) -> bool {
-    matches!(
-        event,
-        Event::Text(_)
-            | Event::Code(_)
-            | Event::InlineMath(_)
-            | Event::InlineHtml(_)
-            | Event::SoftBreak
-            | Event::HardBreak
-            | Event::TaskListMarker(_)
-            | Event::Start(Tag::Emphasis | Tag::Strong | Tag::Strikethrough)
-            | Event::Start(Tag::Link { .. } | Tag::Image { .. })
-    )
-}
-
-fn non_empty(value: &str) -> Option<String> {
-    (!value.trim().is_empty()).then(|| value.to_string())
-}
-
 fn safe_link(href: &str) -> bool {
     let href = href.trim();
     if href.is_empty() || href.starts_with("//") || href.starts_with('\\') {
@@ -1372,211 +863,6 @@ fn asset_id_from_href(href: &str) -> Option<String> {
         .map(str::trim)
         .filter(|id| !id.is_empty() && !id.contains(['/', '\\', '#', '?']))
         .map(str::to_owned)
-}
-
-fn inline_text(inlines: &[Inline]) -> String {
-    inlines.iter().map(Inline::plain_text).collect()
-}
-
-fn write_markdown_blocks(blocks: &[Block], indent: usize, output: &mut String) {
-    for (index, block) in blocks.iter().enumerate() {
-        if index > 0 && !output.ends_with("\n\n") {
-            if !output.ends_with('\n') {
-                output.push('\n');
-            }
-            output.push('\n');
-        }
-        match block {
-            Block::Paragraph { content, .. } => write_markdown_inlines(content, output),
-            Block::Heading { level, content, .. } => {
-                output.push_str(&"#".repeat((*level).clamp(1, 6) as usize));
-                output.push(' ');
-                write_markdown_inlines(content, output);
-            }
-            Block::BlockQuote { blocks, .. } => {
-                let mut nested = String::new();
-                write_markdown_blocks(blocks, indent, &mut nested);
-                for line in nested.lines() {
-                    output.push_str("> ");
-                    output.push_str(line);
-                    output.push('\n');
-                }
-                while output.ends_with('\n') {
-                    output.pop();
-                }
-            }
-            Block::BulletList { items, .. } => write_markdown_list(items, None, indent, output),
-            Block::OrderedList { start, items, .. } => {
-                write_markdown_list(items, Some(*start), indent, output)
-            }
-            Block::CodeBlock { language, code, .. } => {
-                output.push_str("```");
-                if let Some(language) = language {
-                    output.push_str(language);
-                }
-                output.push('\n');
-                output.push_str(code);
-                if !code.ends_with('\n') {
-                    output.push('\n');
-                }
-                output.push_str("```");
-            }
-            Block::ThematicBreak { .. } => output.push_str("---"),
-            Block::Table { header, rows, .. } => write_markdown_table(header, rows, output),
-            Block::Image {
-                asset_id,
-                alt,
-                title,
-                caption,
-                ..
-            } => write_html_image(asset_id, alt, title, caption, output),
-            Block::Audio {
-                asset_id,
-                title,
-                caption,
-                ..
-            } => write_html_media("audio", asset_id, None, title, caption, output),
-            Block::Video {
-                asset_id,
-                poster_asset_id,
-                title,
-                caption,
-                ..
-            } => write_html_media(
-                "video",
-                asset_id,
-                poster_asset_id.as_deref(),
-                title,
-                caption,
-                output,
-            ),
-            Block::RawHtml { source, .. } => output.push_str(&sanitize_html(source)),
-        }
-    }
-}
-
-fn write_markdown_list(items: &[ListItem], start: Option<u64>, indent: usize, output: &mut String) {
-    for (index, item) in items.iter().enumerate() {
-        if index > 0 {
-            output.push('\n');
-        }
-        output.push_str(&" ".repeat(indent));
-        match start {
-            Some(start) => output.push_str(&format!("{}. ", start.saturating_add(index as u64))),
-            None => output.push_str("- "),
-        }
-        if let Some(checked) = item.checked {
-            output.push_str(if checked { "[x] " } else { "[ ] " });
-        }
-        let mut nested = String::new();
-        write_markdown_blocks(&item.blocks, indent + 2, &mut nested);
-        let mut lines = nested.lines();
-        if let Some(first) = lines.next() {
-            output.push_str(first);
-        }
-        for line in lines {
-            output.push('\n');
-            output.push_str(&" ".repeat(indent + 2));
-            output.push_str(line);
-        }
-    }
-}
-
-fn write_markdown_table(header: &Option<TableRow>, rows: &[TableRow], output: &mut String) {
-    let columns = header
-        .iter()
-        .chain(rows.iter())
-        .map(|row| row.cells.len())
-        .max()
-        .unwrap_or(1);
-    let fallback = TableRow::new((0..columns).map(|_| TableCell::text("")).collect());
-    write_markdown_row(header.as_ref().unwrap_or(&fallback), columns, output);
-    output.push('\n');
-    output.push('|');
-    for _ in 0..columns {
-        output.push_str(" --- |");
-    }
-    for row in rows {
-        output.push('\n');
-        write_markdown_row(row, columns, output);
-    }
-}
-
-fn write_markdown_row(row: &TableRow, columns: usize, output: &mut String) {
-    output.push('|');
-    for index in 0..columns {
-        output.push(' ');
-        if let Some(cell) = row.cells.get(index) {
-            let mut value = String::new();
-            write_markdown_inlines(&cell.content, &mut value);
-            output.push_str(&value.replace('|', "\\|"));
-        }
-        output.push_str(" |");
-    }
-}
-
-fn write_markdown_inlines(inlines: &[Inline], output: &mut String) {
-    for inline in inlines {
-        match inline {
-            Inline::Text { value } => output.push_str(&escape_markdown_text(value)),
-            Inline::Emphasis { content } => {
-                output.push('*');
-                write_markdown_inlines(content, output);
-                output.push('*');
-            }
-            Inline::Strong { content } => {
-                output.push_str("**");
-                write_markdown_inlines(content, output);
-                output.push_str("**");
-            }
-            Inline::Strikethrough { content } => {
-                output.push_str("~~");
-                write_markdown_inlines(content, output);
-                output.push_str("~~");
-            }
-            Inline::Code { value } => {
-                let fence = if value.contains('`') { "``" } else { "`" };
-                output.push_str(fence);
-                output.push_str(value);
-                output.push_str(fence);
-            }
-            Inline::Link {
-                href,
-                title,
-                content,
-            } => {
-                output.push('[');
-                write_markdown_inlines(content, output);
-                output.push_str("](");
-                output.push_str(href);
-                if let Some(title) = title {
-                    output.push_str(" \"");
-                    output.push_str(&title.replace('"', "\\\""));
-                    output.push('"');
-                }
-                output.push(')');
-            }
-            Inline::HardBreak => output.push_str("  \n"),
-            Inline::SoftBreak => output.push('\n'),
-            Inline::Image {
-                asset_id,
-                alt,
-                title,
-            } => {
-                output.push_str("![");
-                output.push_str(&escape_markdown_text(alt));
-                output.push_str("](moye-asset:");
-                output.push_str(asset_id);
-                if let Some(title) = title {
-                    output.push_str(" \"");
-                    output.push_str(&title.replace('"', "\\\""));
-                    output.push('"');
-                }
-                output.push(')');
-            }
-            Inline::RawHtml { source, .. } => output.push_str(&sanitize_html(source)),
-        }
-    }
 }
 
 fn write_html_blocks(blocks: &[Block], output: &mut String) {
@@ -1825,15 +1111,6 @@ fn escape_html(value: &str) -> String {
         .replace('"', "&quot;")
 }
 
-fn escape_markdown_text(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('*', "\\*")
-        .replace('_', "\\_")
-        .replace('[', "\\[")
-        .replace(']', "\\]")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1886,7 +1163,7 @@ mod tests {
                 caption: Vec::new(),
             },
         ]);
-        let original_html = serialize_source(&document, SourceKind::Html).unwrap();
+        let original_html = serialize_source(&document).unwrap();
         let fragment = serialize_xhtml(&document).unwrap();
         let body = xhtml_body(&fragment);
         let xml = resvg::usvg::roxmltree::Document::parse(&body).expect("strict XHTML");
@@ -1921,10 +1198,7 @@ mod tests {
             .find(|node| node.has_tag_name("video"))
             .unwrap();
         assert_eq!(video.attribute("poster"), Some("moye-asset:poster-asset"));
-        assert_eq!(
-            serialize_source(&document, SourceKind::Html).unwrap(),
-            original_html
-        );
+        assert_eq!(serialize_source(&document).unwrap(), original_html);
     }
 
     #[test]
@@ -2027,60 +1301,119 @@ mod tests {
     }
 
     #[test]
-    fn markdown_gfm_round_trip_is_semantically_idempotent() {
-        let source = "# 标题\n\n- [x] 完成 **加粗**\n- [ ] 待办\n\n| 名称 | 值 |\n| --- | --- |\n| A | ~~旧~~ |";
-        let first = parse_source_for_unit(SourceKind::Markdown, source, "unit-1").unwrap();
-        let second =
-            parse_source_for_unit(SourceKind::Markdown, &first.canonical_source, "unit-1").unwrap();
-        assert_eq!(first.document, second.document);
-        assert!(first.canonical_source.contains("[x]"));
-        assert!(first.canonical_source.contains("| 名称 | 值 |"));
+    fn html_structured_blocks_round_trip_with_typed_semantics() {
+        let source = r#"<h1>标题</h1><blockquote><p>说明 <em>内容</em></p></blockquote><ol start="3"><li>第一项 <strong>加粗</strong><ul><li><input type="checkbox" checked>已完成</li><li><input type="checkbox">待办</li></ul></li></ol><pre><code class="language-rust">a &lt; b
+line 2</code></pre><table><thead><tr><th>名称</th><th>值</th></tr></thead><tbody><tr><td><p>A</p><p>第二行</p></td><td><del>旧</del></td></tr></tbody></table>"#;
+        let parsed = parse_source_for_unit(source, "structured").unwrap();
+        let reparsed = parse_source_for_unit(&parsed.canonical_source, "structured").unwrap();
+        assert_eq!(parsed.document, reparsed.document);
+        assert_eq!(parsed.canonical_source, reparsed.canonical_source);
+        assert!(matches!(
+            &parsed.document.blocks[1],
+            Block::BlockQuote { .. }
+        ));
+        let Block::OrderedList { start, items, .. } = &parsed.document.blocks[2] else {
+            panic!("expected an ordered list");
+        };
+        assert_eq!(*start, 3);
+        let Block::BulletList { items, .. } = &items[0].blocks[1] else {
+            panic!("expected a nested task list");
+        };
+        assert_eq!(items[0].checked, Some(true));
+        assert_eq!(items[1].checked, Some(false));
+        assert!(
+            matches!(&parsed.document.blocks[3], Block::CodeBlock { language: Some(language), code, .. } if language == "rust" && code == "a < b\nline 2")
+        );
+        let Block::Table { header, rows, .. } = &parsed.document.blocks[4] else {
+            panic!("expected a typed table");
+        };
+        assert_eq!(header.as_ref().unwrap().cells[0].plain_text(), "名称");
+        assert_eq!(rows[0].cells[0].plain_text(), "A\n第二行");
     }
 
     #[test]
-    fn markdown_gfm_autolink_literals_are_typed_and_canonical() {
-        let parsed = parse_source_for_unit(
-            SourceKind::Markdown,
-            "访问 https://example.com/a_(b)，或 www.example.org/path。`https://code.test` [已有](https://linked.test)",
-            "unit-autolink",
-        )
-        .unwrap();
-        let Block::Paragraph { content, .. } = &parsed.document.blocks[0] else {
-            panic!("expected paragraph");
-        };
-        let links = content
-            .iter()
-            .filter_map(|inline| match inline {
-                Inline::Link { href, content, .. } => Some((href.as_str(), content.as_slice())),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(links.len(), 3, "parsed inline AST: {content:#?}");
-        assert_eq!(links[0].0, "https://example.com/a_(b)");
-        assert_eq!(links[1].0, "http://www.example.org/path");
-        assert_eq!(links[2].0, "https://linked.test");
-        assert!(content.iter().any(
-            |inline| matches!(inline, Inline::Code { value } if value == "https://code.test")
-        ));
-        assert!(
-            parsed
-                .canonical_source
-                .contains("[https://example.com/a\\_(b)](https://example.com/a_(b))")
-        );
+    fn html_complex_tables_preserve_their_cleaned_structure() {
+        for source in [
+            "<table><tr><td colspan=\"2\">merged</td></tr></table>",
+            "<table><caption>caption</caption><tr><td>body</td></tr></table>",
+            "<table><tr><td><ul><li>nested</li></ul></td></tr></table>",
+            "<table><tr><td>first</td><td>second</td></tr><tr><td>short row</td></tr></table>",
+        ] {
+            let first = parse_source_for_unit(source, "complex-table").unwrap();
+            assert!(matches!(&first.document.blocks[0], Block::RawHtml { .. }));
+            let second = parse_source_for_unit(&first.canonical_source, "complex-table").unwrap();
+            assert_eq!(first.document, second.document);
+        }
+    }
 
-        let reparsed = parse_source_for_unit(
-            SourceKind::Markdown,
-            &parsed.canonical_source,
-            "unit-autolink",
+    #[test]
+    fn html_preformatted_text_and_empty_containers_remain_saveable() {
+        for (source, expected) in [
+            (
+                "<pre>before<code>x</code>after<code>y</code></pre>",
+                "beforexaftery",
+            ),
+            (
+                "<pre><code>\r\n&lt;a&gt;\r\nline 2</code></pre>",
+                "\n<a>\nline 2",
+            ),
+        ] {
+            let first = parse_source_for_unit(source, "pre").unwrap();
+            assert!(
+                matches!(&first.document.blocks[0], Block::CodeBlock { code, .. } if code == expected)
+            );
+            let second = parse_source_for_unit(&first.canonical_source, "pre").unwrap();
+            assert_eq!(first.document, second.document);
+        }
+        for source in [
+            "<pre><code>before<br>after</code></pre>",
+            "<ul></ul>",
+            "<ul><li></li></ul>",
+            "<blockquote></blockquote>",
+            "<table></table>",
+            "<ol start=\"0\"><li>zero</li></ol>",
+        ] {
+            let first = parse_source_for_unit(source, "container").unwrap();
+            let second = parse_source_for_unit(&first.canonical_source, "container").unwrap();
+            assert_eq!(first.document, second.document, "{source}");
+        }
+    }
+
+    #[test]
+    fn html_source_keeps_markdown_punctuation_as_literal_text() {
+        let parsed = parse_source_for_unit("# title **literal**", "literal").unwrap();
+        assert_eq!(parsed.canonical_source, "<p># title **literal**</p>");
+        assert!(matches!(
+            &parsed.document.blocks[0],
+            Block::Paragraph { .. }
+        ));
+    }
+
+    #[test]
+    fn html_loose_tasks_and_list_adjacent_text_survive_saving() {
+        let parsed = parse_source_for_unit(
+            "<ul><li><p><input type=\"checkbox\" checked>done</p></li></ul>",
+            "tasks",
         )
         .unwrap();
+        let Block::BulletList { items, .. } = &parsed.document.blocks[0] else {
+            panic!("expected task list");
+        };
+        assert_eq!(items[0].checked, Some(true));
+        let reparsed = parse_source_for_unit(&parsed.canonical_source, "tasks").unwrap();
+        assert_eq!(parsed.document, reparsed.document);
+
+        let parsed = parse_source_for_unit("<ul>prefix<li>x</li>suffix</ul>", "list").unwrap();
+        assert!(matches!(&parsed.document.blocks[0], Block::RawHtml { .. }));
+        assert!(parsed.document.plain_text().contains("prefix"));
+        assert!(parsed.document.plain_text().contains("suffix"));
+        let reparsed = parse_source_for_unit(&parsed.canonical_source, "list").unwrap();
         assert_eq!(parsed.document, reparsed.document);
     }
 
     #[test]
     fn html_removes_scripts_handlers_and_network_resources() {
         let parsed = parse_source_for_unit(
-            SourceKind::Html,
             r#"<p onclick="steal()">正文</p><script>alert(1)</script><img src="https://evil.test/a.png"><audio controls src="asset:sound"></audio>"#,
             "unit-1",
         )
@@ -2100,9 +1433,8 @@ mod tests {
             <figure><img src="moye-asset:image-1" alt="diagram"><figcaption>Caption</figcaption></figure>
             <video controls src="moye-asset:video-1" poster="moye-asset:poster-1"></video>
         "#;
-        let first = parse_source_for_unit(SourceKind::Html, source, "unit-html").unwrap();
-        let second =
-            parse_source_for_unit(SourceKind::Html, &first.canonical_source, "unit-html").unwrap();
+        let first = parse_source_for_unit(source, "unit-html").unwrap();
+        let second = parse_source_for_unit(&first.canonical_source, "unit-html").unwrap();
 
         assert_eq!(first.document, second.document);
         assert_eq!(first.canonical_source, second.canonical_source);
@@ -2121,109 +1453,51 @@ mod tests {
         }
 
         parse_source_for_unit(
-            SourceKind::Html,
             &nested_emphasis(MAX_DOCUMENT_DEPTH - 1),
             "unit-at-depth-limit",
         )
         .expect("a visible HTML leaf at the shared depth limit remains accepted");
 
-        let error = parse_source_for_unit(
-            SourceKind::Html,
-            &nested_emphasis(4_096),
-            "unit-over-depth-limit",
-        )
-        .expect_err("extreme HTML nesting must return an error instead of recursing deeply");
+        let error = parse_source_for_unit(&nested_emphasis(4_096), "unit-over-depth-limit")
+            .expect_err("extreme HTML nesting must return an error instead of recursing deeply");
         assert!(error.to_string().contains("HTML nesting exceeds"));
     }
 
     #[test]
-    fn markdown_block_nesting_is_bounded_during_ast_conversion() {
-        fn nested_quote(depth: usize) -> String {
-            format!("{}正文\n", "> ".repeat(depth))
-        }
-
-        parse_source_for_unit(
-            SourceKind::Markdown,
-            &nested_quote(MAX_DOCUMENT_DEPTH - 1),
-            "unit-at-depth-limit",
-        )
-        .expect("a visible Markdown leaf at the shared depth limit remains accepted");
-
-        let error = parse_source_for_unit(
-            SourceKind::Markdown,
-            &nested_quote(4_096),
-            "unit-over-depth-limit",
-        )
-        .expect_err("extreme Markdown block nesting must stop during AST conversion");
-        assert!(error.to_string().contains("Markdown nesting exceeds"));
-    }
-
-    #[test]
-    fn markdown_inline_event_nesting_is_bounded_during_ast_conversion() {
-        fn nested_emphasis_events(depth: usize) -> Vec<Event<'static>> {
-            let mut events = Vec::with_capacity(depth.saturating_mul(2).saturating_add(2));
-            events.extend((0..depth).map(|_| Event::Start(Tag::Emphasis)));
-            events.push(Event::Text("正文".into()));
-            events.extend((0..depth).map(|_| Event::End(TagEnd::Emphasis)));
-            events.push(Event::End(TagEnd::Paragraph));
-            events
-        }
-
-        let mut parser = MarkdownAstParser {
-            events: nested_emphasis_events(MAX_DOCUMENT_DEPTH - 1),
-            cursor: 0,
-            unit_id: "unit-at-depth-limit",
-            block_index: 0,
-        };
-        let inlines = parser
-            .parse_inlines(TagEnd::Paragraph, 1)
-            .expect("an inline leaf at the shared depth limit remains accepted");
-        let document = BlockDocument::new(vec![Block::Paragraph {
-            id: "paragraph-at-depth-limit".to_string(),
-            content: inlines,
-        }]);
-        document.validate().expect("boundary inline AST is valid");
-
-        let mut parser = MarkdownAstParser {
-            events: nested_emphasis_events(4_096),
-            cursor: 0,
-            unit_id: "unit-over-depth-limit",
-            block_index: 0,
-        };
-        let error = parser
-            .parse_inlines(TagEnd::Paragraph, 1)
-            .expect_err("extreme inline nesting must stop during AST conversion");
-        assert!(error.to_string().contains("Markdown nesting exceeds"));
-    }
-
-    #[test]
-    fn unsafe_markdown_link_loses_its_navigation_but_keeps_text() {
+    fn unsafe_html_link_loses_its_navigation_but_keeps_text() {
         let parsed = parse_source_for_unit(
-            SourceKind::Markdown,
-            "[保留文字](javascript:alert(1))",
+            r#"<p><a href="javascript:alert(1)">保留文字</a></p>"#,
             "unit-1",
         )
         .unwrap();
-        assert_eq!(parsed.canonical_source, "保留文字");
+        assert_eq!(parsed.document.plain_text(), "保留文字");
         assert!(!parsed.canonical_source.contains("javascript"));
     }
 
     #[test]
-    fn preserved_markdown_image_keeps_its_inert_alt_projection() {
-        let parsed = parse_source_for_unit(
-            SourceKind::Markdown,
-            "![替代文字](images/figure.png)",
-            "unit-1",
-        )
-        .expect("a safe relative image remains representable as inert raw HTML");
+    fn html_links_keep_local_navigation_and_inert_network_labels() {
+        let source = r##"<p>before<a href="https://example.test/">network</a>after <a href="#section">local</a> <a href="next.xhtml">next</a></p>"##;
+        let first = parse_source_for_unit(source, "links").unwrap();
+        assert!(!first.canonical_source.contains("https:"));
+        assert!(first.canonical_source.contains("beforenetworkafter"));
+        assert!(first.canonical_source.contains("href=\"#section\""));
+        assert!(first.canonical_source.contains("href=\"next.xhtml\""));
+        let second = parse_source_for_unit(&first.canonical_source, "links").unwrap();
+        assert_eq!(first.document, second.document);
+    }
+
+    #[test]
+    fn preserved_html_image_keeps_its_inert_alt_projection() {
+        let parsed =
+            parse_source_for_unit(r#"<img src="images/figure.png" alt="替代文字">"#, "unit-1")
+                .expect("a safe relative image remains representable as inert raw HTML");
         assert!(parsed.document.plain_text().contains("替代文字"));
     }
 
     #[test]
-    fn preserved_markdown_image_canonicalizes_alt_whitespace() {
+    fn preserved_html_image_canonicalizes_alt_whitespace() {
         let parsed = parse_source_for_unit(
-            SourceKind::Markdown,
-            "![替代   文字  \n第二行](images/figure.png)",
+            "<img src=\"images/figure.png\" alt=\"替代   文字  \n第二行\">",
             "unit-1",
         )
         .expect("RawHtml image alt text must use the canonical inert projection");
@@ -2244,14 +1518,14 @@ mod tests {
             title: Some("演示".into()),
             caption: vec![Inline::text("说明")],
         }]);
-        let markdown = serialize_source(&document, SourceKind::Markdown).unwrap();
-        assert!(markdown.contains("moye-asset:video-asset"));
-        assert!(markdown.contains("moye-asset:poster-asset"));
-        assert!(!markdown.contains("blake3/"));
+        let html = serialize_source(&document).unwrap();
+        assert!(html.contains("moye-asset:video-asset"));
+        assert!(html.contains("moye-asset:poster-asset"));
+        assert!(!html.contains("blake3/"));
     }
 
     #[test]
-    fn block_media_metadata_survives_markdown_round_trips() {
+    fn block_media_metadata_survives_html_round_trips() {
         let document = BlockDocument::new(vec![
             Block::Image {
                 id: "image".into(),
@@ -2274,15 +1548,13 @@ mod tests {
                 caption: vec![Inline::text("视频说明")],
             },
         ]);
-        let source = serialize_source(&document, SourceKind::Markdown).unwrap();
+        let source = serialize_source(&document).unwrap();
         assert!(source.contains("<figcaption>图片说明</figcaption>"));
         assert!(source.contains("<figcaption>音频说明</figcaption>"));
         assert!(source.contains("<figcaption>视频说明</figcaption>"));
 
-        let first = parse_source_for_unit(SourceKind::Markdown, &source, "unit-media").unwrap();
-        let second =
-            parse_source_for_unit(SourceKind::Markdown, &first.canonical_source, "unit-media")
-                .unwrap();
+        let first = parse_source_for_unit(&source, "unit-media").unwrap();
+        let second = parse_source_for_unit(&first.canonical_source, "unit-media").unwrap();
         assert_eq!(first.document, second.document);
         assert_eq!(
             first.document.referenced_asset_ids(),

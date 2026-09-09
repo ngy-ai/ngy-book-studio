@@ -84,8 +84,7 @@ mod tests {
                 &unit_id,
                 ContentUnitKind::Chapter,
                 format!("正文文件 {index}"),
-                SourceKind::Markdown,
-                "正文",
+                "<p>正文</p>",
                 BlockDocument::new(vec![Block::paragraph(format!("block-{index}"), "正文")]),
             ));
             let mut node = TocNode::new(

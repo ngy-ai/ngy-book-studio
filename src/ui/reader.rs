@@ -2242,7 +2242,7 @@ mod tests {
                     )?;
                     for index in 1..=3 {
                         editor.add_unit(
-                            moye_epub_editor::editing::NewContentUnit::markdown_chapter(
+                            moye_epub_editor::editing::NewContentUnit::html_chapter(
                                 format!("第 {} 章", index + 1),
                                 index,
                             ),

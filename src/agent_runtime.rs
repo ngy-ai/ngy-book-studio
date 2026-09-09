@@ -2111,9 +2111,9 @@ mod tests {
                                       object_key, created_at)
                  VALUES ('source-1', 'book-1', 1, 'docx', 'original', 'objects/source', 1);
              INSERT INTO content_units(
-                 id, book_id, source_id, ordinal, kind, source_kind,
+                 id, book_id, source_id, ordinal, kind,
                  source_locator_json, block_json, revision, created_at, updated_at)
-                 VALUES ('unit-1', 'book-1', 'source-1', 0, 'section', 'markdown',
+                 VALUES ('unit-1', 'book-1', 'source-1', 0, 'section',
                          '{\"type\":\"office_section\",\"index\":1}',
                          '{\"schema_version\":1,\"blocks\":[]}', 1, 1, 1);",
         )

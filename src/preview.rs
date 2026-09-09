@@ -2943,8 +2943,8 @@ mod tests {
 
     use super::*;
     use crate::document::{
-        AssetRef, AssetRole, Block, BlockDocument, ContentUnit, ContentUnitKind, SourceKind,
-        SourceLocator, TableCell, TableRow,
+        AssetRef, AssetRole, Block, BlockDocument, ContentUnit, ContentUnitKind, SourceLocator,
+        TableCell, TableRow,
     };
 
     fn sample_document() -> BookDocument {
@@ -2954,8 +2954,7 @@ mod tests {
             "unit-1",
             ContentUnitKind::Chapter,
             "第一章",
-            SourceKind::Markdown,
-            "# 第一章",
+            "<h1>第一章</h1>",
             BlockDocument::new(vec![Block::paragraph(
                 "block-1",
                 "包含 <script> 和中文的正文。",
@@ -3037,8 +3036,7 @@ mod tests {
             "unit-image",
             ContentUnitKind::Chapter,
             "图片章节",
-            SourceKind::Markdown,
-            "![说明](moye-asset:asset-image)",
+            "<img src=\"moye-asset:asset-image\" alt=\"说明\">",
             BlockDocument::new(vec![Block::Image {
                 id: "block-image".to_string(),
                 asset_id: "asset-image".to_string(),
@@ -3097,7 +3095,6 @@ mod tests {
                 "unit-slide",
                 ContentUnitKind::Slide,
                 "第三张幻灯片",
-                SourceKind::Markdown,
                 "slide source",
                 BlockDocument::new(vec![
                     Block::paragraph("block-slide-text", "一段需要和图片位于同一页的文字。"),
@@ -3174,7 +3171,6 @@ mod tests {
                 "unit-sheet",
                 ContentUnitKind::Worksheet,
                 "Sales",
-                SourceKind::Markdown,
                 "table source",
                 BlockDocument::new(vec![Block::Table {
                     id: "block-table".to_string(),
@@ -3242,7 +3238,6 @@ mod tests {
                 "unit-ranges",
                 ContentUnitKind::Chapter,
                 "章节",
-                SourceKind::Markdown,
                 text.clone(),
                 BlockDocument::new(vec![Block::paragraph("block-ranges", text)]),
             )
@@ -3341,8 +3336,7 @@ mod tests {
             "unit-image",
             ContentUnitKind::Chapter,
             "SVG 图片章节",
-            SourceKind::Markdown,
-            "![说明](moye-asset:asset-image)",
+            "<img src=\"moye-asset:asset-image\" alt=\"说明\">",
             BlockDocument::new(vec![Block::Image {
                 id: "block-image".to_string(),
                 asset_id: "asset-image".to_string(),

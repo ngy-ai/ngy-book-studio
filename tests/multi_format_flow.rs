@@ -10,7 +10,7 @@ use lopdf::{
     dictionary,
 };
 use moye_epub_editor::{
-    document::{BookFormat, BookSource, ContentUnitKind, SourceKind, SourceLocator},
+    document::{BookFormat, BookSource, ContentUnitKind, SourceLocator},
     formats::{FormatRegistry, ImportLimits, ImportSource, ProbeConfidence},
     library::{ImportOutcome, LibraryStore},
 };
@@ -67,6 +67,21 @@ fn generated_pdf_and_ooxml_import_into_the_canonical_model() {
             fixture.extension
         );
         assert_locator(&fixture, &imported.document.units[0].source_locator);
+        for unit in &imported.document.units {
+            assert!(
+                unit.source.trim_start().starts_with('<'),
+                "{} must produce HTML source",
+                fixture.extension
+            );
+            let reparsed = moye_epub_editor::markup::parse_source_for_unit(&unit.source, &unit.id)
+                .expect("imported HTML remains editable");
+            assert_eq!(reparsed.document.plain_text(), unit.plain_text());
+            assert_eq!(
+                serde_json::to_value(unit).unwrap().get("source_kind"),
+                None,
+                "chapters must not retain a format discriminator"
+            );
+        }
         assert_eq!(
             imported
                 .original_asset()
@@ -132,10 +147,14 @@ fn each_generated_format_survives_library_edit_search_export_and_reopen() {
             .update_content_unit_source(
                 &record.id,
                 &first_unit_id,
-                SourceKind::Markdown,
-                &format!("# Edited\n\n{edited_token}"),
+                &format!("<h1>Edited</h1><p>{edited_token}</p>"),
             )
             .expect("publish canonical edit");
+        let edited_document = library.document(&record.id).expect("load HTML edit");
+        assert_eq!(
+            edited_document.units[0].source,
+            format!("<h1>Edited</h1><p>{edited_token}</p>")
+        );
         assert_eq!(updated.revision, record.revision + 1);
         assert!(
             library
@@ -177,6 +196,11 @@ fn each_generated_format_survives_library_edit_search_export_and_reopen() {
             .document(&record.id)
             .expect("restore canonical document");
         assert_eq!(reopened_record.revision, record.revision + 1);
+        assert_eq!(
+            reopened_document.units[0].source, edited_document.units[0].source,
+            "{} must retain HTML after reopening",
+            fixture.extension
+        );
         assert!(
             reopened_document.units[0]
                 .plain_text()

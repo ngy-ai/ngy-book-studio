@@ -11,7 +11,7 @@ use moye_epub_editor::{
     chat::ChatWindowKind,
     document::{
         AssetRef, AssetRole, Block, BookDocument, BookFormat, BookSource, ContentUnitKind, Inline,
-        Revision, SourceKind, TocNode, deterministic_id,
+        Revision, TocNode, deterministic_id,
     },
     editing::{DocumentEditor, NewContentUnit},
     library::{MediaDraft, MediaKind},
@@ -141,7 +141,6 @@ pub(super) fn editor_chapters_from_document(document: &BookDocument) -> Result<V
 struct EditorUnitState {
     id: String,
     kind: ContentUnitKind,
-    source_kind: SourceKind,
     source: String,
 }
 
@@ -153,7 +152,6 @@ impl EditorUnitState {
             .map(|unit| Self {
                 id: unit.id.clone(),
                 kind: unit.kind,
-                source_kind: unit.source_kind,
                 source: unit.source.clone(),
             })
             .collect()
@@ -413,7 +411,6 @@ enum PendingEditorAction {
     IndentToc,
     OutdentToc,
     CycleUnitKind,
-    SetSourceKind(SourceKind),
     InsertMedia(MediaKind),
     ReplaceMedia,
     EditMediaMetadata,
@@ -1678,17 +1675,16 @@ fn parse_rich_text_snapshot(document: &str, unit_id: &str) -> Result<ParsedSourc
     // whole shell through an HTML fragment sanitizer can preserve the removed
     // <title> text as visible body content, duplicating the chapter title on
     // every rich-text save. Only the serialized body is editable content.
-    parse_source_for_unit(SourceKind::Html, &document[body_start..body_end], unit_id)
+    parse_source_for_unit(&document[body_start..body_end], unit_id)
 }
 
 fn preview_document_from_source(
     template: &str,
     title: &str,
     unit_id: &str,
-    source_kind: SourceKind,
     source: &str,
 ) -> Result<(String, String, moye_epub_editor::document::BlockDocument)> {
-    let parsed = parse_source_for_unit(source_kind, source, unit_id)?;
+    let parsed = parse_source_for_unit(source, unit_id)?;
     let html = serialize_xhtml(&parsed.document)?;
     let fallback = editor_document_shell(title, &html);
     let replacement = if xml_body_element_range(&html).is_some() {
@@ -2113,13 +2109,6 @@ fn retain_referenced_pending_assets(
         .map(|asset| asset.id.as_str())
         .collect::<HashSet<_>>();
     pending.retain(|asset_id, _| retained.contains(asset_id.as_str()));
-}
-
-fn source_kind_label(kind: SourceKind) -> &'static str {
-    match kind {
-        SourceKind::Markdown => "Markdown",
-        SourceKind::Html => "HTML",
-    }
 }
 
 fn editor_book_format_label(document: &BookDocument) -> &'static str {
@@ -3704,9 +3693,6 @@ impl EditorApp {
             PendingEditorAction::IndentToc => self.perform_indent_toc(cx),
             PendingEditorAction::OutdentToc => self.perform_outdent_toc(cx),
             PendingEditorAction::CycleUnitKind => self.perform_cycle_unit_kind(cx),
-            PendingEditorAction::SetSourceKind(kind) => {
-                self.perform_set_source_kind(kind, window, cx)
-            }
             PendingEditorAction::InsertMedia(kind) => {
                 self.choose_media_file(kind, None, window, cx)
             }
@@ -3760,7 +3746,6 @@ impl EditorApp {
                 return;
             }
         }
-        let converted_to_html = tab == EditorTab::RichText && self.convert_selected_to_html();
         if tab == EditorTab::RichText
             && self
                 .chapters
@@ -3789,11 +3774,7 @@ impl EditorApp {
             EditorTab::Preview => self.load_webview(EditorTab::Preview, window, cx),
             EditorTab::RichText => self.load_webview(EditorTab::RichText, window, cx),
         }
-        self.notice = converted_to_html.then(|| Notice {
-            text: "进入富文本模式后，本章源码已规范化为 HTML；保存前仍可切回 Markdown。"
-                .to_string(),
-            error: false,
-        });
+        self.notice = None;
         cx.notify();
     }
 
@@ -3906,7 +3887,7 @@ impl EditorApp {
         }
     }
 
-    /// Pushes the canonical Markdown/HTML source into the source editor.
+    /// Pushes the canonical HTML source into the source editor.
     fn sync_body_input(&self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(source) = self
             .unit_states
@@ -4097,9 +4078,8 @@ impl EditorApp {
             }
             return true;
         };
-        // Structured media blocks deliberately remain authoritative when the
-        // source text has not changed. Re-parsing an identical Markdown source
-        // would otherwise degrade allowlisted audio/video HTML to RawHtml.
+        // Preserve the canonical AST and stable block IDs when the source
+        // text has not changed.
         if value == state.source {
             return true;
         }
@@ -4113,29 +4093,23 @@ impl EditorApp {
             .get(self.selected)
             .map(|chapter| chapter.title.as_str())
             .unwrap_or("章节");
-        let (preview, source, blocks) = match preview_document_from_source(
-            template,
-            title,
-            &state.id,
-            state.source_kind,
-            &value,
-        ) {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                self.notice = Some(Notice {
-                    text: format!("正文源码无效，尚未保存：{error:#}"),
-                    error: true,
-                });
-                cx.notify();
-                return false;
-            }
-        };
+        let (preview, source, blocks) =
+            match preview_document_from_source(template, title, &state.id, &value) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    self.notice = Some(Notice {
+                        text: format!("正文源码无效，尚未保存：{error:#}"),
+                        error: true,
+                    });
+                    cx.notify();
+                    return false;
+                }
+            };
         if let Some(unit) = self
             .canonical_document
             .as_mut()
             .and_then(|document| document.units.iter_mut().find(|unit| unit.id == state.id))
         {
-            unit.source_kind = state.source_kind;
             unit.source = source.clone();
             unit.document = blocks;
         }
@@ -4160,40 +4134,13 @@ impl EditorApp {
             .as_mut()
             .and_then(|document| document.units.iter_mut().find(|unit| unit.id == state.id))
         {
-            unit.source_kind = SourceKind::Html;
             unit.source = parsed.canonical_source.clone();
             unit.document = parsed.document;
         }
         if let Some(unit) = self.unit_states.get_mut(index) {
-            unit.source_kind = SourceKind::Html;
             unit.source = parsed.canonical_source;
         }
         Ok(())
-    }
-
-    fn convert_selected_to_html(&mut self) -> bool {
-        let Some(state) = self.unit_states.get(self.selected).cloned() else {
-            return false;
-        };
-        if state.source_kind == SourceKind::Html {
-            return false;
-        }
-        let Some(document) = self.canonical_document.as_mut() else {
-            return false;
-        };
-        let Some(unit) = document.units.iter_mut().find(|unit| unit.id == state.id) else {
-            return false;
-        };
-        let Ok(source) = serialize_source(&unit.document, SourceKind::Html) else {
-            return false;
-        };
-        unit.source_kind = SourceKind::Html;
-        unit.source = source.clone();
-        if let Some(editor_unit) = self.unit_states.get_mut(self.selected) {
-            editor_unit.source_kind = SourceKind::Html;
-            editor_unit.source = source;
-        }
-        true
     }
 
     fn add_chapter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4218,16 +4165,14 @@ impl EditorApp {
                 return;
             }
         };
-        let unit_id = match editor.add_unit(NewContentUnit::markdown_chapter(
-            title.clone(),
-            new_position,
-        )) {
-            Ok(unit_id) => unit_id,
-            Err(error) => {
-                self.set_error(format!("无法新增章节：{error:#}"), cx);
-                return;
-            }
-        };
+        let unit_id =
+            match editor.add_unit(NewContentUnit::html_chapter(title.clone(), new_position)) {
+                Ok(unit_id) => unit_id,
+                Err(error) => {
+                    self.set_error(format!("无法新增章节：{error:#}"), cx);
+                    return;
+                }
+            };
         let next_document = editor.into_document();
         let Some(unit) = next_document.units.iter().find(|unit| unit.id == unit_id) else {
             self.set_error("新增章节没有生成稳定内容单元", cx);
@@ -4246,15 +4191,10 @@ impl EditorApp {
             index += 1;
             href = format!("chapter-{index}.xhtml");
         }
-        let preview = preview_document_from_source(
-            DEFAULT_CHAPTER_HTML,
-            &title,
-            &unit.id,
-            unit.source_kind,
-            &unit.source,
-        )
-        .map(|(preview, _, _)| preview)
-        .unwrap_or_else(|_| DEFAULT_CHAPTER_HTML.to_string());
+        let preview =
+            preview_document_from_source(DEFAULT_CHAPTER_HTML, &title, &unit.id, &unit.source)
+                .map(|(preview, _, _)| preview)
+                .unwrap_or_else(|_| DEFAULT_CHAPTER_HTML.to_string());
         self.chapters.push(EditorChapter {
             title,
             href,
@@ -4264,7 +4204,6 @@ impl EditorApp {
         self.unit_states.push(EditorUnitState {
             id: unit.id.clone(),
             kind: unit.kind,
-            source_kind: unit.source_kind,
             source: unit.source.clone(),
         });
         self.canonical_document = Some(next_document);
@@ -4499,82 +4438,6 @@ impl EditorApp {
         }
         self.notice = Some(Notice {
             text: format!("内容类型已改为{}，保存后生效。", unit_kind_label(kind)),
-            error: false,
-        });
-        cx.notify();
-    }
-
-    fn set_source_kind(
-        &mut self,
-        source_kind: SourceKind,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self
-            .unit_states
-            .get(self.selected)
-            .is_none_or(|unit| unit.source_kind == source_kind)
-        {
-            return;
-        }
-        self.begin_action(PendingEditorAction::SetSourceKind(source_kind), window, cx);
-    }
-
-    fn perform_set_source_kind(
-        &mut self,
-        source_kind: SourceKind,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.tab == EditorTab::Source && !self.flush_body(cx) {
-            return;
-        }
-        let Some(state) = self.unit_states.get(self.selected).cloned() else {
-            return;
-        };
-        // Toggling the source kind on a chapter that has not been edited only
-        // re-serialises the original content into a different representation,
-        // which the user perceives as the source "being converted" for no
-        // reason. Leave the pristine source untouched.
-        if !self.modified_chapter_ids.contains(&state.id) {
-            return;
-        }
-        let Some(document) = self.canonical_document.as_mut() else {
-            return;
-        };
-        let Some(unit) = document.units.iter_mut().find(|unit| unit.id == state.id) else {
-            return;
-        };
-        let source = match serialize_source(&unit.document, source_kind) {
-            Ok(source) => source,
-            Err(error) => {
-                self.set_error(format!("无法转换正文源码：{error:#}"), cx);
-                return;
-            }
-        };
-        unit.source_kind = source_kind;
-        unit.source = source.clone();
-        if let Some(editor_unit) = self.unit_states.get_mut(self.selected) {
-            editor_unit.source_kind = source_kind;
-            editor_unit.source = source;
-        }
-        if source_kind == SourceKind::Markdown && self.tab == EditorTab::RichText {
-            self.ready_timeout_task.take();
-            self.active_web_page = None;
-            self.ai_selected_text = None;
-            self.tab = EditorTab::Source;
-            if let Some(webview) = &self.editor_webview {
-                webview.update(cx, |webview, _| webview.hide());
-            }
-            self.sync_body_input(self.selected, window, cx);
-        } else if self.tab == EditorTab::Source {
-            self.sync_body_input(self.selected, window, cx);
-        }
-        self.notice = Some(Notice {
-            text: format!(
-                "本章源码已规范化为 {}，保存后生效。",
-                source_kind_label(source_kind)
-            ),
             error: false,
         });
         cx.notify();
@@ -4928,7 +4791,7 @@ impl EditorApp {
             };
             unit.document.blocks.push(block);
         }
-        unit.source = serialize_source(&unit.document, unit.source_kind)?;
+        unit.source = serialize_source(&unit.document)?;
         self.pending_asset_bytes
             .insert(asset_id, draft.bytes().clone());
         prune_editor_assets(document);
@@ -4983,7 +4846,7 @@ impl EditorApp {
             update_media_metadata(&mut unit.document.blocks, block_id, metadata),
             "媒体块不存在"
         );
-        unit.source = serialize_source(&unit.document, unit.source_kind)?;
+        unit.source = serialize_source(&unit.document)?;
         document.validate()?;
         self.sync_unit_state_from_document(self.selected);
         self.refresh_selected_editor_views(window, cx)?;
@@ -5020,7 +4883,7 @@ impl EditorApp {
             self.set_error("媒体块不存在", cx);
             return;
         }
-        match serialize_source(&unit.document, unit.source_kind) {
+        match serialize_source(&unit.document) {
             Ok(source) => unit.source = source,
             Err(error) => {
                 self.set_error(format!("无法更新正文源码：{error:#}"), cx);
@@ -5063,7 +4926,6 @@ impl EditorApp {
         };
         if let Some(state) = self.unit_states.get_mut(index) {
             state.kind = unit.kind;
-            state.source_kind = unit.source_kind;
             state.source = unit.source.clone();
         }
     }
@@ -5083,13 +4945,8 @@ impl EditorApp {
             .get(self.selected)
             .cloned()
             .context("当前章节不存在")?;
-        let (preview, _, _) = preview_document_from_source(
-            &chapter.html,
-            &chapter.title,
-            &state.id,
-            state.source_kind,
-            &state.source,
-        )?;
+        let (preview, _, _) =
+            preview_document_from_source(&chapter.html, &chapter.title, &state.id, &state.source)?;
         self.chapters[self.selected].html = preview;
         match self.tab {
             EditorTab::Source => self.sync_body_input(self.selected, window, cx),
@@ -6095,7 +5952,7 @@ impl Render for EditorApp {
             "暂无章节".to_string()
         };
         let mode = match self.tab {
-            EditorTab::Source => "源码编辑",
+            EditorTab::Source => "HTML 源码编辑",
             EditorTab::Preview => "只读预览",
             EditorTab::RichText => "富文本 · 所见即所得",
         };
@@ -6669,19 +6526,12 @@ impl Render for EditorApp {
                 .into_any_element()
         });
 
-        let current_source_kind = self
-            .unit_states
-            .get(self.selected)
-            .map(|unit| unit.source_kind)
-            .unwrap_or(SourceKind::Html);
         let current_unit_kind = self
             .unit_states
             .get(self.selected)
             .map(|unit| unit.kind)
             .unwrap_or(ContentUnitKind::Chapter);
         let kind_view = view.clone();
-        let markdown_view = view.clone();
-        let html_view = view.clone();
         let chapter_title_bar = render_editor_section(|| {
             div()
                 .h_flex()
@@ -6720,45 +6570,6 @@ impl Render for EditorApp {
                         .on_click(move |_, window, cx| {
                             kind_view.update(cx, |this, cx| this.cycle_unit_kind(window, cx));
                         }),
-                )
-                .child(
-                    div()
-                        .h_flex()
-                        .gap_1()
-                        .child(
-                            Button::new("editor-source-markdown")
-                                .small()
-                                .label("Markdown")
-                                .when(current_source_kind == SourceKind::Markdown, |button| {
-                                    button.primary()
-                                })
-                                .when(current_source_kind != SourceKind::Markdown, |button| {
-                                    button.outline()
-                                })
-                                .disabled(structure_disabled)
-                                .on_click(move |_, window, cx| {
-                                    markdown_view.update(cx, |this, cx| {
-                                        this.set_source_kind(SourceKind::Markdown, window, cx)
-                                    });
-                                }),
-                        )
-                        .child(
-                            Button::new("editor-source-html")
-                                .small()
-                                .label("HTML")
-                                .when(current_source_kind == SourceKind::Html, |button| {
-                                    button.primary()
-                                })
-                                .when(current_source_kind != SourceKind::Html, |button| {
-                                    button.outline()
-                                })
-                                .disabled(structure_disabled)
-                                .on_click(move |_, window, cx| {
-                                    html_view.update(cx, |this, cx| {
-                                        this.set_source_kind(SourceKind::Html, window, cx)
-                                    });
-                                }),
-                        ),
                 )
                 .into_any_element()
         });
@@ -6913,7 +6724,7 @@ impl Render for EditorApp {
                     };
                     view.update(cx, |this, cx| this.switch_tab(tab, window, cx));
                 })
-                .child(Tab::new().label("源码"))
+                .child(Tab::new().label("HTML 源码"))
                 .child(Tab::new().label("预览"))
                 .child(Tab::new().label("富文本"))
                 .into_any_element()
@@ -7206,7 +7017,6 @@ mod editor_tests {
             "unit-1",
             ContentUnitKind::Chapter,
             "第一章",
-            SourceKind::Html,
             source,
             BlockDocument::new(vec![Block::Audio {
                 id: "block-audio".to_string(),
@@ -7289,7 +7099,6 @@ mod editor_tests {
             "unit-a",
             ContentUnitKind::Chapter,
             "第一章",
-            SourceKind::Html,
             "<img src=\"moye-asset:image\" />",
             BlockDocument::new(vec![Block::Image {
                 id: "image-block".to_string(),
@@ -7335,13 +7144,11 @@ mod editor_tests {
             EditorUnitState {
                 id: "unit-one".to_string(),
                 kind: ContentUnitKind::Chapter,
-                source_kind: SourceKind::Html,
                 source: chapters[0].html.clone(),
             },
             EditorUnitState {
                 id: "unit-two".to_string(),
                 kind: ContentUnitKind::Chapter,
-                source_kind: SourceKind::Html,
                 source: chapters[1].html.clone(),
             },
         ];
@@ -7383,30 +7190,33 @@ mod editor_tests {
     }
 
     #[test]
-    fn markdown_source_builds_a_sanitized_preview_without_changing_source_kind() {
+    fn html_source_builds_a_sanitized_preview() {
         let (preview, source, document) = preview_document_from_source(
             DEFAULT_CHAPTER_HTML,
             "测试章",
             "unit-test",
-            SourceKind::Markdown,
-            "# 标题\n\n正文 **加粗**",
+            "<h1>标题</h1><p>正文 <strong>加粗</strong></p>",
         )
         .unwrap();
 
         assert!(preview.contains("<h1"));
         assert!(preview.contains("正文"));
-        assert!(source.contains("# 标题"));
+        assert!(source.contains("<h1"));
+        assert!(source.contains("<strong>加粗</strong>"));
         assert_eq!("标题\n\n正文 加粗", document.plain_text());
-        assert!(
-            preview_document_from_source(
-                DEFAULT_CHAPTER_HTML,
-                "测试章",
-                "unit-test",
-                SourceKind::Markdown,
-                "正文\n\n<script>alert(1)</script>",
-            )
-            .is_err()
-        );
+        let (preview, source, document) = preview_document_from_source(
+            DEFAULT_CHAPTER_HTML,
+            "测试章",
+            "unit-test",
+            "<p onclick=\"alert(1)\">正文</p><script>alert(1)</script>",
+        )
+        .unwrap();
+        assert_eq!(document.plain_text(), "正文");
+        for sanitized in [&preview, &source] {
+            assert!(!sanitized.contains("<script"));
+            assert!(!sanitized.contains("onclick"));
+            assert!(!sanitized.contains("alert(1)"));
+        }
     }
 
     #[test]
@@ -7416,8 +7226,7 @@ mod editor_tests {
             "unit-a",
             ContentUnitKind::Chapter,
             "第一章",
-            SourceKind::Markdown,
-            "# 过期源码",
+            "<h1>过期源码</h1>",
             BlockDocument::new(vec![Block::Paragraph {
                 id: "paragraph-a".to_string(),
                 content: vec![Inline::Text {
@@ -8826,7 +8635,7 @@ mod editor_tests {
                         ),
                         "audio block must accept metadata"
                     );
-                    unit.source = serialize_source(&unit.document, unit.source_kind)?;
+                    unit.source = serialize_source(&unit.document)?;
                     document.assets.push(asset.clone());
                     library.apply_document_with_assets(
                         document,

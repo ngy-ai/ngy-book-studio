@@ -7,7 +7,7 @@ use anyhow::{Context as _, Result, bail, ensure};
 
 use crate::{
     document::{
-        BookDocument, ContentUnit, ContentUnitKind, SourceKind, SourceLocator, TocNode, TocTarget,
+        BookDocument, ContentUnit, ContentUnitKind, SourceLocator, TocNode, TocTarget,
         deterministic_id,
     },
     markup::parse_source_for_unit,
@@ -17,7 +17,6 @@ use crate::{
 pub struct NewContentUnit {
     pub title: String,
     pub kind: ContentUnitKind,
-    pub source_kind: SourceKind,
     pub source: String,
     /// Optional TOC parent. `None` inserts at the root.
     pub toc_parent_id: Option<String>,
@@ -26,18 +25,23 @@ pub struct NewContentUnit {
 }
 
 impl NewContentUnit {
-    pub fn markdown_chapter(title: impl Into<String>, linear_position: usize) -> Self {
+    pub fn html_chapter(title: impl Into<String>, linear_position: usize) -> Self {
         let title = title.into();
         Self {
-            source: format!("# {title}\n"),
+            source: format!("<h1>{}</h1>", escape_html_text(&title)),
             title,
             kind: ContentUnitKind::Chapter,
-            source_kind: SourceKind::Markdown,
             toc_parent_id: None,
             toc_position: linear_position,
             linear_position,
         }
     }
+}
+
+fn escape_html_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 #[derive(Clone, Debug)]
@@ -99,12 +103,11 @@ impl DocumentEditor {
                     title
                 ),
             );
-            let parsed = parse_source_for_unit(request.source_kind, &request.source, &unit_id)?;
+            let parsed = parse_source_for_unit(&request.source, &unit_id)?;
             let unit = ContentUnit::new(
                 unit_id.clone(),
                 request.kind,
                 title.clone(),
-                request.source_kind,
                 parsed.canonical_source,
                 parsed.document,
             )
@@ -129,20 +132,14 @@ impl DocumentEditor {
         Ok(added_id)
     }
 
-    pub fn update_unit_source(
-        &mut self,
-        unit_id: &str,
-        source_kind: SourceKind,
-        source: &str,
-    ) -> Result<()> {
+    pub fn update_unit_source(&mut self, unit_id: &str, source: &str) -> Result<()> {
         self.mutate(|candidate| {
             let unit = candidate
                 .units
                 .iter_mut()
                 .find(|unit| unit.id == unit_id)
                 .context("内容单元不存在")?;
-            let parsed = parse_source_for_unit(source_kind, source, unit_id)?;
-            unit.source_kind = source_kind;
+            let parsed = parse_source_for_unit(source, unit_id)?;
             unit.source = parsed.canonical_source;
             unit.document = parsed.document;
             Ok(())
@@ -333,8 +330,7 @@ mod tests {
                 "unit-1",
                 ContentUnitKind::Chapter,
                 "第一章",
-                SourceKind::Markdown,
-                "第一章",
+                "<p>第一章</p>",
                 BlockDocument::new(vec![Block::paragraph("block-1", "第一章")]),
             )
             .with_source_locator(SourceLocator::created()),
@@ -415,13 +411,46 @@ mod tests {
     }
 
     #[test]
+    fn html_chapter_preserves_titles_as_text_and_escapes_markup() {
+        let title = "A & B <script>alert(1)</script>";
+        let mut editor = DocumentEditor::new(fixture()).unwrap();
+        let unit_id = editor
+            .add_unit(NewContentUnit::html_chapter(title, 1))
+            .unwrap();
+        let unit = editor
+            .document()
+            .units
+            .iter()
+            .find(|unit| unit.id == unit_id)
+            .unwrap();
+        assert_eq!(unit.title, title);
+        assert_eq!(unit.plain_text(), title);
+        assert!(unit.source.starts_with("<h1>"));
+        assert!(unit.source.contains("&amp;"));
+        assert!(unit.source.contains("&lt;script&gt;"));
+        assert!(!unit.source.contains("<script>"));
+    }
+
+    #[test]
+    fn html_source_treats_markdown_syntax_as_literal_text() {
+        let mut editor = DocumentEditor::new(fixture()).unwrap();
+        editor
+            .update_unit_source("unit-1", "<p># Title **literal**</p>")
+            .unwrap();
+        let unit = &editor.document().units[0];
+        assert_eq!(unit.source, "<p># Title **literal**</p>");
+        assert_eq!(unit.plain_text(), "# Title **literal**");
+        assert!(matches!(unit.document.blocks[0], Block::Paragraph { .. }));
+    }
+
+    #[test]
     fn add_edit_reorder_and_remove_units_keeps_valid_document() {
         let mut editor = DocumentEditor::new(fixture()).unwrap();
         let second = editor
-            .add_unit(NewContentUnit::markdown_chapter("第二章", 1))
+            .add_unit(NewContentUnit::html_chapter("第二章", 1))
             .unwrap();
         editor
-            .update_unit_source(&second, SourceKind::Markdown, "## 修改\n\n正文")
+            .update_unit_source(&second, "<h2>修改</h2><p>正文</p>")
             .unwrap();
         editor.move_unit(&second, 0).unwrap();
         assert_eq!(editor.document().units[0].id, second);
@@ -434,7 +463,7 @@ mod tests {
     fn toc_can_be_nested_without_changing_linear_order() {
         let mut editor = DocumentEditor::new(fixture()).unwrap();
         let second = editor
-            .add_unit(NewContentUnit::markdown_chapter("第二章", 1))
+            .add_unit(NewContentUnit::html_chapter("第二章", 1))
             .unwrap();
         let second_toc = editor
             .document()

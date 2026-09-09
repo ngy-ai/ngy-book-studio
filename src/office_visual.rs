@@ -391,7 +391,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        document::{AssetRef, AssetRole, BlockDocument, ContentUnit, ContentUnitKind, SourceKind},
+        document::{AssetRef, AssetRole, BlockDocument, ContentUnit, ContentUnitKind},
         office_com::{
             OfficeEnhanceOutput, OfficeEnhanceRequest, OfficeEnhancementKind, OfficeFuture,
         },
@@ -534,7 +534,6 @@ mod tests {
                     format!("unit-{index}"),
                     ContentUnitKind::Slide,
                     format!("Slide {index}"),
-                    SourceKind::Markdown,
                     String::new(),
                     BlockDocument::default(),
                 )
@@ -592,7 +591,6 @@ mod tests {
                 "unit-word-1",
                 ContentUnitKind::Chapter,
                 "Section 1",
-                SourceKind::Markdown,
                 String::new(),
                 BlockDocument::default(),
             )
@@ -603,7 +601,6 @@ mod tests {
                 "unit-word-2",
                 ContentUnitKind::Chapter,
                 "Section 2",
-                SourceKind::Markdown,
                 String::new(),
                 BlockDocument::default(),
             )

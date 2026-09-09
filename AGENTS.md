@@ -64,7 +64,7 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   `BlockDocument`、`TocNode` 和 `DocumentLocator`。
 - `src/formats/`：`DocumentImporter` 注册表及 EPUB、PDF、Office、Kindle 适配器；
   `office_oxide`、`ebook-rs` 等第三方类型必须在本目录内转换为统一模型。
-- `src/markup.rs`、`src/editing.rs`、`src/export.rs`：Markdown/HTML 解析清洗、事务式
+- `src/markup.rs`、`src/editing.rs`、`src/export.rs`：HTML 解析清洗、事务式
   模型编辑，以及原件/EPUB/PDF 稳定导出。
 - `src/storage.rs`、`src/media.rs`：应用自有 `BlobStore`、基于 `object_store` 的本地
   BLAKE3 内容寻址实现，以及带图书归属校验和 Range 支持的媒体响应。
@@ -366,8 +366,12 @@ EPUB/PDF/原件导出、重新打开及原件字节一致性。
 
 - `BookDocument` 是导入器、编辑器、导出器、搜索与 AI 引用共享的事实模型；稳定 ID、
   revision、内容单元顺序、独立 TOC 和 `DocumentLocator` 语义不得由 UI 临时推断。
-- `source_kind` 决定 Markdown 或 HTML 的规范化序列化。源码只有成功解析、清洗并生成
-  AST 后才能保存；块编辑可以规范化标签、空白和 Markdown 写法。
+- 章节正文只使用 HTML，领域模型、编辑接口和 `content_units` 不再保存或选择
+  Markdown 格式。源码只有成功解析、清洗并生成 AST 后才能保存；块编辑可以规范化
+  HTML 标签和空白。聊天回复与课程讲义的 Markdown 展示独立于图书章节格式。
+  Office 使用解析器的原生 HTML 输出，PDF 文本序列化为 HTML；Office 章节划分依据
+  规范化标题块，不能按正文中的 `#` 猜测标题。列表、引用、代码块和普通表格保留结构，
+  统一模型不能表达的复杂 HTML 保留为清洗后的 RawHtml，不能静默丢弃内容。
 - 所有导入都永久保留字节一致的原件；只有导入图书提供原件导出。Office/Kindle 编辑
   结果不得伪装成能回写原格式；统一模型只保证可规范化导出 EPUB/PDF，不保证复刻原
   Office、PDF 或 Kindle 的复杂版式。
@@ -563,8 +567,8 @@ EPUB/PDF/原件导出、重新打开及原件字节一致性。
   打包整本原格式容器，也不回退提供原件中的 CSS/字体/任意路径资源。持久媒体只在
   协议请求时经 `AppServices` 后台读取；关闭时先封闭协议响应屏障，再释放 WebView，
   禁止迟到任务向已销毁的 Wry responder 回调。
-- 富文本 shell 与不可信正文保持 origin/能力隔离。Markdown 中仅允许白名单音视频
-  HTML；RawHtml 必须清洗，外链、事件处理器和主动嵌入不得进入预览。
+- 富文本 shell 与不可信正文保持 origin/能力隔离。HTML 中仅允许白名单音视频元素；
+  RawHtml 必须清洗，外链、事件处理器和主动嵌入不得进入预览。
 - 不要随意提高归档、正文、IPC、视觉页面或模型上下文大小上限。调整时补上限内、
   越界、取消与资源耗尽测试并说明风险。
 
@@ -588,7 +592,7 @@ cargo run --locked --bin moye-epub-editor
 
 涉及 UI、WebView、导航、编辑器、Office 或窗口生命周期时，除自动验证外还要实际
 走完受影响路径。按范围覆盖：启动；导入 EPUB/PDF/Office/DRM-free Kindle；结构化和
-PDF 预览；新建图书；Markdown/HTML、目录、封面和媒体编辑；保存；三种搜索模式；
+PDF 预览；新建图书；HTML、目录、封面和媒体编辑；保存；三种搜索模式；
 AI 侧栏与引用；原件/EPUB/PDF 导出并重新打开；多 Reader/Editor 窗口；WebView 构建中
 与构建后关闭。
 

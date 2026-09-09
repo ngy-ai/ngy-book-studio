@@ -2790,7 +2790,7 @@ impl Render for AiSidebar {
 mod tests {
     use super::*;
     use moye_epub_editor::document::{
-        Block, BlockDocument, ContentUnit, ContentUnitKind, NormalizedRect, SourceKind,
+        Block, BlockDocument, ContentUnit, ContentUnitKind, NormalizedRect,
     };
 
     fn book(id: &str) -> AiBookOption {
@@ -2804,7 +2804,6 @@ mod tests {
             "unit-1",
             ContentUnitKind::Chapter,
             "Chapter",
-            SourceKind::Html,
             "<p>前文 引用目标 后文</p>",
             BlockDocument::new(vec![Block::paragraph("block-1", text)]),
         )
@@ -3723,12 +3722,7 @@ mod tests {
     fn source_versions_are_checked_before_navigation_and_stale_links_remain_identifiable() {
         let mut document = BookDocument::created("book", "Book");
         document.revision = Revision::new(3);
-        let mut unit = ContentUnit::empty(
-            "unit-1",
-            ContentUnitKind::Chapter,
-            "Chapter",
-            SourceKind::Markdown,
-        );
+        let mut unit = ContentUnit::empty("unit-1", ContentUnitKind::Chapter, "Chapter");
         unit.revision = Revision::new(7);
         document.units.push(unit);
         let mut source = AiSourceLink {

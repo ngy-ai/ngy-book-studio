@@ -164,7 +164,7 @@ fn edit_draft(fixture: &EditorFixture, visual: &mut VisualTestContext, title: &s
                 input.set_value(title.to_string(), window, cx);
             });
             editor.body_input.update(cx, |input, cx| {
-                input.set_value("# 第一章\n\n尚未保存的正文。", window, cx);
+                input.set_value("<h1>第一章</h1><p>尚未保存的正文。</p>", window, cx);
             });
         });
     });
@@ -263,7 +263,7 @@ fn close_requires_an_answer_and_cancel_preserves_the_draft(cx: &mut TestAppConte
         assert_eq!(editor.title_input.read(cx).value(), "取消后保留的书名");
         assert_eq!(
             editor.body_input.read(cx).value(),
-            "# 第一章\n\n尚未保存的正文。"
+            "<h1>第一章</h1><p>尚未保存的正文。</p>"
         );
     });
     assert_eq!(persisted_document(&fixture), fixture.original);
@@ -614,13 +614,12 @@ fn prepare_toc_document(document: &mut BookDocument) {
     ]
     .into_iter()
     .map(|(id, title, body)| {
-        let source = format!("# {title}\n\n{body}\n");
-        let parsed = parse_source_for_unit(SourceKind::Markdown, &source, id).unwrap();
+        let source = format!("<h1>{title}</h1><p>{body}</p>");
+        let parsed = parse_source_for_unit(&source, id).unwrap();
         DocumentUnit::new(
             id,
             ContentUnitKind::Chapter,
             title,
-            SourceKind::Markdown,
             parsed.canonical_source,
             parsed.document,
         )
@@ -741,7 +740,7 @@ fn toc_siblings_in_one_unit_keep_independent_selection_and_unsaved_source(cx: &m
     visual.update(|window, cx| {
         fixture.editor.update(cx, |editor, cx| {
             editor.body_input.update(cx, |input, cx| {
-                input.set_value("# 引言\n\n目录切换前尚未保存的修改。", window, cx);
+                input.set_value("<h1>引言</h1><p>目录切换前尚未保存的修改。</p>", window, cx);
             });
         });
     });
@@ -825,7 +824,11 @@ fn saving_an_edited_unit_preserves_all_293_distinct_toc_entries(cx: &mut TestApp
     visual.update(|window, cx| {
         fixture.editor.update(cx, |editor, cx| {
             editor.body_input.update(cx, |input, cx| {
-                input.set_value("# 引言\n\n保存正文时必须保留独立目录标签。", window, cx);
+                input.set_value(
+                    "<h1>引言</h1><p>保存正文时必须保留独立目录标签。</p>",
+                    window,
+                    cx,
+                );
             });
             editor.save_draft(window, cx);
         });
@@ -855,7 +858,6 @@ fn open_unchanged_media_page(cx: &mut TestAppContext) -> (EditorFixture, &mut Vi
         let image =
             AssetRef::from_bytes(AssetRole::ContentImage, "image/png", None, bytes.as_slice());
         let unit = &mut document.units[3];
-        unit.source_kind = SourceKind::Html;
         unit.document = BlockDocument::new(vec![
             Block::Paragraph {
                 id: "typed-intro-paragraph".into(),
@@ -873,7 +875,7 @@ fn open_unchanged_media_page(cx: &mut TestAppContext) -> (EditorFixture, &mut Vi
                 caption: Vec::new(),
             },
         ]);
-        unit.source = serialize_source(&unit.document, unit.source_kind).unwrap();
+        unit.source = serialize_source(&unit.document).unwrap();
         let bytes = HashMap::from([(image.id.clone(), bytes)]);
         document.assets.push(image);
         Some(bytes)
@@ -958,7 +960,6 @@ fn unchanged_rich_snapshot_preserves_typed_media_and_all_draft_state(cx: &mut Te
         assert_eq!(editor.canonical_document.as_ref(), Some(&fixture.original));
         assert_eq!(editor.draft_generation, generation);
         assert_eq!(editor.modified_chapter_ids, modified);
-        assert_eq!(editor.unit_states[3].source_kind, SourceKind::Html);
         assert_eq!(editor.unit_states[3].source, source);
         assert_eq!(editor.chapters[3].html, html);
         assert_eq!(editor.ai_selected_text.as_deref(), Some("只浏览的引言正文"));
@@ -1015,7 +1016,6 @@ fn unchanged_rich_ack_runs_only_the_matching_toc_action_and_saves_typed_media(
     wait_for_write(&fixture, visual);
     let saved = persisted_document(&fixture);
     assert!(saved.revision > fixture.original.revision);
-    assert_eq!(saved.units[3].source_kind, SourceKind::Html);
     assert_eq!(saved.units[3].document, fixture.original.units[3].document);
     assert_eq!(saved.units[3].source, fixture.original.units[3].source);
     assert_eq!(saved.assets, fixture.original.assets);

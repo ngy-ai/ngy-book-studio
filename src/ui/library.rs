@@ -5187,7 +5187,7 @@ pub fn wrap_root(app: Entity<EpubReaderApp>, window: &mut Window, cx: &mut Conte
 mod tests {
     use super::*;
     use moye_epub_editor::document::{
-        BlockDocument, ContentUnit, ContentUnitKind, DocumentLocator, Revision, SourceKind,
+        BlockDocument, ContentUnit, ContentUnitKind, DocumentLocator, Revision,
     };
 
     #[test]
@@ -5315,8 +5315,7 @@ mod tests {
                 "unit-page",
                 ContentUnitKind::Page,
                 "Page 1",
-                SourceKind::Markdown,
-                "page",
+                "<p>page</p>",
                 BlockDocument::default(),
             )
             .with_source_locator(SourceLocator::pdf_page(1)),
