@@ -51,6 +51,7 @@ async fn exercises_models_embeddings_and_sse_against_a_mock_openai_server() {
         .embeddings(EmbeddingRequest {
             model: "embed-model".to_string(),
             input: vec!["first".to_string(), "second".to_string()],
+            dimensions: None,
         })
         .await
         .unwrap();

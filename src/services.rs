@@ -63,6 +63,10 @@ const MAX_LOADED_OFFICE_PAGE_BYTES: u64 = 512 * 1024 * 1024;
 pub const DEFAULT_CHAT_MODEL: &str = "qwen3.5:0.8b";
 pub const DEFAULT_EMBEDDING_MODEL: &str = "qwen3-embedding:0.6b";
 pub const DEFAULT_VISION_MODEL: &str = "qwen3.5:0.8b";
+/// Default embedding vector dimension. When the configured value differs from
+/// the previously saved one, all existing vector indices are invalidated and
+/// must be regenerated.
+pub const DEFAULT_EMBEDDING_DIMENSIONS: usize = 1024;
 pub const DEFAULT_ENDPOINT_ID: &str = "default";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -154,6 +158,10 @@ fn default_auto_run_background_jobs() -> bool {
     DEFAULT_AUTO_RUN_BACKGROUND_JOBS
 }
 
+fn default_embedding_dimensions() -> usize {
+    DEFAULT_EMBEDDING_DIMENSIONS
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedBackgroundJobSettings {
@@ -186,6 +194,11 @@ pub struct ProviderSettings {
     #[serde(skip, default = "default_auto_run_background_jobs")]
     pub auto_run_background_jobs: bool,
     pub embedding_model: String,
+    /// Dimension override sent to the embedding provider. Changing this value
+    /// invalidates all existing vector indices because stored vectors with the
+    /// old dimension are incompatible with the new request/response size.
+    #[serde(default = "default_embedding_dimensions")]
+    pub embedding_dimensions: usize,
     pub vision_model: String,
     pub remote_content_confirmed: bool,
     pub allow_insecure_remote_http: bool,
@@ -244,6 +257,7 @@ impl Default for ProviderSettings {
             chat_generation: ChatGenerationSettings::default(),
             auto_run_background_jobs: default_auto_run_background_jobs(),
             embedding_model: DEFAULT_EMBEDDING_MODEL.to_string(),
+            embedding_dimensions: DEFAULT_EMBEDDING_DIMENSIONS,
             vision_model: DEFAULT_VISION_MODEL.to_string(),
             remote_content_confirmed: false,
             allow_insecure_remote_http: false,
@@ -268,6 +282,12 @@ impl ProviderSettings {
         validate_model_name("chat", &self.chat_model)?;
         validate_model_name("embedding", &self.embedding_model)?;
         validate_model_name("vision", &self.vision_model)?;
+        ensure!(
+            self.embedding_dimensions > 0
+                && self.embedding_dimensions <= crate::ai::MAX_EMBEDDING_DIMENSIONS,
+            "embedding 维度必须在 1 到 {} 之间",
+            crate::ai::MAX_EMBEDDING_DIMENSIONS
+        );
         self.chat_generation.validate()?;
         let mut ids = BTreeSet::new();
         let mut urls = BTreeSet::new();
@@ -1746,6 +1766,7 @@ fn build_ai_services(
         db_path,
         Arc::clone(&embedding_provider),
         &settings.embedding_model,
+        settings.embedding_dimensions,
         embedding_execution_identity(&settings)?,
     )?);
     Ok(AiServices {
@@ -1837,6 +1858,7 @@ fn restore_ai_settings(db_path: &Path, rows: &[Option<db::settings::Setting>]) -
 fn indexing_model_config(settings: &ProviderSettings) -> Result<IndexingModelConfig> {
     IndexingModelConfig::new(
         &settings.embedding_model,
+        settings.embedding_dimensions,
         embedding_execution_identity(settings)?,
         &settings.vision_model,
         vision_execution_identity(settings)?,
@@ -1860,8 +1882,16 @@ fn embedding_execution_identity(settings: &ProviderSettings) -> Result<String> {
         normalize_provider_base_url(&settings.endpoint_for(ModelRole::Embedding)?.base_url)?;
     Ok(format!(
         "embedding-v1:{}",
-        blake3::hash(format!("{}\0{}", endpoint.as_str(), settings.embedding_model).as_bytes())
-            .to_hex()
+        blake3::hash(
+            format!(
+                "{}\0{}\0{}",
+                endpoint.as_str(),
+                settings.embedding_model,
+                settings.embedding_dimensions
+            )
+            .as_bytes()
+        )
+        .to_hex()
     ))
 }
 
@@ -3350,6 +3380,18 @@ mod tests {
         different_endpoint.base_url = "http://127.0.0.1:11435/v1".to_string();
         assert_ne!(
             embedding_execution_identity(&different_endpoint).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn embedding_identity_changes_when_dimensions_change() {
+        let base = ProviderSettings::default();
+        let expected = embedding_execution_identity(&base).unwrap();
+        let mut different_dimensions = base.clone();
+        different_dimensions.embedding_dimensions = 768;
+        assert_ne!(
+            embedding_execution_identity(&different_dimensions).unwrap(),
             expected
         );
     }

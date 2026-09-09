@@ -32,7 +32,7 @@ const MAX_MODEL_ENTRIES: usize = 4096;
 const MAX_MODEL_FIELD_BYTES: usize = 4096;
 const MAX_EMBEDDINGS_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_EMBEDDING_COUNT: usize = 2048;
-const MAX_EMBEDDING_DIMENSIONS: usize = 65_536;
+pub const MAX_EMBEDDING_DIMENSIONS: usize = 65_536;
 const MAX_CHAT_STREAM_BYTES: usize = 32 * 1024 * 1024;
 const MAX_CHAT_EVENT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CHAT_EVENTS: usize = 65_536;
@@ -402,6 +402,11 @@ pub struct ToolCallDelta {
 pub struct EmbeddingRequest {
     pub model: String,
     pub input: Vec<String>,
+    /// Optional dimension override sent to the provider. When `Some`, the
+    /// request includes `"dimensions": N` so models that support it return
+    /// vectors of exactly this size. `None` omits the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

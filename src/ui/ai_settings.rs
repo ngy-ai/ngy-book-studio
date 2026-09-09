@@ -5,13 +5,13 @@ use gpui_component::{Selectable as _, checkbox::Checkbox};
 use moye_epub_editor::{
     ai::{
         ChatGenerationSettings, DEFAULT_AI_REQUEST_TIMEOUT_SECS, DEFAULT_CHAT_OUTPUT_TOKENS,
-        DEFAULT_OLLAMA_OPENAI_BASE_URL, MAX_AI_REQUEST_TIMEOUT_SECS, MIN_AI_REQUEST_TIMEOUT_SECS,
-        ModelInfo, normalize_provider_base_url,
+        DEFAULT_OLLAMA_OPENAI_BASE_URL, MAX_AI_REQUEST_TIMEOUT_SECS, MAX_EMBEDDING_DIMENSIONS,
+        MIN_AI_REQUEST_TIMEOUT_SECS, ModelInfo, normalize_provider_base_url,
     },
     services::{
-        ApiKeyUpdate, AppServices, DEFAULT_CHAT_MODEL, DEFAULT_EMBEDDING_MODEL,
-        DEFAULT_VISION_MODEL, EndpointRoutingSettings, EndpointSettings, ModelRole,
-        ProviderSettings,
+        ApiKeyUpdate, AppServices, DEFAULT_CHAT_MODEL, DEFAULT_EMBEDDING_DIMENSIONS,
+        DEFAULT_EMBEDDING_MODEL, DEFAULT_VISION_MODEL, EndpointRoutingSettings, EndpointSettings,
+        ModelRole, ProviderSettings,
     },
 };
 
@@ -216,6 +216,7 @@ pub(super) struct AiSettingsWindow {
     presence_penalty_input: Entity<InputState>,
     frequency_penalty_input: Entity<InputState>,
     embedding_model_input: Entity<InputState>,
+    embedding_dimensions_input: Entity<InputState>,
     vision_model_input: Entity<InputState>,
     active_tab: SettingsTab,
     scroll_handles: [gpui::ScrollHandle; 4],
@@ -271,6 +272,12 @@ impl AiSettingsWindow {
             InputState::new(window, cx)
                 .default_value(settings.embedding_model)
                 .placeholder(DEFAULT_EMBEDDING_MODEL)
+        });
+        let embedding_dimensions_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(settings.embedding_dimensions.to_string())
+                .placeholder(DEFAULT_EMBEDDING_DIMENSIONS.to_string())
+                .validate(|value, _| value.chars().all(|character| character.is_ascii_digit()))
         });
         let vision_model_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -331,6 +338,7 @@ impl AiSettingsWindow {
             presence_penalty_input,
             frequency_penalty_input,
             embedding_model_input,
+            embedding_dimensions_input,
             vision_model_input,
             active_tab: SettingsTab::default(),
             scroll_handles: std::array::from_fn(|_| gpui::ScrollHandle::new()),
@@ -411,6 +419,9 @@ impl AiSettingsWindow {
                 .value()
                 .trim()
                 .to_string(),
+            embedding_dimensions: parse_embedding_dimensions(
+                self.embedding_dimensions_input.read(cx).value().as_ref(),
+            )?,
             vision_model: self.vision_model_input.read(cx).value().trim().to_string(),
             remote_content_confirmed: default_endpoint.remote_content_confirmed,
             allow_insecure_remote_http: default_endpoint.allow_insecure_remote_http,
@@ -798,6 +809,38 @@ impl AiSettingsWindow {
                 return;
             }
         };
+        // When the embedding model or dimensions change, all existing vector
+        // indices become incompatible. Warn the user before proceeding.
+        let embedding_confirmation = match self.services.provider_settings() {
+            Ok(current)
+                if current.embedding_model != settings.embedding_model
+                    || current.embedding_dimensions != settings.embedding_dimensions =>
+            {
+                let title = if current.embedding_model != settings.embedding_model
+                    && current.embedding_dimensions != settings.embedding_dimensions
+                {
+                    "Embedding 模型与向量维度已修改"
+                } else if current.embedding_model != settings.embedding_model {
+                    "Embedding 模型已修改"
+                } else {
+                    "向量维度已修改"
+                };
+                let answer = window.prompt(
+                    gpui::PromptLevel::Warning,
+                    title,
+                    Some(
+                        "修改 Embedding 模型或向量维度会使所有已索引的向量失效，保存后将自动重新生成索引。是否继续？",
+                    ),
+                    &[
+                        gpui::PromptButton::ok("继续保存"),
+                        gpui::PromptButton::cancel("取消"),
+                    ],
+                    cx,
+                );
+                Some(answer)
+            }
+            _ => None,
+        };
         let key_updates: BTreeMap<_, _> = self
             .endpoints
             .iter()
@@ -813,6 +856,20 @@ impl AiSettingsWindow {
         let services = Arc::clone(&self.services);
         let window_handle = self.window_handle;
         cx.spawn_in(window, async move |view, cx| {
+            if let Some(confirmation) = embedding_confirmation {
+                let confirmed = matches!(confirmation.await, Ok(0));
+                if !confirmed {
+                    let _ = view.update(cx, |this, cx| {
+                        this.operation = PendingOperation::Idle;
+                        this.notice = Some(SettingsNotice {
+                            text: "已取消保存，Embedding 设置未修改。".to_string(),
+                            error: false,
+                        });
+                        cx.notify();
+                    });
+                    return;
+                }
+            }
             // AppServices moves credential and SQLite work to its dedicated
             // runtime; this UI future only awaits and applies the result.
             let outcome = services.configure_providers(settings, key_updates).await;
@@ -1199,6 +1256,13 @@ impl AiSettingsWindow {
                 )
             })
             .child(self.render_input_field(label, description, self.model_input_for(role)))
+            .when(role == ModelRole::Embedding, |this| {
+                this.child(self.render_input_field(
+                    "向量维度（Dimensions）",
+                    "正整数，默认 1024。修改后所有已索引的向量将失效并需要重新生成。",
+                    &self.embedding_dimensions_input,
+                ))
+            })
             .child(
                 Button::new("ai-role-detect-models")
                     .label("检测此 Endpoint 的模型")
@@ -1917,6 +1981,18 @@ fn parse_web_search_max_results(value: &str) -> Result<usize> {
         "联网搜索结果数必须是 1 到 {MAX_WEB_SEARCH_RESULTS} 之间的整数"
     );
     Ok(count)
+}
+
+fn parse_embedding_dimensions(value: &str) -> Result<usize> {
+    let value = value.trim();
+    let dimensions = value.parse::<usize>().map_err(|_| {
+        anyhow::anyhow!("embedding 维度必须是 1 到 {MAX_EMBEDDING_DIMENSIONS} 之间的正整数")
+    })?;
+    anyhow::ensure!(
+        (1..=MAX_EMBEDDING_DIMENSIONS).contains(&dimensions),
+        "embedding 维度必须是 1 到 {MAX_EMBEDDING_DIMENSIONS} 之间的正整数"
+    );
+    Ok(dimensions)
 }
 
 fn canonical_endpoint(endpoint: &str) -> Option<String> {

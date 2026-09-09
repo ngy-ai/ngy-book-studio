@@ -80,6 +80,7 @@ pub struct IndexingJobSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexingModelConfig {
     embedding_model: String,
+    embedding_dimensions: usize,
     embedding_execution_identity: String,
     vision_model: String,
     vision_execution_identity: String,
@@ -88,12 +89,14 @@ pub struct IndexingModelConfig {
 impl IndexingModelConfig {
     pub fn new(
         embedding_model: impl Into<String>,
+        embedding_dimensions: usize,
         embedding_execution_identity: impl Into<String>,
         vision_model: impl Into<String>,
         vision_execution_identity: impl Into<String>,
     ) -> Result<Self> {
         Ok(Self {
             embedding_model: validated_model(embedding_model.into(), "embedding")?,
+            embedding_dimensions,
             embedding_execution_identity: validated_execution_identity(
                 embedding_execution_identity.into(),
                 "embedding",
@@ -780,6 +783,7 @@ async fn run_embedding(
         let request = models.embedding_provider.embeddings(EmbeddingRequest {
             model: models.config.embedding_model.clone(),
             input: inputs,
+            dimensions: Some(models.config.embedding_dimensions),
         });
         let batch = match await_provider_step(inner, job, &cursor, request).await? {
             Controlled::Value(batch) => batch,
@@ -1894,6 +1898,7 @@ mod tests {
     ) -> IndexingModelConfig {
         IndexingModelConfig::new(
             embedding_model,
+            crate::ai::MAX_EMBEDDING_DIMENSIONS,
             embedding_execution_identity,
             vision_model,
             vision_execution_identity,

@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, bail, ensure};
 use futures_util::{FutureExt as _, future::BoxFuture};
 
 pub use crate::agent::{SearchMode, SearchRequest};
@@ -170,6 +170,7 @@ pub struct SearchService {
     db_path: PathBuf,
     embedding_provider: Arc<dyn OpenAiCompatibleProvider>,
     embedding_model: String,
+    embedding_dimensions: usize,
     embedding_execution_identity: Option<String>,
     vector_index: Arc<dyn VectorIndex>,
 }
@@ -189,11 +190,13 @@ impl SearchService {
         db_path: impl Into<PathBuf>,
         embedding_provider: Arc<dyn OpenAiCompatibleProvider>,
         embedding_model: impl Into<String>,
+        embedding_dimensions: usize,
     ) -> Result<Self> {
         Self::with_vector_index(
             db_path,
             embedding_provider,
             embedding_model,
+            embedding_dimensions,
             Arc::new(SqliteVectorIndex),
         )
     }
@@ -202,13 +205,19 @@ impl SearchService {
         db_path: impl Into<PathBuf>,
         embedding_provider: Arc<dyn OpenAiCompatibleProvider>,
         embedding_model: impl Into<String>,
+        embedding_dimensions: usize,
         embedding_execution_identity: impl Into<String>,
     ) -> Result<Self> {
         let identity = embedding_execution_identity.into();
         if identity.trim().is_empty() || identity.trim() != identity {
             bail!("embedding execution identity is required");
         }
-        let mut service = Self::new(db_path, embedding_provider, embedding_model)?;
+        let mut service = Self::new(
+            db_path,
+            embedding_provider,
+            embedding_model,
+            embedding_dimensions,
+        )?;
         service.embedding_execution_identity = Some(identity);
         Ok(service)
     }
@@ -217,16 +226,23 @@ impl SearchService {
         db_path: impl Into<PathBuf>,
         embedding_provider: Arc<dyn OpenAiCompatibleProvider>,
         embedding_model: impl Into<String>,
+        embedding_dimensions: usize,
         vector_index: Arc<dyn VectorIndex>,
     ) -> Result<Self> {
         let embedding_model = embedding_model.into();
         if embedding_model.trim().is_empty() {
             bail!("embedding model is required");
         }
+        ensure!(
+            embedding_dimensions > 0 && embedding_dimensions <= crate::ai::MAX_EMBEDDING_DIMENSIONS,
+            "embedding dimensions must be between 1 and {}",
+            crate::ai::MAX_EMBEDDING_DIMENSIONS
+        );
         Ok(Self {
             db_path: db_path.into(),
             embedding_provider,
             embedding_model,
+            embedding_dimensions,
             embedding_execution_identity: None,
             vector_index,
         })
@@ -442,6 +458,7 @@ impl SearchService {
             .embeddings(EmbeddingRequest {
                 model: self.embedding_model.clone(),
                 input: vec![input],
+                dimensions: Some(self.embedding_dimensions),
             })
             .await
             .context("embedding request failed")?;
@@ -814,6 +831,7 @@ mod tests {
             &fixture.path,
             Arc::new(MockProvider::new(vec![1.0, 0.0])),
             "mock-model",
+            2,
             "endpoint-a:mock-model",
         )
         .unwrap();
@@ -829,6 +847,7 @@ mod tests {
             &fixture.path,
             Arc::new(provider),
             "mock-model",
+            2,
             "endpoint-a:mock-model",
         )
         .unwrap();
@@ -856,6 +875,7 @@ mod tests {
             &fixture.path,
             Arc::new(MockProvider::new(vec![1.0, 0.0])),
             "mock-model",
+            2,
             "endpoint-b:mock-model",
         )
         .unwrap();
@@ -904,6 +924,7 @@ mod tests {
             PathBuf::from("database-must-not-be-opened.db"),
             provider.clone(),
             "mock-model",
+            2,
             vector_index.clone(),
         )
         .unwrap();
@@ -927,6 +948,7 @@ mod tests {
             &fixture.path,
             provider.clone(),
             "mock-model",
+            2,
             vector_index.clone(),
         )
         .unwrap();
@@ -962,9 +984,14 @@ mod tests {
                 },
             ],
         });
-        let service =
-            SearchService::with_vector_index(&fixture.path, provider, "mock-model", vector_index)
-                .unwrap();
+        let service = SearchService::with_vector_index(
+            &fixture.path,
+            provider,
+            "mock-model",
+            2,
+            vector_index,
+        )
+        .unwrap();
 
         let hits = service
             .search(request(SearchMode::Semantic, vec!["book-a"]))
@@ -1004,9 +1031,14 @@ mod tests {
                 },
             ],
         });
-        let service =
-            SearchService::with_vector_index(&fixture.path, provider, "mock-model", vector_index)
-                .unwrap();
+        let service = SearchService::with_vector_index(
+            &fixture.path,
+            provider,
+            "mock-model",
+            2,
+            vector_index,
+        )
+        .unwrap();
 
         for mode in [SearchMode::Keyword, SearchMode::Semantic] {
             let hits = service.search(request(mode, vec!["book-a"])).await.unwrap();
