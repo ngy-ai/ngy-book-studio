@@ -32,7 +32,19 @@ GlobalWorkerOptions.workerSrc = "./pdf.worker.mjs";
 // available for bundled CMaps/fonts/Wasm; CSP independently blocks every
 // network origin.
 globalThis.fetch = (input, init) => {
-  const raw = typeof input === "string" ? input : input.url;
+  // `URL` instances expose their absolute address as `href`, while only
+  // `Request` instances use `url`. Reading `.url` from a `URL` yields
+  // `undefined`, which `new URL` would resolve into a same-origin
+  // "/undefined" request that fails with a confusing 404.
+  const raw =
+    typeof input === "string"
+      ? input
+      : input instanceof URL
+        ? input.href
+        : input.url;
+  if (!raw) {
+    return Promise.reject(new Error("network access is disabled in PDF preview"));
+  }
   const target = new URL(raw, location.href);
   if (target.origin !== location.origin) {
     return Promise.reject(new Error("network access is disabled in PDF preview"));

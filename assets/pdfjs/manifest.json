@@ -1138,8 +1138,8 @@
     {
       "path": "viewer.mjs",
       "mediaType": "text/javascript; charset=utf-8",
-      "bytes": 10620,
-      "sha256": "3429b4fe93bb583c64467e73be88610590a8d78b603d3d7297922e19f2a651a2"
+      "bytes": 11059,
+      "sha256": "4a81a0f4072bb17cf6dbc8a08b56c5621dee42b43504615ecfb63816450d2062"
     },
     {
       "path": "wasm/LICENSE_JBIG2",
