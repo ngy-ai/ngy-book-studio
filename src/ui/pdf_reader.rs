@@ -260,6 +260,8 @@ pub struct PdfReaderApp {
     search_input: Entity<InputState>,
     search_query: String,
     search_results: Vec<SearchHit>,
+    page_list_scroll: gpui::UniformListScrollHandle,
+    page_list_synced_page: Option<u32>,
     _search_subscription: Subscription,
     _ai_subscription: Subscription,
     _ai_layout_subscription: Subscription,
@@ -369,6 +371,8 @@ impl PdfReaderApp {
             search_input,
             search_query: String::new(),
             search_results: Vec::new(),
+            page_list_scroll: gpui::UniformListScrollHandle::new(),
+            page_list_synced_page: None,
             _search_subscription,
             _ai_subscription,
             _ai_layout_subscription,
@@ -1249,91 +1253,169 @@ impl Render for PdfReaderApp {
                     .child(div().h_full().w(gpui::relative(progress)).bg(rgb(ACCENT))),
             );
 
-        let navigation_items = if self.search_query.is_empty() {
-            vec![
-                div()
-                    .v_flex()
-                    .gap_2()
-                    .p_4()
-                    .rounded(px(8.))
-                    .bg(rgb(ACCENT_SOFT))
-                    .text_sm()
-                    .text_color(rgb(INK))
-                    .child(div().font_semibold().child(format!("第 {current_page} 页")))
-                    .child(div().text_xs().text_color(rgb(MUTED)).child(page_title))
-                    .into_any_element(),
-            ]
-        } else if self.search_results.is_empty() {
-            vec![
-                div()
-                    .p_4()
-                    .text_center()
-                    .text_sm()
-                    .text_color(rgb(MUTED))
-                    .child("当前 PDF 没有匹配页面")
-                    .into_any_element(),
-            ]
-        } else {
-            self.search_results
+        // Keep the page list centered on the page the WebView is actually on
+        // (initial open, prev/next, search and AI citation jumps).
+        if self.page_list_synced_page != Some(current_page) {
+            if let Some(index) = self
+                .pages
                 .iter()
-                .enumerate()
-                .map(|(index, hit)| {
-                    let result_view = view.clone();
-                    let unit_index = hit.spine_index;
-                    let page_number = self.page_for_unit_index(unit_index);
-                    let selected = page_number == Some(current_page);
-                    Button::new(("pdf-search-result", index))
-                        .ghost()
-                        .w_full()
-                        .h_auto()
-                        .min_h(px(66.))
-                        .justify_start()
-                        .px_3()
-                        .py_2()
-                        .rounded(px(7.))
-                        .when(selected, |this| this.bg(rgb(ACCENT_SOFT)))
-                        .disabled(unit_index.is_none())
-                        .on_click(move |_, window, cx| {
-                            if let Some(unit_index) = unit_index {
-                                result_view.update(cx, |this, cx| {
-                                    this.open_canonical_unit(unit_index, window, cx)
-                                });
-                            }
-                        })
-                        .child(
-                            div()
-                                .v_flex()
-                                .w_full()
-                                .min_w(px(0.))
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .truncate()
-                                        .text_left()
-                                        .text_sm()
-                                        .font_medium()
-                                        .text_color(if selected { rgb(ACCENT) } else { rgb(INK) })
-                                        .child(
-                                            hit.chapter_title
-                                                .clone()
-                                                .or_else(|| {
-                                                    page_number.map(|page| format!("第 {page} 页"))
-                                                })
-                                                .unwrap_or_else(|| "PDF".to_string()),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .line_clamp(2)
-                                        .text_left()
-                                        .text_xs()
-                                        .text_color(rgb(MUTED))
-                                        .child(hit.snippet.clone()),
-                                ),
-                        )
-                        .into_any_element()
-                })
-                .collect()
+                .position(|page| page.page_number == current_page)
+            {
+                self.page_list_scroll
+                    .scroll_to_item(index, gpui::ScrollStrategy::Center);
+            }
+            self.page_list_synced_page = Some(current_page);
+        }
+
+        let navigation_body: gpui::AnyElement = if self.search_query.is_empty() {
+            let page_entries = self
+                .pages
+                .iter()
+                .map(|page| (page.page_number, page.title.clone()))
+                .collect::<Vec<_>>();
+            let pdf_ready = self.pdf_ready;
+            gpui::uniform_list("pdf-page-list", page_entries.len(), move |range, _, _| {
+                range
+                    .map(|index| {
+                        let (page_number, title) = page_entries[index].clone();
+                        let selected = page_number == current_page;
+                        let item_view = view.clone();
+                        Button::new(("pdf-page-item", page_number as usize))
+                            .ghost()
+                            .w_full()
+                            .h(px(50.))
+                            .justify_start()
+                            .px_3()
+                            .rounded(px(7.))
+                            .when(selected, |this| this.bg(rgb(ACCENT_SOFT)))
+                            .disabled(!pdf_ready)
+                            .on_click(move |_, _, cx| {
+                                item_view.update(cx, |this, cx| this.request_page(page_number, cx));
+                            })
+                            .child(
+                                div()
+                                    .v_flex()
+                                    .w_full()
+                                    .min_w(px(0.))
+                                    .gap_0p5()
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .text_left()
+                                            .text_sm()
+                                            .font_medium()
+                                            .text_color(if selected {
+                                                rgb(ACCENT)
+                                            } else {
+                                                rgb(INK)
+                                            })
+                                            .child(format!("第 {page_number} 页")),
+                                    )
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .text_left()
+                                            .text_xs()
+                                            .text_color(rgb(MUTED))
+                                            .child(title),
+                                    ),
+                            )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .track_scroll(self.page_list_scroll.clone())
+            .flex_1()
+            .min_h(px(0.))
+            .w_full()
+            .px_2()
+            .py_2()
+            .into_any_element()
+        } else {
+            let navigation_items = if self.search_results.is_empty() {
+                vec![
+                    div()
+                        .p_4()
+                        .text_center()
+                        .text_sm()
+                        .text_color(rgb(MUTED))
+                        .child("当前 PDF 没有匹配页面")
+                        .into_any_element(),
+                ]
+            } else {
+                self.search_results
+                    .iter()
+                    .enumerate()
+                    .map(|(index, hit)| {
+                        let result_view = view.clone();
+                        let unit_index = hit.spine_index;
+                        let page_number = self.page_for_unit_index(unit_index);
+                        let selected = page_number == Some(current_page);
+                        Button::new(("pdf-search-result", index))
+                            .ghost()
+                            .w_full()
+                            .h_auto()
+                            .min_h(px(66.))
+                            .justify_start()
+                            .px_3()
+                            .py_2()
+                            .rounded(px(7.))
+                            .when(selected, |this| this.bg(rgb(ACCENT_SOFT)))
+                            .disabled(unit_index.is_none())
+                            .on_click(move |_, window, cx| {
+                                if let Some(unit_index) = unit_index {
+                                    result_view.update(cx, |this, cx| {
+                                        this.open_canonical_unit(unit_index, window, cx)
+                                    });
+                                }
+                            })
+                            .child(
+                                div()
+                                    .v_flex()
+                                    .w_full()
+                                    .min_w(px(0.))
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .text_left()
+                                            .text_sm()
+                                            .font_medium()
+                                            .text_color(if selected {
+                                                rgb(ACCENT)
+                                            } else {
+                                                rgb(INK)
+                                            })
+                                            .child(
+                                                hit.chapter_title
+                                                    .clone()
+                                                    .or_else(|| {
+                                                        page_number
+                                                            .map(|page| format!("第 {page} 页"))
+                                                    })
+                                                    .unwrap_or_else(|| "PDF".to_string()),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .line_clamp(2)
+                                            .text_left()
+                                            .text_xs()
+                                            .text_color(rgb(MUTED))
+                                            .child(hit.snippet.clone()),
+                                    ),
+                            )
+                            .into_any_element()
+                    })
+                    .collect()
+            };
+            div()
+                .flex_1()
+                .min_h(px(0.))
+                .w_full()
+                .p_3()
+                .overflow_y_scrollbar()
+                .child(div().v_flex().gap_1().children(navigation_items))
+                .into_any_element()
         };
 
         let navigation = div()
@@ -1374,14 +1456,7 @@ impl Render for PdfReaderApp {
                             .cleanable(true),
                     ),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .p_3()
-                    .overflow_y_scrollbar()
-                    .child(div().v_flex().gap_1().children(navigation_items)),
-            );
+            .child(navigation_body);
 
         let body = match &self.webview {
             Some(webview) => webview.clone().into_any_element(),
