@@ -17,13 +17,14 @@ use moye_epub_editor::{
     },
     services::AppServices,
 };
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 mod annotations;
 use annotations::{AnnotationAction, ReaderAnnotations};
 
 #[cfg(target_os = "windows")]
-mod selection_menu;
+pub(super) mod selection_menu;
 
 const MAX_READER_SELECTION_BYTES: usize = 32 * 1024;
 const READER_NAVIGATION_DEFAULT_WIDTH: f32 = 286.;
@@ -718,8 +719,18 @@ pub(super) async fn build_reader_webview(
         .context("无法创建正文视图")?;
 
     #[cfg(target_os = "windows")]
-    selection_menu::install(&raw_webview, event_sender, protocol_gate.clone())
-        .context("无法添加阅读器 AI 解释菜单")?;
+    selection_menu::install(
+        &raw_webview,
+        event_sender,
+        Arc::new({
+            let gate = protocol_gate.clone();
+            move || gate.is_open()
+        }),
+        selection_menu::reader_document_uri,
+        |url, selected_text| ReaderWebEvent::ExplainSelection { url, selected_text },
+        MAX_READER_SELECTION_BYTES,
+    )
+    .context("无法添加阅读器 AI 解释菜单")?;
 
     Ok((raw_webview, event_receiver, protocol_gate))
 }

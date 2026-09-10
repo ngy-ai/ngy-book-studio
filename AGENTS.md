@@ -118,6 +118,17 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   产物；普通 Cargo 构建不运行 Node。
 - `src/ui/reader/annotations.rs`、`annotations.js`：Reader 笔记宿主与可信选区菜单，
   闭合 Shadow DOM 隔离正文 CSS，覆盖层绘制而不改写正文节点。
+  `src/ui/reader/selection_menu.rs` 是 EPUB 与 PDF 共用的 WebView2 原生「AI解释」菜单，
+  由调用方提供私有文档判定与事件构造，仍要求 page/frame 为同一私有文档。
+- `src/ui/pdf_reader/annotations.rs`、`annotations.js`：PDF 页面笔记宿主与页面桥接，
+  复用同一张 `annotations` 表、互斥标记规则、人工/AI 想法流程与展示清洗。锚点作用域
+  是当前页的 PDF.js 文字层：宿主无法复刻该投影，因此
+  `LibraryStore::validate_pdf_annotation_anchor` 不比对规范页面文字，只校验图书/页面
+  归属、`ContentUnitKind::Page`、双版本、引文上限，以及范围长度必须等于压缩引文的
+  UTF-16 长度；偏移的稳定性来自不可变原件加固定版 PDF.js。页面桥接的每个请求都带
+  当前页码，宿主按已渲染页码、session、代次与版本拒绝过期请求；`configure` 绑定页面，
+  `disable` 用于没有规范身份的页面（同时清空 session 并隐藏笔记控件）。前端不得提交
+  AI 类型，AI 想法只能由宿主在回复保存后写入。
   `src/ui/notes.rs` 是“本书笔记”与“全部笔记”共用的原生浏览窗口，查询当前数据库，
   不使用图书窗口的旧投影推断范围；保留单表存储。列表按最近更新排序，搜索、类型筛选和
   分页控制渲染规模，引文按纯文本、人工/AI 想法按安全 Markdown 展示并支持复制。

@@ -767,6 +767,119 @@ impl LibraryStore {
         crate::annotations::validate_anchor(&text, anchor)
     }
 
+    /// PDF notes are anchored to the pinned PDF.js text layer of one page.
+    ///
+    /// No host extractor reproduces that projection byte-for-byte, so the
+    /// quote cannot be compared against the canonical page text the way EPUB
+    /// chapters are: doing so would reject ordinary selections on any page
+    /// whose PDF.js layout differs from the importer's. Offsets stay stable
+    /// because the imported original and the bundled PDF.js build are both
+    /// immutable, so verify every ownership, scope and revision rule plus the
+    /// anchor's own bounds instead.
+    pub fn validate_pdf_annotation_anchor(
+        &self,
+        book_id: &str,
+        content_unit_id: &str,
+        document_revision: u64,
+        unit_revision: u64,
+        anchor: &TextAnchor,
+    ) -> Result<()> {
+        ensure!(anchor.start < anchor.end, "请选择非空文本后添加笔记");
+        ensure!(
+            anchor.quote.len() <= crate::annotations::MAX_ANNOTATION_QUOTE_BYTES,
+            "所选文本过长，请缩小笔记范围"
+        );
+        let compacted = crate::annotations::compact_text(&anchor.quote);
+        ensure!(!compacted.is_empty(), "请选择非空文本后添加笔记");
+        // The page range and its quote are two views of one selection: the
+        // reader derives both from the same compacted text layer, so their
+        // lengths must agree even though the page text itself is not readable
+        // here. A range that cannot describe this quote is never stored.
+        ensure!(
+            u64::from(anchor.end - anchor.start) == compacted.encode_utf16().count() as u64,
+            "所选文本与页面位置不一致，请重新选择后添加笔记"
+        );
+        let document = self.document(book_id)?;
+        ensure!(
+            document.revision.get() == document_revision,
+            "图书已更新，请重新打开页面后添加笔记"
+        );
+        let unit = document
+            .units
+            .iter()
+            .find(|unit| unit.id == content_unit_id)
+            .context("笔记页面不属于当前图书")?;
+        ensure!(unit.kind == ContentUnitKind::Page, "笔记位置不是 PDF 页面");
+        ensure!(
+            unit.revision.get() == unit_revision,
+            "页面已更新，请重新打开后添加笔记"
+        );
+        Ok(())
+    }
+
+    /// Persists a PDF page note. Shares the single notes table, the exclusive
+    /// mark replacement and every revision rule with EPUB notes; only the
+    /// canonical-text comparison is replaced by
+    /// [`Self::validate_pdf_annotation_anchor`].
+    pub fn create_pdf_annotation(
+        &mut self,
+        book_id: &str,
+        draft: &AnnotationDraft,
+    ) -> Result<Annotation> {
+        crate::annotations::validate_draft(draft)?;
+        self.validate_pdf_annotation_anchor(
+            book_id,
+            &draft.content_unit_id,
+            draft.document_revision,
+            draft.unit_revision,
+            &draft.anchor,
+        )?;
+        let now = now_secs();
+        let note = Annotation {
+            id: deterministic_id("annotation", format!("{book_id}\0{}", now_nanos())),
+            book_id: book_id.to_string(),
+            content_unit_id: draft.content_unit_id.clone(),
+            document_revision: draft.document_revision,
+            unit_revision: draft.unit_revision,
+            anchor: draft.anchor.clone(),
+            kind: draft.kind,
+            comment: draft.comment.clone(),
+            created_at: now,
+            updated_at: now,
+            stale: false,
+        };
+        let mut conn = db::open_conn(&self.db_path)?;
+        db::transactions::insert_annotation(&mut conn, &note)
+    }
+
+    /// Removes only the mark on this exact PDF selection. Thoughts and other
+    /// occurrences of the same quote are retained; an unmarked range succeeds.
+    pub fn delete_pdf_annotation_marks(
+        &mut self,
+        book_id: &str,
+        content_unit_id: &str,
+        document_revision: u64,
+        unit_revision: u64,
+        anchor: &TextAnchor,
+    ) -> Result<()> {
+        self.validate_pdf_annotation_anchor(
+            book_id,
+            content_unit_id,
+            document_revision,
+            unit_revision,
+            anchor,
+        )?;
+        let mut conn = db::open_conn(&self.db_path)?;
+        db::transactions::delete_annotation_marks(
+            &mut conn,
+            book_id,
+            content_unit_id,
+            document_revision,
+            unit_revision,
+            anchor,
+        )
+    }
+
     /// All marks and both kinds of thought share one persisted notes table.
     /// A mark replaces the style of the same exact selection, retaining its
     /// identity; repeating the existing style leaves the note unchanged.
@@ -2859,6 +2972,125 @@ mod tests {
         assert_eq!(notes.len(), 4);
         assert!(notes.iter().all(|note| note.stale));
         assert!(notes.iter().any(|note| note.id == duplicate_mark.id));
+    }
+
+    /// PDF page notes reuse the EPUB rules for storage, ownership, revisions
+    /// and exclusive marks. Only the canonical-text comparison differs: a page
+    /// anchor addresses the pinned PDF.js text layer, which no host extractor
+    /// reproduces, so the range is checked against its own quote instead.
+    #[test]
+    fn pdf_page_notes_share_storage_and_scope_rules_without_reading_page_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut library = LibraryStore::load_from(temp.path().into()).unwrap();
+        let book = library.create_book("PDF 笔记", "作者").unwrap();
+        let chapter_book = library.create_book("重排图书", "作者").unwrap();
+        let document = library.document(&book.id).unwrap();
+        let page_id = document.units[0].id.clone();
+        let mut editor = DocumentEditor::new(document).unwrap();
+        editor
+            .update_unit_identity(&page_id, "第 1 页", ContentUnitKind::Page)
+            .unwrap();
+        library.apply_document(editor.into_document()).unwrap();
+        let document = library.document(&book.id).unwrap();
+        let mut draft = AnnotationDraft {
+            content_unit_id: page_id.clone(),
+            document_revision: document.revision.get(),
+            unit_revision: document.units[0].revision.get(),
+            anchor: TextAnchor {
+                quote: "页面 选区".into(),
+                start: 12,
+                end: 16,
+            },
+            kind: AnnotationKind::Highlight,
+            comment: None,
+        };
+
+        // The very same draft is not a valid reflowable chapter anchor.
+        assert!(library.create_annotation(&book.id, &draft).is_err());
+        let mark = library.create_pdf_annotation(&book.id, &draft).unwrap();
+        for kind in [AnnotationKind::Wavy, AnnotationKind::Underline] {
+            draft.kind = kind;
+            let replaced = library.create_pdf_annotation(&book.id, &draft).unwrap();
+            assert_eq!(replaced.id, mark.id);
+            assert_eq!(replaced.kind, kind);
+        }
+        let mut thoughts = Vec::new();
+        for kind in [AnnotationKind::HumanComment, AnnotationKind::AiComment] {
+            let mut thought = draft.clone();
+            thought.kind = kind;
+            thought.comment = Some("对这一页的想法".to_string());
+            thoughts.push(
+                library
+                    .create_pdf_annotation(&book.id, &thought)
+                    .unwrap()
+                    .id,
+            );
+        }
+        assert_eq!(library.list_annotations(&book.id, None).unwrap().len(), 3);
+
+        for invalid in [
+            {
+                // A range that cannot describe its own quote.
+                let mut invalid = draft.clone();
+                invalid.anchor.end += 1;
+                invalid
+            },
+            {
+                let mut invalid = draft.clone();
+                invalid.anchor.quote = "   ".into();
+                invalid
+            },
+            {
+                let mut invalid = draft.clone();
+                invalid.document_revision += 1;
+                invalid
+            },
+            {
+                let mut invalid = draft.clone();
+                invalid.unit_revision += 1;
+                invalid
+            },
+            {
+                // A reflowable chapter is never a PDF page position.
+                let other = library.document(&chapter_book.id).unwrap();
+                let mut invalid = draft.clone();
+                invalid.content_unit_id = other.units[0].id.clone();
+                invalid.document_revision = other.revision.get();
+                invalid.unit_revision = other.units[0].revision.get();
+                invalid
+            },
+        ] {
+            assert!(
+                library.create_pdf_annotation(&book.id, &invalid).is_err(),
+                "{invalid:?}"
+            );
+        }
+        assert!(
+            library
+                .create_pdf_annotation(&chapter_book.id, &draft)
+                .is_err()
+        );
+
+        // Removing the mark keeps both thoughts on the identical range.
+        library
+            .delete_pdf_annotation_marks(
+                &book.id,
+                &page_id,
+                draft.document_revision,
+                draft.unit_revision,
+                &draft.anchor,
+            )
+            .unwrap();
+        drop(library);
+        let reopened = LibraryStore::load_from(temp.path().into()).unwrap();
+        let notes = reopened.list_annotations(&book.id, Some(&page_id)).unwrap();
+        assert_eq!(notes.len(), 2);
+        assert!(
+            notes
+                .iter()
+                .all(|note| note.kind.is_comment() && !note.stale)
+        );
+        assert!(thoughts.iter().all(|id| notes.iter().any(|n| &n.id == id)));
     }
 
     #[test]

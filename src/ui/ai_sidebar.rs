@@ -25,7 +25,7 @@ const AI_SIDEBAR_NARROW_THRESHOLD: f32 = 1080.;
 const AI_REFERENCE_VISIBLE_ROWS: usize = 3;
 const AI_REFERENCE_ROW_HEIGHT: f32 = 28.;
 const MAX_QUESTION_BYTES: usize = 32 * 1024;
-const SELECTION_EXPLANATION_QUESTION: &str = "详细解释一下";
+const SELECTION_EXPLANATION_QUESTION: &str = "用汉语详细解释一下";
 const NO_KNOWLEDGE_BASE_SOURCE_WARNING_TITLE: &str = "没有可验证的知识库来源";
 const NO_KNOWLEDGE_BASE_SOURCE_WARNING_BODY: &str =
     "以下回答由大模型根据自身能力生成，不能视为基于所选图书的回答，请自行核实。";

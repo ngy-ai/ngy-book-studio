@@ -317,6 +317,7 @@ enum OpenReaderPayload {
         bytes: Arc<Vec<u8>>,
         pages: Vec<PdfReaderPage>,
         initial_page: u32,
+        document_revision: u64,
     },
     Reflowable {
         record: BookRecord,
@@ -352,6 +353,7 @@ struct PdfReaderWindowRequest {
     bytes: Arc<Vec<u8>>,
     pages: Vec<PdfReaderPage>,
     initial_page: u32,
+    document_revision: u64,
     library: LibraryStore,
     services: Arc<AppServices>,
     library_view: Entity<EpubReaderApp>,
@@ -506,6 +508,7 @@ fn open_pdf_reader_window(request: PdfReaderWindowRequest, cx: &mut App) {
         bytes,
         pages,
         initial_page,
+        document_revision,
         library,
         services,
         library_view,
@@ -552,6 +555,7 @@ fn open_pdf_reader_window(request: PdfReaderWindowRequest, cx: &mut App) {
                         PdfReaderInit {
                             book_id: record.id.clone(),
                             book_incarnation,
+                            document_revision,
                             title: record.title.clone(),
                             pages,
                             initial_page,
@@ -601,6 +605,7 @@ fn open_pdf_reader_window(request: PdfReaderWindowRequest, cx: &mut App) {
                 PdfReaderInit {
                     book_id: record.id.clone(),
                     book_incarnation,
+                    document_revision,
                     title: record.title.clone(),
                     pages: pages.clone(),
                     initial_page,
@@ -1863,6 +1868,7 @@ impl EpubReaderApp {
                     .map(|(index, unit)| PdfReaderPage {
                         unit_id: Some(unit.id),
                         unit_index: Some(index),
+                        unit_revision: unit.revision.0,
                         title: if unit.title.trim().is_empty() {
                             format!("第 {} 页", index + 1)
                         } else {
@@ -1908,6 +1914,7 @@ impl EpubReaderApp {
                     bytes,
                     pages,
                     initial_page,
+                    document_revision: document.revision.0,
                 });
             }
             let opened = library
@@ -1944,6 +1951,7 @@ impl EpubReaderApp {
                     bytes,
                     pages,
                     initial_page,
+                    document_revision,
                 })) => {
                     let (library, services, library_view) =
                         match view.update(cx, |this, cx| {
@@ -1987,6 +1995,7 @@ impl EpubReaderApp {
                                 bytes,
                                 pages,
                                 initial_page,
+                                document_revision,
                                 library,
                                 services,
                                 library_view,
