@@ -1,7 +1,7 @@
 use super::reader::{
-    READER_PANE_RESIZE_HANDLE_WIDTH, ReaderPaneLayout, ReaderResizablePane,
-    ReadingProgressProjection, ReadingProgressWrite, ReadingProgressWriteEvent,
-    ReadingProgressWriter,
+    READER_NAVIGATION_COLLAPSED_WIDTH, READER_PANE_RESIZE_HANDLE_WIDTH, ReaderPaneLayout,
+    ReaderResizablePane, ReadingProgressProjection, ReadingProgressWrite,
+    ReadingProgressWriteEvent, ReadingProgressWriter,
 };
 use super::*;
 use gpui::{DragMoveEvent, EmptyView, Focusable};
@@ -1128,6 +1128,44 @@ impl PdfReaderApp {
         window.refresh();
     }
 
+    fn toggle_navigation_collapsed(&mut self, cx: &mut Context<Self>) {
+        if self.pane_layout.toggle_navigation_collapsed() {
+            cx.notify();
+        }
+    }
+
+    /// Narrow rail shown while the page list is collapsed. The reader keeps the
+    /// resized width so expanding restores the previous layout.
+    fn render_collapsed_navigation(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let view = cx.entity().clone();
+        div()
+            .v_flex()
+            .w(px(READER_NAVIGATION_COLLAPSED_WIDTH))
+            .h_full()
+            .flex_none()
+            .items_center()
+            .border_r_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(SIDEBAR))
+            .py_3()
+            .child(
+                Button::new("pdf-navigation-expand")
+                    .ghost()
+                    .icon(IconName::PanelLeftOpen)
+                    .tooltip("展开页面列表")
+                    .on_click(move |_, _, cx| {
+                        view.update(cx, |this, cx| this.toggle_navigation_collapsed(cx));
+                    }),
+            )
+            .child(
+                div()
+                    .mt_3()
+                    .text_color(rgb(ACCENT))
+                    .child(Icon::new(IconName::Menu).small()),
+            )
+            .into_any_element()
+    }
+
     fn render_pane_resize_handle(
         &self,
         pane: ReaderResizablePane,
@@ -1508,6 +1546,7 @@ impl Render for PdfReaderApp {
                 .collect()
         };
 
+        let navigation_collapse_view = view.clone();
         let navigation = div()
             .v_flex()
             .w(self.pane_layout.navigation_width())
@@ -1520,19 +1559,38 @@ impl Render for PdfReaderApp {
                 div()
                     .h_flex()
                     .h(px(54.))
-                    .px_5()
+                    .pl_5()
+                    .pr_2()
+                    .justify_between()
                     .gap_2()
                     .border_b_1()
                     .border_color(rgb(BORDER))
                     .text_sm()
                     .font_semibold()
                     .text_color(rgb(INK))
-                    .child(Icon::new(IconName::Menu).small())
-                    .child(if self.search_query.is_empty() {
-                        format!("页面（{}）", page_entries.len())
-                    } else {
-                        format!("搜索结果（{}）", self.search_results.len())
-                    }),
+                    .child(
+                        div()
+                            .h_flex()
+                            .min_w(px(0.))
+                            .gap_2()
+                            .child(Icon::new(IconName::Menu).small())
+                            .child(div().truncate().child(if self.search_query.is_empty() {
+                                format!("页面（{}）", page_entries.len())
+                            } else {
+                                format!("搜索结果（{}）", self.search_results.len())
+                            })),
+                    )
+                    .child(
+                        Button::new("pdf-navigation-collapse")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::PanelLeftClose)
+                            .tooltip("收起页面列表")
+                            .on_click(move |_, _, cx| {
+                                navigation_collapse_view
+                                    .update(cx, |this, cx| this.toggle_navigation_collapsed(cx));
+                            }),
+                    ),
             )
             .child(
                 div()
@@ -1548,8 +1606,12 @@ impl Render for PdfReaderApp {
             )
             .child(if self.search_query.is_empty() {
                 // Keep the list centered on the page the WebView is actually on
-                // (initial open, prev/next, search and AI citation jumps).
-                if self.page_list_synced_page != Some(current_page) {
+                // (initial open, prev/next, search and AI citation jumps). While
+                // the pane is collapsed the list is not mounted, so leave the
+                // sync to the first frame that shows it again.
+                if !self.pane_layout.is_navigation_collapsed()
+                    && self.page_list_synced_page != Some(current_page)
+                {
                     if let Some(index) = page_entries
                         .iter()
                         .position(|(page_number, _)| *page_number == current_page)
@@ -1649,8 +1711,13 @@ impl Render for PdfReaderApp {
             .h_full()
             .bg(rgb(0x242424))
             .child(body);
-        let navigation_resize_handle =
-            self.render_pane_resize_handle(ReaderResizablePane::Navigation, cx);
+        let navigation: gpui::AnyElement = if self.pane_layout.is_navigation_collapsed() {
+            self.render_collapsed_navigation(cx)
+        } else {
+            navigation.into_any_element()
+        };
+        let navigation_resize_handle = (!self.pane_layout.is_navigation_collapsed())
+            .then(|| self.render_pane_resize_handle(ReaderResizablePane::Navigation, cx));
         let ai_resize_handle = (!self.ai_sidebar_collapsed)
             .then(|| self.render_pane_resize_handle(ReaderResizablePane::Ai, cx));
 
@@ -1688,7 +1755,7 @@ impl Render for PdfReaderApp {
                     .flex_1()
                     .min_h(px(0.))
                     .child(navigation)
-                    .child(navigation_resize_handle)
+                    .when_some(navigation_resize_handle, |this, handle| this.child(handle))
                     .child(content)
                     .when_some(ai_resize_handle, |this, handle| this.child(handle))
                     .child(self.ai_sidebar.clone()),

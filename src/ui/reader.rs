@@ -30,6 +30,7 @@ const MAX_READER_SELECTION_BYTES: usize = 32 * 1024;
 const READER_NAVIGATION_DEFAULT_WIDTH: f32 = 286.;
 const READER_NAVIGATION_MIN_WIDTH: f32 = 200.;
 const READER_NAVIGATION_MAX_WIDTH: f32 = 480.;
+pub(super) const READER_NAVIGATION_COLLAPSED_WIDTH: f32 = 44.;
 const READER_CONTENT_MIN_WIDTH: f32 = 320.;
 pub(super) const READER_PANE_RESIZE_HANDLE_WIDTH: f32 = 6.;
 const READER_CSP: &str = "default-src 'self' data:; script-src 'none'; connect-src 'none'; frame-src 'none'; object-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; media-src 'self' data:";
@@ -175,6 +176,7 @@ pub(super) enum ReaderResizablePane {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct ReaderPaneLayout {
     navigation_width: f32,
+    navigation_collapsed: bool,
     ai_width: f32,
     resizing: Option<ReaderResizablePane>,
 }
@@ -183,13 +185,45 @@ impl ReaderPaneLayout {
     pub(super) fn new(ai_width: Pixels) -> Self {
         Self {
             navigation_width: READER_NAVIGATION_DEFAULT_WIDTH,
+            navigation_collapsed: false,
             ai_width: f32::from(ai_width).clamp(AI_SIDEBAR_MIN_WIDTH, AI_SIDEBAR_MAX_WIDTH),
             resizing: None,
         }
     }
 
     pub(super) fn navigation_width(&self) -> Pixels {
-        px(self.navigation_width)
+        px(self.effective_navigation_width())
+    }
+
+    pub(super) fn is_navigation_collapsed(&self) -> bool {
+        self.navigation_collapsed
+    }
+
+    pub(super) fn set_navigation_collapsed(&mut self, collapsed: bool) -> bool {
+        if self.navigation_collapsed == collapsed {
+            return false;
+        }
+        self.navigation_collapsed = collapsed;
+        if collapsed {
+            self.resizing = self
+                .resizing
+                .filter(|pane| *pane != ReaderResizablePane::Navigation);
+        }
+        true
+    }
+
+    pub(super) fn toggle_navigation_collapsed(&mut self) -> bool {
+        self.set_navigation_collapsed(!self.navigation_collapsed)
+    }
+
+    /// The width the navigation pane actually occupies. Collapsing keeps the
+    /// resized width so expanding again restores what the reader had chosen.
+    fn effective_navigation_width(&self) -> f32 {
+        if self.navigation_collapsed {
+            READER_NAVIGATION_COLLAPSED_WIDTH
+        } else {
+            self.navigation_width
+        }
     }
 
     pub(super) fn ai_width(&self) -> Pixels {
@@ -198,6 +232,9 @@ impl ReaderPaneLayout {
 
     pub(super) fn begin_resize(&mut self, pane: ReaderResizablePane) -> bool {
         if self.resizing == Some(pane) {
+            return false;
+        }
+        if pane == ReaderResizablePane::Navigation && self.navigation_collapsed {
             return false;
         }
         self.resizing = Some(pane);
@@ -227,9 +264,11 @@ impl ReaderPaneLayout {
         if !ai_collapsed {
             self.ai_width = self.ai_width.min(self.maximum_ai_width(viewport_width));
         }
-        self.navigation_width = self
-            .navigation_width
-            .min(self.maximum_navigation_width(viewport_width, ai_collapsed));
+        if !self.navigation_collapsed {
+            self.navigation_width = self
+                .navigation_width
+                .min(self.maximum_navigation_width(viewport_width, ai_collapsed));
+        }
         old != (self.navigation_width, self.ai_width)
     }
 
@@ -240,7 +279,10 @@ impl ReaderPaneLayout {
         viewport_width: Pixels,
         ai_collapsed: bool,
     ) -> bool {
-        if self.resizing != Some(pane) || (pane == ReaderResizablePane::Ai && ai_collapsed) {
+        if self.resizing != Some(pane)
+            || (pane == ReaderResizablePane::Ai && ai_collapsed)
+            || (pane == ReaderResizablePane::Navigation && self.navigation_collapsed)
+        {
             return false;
         }
         let pointer_x = f32::from(pointer_x);
@@ -283,7 +325,7 @@ impl ReaderPaneLayout {
 
     fn maximum_ai_width(&self, viewport_width: f32) -> f32 {
         (viewport_width
-            - self.navigation_width
+            - self.effective_navigation_width()
             - READER_CONTENT_MIN_WIDTH
             - READER_PANE_RESIZE_HANDLE_WIDTH * 2.)
             .clamp(AI_SIDEBAR_MIN_WIDTH, AI_SIDEBAR_MAX_WIDTH)
@@ -1158,6 +1200,7 @@ impl Render for ReaderApp {
             }
         };
 
+        let navigation_collapse_view = view.clone();
         let toc = div()
             .v_flex()
             .w(self.pane_layout.navigation_width())
@@ -1170,19 +1213,38 @@ impl Render for ReaderApp {
                 div()
                     .h_flex()
                     .h(px(54.))
-                    .px_5()
+                    .pl_5()
+                    .pr_2()
+                    .justify_between()
                     .gap_2()
                     .border_b_1()
                     .border_color(rgb(BORDER))
                     .text_sm()
                     .font_semibold()
                     .text_color(rgb(INK))
-                    .child(Icon::new(IconName::Menu).small())
-                    .child(if self.search_query.is_empty() {
-                        "目录".to_string()
-                    } else {
-                        format!("搜索结果（{}）", self.search_results.len())
-                    }),
+                    .child(
+                        div()
+                            .h_flex()
+                            .min_w(px(0.))
+                            .gap_2()
+                            .child(Icon::new(IconName::Menu).small())
+                            .child(div().truncate().child(if self.search_query.is_empty() {
+                                "目录".to_string()
+                            } else {
+                                format!("搜索结果（{}）", self.search_results.len())
+                            })),
+                    )
+                    .child(
+                        Button::new("reader-navigation-collapse")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::PanelLeftClose)
+                            .tooltip("收起目录")
+                            .on_click(move |_, _, cx| {
+                                navigation_collapse_view
+                                    .update(cx, |this, cx| this.toggle_navigation_collapsed(cx));
+                            }),
+                    ),
             )
             .child(
                 div()
@@ -1236,8 +1298,13 @@ impl Render for ReaderApp {
                         .child(body),
                 ),
             );
-        let navigation_resize_handle =
-            self.render_pane_resize_handle(ReaderResizablePane::Navigation, cx);
+        let navigation: gpui::AnyElement = if self.pane_layout.is_navigation_collapsed() {
+            self.render_collapsed_navigation(cx)
+        } else {
+            toc.into_any_element()
+        };
+        let navigation_resize_handle = (!self.pane_layout.is_navigation_collapsed())
+            .then(|| self.render_pane_resize_handle(ReaderResizablePane::Navigation, cx));
         let ai_resize_handle = (!self.ai_sidebar_collapsed)
             .then(|| self.render_pane_resize_handle(ReaderResizablePane::Ai, cx));
 
@@ -1252,8 +1319,8 @@ impl Render for ReaderApp {
                     .items_start()
                     .flex_1()
                     .min_h(px(0.))
-                    .child(toc)
-                    .child(navigation_resize_handle)
+                    .child(navigation)
+                    .when_some(navigation_resize_handle, |this, handle| this.child(handle))
                     .child(content)
                     .when_some(ai_resize_handle, |this, handle| this.child(handle))
                     .child(self.ai_sidebar.clone()),
@@ -1397,6 +1464,44 @@ impl ReaderApp {
             }
         }));
         reader
+    }
+
+    fn toggle_navigation_collapsed(&mut self, cx: &mut Context<Self>) {
+        if self.pane_layout.toggle_navigation_collapsed() {
+            cx.notify();
+        }
+    }
+
+    /// Narrow rail shown while the table of contents is collapsed. The reader
+    /// keeps the resized width so expanding restores the previous layout.
+    fn render_collapsed_navigation(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let view = cx.entity().clone();
+        div()
+            .v_flex()
+            .w(px(READER_NAVIGATION_COLLAPSED_WIDTH))
+            .h_full()
+            .flex_none()
+            .items_center()
+            .border_r_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(SIDEBAR))
+            .py_3()
+            .child(
+                Button::new("reader-navigation-expand")
+                    .ghost()
+                    .icon(IconName::PanelLeftOpen)
+                    .tooltip("展开目录")
+                    .on_click(move |_, _, cx| {
+                        view.update(cx, |this, cx| this.toggle_navigation_collapsed(cx));
+                    }),
+            )
+            .child(
+                div()
+                    .mt_3()
+                    .text_color(rgb(ACCENT))
+                    .child(Icon::new(IconName::Menu).small()),
+            )
+            .into_any_element()
     }
 
     fn render_pane_resize_handle(
@@ -2268,6 +2373,58 @@ mod tests {
                 + READER_CONTENT_MIN_WIDTH
                 + READER_PANE_RESIZE_HANDLE_WIDTH * 2.,
             1180.
+        );
+    }
+
+    #[test]
+    fn collapsing_navigation_narrows_the_pane_and_frees_room_for_content() {
+        let mut layout = ReaderPaneLayout::new(px(360.));
+        assert!(layout.constrain(px(900.), false));
+        assert_eq!(layout.navigation_width(), px(286.));
+        assert_eq!(layout.ai_width(), px(282.));
+
+        assert!(layout.toggle_navigation_collapsed());
+        assert!(layout.is_navigation_collapsed());
+        assert_eq!(
+            layout.navigation_width(),
+            px(READER_NAVIGATION_COLLAPSED_WIDTH)
+        );
+        // The freed width goes first to the reading area, and the AI sidebar may
+        // now grow past the limit the expanded navigation used to impose.
+        assert!(layout.begin_resize(ReaderResizablePane::Ai));
+        assert!(layout.resize_from_pointer(ReaderResizablePane::Ai, px(0.), px(900.), false,));
+        assert_eq!(layout.ai_width(), px(524.));
+        assert!(layout.finish_resize());
+
+        assert!(layout.toggle_navigation_collapsed());
+        assert!(!layout.is_navigation_collapsed());
+        assert_eq!(layout.navigation_width(), px(286.));
+        assert!(layout.constrain(px(900.), false));
+        assert_eq!(layout.ai_width(), px(282.));
+    }
+
+    #[test]
+    fn collapsed_navigation_rail_is_not_resizable_and_cancels_its_drag() {
+        let mut layout = ReaderPaneLayout::new(px(360.));
+        assert!(layout.begin_resize(ReaderResizablePane::Navigation));
+        assert!(layout.is_resizing(ReaderResizablePane::Navigation));
+
+        assert!(layout.toggle_navigation_collapsed());
+        assert!(!layout.is_resizing(ReaderResizablePane::Navigation));
+        assert!(!layout.finish_resize());
+        assert!(!layout.begin_resize(ReaderResizablePane::Navigation));
+        assert!(!layout.resize_from_pointer(
+            ReaderResizablePane::Navigation,
+            px(600.),
+            px(900.),
+            false,
+        ));
+
+        assert!(layout.set_navigation_collapsed(false));
+        assert!(!layout.set_navigation_collapsed(false));
+        assert_eq!(
+            layout.navigation_width(),
+            px(READER_NAVIGATION_DEFAULT_WIDTH)
         );
     }
 
