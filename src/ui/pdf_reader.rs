@@ -135,15 +135,23 @@ fn normalize_pdf_selection(text: &str) -> String {
     normalized
 }
 
+/// Validates a selection reported by the continuous reader.
+///
+/// The viewer reports the page that owns the selection, which is not always the
+/// page it is reporting as current while the document scrolls, so the page is
+/// checked against the document instead of the current position. The request id
+/// still binds the message to the navigation that produced it, and an empty
+/// selection clears the frozen reference.
 fn validated_pdf_selection(
     expected_request_id: u64,
-    current_page: u32,
+    page_count: u32,
     request_id: u64,
     page_number: u32,
     selected_text: &str,
 ) -> Option<Option<PdfTextSelection>> {
     if request_id != expected_request_id
-        || page_number != current_page
+        || page_number == 0
+        || page_number > page_count.max(1)
         || selected_text.len() > MAX_PDF_SELECTION_BYTES
     {
         return None;
@@ -165,8 +173,25 @@ fn is_pdf_navigation_url(url: &str) -> bool {
         || url.starts_with("https://moyepdf.viewer/")
 }
 
-fn pdf_viewer_url(initial_page: u32) -> String {
-    format!("moyepdf://viewer/viewer.html?startPage={initial_page}")
+fn pdf_viewer_url(initial_page: u32, compact_reading: bool) -> String {
+    // The default URL stays byte-identical to the pre-preference one; the
+    // preference is only named when it is enabled.
+    if compact_reading {
+        format!("moyepdf://viewer/viewer.html?startPage={initial_page}&compact=1")
+    } else {
+        format!("moyepdf://viewer/viewer.html?startPage={initial_page}")
+    }
+}
+
+/// The single contract behind the compact reading preference: page spacing is
+/// one attribute on the viewer document, so the URL parameter and a live update
+/// of an already open reader apply exactly the same state.
+fn pdf_compact_reading_script(compact_reading: bool) -> &'static str {
+    if compact_reading {
+        "document.documentElement.setAttribute(\"data-pdf-compact\", \"1\");"
+    } else {
+        "document.documentElement.removeAttribute(\"data-pdf-compact\");"
+    }
 }
 
 fn pdf_progress_write(
@@ -210,6 +235,7 @@ fn pdf_resource(
 pub(super) async fn build_pdf_reader_webview(
     pdf_bytes: Arc<Vec<u8>>,
     initial_page: u32,
+    compact_reading: bool,
     parent: &ParentWindowHandle,
 ) -> Result<(
     gpui_component::wry::WebView,
@@ -264,7 +290,7 @@ pub(super) async fn build_pdf_reader_webview(
         .with_background_color((36, 36, 36, 255))
         .with_hotkeys_zoom(false)
         .with_incognito(true)
-        .with_url(pdf_viewer_url(initial_page))
+        .with_url(pdf_viewer_url(initial_page, compact_reading))
         .build_as_child_async(parent)
         .await
         .context("无法创建 PDF 视图")?;
@@ -377,6 +403,8 @@ pub struct PdfReaderApp {
     notice: Option<Notice>,
     persist_progress_enabled: bool,
     preview_label: String,
+    /// Global PDF reading preference, applied to this window's viewer document.
+    pdf_compact_reading: bool,
 }
 
 impl PdfReaderApp {
@@ -455,6 +483,15 @@ impl PdfReaderApp {
         } else {
             (None, None)
         };
+        // A failed read is not a reader failure: page spacing falls back to the
+        // documented default (the ordinary gap).
+        let pdf_compact_reading = services
+            .provider_settings()
+            .map(|settings| settings.pdf_compact_reading)
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "cannot read the PDF reading preference");
+                false
+            });
         let mut reader = Self {
             book_id,
             book_incarnation,
@@ -497,6 +534,7 @@ impl PdfReaderApp {
             notice: None,
             persist_progress_enabled: persist_progress,
             preview_label,
+            pdf_compact_reading,
         };
         if let Some(progress_events) = progress_events {
             reader.progress_sync_task = Some(cx.spawn(async move |view, cx| {
@@ -719,12 +757,49 @@ impl PdfReaderApp {
         self.set_error(error, cx);
     }
 
+    /// Applies the global compact reading preference to this window's viewer.
+    ///
+    /// The saved preference only changes page spacing, so an already open reader
+    /// follows it without being reopened and a stale viewer never reports an
+    /// error: the update is one attribute write on the viewer document.
+    pub(super) fn apply_pdf_compact_reading(
+        &mut self,
+        compact_reading: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pdf_compact_reading == compact_reading {
+            return;
+        }
+        self.pdf_compact_reading = compact_reading;
+        self.push_pdf_compact_reading(cx);
+    }
+
+    /// Sends the current preference to the viewer document. Safe to call more
+    /// than once: the attribute write is idempotent, and a viewer that is still
+    /// building simply receives it when it reports itself ready.
+    fn push_pdf_compact_reading(&mut self, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
+        let Some(webview) = self.webview.clone() else {
+            return;
+        };
+        let script = pdf_compact_reading_script(self.pdf_compact_reading);
+        if let Err(error) = webview.read(cx).raw().evaluate_script(script) {
+            // Presentation only: a missed update must not turn into reader error.
+            tracing::warn!(%error, "cannot apply the PDF compact reading preference");
+        }
+    }
+
     pub(super) fn handle_ipc(&mut self, message: PdfIpcMessage, cx: &mut Context<Self>) {
         if self.closing {
             return;
         }
         match message {
             PdfIpcMessage::ViewerReady => {
+                // The document is loaded, so a preference saved while this
+                // WebView was still building now reaches a live page.
+                self.push_pdf_compact_reading(cx);
                 self.notice = Some(Notice {
                     text: "正在解析本地 PDF…".to_string(),
                     error: false,
@@ -764,7 +839,7 @@ impl PdfReaderApp {
             } => {
                 let Some(selection) = validated_pdf_selection(
                     self.page_request_id,
-                    self.current_page,
+                    self.actual_page_count,
                     request_id,
                     page_number,
                     &selected_text,
@@ -1796,7 +1871,9 @@ fn pdf_reference_hints(
                         .with_source(SourceLocator::pdf_page(page.page_number)),
                 ),
                 label: if selected_text.is_some() {
-                    format!("当前页高亮 · 第 {} 页 · {}", page.page_number, page.title)
+                    // A continuous reader can select text on a page that is not
+                    // the one reported as current, so name the page instead.
+                    format!("选中高亮 · 第 {} 页 · {}", page.page_number, page.title)
                 } else if page.page_number == current_page {
                     format!("当前页 · 第 {} 页 · {}", page.page_number, page.title)
                 } else {
@@ -1833,6 +1910,32 @@ mod tests {
         assert!(is_pdf_navigation_url("http://moyepdf.viewer/pdf.mjs"));
         assert!(!is_pdf_navigation_url("https://example.com/document.pdf"));
         assert!(!is_pdf_navigation_url("moyepdf://attacker/viewer.html"));
+    }
+
+    #[test]
+    fn compact_reading_only_changes_the_viewer_url_when_enabled() {
+        assert_eq!(
+            pdf_viewer_url(7, false),
+            "moyepdf://viewer/viewer.html?startPage=7"
+        );
+        assert_eq!(
+            pdf_viewer_url(7, true),
+            "moyepdf://viewer/viewer.html?startPage=7&compact=1"
+        );
+        // A parameter must never leave the private origin or its viewer path.
+        assert!(is_pdf_navigation_url(&pdf_viewer_url(7, true)));
+    }
+
+    /// The URL parameter and the live update must name the same attribute, or an
+    /// already open reader would show a different gap than a freshly opened one.
+    #[test]
+    fn compact_reading_script_toggles_the_same_document_attribute() {
+        let enabled = pdf_compact_reading_script(true);
+        assert!(enabled.contains("setAttribute(\"data-pdf-compact\", \"1\")"));
+        assert!(enabled.contains("document.documentElement"));
+        let disabled = pdf_compact_reading_script(false);
+        assert!(disabled.contains("removeAttribute(\"data-pdf-compact\")"));
+        assert!(disabled.contains("document.documentElement"));
     }
 
     #[test]
@@ -1897,17 +2000,25 @@ mod tests {
         else {
             panic!("expected selection message");
         };
-        let selection = validated_pdf_selection(7, 3, request_id, page_number, &selected_text)
+        let selection = validated_pdf_selection(7, 9, request_id, page_number, &selected_text)
             .expect("current request and page")
             .expect("non-empty selection");
         assert_eq!(selection.text, "first second");
+        assert_eq!(selection.page_number, 3);
 
-        assert!(validated_pdf_selection(8, 3, request_id, page_number, &selected_text).is_none());
-        assert!(validated_pdf_selection(7, 4, request_id, page_number, &selected_text).is_none());
+        // A selection on another page of the same document keeps its own page.
+        let other = validated_pdf_selection(7, 9, 7, 4, "another page")
+            .expect("page inside the document")
+            .expect("non-empty selection");
+        assert_eq!(other.page_number, 4);
+
+        assert!(validated_pdf_selection(8, 9, request_id, page_number, &selected_text).is_none());
+        assert!(validated_pdf_selection(7, 9, 7, 0, "selected").is_none());
+        assert!(validated_pdf_selection(7, 9, 7, 10, "selected").is_none());
         assert!(
-            validated_pdf_selection(7, 3, 7, 3, &"x".repeat(MAX_PDF_SELECTION_BYTES + 1)).is_none()
+            validated_pdf_selection(7, 9, 7, 3, &"x".repeat(MAX_PDF_SELECTION_BYTES + 1)).is_none()
         );
-        assert_eq!(validated_pdf_selection(7, 3, 7, 3, " \n\t "), Some(None));
+        assert_eq!(validated_pdf_selection(7, 9, 7, 3, " \n\t "), Some(None));
     }
 
     #[test]
@@ -2019,7 +2130,7 @@ mod tests {
         let references = pdf_reference_hints("book-a", &pages, 2, 11, Some(&selection));
 
         assert_eq!(references[0].unit_id, "unit-2");
-        assert!(references[0].label.starts_with("当前页高亮"));
+        assert!(references[0].label.starts_with("选中高亮"));
         assert_eq!(
             references[0].frozen_text.as_deref(),
             Some("exact highlighted text")

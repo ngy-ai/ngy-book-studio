@@ -10,11 +10,17 @@ use super::*;
 use crate::ui::ai_sidebar::{AiAnswerCompleted, AiExplanationFailed, AiExplanationSubmitted};
 use anyhow::ensure;
 use moye_epub_editor::annotations::{Annotation, AnnotationDraft, AnnotationKind, TextAnchor};
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // This bounds only the derived display. Stored Markdown retains its existing
 // limits and is never replaced with HTML.
 const MAX_NOTE_DISPLAY_HTML_BYTES: usize = 8 * 1024 * 1024;
+
+/// One continuous-scroll reading window is far smaller than any page count the
+/// importer accepts, so a declaration and a multi-page listing both stay tiny.
+const MAX_ANNOTATION_PAGES: usize = 64;
+const MAX_ANNOTATION_PAGE: u32 = 1_000_000;
 
 fn thought_display_html(content: &str) -> String {
     let display = crate::ui::ai_sidebar::markdown::assistant_display_markdown(content);
@@ -40,6 +46,9 @@ fn thought_display_html(content: &str) -> String {
 #[serde(rename_all = "snake_case")]
 pub(super) enum PdfNoteAction {
     List,
+    /// The viewer's mounted reading window. Pages outside it may not author
+    /// notes, which replaces "only the single rendered page may".
+    PagesRendered,
     Highlight,
     Wavy,
     Underline,
@@ -62,6 +71,10 @@ pub(crate) struct PdfAnnotationAction {
     request_id: u64,
     #[serde(default)]
     page: u32,
+    /// Pages this request concerns: the mounted reading window for a
+    /// declaration, or the pages whose notes are requested in one reply.
+    #[serde(default)]
+    pages: Vec<u32>,
     #[serde(default)]
     anchor: Option<TextAnchor>,
     #[serde(default)]
@@ -77,8 +90,9 @@ impl PdfAnnotationAction {
         !self.session.is_empty()
             && self.session.len() <= 128
             // Every request names the page it was authored on. `handle` then
-            // compares it with the page actually rendered.
+            // compares it with the pages the viewer declared as rendered.
             && self.page >= 1
+            && self.page <= MAX_ANNOTATION_PAGE
             && (1..=(1_u64 << 53) - 1).contains(&self.request_id)
             && self
                 .id
@@ -97,6 +111,13 @@ impl PdfAnnotationAction {
             // through the mark path.
             && (self.action != PdfNoteAction::RemoveMark
                 || (self.anchor.is_some() && self.id.is_none() && self.content.is_none()))
+            && self.pages.len() <= MAX_ANNOTATION_PAGES
+            && self
+                .pages
+                .iter()
+                .all(|page| (1..=MAX_ANNOTATION_PAGE).contains(page))
+            // An empty window would disable every note the viewer could write.
+            && (self.action != PdfNoteAction::PagesRendered || !self.pages.is_empty())
     }
 }
 
@@ -112,8 +133,15 @@ pub(super) struct PdfAnnotations {
     /// say in whether notes are offered: `0` is the ordinary revision of every
     /// imported or created book, so a zero value must not hide the toolbar.
     document_revision: u64,
+    /// One bridge session per opened PDF revision. The continuous viewer keeps
+    /// several pages mounted at once, so pages are declared separately instead
+    /// of rebinding the whole session on every scroll.
     session: String,
     last_request: u64,
+    /// Pages the viewer currently has mounted. A page request is only served
+    /// while it is part of this window, which replaces the old single-page
+    /// check without weakening it.
+    rendered_pages: BTreeSet<u32>,
     busy: bool,
     dirty: bool,
     pending_ai: Option<PendingAiNote>,
@@ -125,11 +153,30 @@ impl PdfAnnotations {
             document_revision,
             session: String::new(),
             last_request: 0,
+            rendered_pages: BTreeSet::new(),
             busy: false,
             dirty: false,
             pending_ai: None,
         }
     }
+}
+
+/// Notes of one page, already resolved to its canonical content unit.
+#[derive(Clone)]
+struct PageAnnotations {
+    page: u32,
+    unit_revision: u64,
+    enabled: bool,
+    notes: Vec<Annotation>,
+}
+
+fn page_annotations_json(entry: PageAnnotations) -> serde_json::Value {
+    serde_json::json!({
+        "page": entry.page,
+        "revision": entry.unit_revision,
+        "enabled": entry.enabled,
+        "notes": notes_json(entry.notes),
+    })
 }
 
 fn notes_json(notes: Vec<Annotation>) -> serde_json::Value {
@@ -167,8 +214,14 @@ struct PdfNotePosition {
 /// ephemeral Office PDFs are represented. The document revision must never
 /// gate this because `Revision::INITIAL` (`0`) is the ordinary revision of
 /// every imported or created book, and only editing advances it.
-fn pdf_note_position(pages: &[PdfReaderPage], current_page: u32) -> Option<PdfNotePosition> {
-    let page = pages.iter().find(|page| page.page_number == current_page)?;
+fn page_can_own_notes(page: &PdfReaderPage) -> bool {
+    page.unit_id
+        .as_deref()
+        .is_some_and(|unit_id| !unit_id.trim().is_empty())
+}
+
+fn pdf_note_position(pages: &[PdfReaderPage], page_number: u32) -> Option<PdfNotePosition> {
+    let page = pages.iter().find(|page| page.page_number == page_number)?;
     let unit_id = page
         .unit_id
         .as_deref()
@@ -181,12 +234,31 @@ fn pdf_note_position(pages: &[PdfReaderPage], current_page: u32) -> Option<PdfNo
 }
 
 impl PdfReaderApp {
-    fn note_position(&self) -> Option<PdfNotePosition> {
-        pdf_note_position(&self.pages, self.current_page)
+    fn note_position_for(&self, page_number: u32) -> Option<PdfNotePosition> {
+        pdf_note_position(&self.pages, page_number)
     }
 
+    /// Whether this document can own notes at all. An ephemeral Office preview
+    /// has no canonical page identity, so its bridge chrome stays hidden.
     pub(super) fn notes_enabled(&self) -> bool {
-        self.note_position().is_some()
+        self.pages.iter().any(page_can_own_notes)
+    }
+
+    /// Pages a request applies to, restricted to the window the viewer has
+    /// declared as rendered. An undeclared page is never served.
+    fn requested_note_pages(&self, action: &PdfAnnotationAction) -> Vec<u32> {
+        let requested = if action.pages.is_empty() {
+            vec![action.page]
+        } else {
+            action.pages.clone()
+        };
+        let mut pages = requested
+            .into_iter()
+            .filter(|page| self.annotations.rendered_pages.contains(page))
+            .collect::<Vec<_>>();
+        pages.dedup();
+        pages.truncate(MAX_ANNOTATION_PAGES);
+        pages
     }
 
     fn note_script(&mut self, method: &str, value: serde_json::Value, cx: &mut Context<Self>) {
@@ -199,31 +271,38 @@ impl PdfReaderApp {
         }
     }
 
-    /// Rebinds the page bridge to the page that is actually rendered. A new
-    /// session invalidates every in-flight request from the previous page.
+    /// Binds the page bridge to this document revision. The session stays valid
+    /// while the same PDF revision is open, so scrolling never invalidates the
+    /// notes of the pages that remain mounted; the viewer declares its mounted
+    /// window separately and every page request is checked against it.
     pub(super) fn configure_annotations(&mut self, cx: &mut Context<Self>) {
         static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
-        let Some(position) = self.note_position() else {
-            // An ephemeral preview page carries no canonical identity, so it
-            // cannot own notes. Retire the previous page's session before the
-            // page bridge hides its controls: a late request from the page
-            // that just scrolled away must not reach this one.
+        if !self.notes_enabled() {
+            // An ephemeral preview carries no canonical page identity, so it
+            // cannot own notes. Retire the session before the page bridge hides
+            // its controls: a late request from the document that just went away
+            // must not reach a later one.
             self.annotations.session.clear();
             self.annotations.last_request = 0;
             self.annotations.dirty = false;
+            self.annotations.rendered_pages.clear();
             self.note_script("disable", serde_json::json!({}), cx);
             return;
-        };
-        self.annotations.session = NEXT_SESSION.fetch_add(1, Ordering::Relaxed).to_string();
-        self.annotations.last_request = 0;
-        self.annotations.dirty = false;
+        }
+        if self.annotations.session.is_empty() {
+            self.annotations.session = NEXT_SESSION.fetch_add(1, Ordering::Relaxed).to_string();
+            self.annotations.last_request = 0;
+            self.annotations.dirty = false;
+            self.annotations.rendered_pages.clear();
+        }
+        let session = self.annotations.session.clone();
+        let revision = self.annotations.document_revision;
         self.note_script(
             "configure",
             serde_json::json!({
-                "session": self.annotations.session,
-                "revision": position.unit_revision,
-                "page": position.page_number,
-                "notes": [],
+                "session": session,
+                "revision": revision,
+                "notes_enabled": true,
             }),
             cx,
         );
@@ -232,23 +311,26 @@ impl PdfReaderApp {
     fn note_result(
         &mut self,
         action: &PdfAnnotationAction,
-        result: Result<serde_json::Value, String>,
+        result: Result<Vec<serde_json::Value>, String>,
         cx: &mut Context<Self>,
     ) {
         if self.annotations.session != action.session || self.closing {
             return;
         }
+        let session = action.session.clone();
+        let revision = self.annotations.document_revision;
+        let request_id = action.request_id;
         let payload = match result {
-            Ok(notes) => {
+            Ok(pages) => {
                 if action.action != PdfNoteAction::List {
                     self.notice = None;
                     cx.notify();
                 }
-                serde_json::json!({"session":action.session,"revision":action.revision,"request_id":action.request_id,"ok":true,"notes":notes})
+                serde_json::json!({"session":session,"revision":revision,"request_id":request_id,"ok":true,"pages":pages})
             }
             Err(error) => {
                 self.set_error(error.clone(), cx);
-                serde_json::json!({"session":action.session,"revision":action.revision,"request_id":action.request_id,"ok":false,"error":error})
+                serde_json::json!({"session":session,"revision":revision,"request_id":request_id,"ok":false,"error":error})
             }
         };
         self.note_script("result", payload, cx);
@@ -285,7 +367,9 @@ impl PdfReaderApp {
         action: &PdfAnnotationAction,
         kind: AnnotationKind,
     ) -> Result<AnnotationDraft, String> {
-        let position = self.note_position().ok_or("当前页面没有可用的笔记位置")?;
+        let position = self
+            .note_position_for(action.page)
+            .ok_or("当前页面没有可用的笔记位置")?;
         Ok(AnnotationDraft {
             content_unit_id: position.unit_id,
             document_revision: self.annotations.document_revision,
@@ -301,16 +385,11 @@ impl PdfReaderApp {
         action: PdfAnnotationAction,
         cx: &mut Context<Self>,
     ) {
-        let Some(position) = self.note_position() else {
-            return;
-        };
-        // Reject anything that does not describe the page currently rendered in
-        // this exact session generation, plus replayed request numbers.
+        // Reject anything outside this document session, plus replayed request
+        // numbers. Which pages may author a note is decided per request.
         if self.closing
             || self.webview_build_gate.close_requested
             || action.session != self.annotations.session
-            || action.revision != position.unit_revision
-            || action.page != position.page_number
             || action.request_id <= self.annotations.last_request
         {
             return;
@@ -318,6 +397,32 @@ impl PdfReaderApp {
         self.annotations.last_request = action.request_id;
         if action.action == PdfNoteAction::DraftChanged {
             self.annotations.dirty = action.dirty;
+            return;
+        }
+        if action.action == PdfNoteAction::PagesRendered {
+            // The mounted reading window. A page outside it is never served, so
+            // a request that outlives its page cannot reach another page.
+            self.annotations.rendered_pages = action.pages.iter().copied().collect();
+            return;
+        }
+        let pages = self.requested_note_pages(&action);
+        if pages.is_empty() {
+            self.note_result(&action, Err("笔记请求与已渲染的页面不一致。".into()), cx);
+            return;
+        }
+        if action.action == PdfNoteAction::List {
+            // Listing is the one action a page without canonical identity may
+            // still answer: it reports `enabled: false` instead of notes.
+            self.write_or_load_notes(action, None, pages, cx);
+            return;
+        }
+        let Some(position) = self.note_position_for(action.page) else {
+            self.note_result(&action, Err("当前页面没有可用的笔记位置。".into()), cx);
+            return;
+        };
+        // A write must describe the anchor revision of the page it targets.
+        if action.revision != position.unit_revision {
+            self.note_result(&action, Err("笔记请求与页面版本不一致。".into()), cx);
             return;
         }
         if self.annotations.busy {
@@ -330,7 +435,7 @@ impl PdfReaderApp {
             {
                 pending.action = action.clone();
                 let draft = pending.draft.clone();
-                self.write_or_load_notes(action, Some(draft), cx);
+                self.write_or_load_notes(action, Some(draft), pages, cx);
             } else {
                 self.note_result(&action, Err("没有待保存的 AI 想法。".into()), cx);
             }
@@ -344,7 +449,7 @@ impl PdfReaderApp {
                 .is_some_and(|pending| pending.draft.comment.is_some())
             {
                 self.annotations.pending_ai = None;
-                self.write_or_load_notes(action, None, cx);
+                self.write_or_load_notes(action, None, pages, cx);
             } else {
                 self.note_result(&action, Err("没有可放弃的待保存 AI 想法。".into()), cx);
             }
@@ -372,20 +477,34 @@ impl PdfReaderApp {
                 return;
             }
         };
-        self.write_or_load_notes(action, draft, cx);
+        self.write_or_load_notes(action, draft, pages, cx);
     }
 
     fn write_or_load_notes(
         &mut self,
         action: PdfAnnotationAction,
         draft: Option<AnnotationDraft>,
+        pages: Vec<u32>,
         cx: &mut Context<Self>,
     ) {
-        let Some(position) = self.note_position() else {
+        // `pages` already passed the rendered-window check, so every target is
+        // a page the viewer currently shows. A page without canonical identity
+        // still answers with `enabled: false` instead of notes, and a write only
+        // ever targets the page this request was authored on.
+        let targets = pages
+            .into_iter()
+            .map(|page| (page, self.note_position_for(page)))
+            .collect::<Vec<_>>();
+        let Some(unit_id) = targets
+            .iter()
+            .find(|(page, _)| *page == action.page)
+            .and_then(|(_, position)| position.as_ref())
+            .map(|position| position.unit_id.clone())
+        else {
+            self.note_result(&action, Err("当前页面没有可用的笔记位置。".into()), cx);
             return;
         };
         let book_id = self.book_id.clone();
-        let unit_id = position.unit_id;
         let document_revision = self.annotations.document_revision;
         let operation = action.clone();
         let is_ai_save = draft
@@ -430,13 +549,37 @@ impl PdfReaderApp {
                             )?;
                         }
                     }
-                    PdfNoteAction::List | PdfNoteAction::DiscardAiSave => {}
+                    PdfNoteAction::List
+                    | PdfNoteAction::DiscardAiSave
+                    | PdfNoteAction::PagesRendered
+                    | PdfNoteAction::DraftChanged => {}
                     _ => anyhow::bail!("无效的笔记操作"),
                 }
             }
             // The mutation above has committed. A later refresh failure must
-            // not invite a duplicate insert on retry.
-            Ok::<_, anyhow::Error>(library.list_annotations(&book_id, Some(&unit_id)))
+            // not invite a duplicate insert on retry, so the listing stays a
+            // separate inner result.
+            let listing = (|| -> Result<Vec<PageAnnotations>, anyhow::Error> {
+                let mut results = Vec::with_capacity(targets.len());
+                for (page, position) in targets {
+                    match position {
+                        Some(position) => results.push(PageAnnotations {
+                            page,
+                            unit_revision: position.unit_revision,
+                            enabled: true,
+                            notes: library.list_annotations(&book_id, Some(&position.unit_id))?,
+                        }),
+                        None => results.push(PageAnnotations {
+                            page,
+                            unit_revision: 0,
+                            enabled: false,
+                            notes: Vec::new(),
+                        }),
+                    }
+                }
+                Ok(results)
+            })();
+            Ok::<_, anyhow::Error>(listing)
         });
         cx.spawn(async move |view, cx| {
             let (committed, result) = match task.await {
@@ -457,7 +600,12 @@ impl PdfReaderApp {
                     } else {
                         None
                     };
-                    (result.map(notes_json), failed_html)
+                    (
+                        result.map(|pages| {
+                            pages.into_iter().map(page_annotations_json).collect::<Vec<_>>()
+                        }),
+                        failed_html,
+                    )
                 })
                 .await
             {
@@ -470,7 +618,7 @@ impl PdfReaderApp {
                     if is_ai_save {
                         this.annotations.pending_ai = None;
                     }
-                    this.note_script("result", serde_json::json!({"session":action.session,"revision":action.revision,"request_id":action.request_id,"ok":true}), cx);
+                    this.note_script("result", serde_json::json!({"session":action.session,"revision":document_revision,"request_id":action.request_id,"ok":true}), cx);
                     this.set_error("笔记已更新，但列表刷新失败；请重新打开笔记面板。".into(), cx);
                     return;
                 }
@@ -483,7 +631,7 @@ impl PdfReaderApp {
                             .and_then(|pending| pending.draft.comment.as_deref())
                             .unwrap_or_default()
                             .to_owned();
-                        this.note_script("result", serde_json::json!({"session":action.session,"revision":action.revision,"request_id":action.request_id,"ok":false,"error":error,"retry_ai_save":true,"content":content,"content_html":failed_content_html}), cx);
+                        this.note_script("result", serde_json::json!({"session":action.session,"revision":document_revision,"request_id":action.request_id,"ok":false,"error":error,"retry_ai_save":true,"content":content,"content_html":failed_content_html}), cx);
                         this.set_error(error.clone(), cx);
                         return;
                     }
@@ -512,12 +660,11 @@ impl PdfReaderApp {
                 return;
             }
         };
-        let Some(reference) = pdf_explanation_reference(
-            &self.book_id,
-            &self.pages,
-            self.current_page,
-            &draft.anchor.quote,
-        ) else {
+        // The explanation cites the page the anchor was authored on, which the
+        // continuous viewer already checked against its mounted window.
+        let Some(reference) =
+            pdf_explanation_reference(&self.book_id, &self.pages, action.page, &draft.anchor.quote)
+        else {
             self.note_result(&action, Err("所选文本已失效，请重新选择。".into()), cx);
             return;
         };
@@ -553,7 +700,8 @@ impl PdfReaderApp {
                     None => false,
                 };
                 if started {
-                    this.note_script("state", serde_json::json!({"session":action.session,"revision":action.revision,"request_id":action.request_id,"phase":"pending"}), cx);
+                    let revision = this.annotations.document_revision;
+                    this.note_script("state", serde_json::json!({"session":action.session,"revision":revision,"request_id":action.request_id,"phase":"pending"}), cx);
                     this.annotations.pending_ai = Some(PendingAiNote {
                         action,
                         draft,
@@ -619,7 +767,11 @@ impl PdfReaderApp {
         }
         pending.draft.comment = Some(event.markdown.clone());
         let pending = pending.clone();
-        self.write_or_load_notes(pending.action, Some(pending.draft), cx);
+        // The host chose this page when it started the explanation and already
+        // validated the anchor against its canonical unit, so the saved thought
+        // goes back to that page even if the reader scrolled on.
+        let pages = vec![pending.action.page];
+        self.write_or_load_notes(pending.action, Some(pending.draft), pages, cx);
     }
 
     pub(super) fn on_pdf_annotation_ai_failed(
@@ -781,20 +933,24 @@ mod tests {
     }
 
     /// The injected bridge is the only page-side author of note requests, so
-    /// its contract with this host is pinned here: private origin, PDF.js text
-    /// layer scope, and a page number on every request.
+    /// its contract with this host is pinned here: private origin, page-local
+    /// PDF.js text layer scope, a declared reading window and a page number on
+    /// every request.
     #[test]
-    fn trusted_pdf_bridge_binds_every_request_to_the_rendered_page() {
+    fn trusted_pdf_bridge_binds_every_request_to_a_rendered_page() {
         let bridge = include_str!("annotations.js");
         for contract in [
             "window.top === window",
             "moyepdf.viewer",
             "\"moyepdf:\"",
+            "document.querySelector(`.pdf-page[data-page=\"${page}\"]`)",
             "querySelector(\".textLayer\")",
             "attachShadow({ mode: \"closed\" })",
             "type: \"annotation_action\"",
-            "page: context.page",
-            "!Number.isSafeInteger(payload.page) || payload.page < 1",
+            "page, request_id: requestId, ...fields",
+            "postSilent(\"pages_rendered\", { pages: declaredPages })",
+            "setPages(pages)",
+            "lockedPage()",
             "disable()",
         ] {
             assert!(
@@ -806,6 +962,32 @@ mod tests {
         // written by this host after the answer is saved.
         assert!(!bridge.contains(r#"post("ai_comment""#));
         assert!(!bridge.contains(r#"choose("ai_comment")"#));
+    }
+
+    /// The continuous viewer declares the pages it has mounted; the host serves
+    /// a page request only while it is inside that window.
+    #[test]
+    fn rendered_window_ipc_is_bounded_and_requires_the_declared_pages() {
+        let body = r#"{"type":"annotation_action","action":"pages_rendered","session":"1","revision":0,"request_id":1,"page":7,"pages":[3,4,5]}"#;
+        let action = parse(body).expect("valid rendered-window declaration");
+        assert_eq!(action.action, PdfNoteAction::PagesRendered);
+        assert_eq!(action.pages, vec![3, 4, 5]);
+
+        for invalid in [
+            body.replace(r#""pages":[3,4,5]"#, r#""pages":[]"#),
+            body.replace(r#""pages":[3,4,5]"#, r#""pages":[0]"#),
+            body.replace(
+                r#""pages":[3,4,5]"#,
+                &format!(r#""pages":[{}0]"#, "1,".repeat(MAX_ANNOTATION_PAGES)),
+            ),
+        ] {
+            assert!(parse(&invalid).is_none(), "{invalid}");
+        }
+
+        let list = r#"{"type":"annotation_action","action":"list","session":"1","revision":0,"request_id":2,"page":3,"pages":[3,4]}"#;
+        let action = parse(list).expect("valid multi-page listing");
+        assert_eq!(action.action, PdfNoteAction::List);
+        assert_eq!(action.pages, vec![3, 4]);
     }
 
     #[test]

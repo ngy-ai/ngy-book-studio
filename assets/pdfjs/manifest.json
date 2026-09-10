@@ -1132,14 +1132,14 @@
     {
       "path": "viewer.html",
       "mediaType": "text/html; charset=utf-8",
-      "bytes": 3009,
-      "sha256": "b240382cb4a29a003e4aa7da5b20932890919eb1b956764543a4fca045b60bca"
+      "bytes": 4098,
+      "sha256": "eed2d755adbcf3a50151b4af296f3d2c5962f4c0901e2665ad97f52c97d0b8e2"
     },
     {
       "path": "viewer.mjs",
       "mediaType": "text/javascript; charset=utf-8",
-      "bytes": 11835,
-      "sha256": "a45ff6474aca87e9a1d45c2eaca954d5f32545211562c0213dac9b5786a17294"
+      "bytes": 24734,
+      "sha256": "179df070fcf83b989e9fea102379656a9134607690c7b751e5d584b4b0baaa7a"
     },
     {
       "path": "wasm/LICENSE_JBIG2",

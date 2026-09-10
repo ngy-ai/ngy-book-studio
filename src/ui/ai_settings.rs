@@ -22,14 +22,19 @@ enum SettingsTab {
     Models,
     WebSearch,
     BackgroundJobs,
+    /// Application-level preferences that are not provider configuration. The
+    /// variant must stay last: `active_tab as usize` indexes both the tab bar
+    /// and the per-tab scroll handles.
+    System,
 }
 
 impl SettingsTab {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::Endpoint,
         Self::Models,
         Self::WebSearch,
         Self::BackgroundJobs,
+        Self::System,
     ];
 
     fn label(self) -> &'static str {
@@ -38,6 +43,7 @@ impl SettingsTab {
             Self::Models => "对话模型",
             Self::WebSearch => "联网搜索",
             Self::BackgroundJobs => "后台任务",
+            Self::System => "系统配置",
         }
     }
 
@@ -47,6 +53,7 @@ impl SettingsTab {
             Self::Models => "ai-settings-tab-models",
             Self::WebSearch => "ai-settings-tab-web-search",
             Self::BackgroundJobs => "ai-settings-tab-background-jobs",
+            Self::System => "ai-settings-tab-system",
         }
     }
 }
@@ -219,7 +226,7 @@ pub(super) struct AiSettingsWindow {
     embedding_dimensions_input: Entity<InputState>,
     vision_model_input: Entity<InputState>,
     active_tab: SettingsTab,
-    scroll_handles: [gpui::ScrollHandle; 4],
+    scroll_handles: [gpui::ScrollHandle; 5],
     window_handle: gpui::AnyWindowHandle,
     // --- Host web-search fallback (opt-in) ---
     web_search_enabled: bool,
@@ -235,6 +242,8 @@ pub(super) struct AiSettingsWindow {
     web_search_confirmed_remote_endpoint: String,
     delete_web_search_api_key: bool,
     auto_run_background_jobs: bool,
+    /// Global PDF reading preference: no gap between pages when enabled.
+    pdf_compact_reading: bool,
     operation: PendingOperation,
     notice: Option<SettingsNotice>,
 }
@@ -356,6 +365,7 @@ impl AiSettingsWindow {
             web_search_confirmed_remote_endpoint: settings.web_search_confirmed_remote_endpoint,
             delete_web_search_api_key: false,
             auto_run_background_jobs: settings.auto_run_background_jobs,
+            pdf_compact_reading: settings.pdf_compact_reading,
             operation: PendingOperation::Idle,
             notice: None,
         }
@@ -448,6 +458,7 @@ impl AiSettingsWindow {
             web_search_timeout_secs,
             web_search_max_results,
             auto_run_background_jobs: self.auto_run_background_jobs,
+            pdf_compact_reading: self.pdf_compact_reading,
         };
         settings.validate()?;
         Ok(settings)
@@ -853,6 +864,9 @@ impl AiSettingsWindow {
             error: false,
         });
 
+        // The reading preference applies to open readers as soon as the save
+        // commits, so it is captured before the settings move into the future.
+        let pdf_compact_reading = settings.pdf_compact_reading;
         let services = Arc::clone(&self.services);
         let window_handle = self.window_handle;
         cx.spawn_in(window, async move |view, cx| {
@@ -887,6 +901,9 @@ impl AiSettingsWindow {
                                 .to_string(),
                             error: false,
                         });
+                        // Saved settings now reach documents that are already
+                        // open; the write above is the source of truth.
+                        apply_pdf_compact_reading(pdf_compact_reading, cx);
                         cx.spawn(async move |_entity, cx| {
                             let _ = window_handle.update(cx, |_, window, cx| {
                                 remove_window_after_current_frame(window, cx, None);
@@ -1642,7 +1659,54 @@ impl AiSettingsWindow {
             SettingsTab::Models => self.render_models_panel(cx),
             SettingsTab::WebSearch => self.render_web_search_panel(cx),
             SettingsTab::BackgroundJobs => self.render_background_jobs_panel(cx),
+            SettingsTab::System => self.render_system_panel(cx),
         }
+    }
+
+    #[inline(never)]
+    fn render_system_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let compact_view = cx.entity();
+
+        div()
+            .v_flex()
+            .gap_3()
+            .p_4()
+            .rounded(px(12.))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(SURFACE))
+            .child(
+                div()
+                    .text_sm()
+                    .font_semibold()
+                    .text_color(rgb(INK))
+                    .child("PDF 阅读"),
+            )
+            .child(
+                Checkbox::new("ai-pdf-compact-reading")
+                    .checked(self.pdf_compact_reading)
+                    .disabled(self.operation.busy())
+                    .label("PDF 紧凑阅读")
+                    .debug_selector(|| "ai-pdf-compact-reading".into())
+                    .on_click(move |checked, _, cx| {
+                        let checked = *checked;
+                        compact_view.update(cx, |this, cx| {
+                            this.pdf_compact_reading = checked;
+                            cx.notify();
+                        });
+                    }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .line_height(gpui::relative(1.5))
+                    .text_color(rgb(MUTED))
+                    .child(
+                        "开启后 PDF 阅读窗口的页面上下贴合，不再保留页间留白；关闭时恢复默认间距。\
+                         页面投影、左右留白与阅读位置不变，标注与笔记仍按页面文字位置保存。",
+                    ),
+            )
+            .into_any_element()
     }
 }
 
@@ -1758,7 +1822,7 @@ impl Render for AiSettingsWindow {
                             .text_xs()
                             .line_height(gpui::relative(1.5))
                             .text_color(rgb(MUTED))
-                            .child("切换标签保留输入；保存设置会应用全部四个标签中的配置。"),
+                            .child("切换标签保留输入；保存设置会应用全部标签中的配置。"),
                     )
                     .child(
                         div()
@@ -2172,6 +2236,29 @@ mod tests {
             );
         });
 
+        click_tab(visual, SettingsTab::System);
+        settings.read_with(visual, |view, _| {
+            assert_eq!(view.active_tab, SettingsTab::System);
+            assert!(!view.pdf_compact_reading);
+        });
+        let compact = visual
+            .debug_bounds("ai-pdf-compact-reading")
+            .expect("compact reading checkbox must be rendered");
+        visual.simulate_click(compact.center(), Modifiers::none());
+        redraw(visual);
+        settings.read_with(visual, |view, cx| {
+            assert!(view.pdf_compact_reading);
+            assert!(view.entered_settings(cx).unwrap().pdf_compact_reading);
+            assert!(
+                !view
+                    .services
+                    .provider_settings()
+                    .unwrap()
+                    .pdf_compact_reading,
+                "changing the checkbox must not save the reading preference",
+            );
+        });
+
         click_tab(visual, SettingsTab::Endpoint);
         settings.read_with(visual, |view, _| {
             assert_eq!(view.active_tab, SettingsTab::Endpoint)
@@ -2197,6 +2284,7 @@ mod tests {
                 assert_eq!(entered.web_search_url_template, web_draft);
                 assert!(!entered.web_search_enabled);
                 assert!(entered.auto_run_background_jobs);
+                assert!(entered.pdf_compact_reading);
                 assert_eq!(
                     view.selected_endpoint().api_key_update(cx),
                     ApiKeyUpdate::Set(key_draft.into())
@@ -2538,6 +2626,7 @@ mod tests {
                 SettingsTab::Models,
                 SettingsTab::WebSearch,
                 SettingsTab::BackgroundJobs,
+                SettingsTab::System,
             ] {
                 click_tab(visual, tab);
                 settings.read_with(visual, |view, _| {

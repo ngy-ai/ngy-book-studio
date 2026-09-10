@@ -53,6 +53,7 @@ const PROVIDER_SETTINGS_KEY: &str = "ai.openai_compatible.provider.v1";
 const CHAT_GENERATION_SETTINGS_KEY: &str = "ai.openai_compatible.chat_generation.v1";
 const ENDPOINT_ROUTING_SETTINGS_KEY: &str = "ai.openai_compatible.endpoint_routing.v1";
 const BACKGROUND_JOB_SETTINGS_KEY: &str = "background_jobs.preferences.v1";
+const PDF_READER_SETTINGS_KEY: &str = "pdf.reader.preferences.v1";
 const WEB_SEARCH_CREDENTIAL_TARGET: &str = "ai.openai_compatible.web_search.v1";
 const MAX_MODEL_NAME_CHARS: usize = 256;
 #[cfg(target_os = "windows")]
@@ -176,6 +177,29 @@ impl Default for PersistedBackgroundJobSettings {
     }
 }
 
+/// Reading preferences of the PDF reader. Kept in their own settings key so the
+/// established Provider JSON contract stays unchanged, exactly like the
+/// background-job preference above.
+pub(crate) const DEFAULT_PDF_COMPACT_READING: bool = false;
+
+fn default_pdf_compact_reading() -> bool {
+    DEFAULT_PDF_COMPACT_READING
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedPdfReaderSettings {
+    compact_reading: bool,
+}
+
+impl Default for PersistedPdfReaderSettings {
+    fn default() -> Self {
+        Self {
+            compact_reading: default_pdf_compact_reading(),
+        }
+    }
+}
+
 /// Persisted provider choices. Secrets intentionally cannot be represented by
 /// this type; API keys live behind [`CredentialStore`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -193,6 +217,11 @@ pub struct ProviderSettings {
     /// contract remains unchanged.
     #[serde(skip, default = "default_auto_run_background_jobs")]
     pub auto_run_background_jobs: bool,
+    /// Reading preference of the PDF reader: when enabled the continuous page
+    /// column drops the gap between pages. Stored under its own settings key,
+    /// like the background-job preference above.
+    #[serde(skip, default = "default_pdf_compact_reading")]
+    pub pdf_compact_reading: bool,
     pub embedding_model: String,
     /// Dimension override sent to the embedding provider. Changing this value
     /// invalidates all existing vector indices because stored vectors with the
@@ -256,6 +285,7 @@ impl Default for ProviderSettings {
             chat_model: DEFAULT_CHAT_MODEL.to_string(),
             chat_generation: ChatGenerationSettings::default(),
             auto_run_background_jobs: default_auto_run_background_jobs(),
+            pdf_compact_reading: default_pdf_compact_reading(),
             embedding_model: DEFAULT_EMBEDDING_MODEL.to_string(),
             embedding_dimensions: DEFAULT_EMBEDDING_DIMENSIONS,
             vision_model: DEFAULT_VISION_MODEL.to_string(),
@@ -1819,11 +1849,12 @@ fn restore_endpoint_keys(
     }
 }
 
-const AI_SETTINGS_KEYS: [&str; 4] = [
+const AI_SETTINGS_KEYS: [&str; 5] = [
     PROVIDER_SETTINGS_KEY,
     CHAT_GENERATION_SETTINGS_KEY,
     ENDPOINT_ROUTING_SETTINGS_KEY,
     BACKGROUND_JOB_SETTINGS_KEY,
+    PDF_READER_SETTINGS_KEY,
 ];
 
 fn snapshot_ai_settings(db_path: &Path) -> Result<Vec<Option<db::settings::Setting>>> {
@@ -1921,6 +1952,14 @@ fn load_provider_settings(db_path: &Path) -> Result<ProviderSettings> {
         }
         None => default_auto_run_background_jobs(),
     };
+    settings.pdf_compact_reading = match db::settings::get(&tx, PDF_READER_SETTINGS_KEY)? {
+        Some(row) => {
+            serde_json::from_str::<PersistedPdfReaderSettings>(&row.value_json)
+                .context("保存的 PDF 阅读设置无效")?
+                .compact_reading
+        }
+        None => default_pdf_compact_reading(),
+    };
     settings.validate()?;
     tx.commit().context("无法完成 AI 设置快照读取")?;
     Ok(settings)
@@ -1960,6 +1999,14 @@ fn save_provider_settings(db_path: &Path, settings: &ProviderSettings) -> Result
         .context("无法序列化后台任务设置")?,
         updated_at,
     };
+    let pdf_reader = db::settings::Setting {
+        key: PDF_READER_SETTINGS_KEY.to_string(),
+        value_json: serde_json::to_string(&PersistedPdfReaderSettings {
+            compact_reading: settings.pdf_compact_reading,
+        })
+        .context("无法序列化 PDF 阅读设置")?,
+        updated_at,
+    };
     let routing = db::settings::Setting {
         key: ENDPOINT_ROUTING_SETTINGS_KEY.to_string(),
         value_json: serde_json::to_string(&settings.endpoint_routing)
@@ -1979,6 +2026,10 @@ fn save_provider_settings(db_path: &Path, settings: &ProviderSettings) -> Result
     ensure!(
         db::settings::upsert(&tx, &background_jobs)? == 1,
         "后台任务设置未能保存"
+    );
+    ensure!(
+        db::settings::upsert(&tx, &pdf_reader)? == 1,
+        "PDF 阅读设置未能保存"
     );
     ensure!(
         db::settings::upsert(&tx, &routing)? == 1,
@@ -2782,6 +2833,7 @@ mod tests {
                 frequency_penalty: Some(-0.4),
             },
             auto_run_background_jobs: false,
+            pdf_compact_reading: true,
             embedding_model: "embed-test".to_string(),
             vision_model: "vision-test".to_string(),
             remote_content_confirmed: true,
@@ -2817,6 +2869,7 @@ mod tests {
         assert!(!row.value_json.to_ascii_lowercase().contains("api_key"));
         assert!(!row.value_json.contains("chat_generation"));
         assert!(!row.value_json.contains("auto_run_background_jobs"));
+        assert!(!row.value_json.contains("pdf_compact_reading"));
         assert!(!row.value_json.contains("endpoint_routing"));
         let generation_row = db::settings::get(
             &db::open_conn(services.database_path()).unwrap(),
@@ -2838,6 +2891,18 @@ mod tests {
             serde_json::from_str::<PersistedBackgroundJobSettings>(&background_job_row.value_json)
                 .unwrap(),
             PersistedBackgroundJobSettings { auto_run: false }
+        );
+        let pdf_reader_row = db::settings::get(
+            &db::open_conn(services.database_path()).unwrap(),
+            PDF_READER_SETTINGS_KEY,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<PersistedPdfReaderSettings>(&pdf_reader_row.value_json).unwrap(),
+            PersistedPdfReaderSettings {
+                compact_reading: true
+            }
         );
         drop(services);
 
@@ -3228,6 +3293,11 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        assert!(
+            db::settings::get(&conn, PDF_READER_SETTINGS_KEY)
+                .unwrap()
+                .is_none()
+        );
         drop(conn);
 
         let services = AppServices::open_with_credentials(
@@ -3242,6 +3312,9 @@ mod tests {
                 .unwrap()
                 .auto_run_background_jobs
         );
+        // A book-less install defaults to the ordinary page gap and does not
+        // write the reading preference until the user saves it.
+        assert!(!services.provider_settings().unwrap().pdf_compact_reading);
         let conn = db::open_conn(services.database_path()).unwrap();
         assert_eq!(
             db::settings::get(&conn, PROVIDER_SETTINGS_KEY).unwrap(),
@@ -3254,6 +3327,11 @@ mod tests {
         );
         assert!(
             db::settings::get(&conn, BACKGROUND_JOB_SETTINGS_KEY)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db::settings::get(&conn, PDF_READER_SETTINGS_KEY)
                 .unwrap()
                 .is_none()
         );

@@ -14,17 +14,41 @@
       :root { background: #242424; color: #eee; font-family: system-ui, sans-serif; }
       * { box-sizing: border-box; }
       body { margin: 0; min-height: 100vh; }
-      #status { padding: 12px 16px; text-align: center; }
-      #pages { display: flex; flex-direction: column; align-items: center; gap: 18px; padding: 18px; overflow: auto; }
+      #status { padding: 12px 16px; text-align: center; color: #c9cdd4; font-size: 13px; }
+      /* One vertical column of pages: the document itself scrolls, so the note
+         overlay can stay anchored to viewport coordinates. */
+      #pages { padding: 0 18px 56px; }
       .pdf-page {
         --scale-round-x: 1px;
         --scale-round-y: 1px;
         position: relative;
         flex: none;
+        margin: 0 auto 18px;
         background: white;
         box-shadow: 0 2px 14px #0008;
         overflow: hidden;
       }
+      .pdf-page[data-rendered="false"] {
+        background: #f7f8fa;
+        box-shadow: 0 2px 12px #0006, inset 0 0 0 1px #00000010;
+      }
+      /* Compact reading: the host preference drops the gap between pages and
+         keeps the page shadow, so consecutive pages touch. */
+      html[data-pdf-compact] .pdf-page { margin-bottom: 0; }
+      .page-placeholder {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: #9aa4b2;
+        font: 13px/1.5 "Microsoft YaHei", system-ui, sans-serif;
+        letter-spacing: 0.14em;
+        animation: page-placeholder-pulse 1.6s ease-in-out infinite;
+      }
+      .page-placeholder.error { color: #8c4540; animation: none; }
+      @keyframes page-placeholder-pulse { 0%, 100% { opacity: 0.55; } 50% { opacity: 0.9; } }
+      @media (prefers-reduced-motion: reduce) { .page-placeholder { animation: none; opacity: 0.7; } }
       .page-canvas { position: absolute; inset: 0; display: block; }
       .textLayer {
         --min-font-size: 1;

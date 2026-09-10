@@ -4246,6 +4246,17 @@ mod tests {
         assert!(PDFJS_VIEWER_SCRIPT.contains("isEvalSupported: false"));
         assert!(PDFJS_VIEWER_SCRIPT.contains("enableXfa: false"));
         assert!(PDFJS_VIEWER_SCRIPT.contains("useWorkerFetch: false"));
+        // The reader lays the whole document out in one scrollable column, so
+        // every page is drawn on demand and released again once it is far away.
+        assert!(PDFJS_VIEWER_SCRIPT.contains("IntersectionObserver("));
+        assert!(PDFJS_VIEWER_SCRIPT.contains("moye-pdf-page-changed"));
+        assert!(PDFJS_VIEWER_SCRIPT.contains("moye-pdf-selection-changed"));
+        assert!(PDFJS_VIEWER_SCRIPT.contains("moye-pdf-request-page"));
+        // The compact reading preference reaches the viewer through one URL
+        // parameter and one document attribute, and stale bundle assets would
+        // silently ignore it.
+        assert!(PDFJS_VIEWER_SCRIPT.contains("\"data-pdf-compact\""));
+        assert!(PDFJS_VIEWER_HTML.contains("data-pdf-compact"));
         assert!(!PDFJS_VIEWER_SCRIPT.contains("https://"));
         let (mime, library) = bundled_pdfjs_asset("pdf.mjs").expect("local PDF.js library");
         assert_eq!(mime, "text/javascript; charset=utf-8");

@@ -101,6 +101,8 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   `ai_controller.rs`、`ai_settings.rs` 管理 AI 交互；`background_jobs.rs` 管理当前图书范围
   的派生任务；`mod.rs` 只保留跨窗口主题、窗口打开与安全关闭基础设施，其中包含按
   图书登记的窗口表：删除图书后关闭该书已打开的阅读、PDF/Office 预览和编辑窗口。
+  `mod.rs` 另维护 `PdfReaderWindowRegistry`：保存“PDF 紧凑阅读”后向所有已打开的 PDF
+  阅读窗口推送 `<html data-pdf-compact>`，这是唯一能枚举非单例 Office 预览窗口的登记表。
   这类关闭走各窗口的“图书已移除”路径，不写最终阅读进度、不保存草稿、不弹保存确认，
   WebView 仍在构建时等构建结束后再拆除。
   AI 回复用与 `gpui-component` 相同的固定版 `markdown` 解析器生成展示投影，按消息
@@ -122,13 +124,25 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   由调用方提供私有文档判定与事件构造，仍要求 page/frame 为同一私有文档。
 - `src/ui/pdf_reader/annotations.rs`、`annotations.js`：PDF 页面笔记宿主与页面桥接，
   复用同一张 `annotations` 表、互斥标记规则、人工/AI 想法流程与展示清洗。锚点作用域
-  是当前页的 PDF.js 文字层：宿主无法复刻该投影，因此
+  是单页的 PDF.js 文字层：宿主无法复刻该投影，因此
   `LibraryStore::validate_pdf_annotation_anchor` 不比对规范页面文字，只校验图书/页面
   归属、`ContentUnitKind::Page`、双版本、引文上限，以及范围长度必须等于压缩引文的
-  UTF-16 长度；偏移的稳定性来自不可变原件加固定版 PDF.js。页面桥接的每个请求都带
-  当前页码，宿主按已渲染页码、session、代次与版本拒绝过期请求；`configure` 绑定页面，
-  `disable` 用于没有规范身份的页面（同时清空 session 并隐藏笔记控件）。前端不得提交
-  AI 类型，AI 想法只能由宿主在回复保存后写入。
+  UTF-16 长度；偏移的稳定性来自不可变原件加固定版 PDF.js。
+  连续滚动会同时挂载多页文字层，因此文本索引与锚点解析必须按页缓存、按页失效，标记要
+  绘制在各自页面坐标上；阅读窗口一次只保留一个文档级 session，页面窗口由前端用
+  `pages_rendered` 声明，宿主用自身规范页面解析每页版本与能否写笔记，`list` 可在一次
+  往返中取多页笔记。写请求必须指向已声明的规范页且 `revision` 等于该页 `unit_revision`，
+  宿主按 session、已渲染页窗口、请求代次与版本拒绝过期请求；`configure` 绑定文档版本，
+  `disable` 用于整本文档没有规范身份的情况（同时清空 session 并隐藏笔记控件）。前端不得
+  提交 AI 类型，AI 想法只能由宿主在回复保存后写入，且写入发起解释的那一页，不因滚动
+  改变目标页。未保存的人工想法或待保存 AI 想法期间，前端 `lockedPage()` 钉住该页：
+  宿主 `current_page`、阅读进度与笔记面板不随滚动前进，该页也不会被回收卸载；保存或
+  取消后再跟随真实阅读位置。可选 DOM 门禁 `node --test src/ui/pdf_reader/annotations.test.cjs`
+  与 `node --test src/ui/pdf_reader/viewer.test.cjs` 使用已安装 Playwright，
+  `MOYE_TEST_CHROMIUM` 可指定浏览器；不为测试安装或修改项目依赖。前者用合成多页文字层
+  覆盖按页笔记、按页命中与草稿钉页；后者用测试内生成的最小 PDF 驱动提交的 `assets/pdfjs`
+  产物，覆盖整本连续滚动成列、远离阅读位置的页面回收与返回重绘、`moye-pdf-page-changed`
+  与按页选区上报，以及紧凑阅读的 URL 参数与“切换不跳动”。
   `src/ui/notes.rs` 是“本书笔记”与“全部笔记”共用的原生浏览窗口，查询当前数据库，
   不使用图书窗口的旧投影推断范围；保留单表存储。列表按最近更新排序，搜索、类型筛选和
   分页控制渲染规模，引文按纯文本、人工/AI 想法按安全 Markdown 展示并支持复制。
@@ -183,7 +197,14 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   侧栏保持“当前章节”且无自动引用；重新选择正文恢复“当前章节高亮”。HTML/XHTML
   联合桥接回归还覆盖选区复制、80ms 迟到事件及笔记右键清除旧正文解释快照。
 - `web/pdf/` 与 `assets/pdfjs/`：固定版本 PDF.js shell、lockfile、清单和提交的本地
-  资产；不得改为 CDN 或运行时联网获取。
+  资产；不得改为 CDN 或运行时联网获取。`web/pdf/src/viewer.mjs` 是上下连续滚动的实现：
+  页列一次性布局，`IntersectionObserver` 按需绘制、远离阅读位置后回收为占位页；滚动
+  停止约 150ms 才上报 `moye-pdf-page-changed`，并复用最近一次 `moye-pdf-go-to` 的
+  `requestId` 以保持宿主过期请求拒绝语义。读取 URL 的 `compact=1` 后给 `<html>` 设置
+  `data-pdf-compact`：这是“PDF 紧凑阅读”唯一的页间距契约，宿主对已打开窗口也用同一
+  属性做实时更新。改动 `web/pdf/src/` 后必须在 `web/pdf` 执行
+  `npm ci` 与 `node scripts/build.mjs` 重新生成 `assets/pdfjs/viewer.html`、
+  `viewer.mjs` 与 `manifest.json`，并让 `node scripts/check-bundle.mjs` 通过。
 - `tests/epub_flow.rs`：运行时生成 EPUB 2/3 fixture 的原有跨模块流程。
 - `tests/multi_format_flow.rs`：统一模型、格式、对象存储、编辑、搜索和导出的多格式流程。
 - `tests/openai_compatible_flow.rs`：mock OpenAI-compatible models/embeddings/SSE 流程。
@@ -543,6 +564,21 @@ EPUB/PDF/原件导出、重新打开及原件字节一致性。
   默认或关闭时，新导入、创建或保存编辑仍须在文档事务内创建 `visual_render`、`vision`、
   `embedding` 三类任务，但初始状态为 `Paused` 且未开始；已有任务不随设置切换改变状态，
   用户仍可在后台任务窗口逐项恢复。
+- PDF 紧凑阅读使用独立 settings key（`pdf.reader.preferences.v1`，默认关闭，AI 设置
+  “系统配置”中的“PDF 紧凑阅读”默认不勾选），同样不得扩展 Provider JSON；新 key 必须
+  加入 `AI_SETTINGS_KEYS`，否则 `snapshot_ai_settings`/`restore_ai_settings` 的失败回滚
+  会不对称（`restore_ai_settings` 校验备份行数）。页间距只有一份契约：宿主用
+  `moyepdf://viewer/viewer.html?...&compact=1` 让新窗口在首帧前设置
+  `<html data-pdf-compact="1">`，保存设置后再用一次 `evaluate_script` 切换同一属性，
+  因此已打开的阅读窗口无需重开即可跟随；两种通道必须幂等，前端不要为该偏好新增 API。
+  该偏好作用于所有 PDF 阅读窗口（含 Office 增强预览）：`src/ui/mod.rs` 的
+  `PdfReaderWindowRegistry` 是唯一枚举它们的登记表，登记与广播都要顺带剪掉失效 weak，
+  不得只依赖按书的单例窗口表。只改页间距（`margin-bottom`），不改变页面几何、投影、
+  笔记坐标与滚动位置。切换时必须保持阅读位置：前端在 `MutationObserver` 里用
+  “临时还原属性 → 量旧布局 → 恢复属性 → 量新布局”得到精确位移，只补偿浏览器锚定之后
+  仍存在的差额（<0.5px 不动手），并用 `takeRecords()` 丢弃自己的两条记录；
+  锚点页必须取“视口中心覆盖的那一页”（草稿钉住的页优先），不能用 `currentPage`——
+  它只跟踪已绘制的页，刚滚到、仍在占位状态的页会让它滞后一页，补偿就会少算一个页间距。
 - Agent 只允许 `search_books`、`read_passages`、`get_outline` 三个只读工具。宿主先
   计算授权 book IDs，模型参数只能缩小范围；保留工具轮次、结果数、上下文和超时限制。
   `AgentLimits::max_tool_rounds` 的既有计数单位是实际工具调用（默认 6 次），不是模型

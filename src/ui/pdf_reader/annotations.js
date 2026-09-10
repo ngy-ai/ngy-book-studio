@@ -1,10 +1,11 @@
 (() => {
   "use strict";
 
-  // This bridge is injected by the host before the bundled viewer loads. A PDF
-  // page renders exactly one PDF.js text layer at a time; its spans keep the
-  // reading order of the immutable original, so the compacted UTF-16 offsets
-  // below are reproducible across page re-renders.
+  // This bridge is injected by the host before the bundled viewer loads. The
+  // continuous viewer keeps several PDF.js text layers mounted at once, but each
+  // layer belongs to exactly one page and keeps the reading order of the
+  // immutable original, so the compacted UTF-16 offsets below stay page-local
+  // and reproducible across page re-renders and unloads.
   const ownDocument = () => {
     const url = new URL(window.location.href);
     return window.top === window && (
@@ -18,6 +19,9 @@
   const encoder = new TextEncoder();
   const MAX_AI_BYTES = 1024 * 1024;
   const MAX_CONTENT_HTML_BYTES = 8 * MAX_AI_BYTES;
+  const MAX_DECLARED_PAGES = 256;
+  const MAX_LIST_PAGES = 64;
+  const MAX_PAGE_NUMBER = 1_000_000;
   const HTML_NS = "http://www.w3.org/1999/xhtml";
   const markdownTags = new Set([
     "p", "h1", "h2", "h3", "h4", "h5", "h6", "strong", "em", "b", "i", "del", "s",
@@ -32,21 +36,31 @@
   const normalize = (value) => value.replace(/\s+/gu, " ").trim();
   const bounded = (value, bytes) => typeof value === "string" &&
     encoder.encode(value).byteLength <= bytes;
+  const pageNumber = (value) => Number.isSafeInteger(value) && value >= 1 &&
+    value <= MAX_PAGE_NUMBER ? value : null;
   const kinds = {
     highlight: "马克笔", wavy: "波浪线", underline: "直线",
     human_comment: "人工想法", ai_comment: "AI 想法",
   };
+  // Document-level binding established by the host for this rendered PDF.
   let context = null;
+  let notesEnabled = false;
   let ready = false;
   let requestSequence = 0;
-  let notes = [];
+  // page -> { revision, enabled, notes }
+  const pageState = new Map();
+  // page -> { entries, text }
+  const indexByPage = new Map();
+  let declaredPages = [];
+  const listedPages = new Set();
+  let currentPage = 0;
+  let drawerPage = 0;
   let noteScope = null;
   let selectionSnapshot = null;
   let contextMenuSnapshot = null;
   let draftDirty = false;
   let failedAiSave = null;
   let editor = null;
-  let index = null;
   let paintFrame = 0;
   let selectionTimer = 0;
   let hitTimer = 0;
@@ -167,86 +181,126 @@
     toastTimer = setTimeout(() => { toast.hidden = true; }, error ? 7000 : 3000);
   }
 
-  function post(action, fields = {}) {
+  // The revision of the page a request is authored on; the host rejects a page
+  // request whose revision does not describe that page's canonical unit.
+  function pageRevision(page) {
+    return pageState.get(page)?.revision ?? context?.revision ?? 0;
+  }
+
+  function send(action, fields, track) {
     if (!context || !ready || !ownDocument()) return null;
     const requestId = ++requestSequence;
     if (!Number.isSafeInteger(requestId)) return null;
-    pending.set(requestId, { action, ...fields });
+    const page = pageNumber(fields.page) || currentPage || 1;
+    const revision = action === "pages_rendered" ? context.revision : pageRevision(page);
+    const request = { action, ...fields, page, revision };
+    if (track) pending.set(requestId, request);
     try {
       if (!window.ipc || typeof window.ipc.postMessage !== "function") {
         throw new Error("PDF host unavailable");
       }
       // The rendered page number travels with every request: the host only
-      // accepts a note for the page it is currently showing, so a request that
+      // accepts a note for a page it knows is rendered, so a request that
       // outlives its page can never reach another page's text.
       window.ipc.postMessage(JSON.stringify({
         type: "annotation_action", action, session: context.session,
-        revision: context.revision, page: context.page,
-        request_id: requestId, ...fields,
+        revision, page, request_id: requestId, ...fields,
       }));
       return requestId;
     } catch {
-      pending.delete(requestId);
+      if (track) pending.delete(requestId);
       tell("无法连接笔记服务，请重新打开本页后重试。", true);
       return null;
     }
   }
 
-  function reportDraft(dirty) {
-    if (draftDirty === dirty) return;
-    draftDirty = dirty;
-    const requestId = post("draft_changed", { dirty });
-    // This notification has no persistence operation or asynchronous result.
-    if (requestId !== null) pending.delete(requestId);
+  function post(action, fields = {}) {
+    return send(action, fields, true);
   }
 
-  // The active PDF.js text layer; the viewer renders one page at a time and
-  // clears the previous layer before building the next one.
-  function textLayerElement() {
-    return document.querySelector(".textLayer");
+  // Declarations and draft flags have no persistence result to correlate.
+  function postSilent(action, fields = {}) {
+    return send(action, fields, false);
+  }
+
+  // The page travels with the flag so the host can pin the page that owns the
+  // draft even after the editor has been closed locally.
+  function reportDraft(dirty, page) {
+    if (draftDirty === dirty) return;
+    draftDirty = dirty;
+    postSilent("draft_changed", {
+      page: pageNumber(page) || editor?.page || currentPage || 1,
+      dirty,
+    });
+  }
+
+  function pageContainer(page) {
+    return document.querySelector(`.pdf-page[data-page="${page}"]`);
+  }
+
+  // The page-local PDF.js text layer. A page that is not mounted right now has
+  // no layer at all, so its notes are simply not painted until it returns.
+  function textLayerElement(page) {
+    return pageContainer(page)?.querySelector(".textLayer") || null;
+  }
+
+  function pageOfNode(node) {
+    const element = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
+    const container = element?.closest?.(".pdf-page");
+    return container ? pageNumber(Number(container.dataset.page)) : null;
+  }
+
+  function notesOf(page) {
+    return pageState.get(page)?.notes || [];
   }
 
   // Offsets count UTF-16 code units after ECMAScript whitespace is removed.
   // Keep the PDF.js text spans intact: selections, links, and copy use the
   // real layer text.
-  function textIndex() {
-    if (index) return index;
+  function textIndex(page) {
+    const cached = indexByPage.get(page);
+    if (cached) return cached;
+    const layer = textLayerElement(page);
+    if (!layer) return null;
     const entries = [];
     const parts = [];
     let length = 0;
-    const layer = textLayerElement();
-    if (layer) {
-      const walker = document.createTreeWalker(layer, NodeFilter.SHOW_TEXT, {
-        acceptNode(node) {
-          return node.parentElement?.closest("script,style,noscript,template") ||
-            host?.contains(node) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
-        },
-      });
-      while (walker.nextNode()) {
-        const node = walker.currentNode;
-        const text = compact(node.data);
-        if (!text) continue;
-        entries.push({ node, start: length, end: length + text.length });
-        parts.push(text);
-        length += text.length;
-      }
+    const walker = document.createTreeWalker(layer, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        return node.parentElement?.closest("script,style,noscript,template") ||
+          host?.contains(node) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+      },
+    });
+    while (walker.nextNode()) {
+      const node = walker.currentNode;
+      const text = compact(node.data);
+      if (!text) continue;
+      entries.push({ node, start: length, end: length + text.length });
+      parts.push(text);
+      length += text.length;
     }
-    index = { entries, text: parts.join("") };
+    const index = { entries, text: parts.join("") };
+    indexByPage.set(page, index);
     return index;
   }
 
   function currentSelection() {
-    const layer = textLayerElement();
-    if (!layer) return null;
     const selection = window.getSelection();
     if (!selection || selection.isCollapsed || selection.rangeCount !== 1) return null;
     const range = selection.getRangeAt(0);
-    if (!layer.contains(range.startContainer) || !layer.contains(range.endContainer)) return null;
+    const page = pageOfNode(range.startContainer);
+    if (!page || page !== pageOfNode(range.endContainer)) return null;
+    if (!pageState.get(page)?.enabled) return null;
+    const layer = textLayerElement(page);
+    if (!layer || !layer.contains(range.startContainer) || !layer.contains(range.endContainer)) {
+      return null;
+    }
     const quote = normalize(selection.toString());
     if (!quote || !bounded(quote, 32768)) return null;
     let start = null;
     let end = null;
-    const current = textIndex();
+    const current = textIndex(page);
+    if (!current) return null;
     for (const entry of current.entries) {
       if (!range.intersectsNode(entry.node)) continue;
       const from = range.startContainer === entry.node ? range.startOffset : 0;
@@ -259,7 +313,7 @@
     }
     if (start === null || end === null || end <= start ||
         current.text.slice(start, end) !== compact(quote)) return null;
-    return { anchor: { quote, start, end }, range: range.cloneRange() };
+    return { page, anchor: { quote, start, end }, range: range.cloneRange() };
   }
 
   function rawOffset(text, offset, after) {
@@ -273,12 +327,14 @@
     return text.length;
   }
 
-  function anchorRange(anchor) {
+  function anchorRange(anchor, page) {
     if (!anchor || !bounded(anchor.quote, 32768) ||
         !Number.isSafeInteger(anchor.start) || !Number.isSafeInteger(anchor.end) ||
         anchor.start < 0 || anchor.end <= anchor.start) return null;
-    const current = textIndex();
-    if (current.text.slice(anchor.start, anchor.end) !== compact(anchor.quote)) return null;
+    const current = textIndex(page);
+    if (!current || current.text.slice(anchor.start, anchor.end) !== compact(anchor.quote)) {
+      return null;
+    }
     const first = current.entries.find((entry) =>
       entry.start <= anchor.start && entry.end > anchor.start);
     const last = current.entries.find((entry) =>
@@ -291,7 +347,7 @@
   }
 
   function showSelection() {
-    if (!ready || !context || (editor && !drawer.hidden)) return;
+    if (!ready || !context || !notesEnabled || (editor && !drawer.hidden)) return;
     const selected = currentSelection();
     if (!selected) {
       toolbar.hidden = true;
@@ -321,15 +377,16 @@
 
   function choose(action) {
     if (!selectionSnapshot) return;
-    const anchor = selectionSnapshot.anchor;
-    if (!anchorRange(anchor)) { tell("选中文字已变化，请重新选择。", true); return; }
+    const { page, anchor } = selectionSnapshot;
+    if (!anchorRange(anchor, page)) { tell("选中文字已变化，请重新选择。", true); return; }
     if (action === "human_comment") {
-      openEditor({ anchor, value: "" });
+      openEditor({ page, anchor, value: "" });
     } else {
-      const requestId = post(action, { anchor });
+      setDrawerPage(page);
+      const requestId = post(action, { page, anchor });
       if (requestId !== null) {
         if (action === "ai_explain") {
-          openDrawer(null);
+          openDrawer(null, page);
           tell("AI 正在解释选中文字，完成后会保存为 AI 想法。");
         } else tell(action === "remove_mark" ? "正在删除划线…" : "正在保存笔记…");
       }
@@ -356,20 +413,29 @@
   // The related-notes drawer lists thoughts only. An AI thought that is still
   // generating or waiting to be saved also holds a card, so it counts here and
   // the drawer opens instead of falling back to a page selection.
-  function hasRelatedThought(scope) {
-    if (failedAiSave && inScope(failedAiSave, scope)) return true;
+  function hasRelatedThought(page, scope) {
+    if (failedAiSave && failedAiSave.page === page && inScope(failedAiSave, scope)) return true;
     for (const request of pending.values()) {
-      if (request.action === "ai_explain" && inScope(request, scope)) return true;
+      if (request.action === "ai_explain" && request.page === page &&
+          inScope(request, scope)) return true;
     }
-    return notes.some((note) => (note.kind === "human_comment" || note.kind === "ai_comment") &&
-      inScope(note, scope));
+    return notesOf(page).some((note) =>
+      (note.kind === "human_comment" || note.kind === "ai_comment") && inScope(note, scope));
+  }
+
+  function noteLocation(id) {
+    for (const [page, state] of pageState) {
+      const note = state.notes.find((candidate) => candidate.id === id);
+      if (note) return { page, note };
+    }
+    return null;
   }
 
   // Clicking a mark that carries no thought selects exactly the marked range so
   // the shared toolbar can restyle or delete the mark, or start a thought on it.
   function selectMarkedRange(noteId) {
-    const note = notes.find((candidate) => candidate.id === noteId);
-    const range = note && !note.stale ? anchorRange(note.anchor) : null;
+    const found = noteLocation(noteId);
+    const range = found && !found.note.stale ? anchorRange(found.note.anchor, found.page) : null;
     if (!range) return;
     const selection = window.getSelection();
     if (!selection) return;
@@ -378,7 +444,16 @@
     showSelection();
   }
 
-  function openDrawer(scope = noteScope) {
+  function setDrawerPage(page) {
+    const next = pageNumber(page) || currentPage || 1;
+    if (drawerPage === next) return;
+    drawerPage = next;
+    noteScope = null;
+    refreshList();
+  }
+
+  function openDrawer(scope = noteScope, page = drawerPage) {
+    drawerPage = pageNumber(page) || drawerPage || currentPage || 1;
     noteScope = scope;
     drawer.hidden = false;
     toggle.setAttribute("aria-expanded", "true");
@@ -394,7 +469,7 @@
 
   function openEditor(draft) {
     if (editor && (editor.pending || editor.value.trim())) {
-      openDrawer(null);
+      openDrawer(null, editor.page);
       tell("请先保存或取消当前想法，再添加另一条。", true);
       input.focus({ preventScroll: true });
       return;
@@ -402,13 +477,15 @@
     editor = draft;
     reportDraft(true);
     editorPanel.hidden = false;
-    editorTitle.textContent = draft.id ? "编辑人工想法" : "写想法 · 人工想法";
+    const page = editor.page || currentPage || 1;
+    editorTitle.textContent = (draft.id ? "编辑人工想法" : "写想法 · 人工想法") +
+      (page === drawerPage ? "" : ` · 第 ${page} 页`);
     quoteView.textContent = draft.anchor.quote;
     input.value = draft.value;
     input.disabled = false;
     saveButton.disabled = false;
     editorStatus.textContent = "仅保存你输入的内容。Ctrl + Enter 保存。";
-    openDrawer(draft.id ? noteScope : null);
+    openDrawer(draft.id ? noteScope : null, page);
     input.focus({ preventScroll: true });
   }
 
@@ -421,8 +498,9 @@
       editorStatus.textContent = "想法过长，请缩短至 64 KiB 以内后重试。";
       return;
     }
-    const fields = editor.id ? { id: editor.id, content: value } :
-      { anchor: editor.anchor, content: value };
+    const page = editor.page || currentPage || 1;
+    const fields = editor.id ? { id: editor.id, page, content: value } :
+      { anchor: editor.anchor, page, content: value };
     const requestId = post(editor.id ? "update" : "human_comment", fields);
     if (requestId === null) return;
     editor.pending = requestId;
@@ -433,15 +511,19 @@
 
   function refreshList() {
     if (!ready) return;
-    toggle.textContent = `笔记 ${notes.length}`;
-    drawerTitle.textContent = noteScope === null ? "本页笔记" : "划线相关笔记";
+    const page = drawerPage || currentPage || 1;
+    const notes = notesOf(page);
+    toggle.textContent = `笔记 ${notesOf(currentPage).length}`;
+    drawerTitle.textContent = noteScope === null ? `第 ${page} 页笔记` : "划线相关笔记";
     drawer.setAttribute("aria-label", drawerTitle.textContent);
-    editorPanel.hidden = !editor || !inNoteScope(editor);
+    // An unsaved thought stays on screen no matter which page is being read,
+    // because it pins the host to the page that owns it.
+    editorPanel.hidden = !editor;
     const visibleNotes = notes.filter((note) => inNoteScope(note) && (noteScope === null ||
       note.kind === "human_comment" || note.kind === "ai_comment"));
     list.replaceChildren();
     let aiCount = 0;
-    if (failedAiSave && inNoteScope(failedAiSave)) {
+    if (failedAiSave && failedAiSave.page === page && inNoteScope(failedAiSave)) {
       aiCount++;
       const card = element("article", "note pending-note");
       card.append(element("div", "note-type", "AI 想法 · 尚未保存"));
@@ -449,7 +531,7 @@
       card.append(thoughtContent(failedAiSave));
       card.append(element("p", "editor-status", failedAiSave.error));
       const retry = button("重试保存", "save", () => {
-        const requestId = post("retry_ai_save");
+        const requestId = post("retry_ai_save", { page: failedAiSave.page });
         if (requestId !== null) {
           failedAiSave.pending = requestId;
           failedAiSave.pendingAction = "retry";
@@ -459,7 +541,7 @@
       retry.disabled = !!failedAiSave.pending;
       if (failedAiSave.pendingAction === "retry") retry.textContent = "正在保存…";
       const discard = button("放弃", "text-button danger", () => {
-        const requestId = post("discard_ai_save");
+        const requestId = post("discard_ai_save", { page: failedAiSave.page });
         if (requestId !== null) {
           failedAiSave.pending = requestId;
           failedAiSave.pendingAction = "discard";
@@ -476,7 +558,8 @@
       list.append(card);
     }
     for (const request of pending.values()) {
-      if (request.action !== "ai_explain" || !inNoteScope(request)) continue;
+      if (request.action !== "ai_explain" || request.page !== page ||
+          !inNoteScope(request)) continue;
       aiCount++;
       const card = element("article", "note pending-note");
       card.append(element("div", "note-type", "AI 想法 · 生成中"));
@@ -491,25 +574,25 @@
       card.dataset.noteId = note.id;
       const header = element("div", "note-header");
       header.append(element("span", "note-type", kinds[note.kind]));
-      const range = note.stale ? null : anchorRange(note.anchor);
+      const range = note.stale ? null : anchorRange(note.anchor, page);
       if (!range) header.append(element("span", "stale", "原文已变化"));
       card.append(header, element("blockquote", "quote", note.anchor.quote));
       if (note.content) card.append(thoughtContent(note));
       const actions = element("div", "note-actions");
       if (range) actions.append(button("定位原文", "text-button", () => {
-        const target = anchorRange(note.anchor);
+        const target = anchorRange(note.anchor, page);
         if (!target) return;
         const rect = target.getBoundingClientRect();
         window.scrollBy({ top: rect.top - innerHeight / 3, behavior: "smooth" });
         tell(`已定位${kinds[note.kind]}。`);
       }));
       if (note.kind === "human_comment") actions.append(button("编辑", "text-button", () => {
-        openEditor({ id: note.id, anchor: note.anchor, value: note.content || "" });
+        openEditor({ id: note.id, page, anchor: note.anchor, value: note.content || "" });
       }));
       if (note.content) actions.append(button("复制想法", "text-button copy-thought", () => copyThought(note.content)));
       const remove = button("删除", "text-button danger", () => {
         if (editor?.id === note.id && editor.pending) return;
-        const requestId = post("delete", { id: note.id });
+        const requestId = post("delete", { page, id: note.id });
         if (requestId !== null) { remove.disabled = true; tell("正在删除笔记…"); }
       });
       remove.disabled = Array.from(pending.values()).some((request) =>
@@ -522,27 +605,31 @@
 
   function paint() {
     paintFrame = 0;
-    if (!ready) return;
+    if (!ready || !context) { layer.replaceChildren(); hitAreas = []; return; }
     const fragment = document.createDocumentFragment();
     hitAreas = [];
-    for (const note of notes) {
-      if (note.stale) continue;
-      const range = anchorRange(note.anchor);
-      if (!range) continue;
-      const seen = new Set();
-      for (const rect of Array.from(range.getClientRects()).slice(0, 2048)) {
-        if (rect.width < 0.5 || rect.height < 0.5 || rect.bottom < 0 ||
-            rect.top > innerHeight || rect.right < 0 || rect.left > innerWidth) continue;
-        const key = `${rect.x},${rect.y},${rect.width},${rect.height}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        const mark = element("span", `mark ${note.kind}`);
-        mark.style.left = `${rect.left}px`;
-        mark.style.top = `${rect.top}px`;
-        mark.style.width = `${rect.width}px`;
-        mark.style.height = `${rect.height}px`;
-        fragment.append(mark);
-        hitAreas.push({ id: note.id, rect });
+    for (const page of declaredPages) {
+      const state = pageState.get(page);
+      if (!state?.enabled || !state.notes.length) continue;
+      for (const note of state.notes) {
+        if (note.stale) continue;
+        const range = anchorRange(note.anchor, page);
+        if (!range) continue;
+        const seen = new Set();
+        for (const rect of Array.from(range.getClientRects()).slice(0, 2048)) {
+          if (rect.width < 0.5 || rect.height < 0.5 || rect.bottom < 0 ||
+              rect.top > innerHeight || rect.right < 0 || rect.left > innerWidth) continue;
+          const key = `${rect.x},${rect.y},${rect.width},${rect.height}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          const mark = element("span", `mark ${note.kind}`);
+          mark.style.left = `${rect.left}px`;
+          mark.style.top = `${rect.top}px`;
+          mark.style.width = `${rect.width}px`;
+          mark.style.height = `${rect.height}px`;
+          fragment.append(mark);
+          hitAreas.push({ id: note.id, page, rect });
+        }
       }
     }
     layer.replaceChildren(fragment);
@@ -553,17 +640,37 @@
     if (!paintFrame) paintFrame = requestAnimationFrame(paint);
   }
 
-  function receiveNotes(value) {
-    if (!Array.isArray(value)) return;
-    notes = value.filter((note) => note && typeof note.id === "string" &&
+  function sanitizeNotes(value) {
+    if (!Array.isArray(value)) return [];
+    return value.filter((note) => note && typeof note.id === "string" &&
       Object.hasOwn(kinds, note.kind) && note.anchor && bounded(note.anchor.quote, 32768) &&
       (note.content == null || bounded(note.content, note.kind === "ai_comment" ? MAX_AI_BYTES : 65536)));
-    if (ready) { refreshList(); schedulePaint(); }
   }
 
-  function forgetPage() {
+  // The host answers every page-scoped request with the notes of that page; a
+  // declaration request only updates which pages may author notes.
+  function applyPages(value) {
+    if (!Array.isArray(value)) return false;
+    let applied = false;
+    for (const entry of value.slice(0, MAX_LIST_PAGES)) {
+      const page = pageNumber(entry?.page);
+      if (!page) continue;
+      listedPages.delete(page);
+      pageState.set(page, {
+        revision: Number.isSafeInteger(entry.revision) && entry.revision >= 0 ? entry.revision : 0,
+        enabled: entry.enabled === true,
+        notes: sanitizeNotes(entry.notes),
+      });
+      applied = true;
+    }
+    return applied;
+  }
+
+  function forgetDocument() {
     pending.clear();
-    notes = [];
+    pageState.clear();
+    indexByPage.clear();
+    listedPages.clear();
     noteScope = null;
     selectionSnapshot = null;
     contextMenuSnapshot = null;
@@ -574,37 +681,66 @@
       editorPanel.hidden = true;
       toolbar.hidden = true;
       input.value = "";
+      input.disabled = false;
+      saveButton.disabled = false;
     }
   }
 
-  // Notes chrome stays out of the way until the host binds this rendered page:
-  // an ephemeral preview page without canonical identity must not offer note
-  // controls that could never persist anything.
+  // Re-reads one page after a mutation whose reply could not carry its notes.
+  function refreshPage(page) {
+    if (!context || !ready || !ownDocument()) return;
+    listedPages.add(page);
+    if (post("list", { page, pages: [page] }) === null) listedPages.delete(page);
+  }
+
+  /// Declares the pages the viewer currently has mounted and asks for the notes
+  /// of the pages this bridge has not loaded yet.
+  function syncRenderedPages() {
+    if (!context || !ready || !ownDocument()) return;
+    if (declaredPages.length) postSilent("pages_rendered", { pages: declaredPages });
+    const missing = declaredPages.filter((page) => !pageState.has(page) && !listedPages.has(page));
+    const requested = missing.slice(0, MAX_LIST_PAGES);
+    if (!requested.length) return;
+    for (const page of requested) listedPages.add(page);
+    const requestId = post("list", { page: requested[0], pages: requested });
+    if (requestId === null) {
+      for (const page of requested) listedPages.delete(page);
+    }
+  }
+
+  // Notes chrome stays out of the way until the host binds this rendered
+  // document: an ephemeral preview without canonical page identities must not
+  // offer note controls that could never persist anything.
   function showChrome(visible) {
     host?.style.setProperty("display", visible ? "block" : "none", "important");
   }
 
   const api = Object.freeze({
+    /// Document-level binding: one session per opened PDF revision.
     configure(payload) {
       if (!payload || typeof payload.session !== "string" || !payload.session ||
-          !Number.isSafeInteger(payload.revision) || payload.revision < 0 ||
-          !Number.isSafeInteger(payload.page) || payload.page < 1) return false;
-      const changed = !matches(payload) || context.page !== payload.page;
-      context = {
-        session: payload.session, revision: payload.revision, page: payload.page,
-      };
-      if (changed) forgetPage();
-      showChrome(true);
-      receiveNotes(payload.notes || []);
-      if (ready && changed) post("list");
+          payload.session.length > 128 ||
+          !Number.isSafeInteger(payload.revision) || payload.revision < 0) return false;
+      const changed = !matches(payload);
+      context = { session: payload.session, revision: payload.revision };
+      notesEnabled = payload.notes_enabled === true;
+      if (changed) {
+        forgetDocument();
+        if (ready) { drawer.hidden = true; toggle.setAttribute("aria-expanded", "false"); }
+      }
+      showChrome(notesEnabled);
+      refreshList();
+      schedulePaint();
+      if (changed) syncRenderedPages();
       return true;
     },
-    // Called when the rendered page cannot own notes at all. The host only
-    // reaches this state once navigation is unblocked, so no unsaved thought
-    // can be discarded here.
+    // Called when this document cannot own notes at all. The host only reaches
+    // this state once navigation is unblocked, so no unsaved thought can be
+    // discarded here.
     disable() {
       context = null;
-      forgetPage();
+      notesEnabled = false;
+      forgetDocument();
       if (ready) {
         // Do not restore focus to chrome that is about to be hidden.
         drawer.hidden = true;
@@ -617,34 +753,51 @@
     },
     render(payload) {
       if (!matches(payload)) return false;
-      receiveNotes(payload.notes);
-      return true;
+      return applyPages(payload.pages);
     },
     result(payload) {
       if (!matches(payload) || !Number.isSafeInteger(payload.request_id)) return false;
       const request = pending.get(payload.request_id);
       if (!request) return false;
       pending.delete(payload.request_id);
+      const applied = applyPages(payload.pages);
+      if (!applied) {
+        if (request.action === "list") {
+          // A refused or failed listing stays retryable, but the next render
+          // window change must ask again: retrying here would loop forever on a
+          // page the host no longer serves.
+          for (const value of request.pages?.length ? request.pages : [request.page]) {
+            const page = pageNumber(value);
+            if (page) listedPages.delete(page);
+          }
+        } else if (pageNumber(request.page)) {
+          // A mutation can commit while its refresh fails; re-read that page so
+          // the marks never silently disagree with the stored notes.
+          refreshPage(request.page);
+        }
+      }
       if (payload.retry_ai_save && bounded(payload.content, MAX_AI_BYTES)) {
         failedAiSave = {
+          page: request.page || failedAiSave?.page || currentPage,
           anchor: request.anchor || failedAiSave?.anchor,
           content: payload.content,
           content_html: payload.content_html,
           error: payload.error || "AI 解释已生成，但保存失败。请重试保存。",
           pending: null,
+          pendingAction: null,
         };
       } else if (["retry_ai_save", "discard_ai_save"].includes(request.action) && failedAiSave) {
         failedAiSave.pending = null;
         failedAiSave.pendingAction = null;
       }
-      if (payload.notes) receiveNotes(payload.notes);
       if (editor?.pending === payload.request_id) {
         editor.pending = null;
         input.disabled = false;
         saveButton.disabled = false;
         if (payload.ok) {
+          const savedPage = editor.page;
           editor = null;
-          reportDraft(false);
+          reportDraft(false, savedPage);
           input.value = "";
           editorPanel.hidden = true;
         } else {
@@ -655,8 +808,9 @@
       if (payload.ok) {
         if (["ai_explain", "retry_ai_save", "discard_ai_save"].includes(request.action)) failedAiSave = null;
         if (request.action === "delete" && editor?.id === request.id) {
+          const removedPage = editor.page;
           editor = null;
-          reportDraft(false);
+          reportDraft(false, removedPage);
           input.value = "";
           editorPanel.hidden = true;
         }
@@ -666,7 +820,6 @@
             request.action === "discard_ai_save" ? "已放弃未保存的 AI 想法。" :
             ["ai_explain", "retry_ai_save"].includes(request.action) ? "AI 解释已保存为 AI 想法。" : "笔记已保存。");
         }
-        if (!payload.notes && request.action !== "list") post("list");
       } else {
         tell(payload.error || "笔记操作失败，请重试。", true);
       }
@@ -689,7 +842,8 @@
       const selected = ready && context ?
         (typeof selectedText === "string" ? contextMenuSnapshot : currentSelection()) : null;
       if (!selected || (typeof selectedText === "string" &&
-          normalize(selectedText) !== selected.anchor.quote) || !anchorRange(selected.anchor)) {
+          normalize(selectedText) !== selected.anchor.quote) ||
+          !anchorRange(selected.anchor, selected.page)) {
         tell("选中文字已变化，请重新选择后再使用 AI 解释。", true);
         return false;
       }
@@ -698,6 +852,76 @@
       choose("ai_explain");
       return true;
     },
+    /// The viewer declares the pages it currently has mounted.
+    setPages(pages) {
+      if (!Array.isArray(pages)) return false;
+      const next = [];
+      const seen = new Set();
+      for (const value of pages) {
+        const page = pageNumber(value);
+        if (!page || seen.has(page)) continue;
+        seen.add(page);
+        next.push(page);
+        if (next.length >= MAX_DECLARED_PAGES) break;
+      }
+      next.sort((left, right) => left - right);
+      const unchanged = next.length === declaredPages.length &&
+        next.every((page, index) => page === declaredPages[index]);
+      declaredPages = next;
+      // Notes stay cached for pages that scrolled out of the window so coming
+      // back never costs another round trip; only a pathological document is
+      // trimmed, always keeping the pages that are still mounted.
+      if (!unchanged) {
+        for (const page of [...pageState.keys()]) {
+          if (pageState.size <= MAX_DECLARED_PAGES * 2) break;
+          if (!seen.has(page)) pageState.delete(page);
+        }
+        // Marks follow the mounted window, so a narrowed declaration must
+        // repaint even though no page DOM changed.
+        schedulePaint();
+      }
+      syncRenderedPages();
+      return true;
+    },
+    setCurrentPage(page) {
+      const value = pageNumber(page);
+      if (!value) return false;
+      currentPage = value;
+      if (!drawerPage) setDrawerPage(value);
+      refreshList();
+      return true;
+    },
+    /// A page was (re)built: its text layer offsets must be measured again.
+    pageRendered(page) {
+      const value = pageNumber(page);
+      if (!value) return false;
+      indexByPage.delete(value);
+      schedulePaint();
+      return true;
+    },
+    /// A page was unloaded: its layer and any selection inside it are gone.
+    pageReleased(page) {
+      const value = pageNumber(page);
+      if (!value) return false;
+      indexByPage.delete(value);
+      if (selectionSnapshot?.page === value) selectionSnapshot = null;
+      if (contextMenuSnapshot?.page === value) contextMenuSnapshot = null;
+      schedulePaint();
+      return true;
+    },
+    /// The page that owns an unsaved thought or marks, if any. The viewer keeps
+    /// that page mounted and does not report a page change while it is pinned.
+    lockedPage() {
+      if (editor) return editor.page || currentPage || null;
+      if (failedAiSave) return failedAiSave.page || currentPage || null;
+      for (const request of pending.values()) {
+        if (request.action === "list" || request.action === "pages_rendered") continue;
+        const page = pageNumber(request.page);
+        if (page) return page;
+      }
+      return null;
+    },
+    ready: () => ready,
   });
   Object.defineProperty(window, "moyeAnnotations", { value: api });
 
@@ -877,17 +1101,19 @@
     saveButton = button("保存", "save", saveEditor);
     editorActions.append(button("取消", "cancel", () => {
       if (editor?.pending) return;
+      const cancelledPage = editor?.page;
       editor = null;
-      reportDraft(false);
+      reportDraft(false, cancelledPage);
       input.value = "";
       editorPanel.hidden = true;
+      refreshList();
     }), saveButton);
     editorStatus = element("div", "editor-status");
     editorStatus.setAttribute("role", "status");
     editorPanel.append(editorTitle, quoteView, input, editorActions, editorStatus);
     drawer.append(header, scroll, editorPanel);
     toggle = button("笔记 0", "surface toggle", () => {
-      if (drawer.hidden || noteScope !== null) openDrawer(null);
+      if (drawer.hidden || noteScope !== null) openDrawer(null, editor?.page || currentPage);
       else closeDrawer();
     });
     toggle.setAttribute("aria-expanded", "false");
@@ -898,11 +1124,11 @@
     root.append(layer, toolbar, drawer, toggle, toast);
     document.documentElement.append(host);
     ready = true;
-    // The host configures this page only after PDF.js reports it as rendered.
-    showChrome(!!context);
+    // The host configures this document once its PDF.js view is ready.
+    showChrome(!!context && notesEnabled);
     refreshList();
     schedulePaint();
-    if (context) post("list");
+    syncRenderedPages();
 
     document.addEventListener("selectionchange", () => {
       if (root.activeElement === input || root.activeElement?.closest(".toolbar")) return;
@@ -937,10 +1163,11 @@
           const hits = hitAreas.filter(({ rect }) => event.clientX >= rect.left &&
             event.clientX <= rect.right && event.clientY >= rect.top && event.clientY <= rect.bottom);
           if (hits.length) {
+            const page = hits[0].page;
             const ids = new Set(hits.map((hit) => hit.id));
-            const anchors = notes.filter((note) => ids.has(note.id)).map((note) => note.anchor);
-            if (hasRelatedThought(anchors)) {
-              openDrawer(anchors);
+            const anchors = notesOf(page).filter((note) => ids.has(note.id)).map((note) => note.anchor);
+            if (hasRelatedThought(page, anchors)) {
+              openDrawer(anchors, page);
               const card = Array.from(list.children).find((node) => node.dataset.noteId === hits[0].id);
               card?.scrollIntoView({ block: "nearest" });
             } else {
@@ -956,7 +1183,7 @@
         if (!drawer.hidden) { event.preventDefault(); closeDrawer(); }
       }
       if (event.ctrlKey && event.altKey && event.key.toLowerCase() === "n") {
-        event.preventDefault(); openDrawer(null);
+        event.preventDefault(); openDrawer(null, editor?.page || currentPage);
         drawer.querySelector("button")?.focus({ preventScroll: true });
       }
       if (event.altKey && event.key === "Enter" && currentSelection()) {
@@ -968,9 +1195,6 @@
     document.addEventListener("load", schedulePaint, true);
     if (document.fonts) document.fonts.ready.then(schedulePaint);
     new ResizeObserver(schedulePaint).observe(document.body);
-    new MutationObserver(() => { index = null; schedulePaint(); }).observe(document.body, {
-      childList: true, characterData: true, subtree: true,
-    });
   }
 
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", install, { once: true });

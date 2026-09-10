@@ -544,6 +544,15 @@ fn open_pdf_reader_window(request: PdfReaderWindowRequest, cx: &mut App) {
         ..Default::default()
     };
     let register_key = singleton_key.clone();
+    // Page spacing is a global reading preference, read once per window so the
+    // first frame already uses the saved value.
+    let compact_reading = services
+        .provider_settings()
+        .map(|settings| settings.pdf_compact_reading)
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "cannot read the PDF reading preference");
+            false
+        });
     let opened = cx.open_window(options, move |window, cx| {
         let parent = match ParentWindowHandle::capture(window) {
             Ok(parent) => parent,
@@ -576,6 +585,7 @@ fn open_pdf_reader_window(request: PdfReaderWindowRequest, cx: &mut App) {
                 // so final progress persistence and cancellation cannot be
                 // bypassed by this early-return error path.
                 let close_weak = reader.downgrade();
+                register_pdf_reader_window(close_weak.clone(), cx);
                 if let Some(key) = &register_key {
                     register_singleton_pdf_reader(key, close_weak.clone(), cx);
                 }
@@ -621,6 +631,7 @@ fn open_pdf_reader_window(request: PdfReaderWindowRequest, cx: &mut App) {
             )
         });
         let weak = reader.downgrade();
+        register_pdf_reader_window(weak.clone(), cx);
         if let Some(key) = &register_key {
             register_singleton_pdf_reader(key, weak.clone(), cx);
         }
@@ -638,7 +649,8 @@ fn open_pdf_reader_window(request: PdfReaderWindowRequest, cx: &mut App) {
         );
         window
             .spawn(cx, async move |cx| {
-                match build_pdf_reader_webview(bytes, initial_page, &parent).await {
+                match build_pdf_reader_webview(bytes, initial_page, compact_reading, &parent).await
+                {
                     Ok((raw_webview, ipc_receiver)) => {
                         let _ = cx.update(|window, cx| {
                             let mut keep_open = false;

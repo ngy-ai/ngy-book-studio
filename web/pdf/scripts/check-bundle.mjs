@@ -25,8 +25,18 @@ for (const contract of [
   "page.getTextContent(",
   "new TextLayer(",
   "moye-pdf-selection-changed",
+  "moye-pdf-page-changed",
   "moye-pdf-request-page",
   "MAX_SELECTION_BYTES = 32 * 1024",
+  // The reading column is laid out in one pass and drawn page by page.
+  "IntersectionObserver(",
+  "releaseSlot(",
+  "globalThis.moyeAnnotations",
+  // Page spacing is a host preference applied through one html attribute, and a
+  // live change must keep the reading position instead of scrolling the reader.
+  'get("compact")',
+  '"data-pdf-compact"',
+  "MutationObserver(",
 ]) {
   if (!viewer.includes(contract)) throw new Error(`missing PDF viewer contract: ${contract}`);
 }
