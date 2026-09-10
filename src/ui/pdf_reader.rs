@@ -4,7 +4,7 @@ use super::reader::{
     ReadingProgressWriter,
 };
 use super::*;
-use gpui::{DragMoveEvent, EmptyView};
+use gpui::{DragMoveEvent, EmptyView, Focusable};
 use moye_epub_editor::document::DocumentLocator;
 
 mod annotations;
@@ -107,6 +107,14 @@ pub(super) enum PdfIpcMessage {
         selected_text: String,
         #[serde(rename = "url")]
         url: String,
+    },
+    /// Sent by the bundled viewer when Ctrl + Arrow is pressed. The host owns
+    /// page state, reading progress and note re-binding, so the shell only asks
+    /// for a relative step instead of rendering a page on its own.
+    #[serde(rename = "moye-pdf-request-page")]
+    RequestPage {
+        /// -1 for the previous page, +1 for the next page.
+        delta: i32,
     },
 }
 
@@ -788,6 +796,22 @@ impl PdfReaderApp {
                     self.explain_selection(&selected_text, cx);
                 }
                 return;
+            }
+            PdfIpcMessage::RequestPage { delta } if matches!(delta, -1 | 1) => {
+                let current = self.current_page;
+                let total = self.actual_page_count.max(1);
+                let target = if delta < 0 {
+                    if current <= 1 {
+                        return;
+                    }
+                    current.saturating_sub(1)
+                } else {
+                    if current >= total {
+                        return;
+                    }
+                    current.saturating_add(1)
+                };
+                self.request_page(target, cx);
             }
             _ => return,
         }
@@ -1634,6 +1658,28 @@ impl Render for PdfReaderApp {
             .v_flex()
             .size_full()
             .bg(rgb(PAPER))
+            .on_key_down(move |event: &gpui::KeyDownEvent, window, cx| {
+                let view = view.clone();
+                let current_page = current_page;
+                view.update(cx, |this, cx| {
+                    if this
+                        .search_input
+                        .read(cx)
+                        .focus_handle(cx)
+                        .is_focused(window)
+                    {
+                        return;
+                    }
+                    if event.keystroke.modifiers != gpui::Modifiers::control() {
+                        return;
+                    }
+                    match event.keystroke.key.as_str() {
+                        "left" | "up" => this.request_page(current_page.saturating_sub(1), cx),
+                        "right" | "down" => this.request_page(current_page.saturating_add(1), cx),
+                        _ => {}
+                    }
+                });
+            })
             .child(toolbar)
             .child(
                 div()

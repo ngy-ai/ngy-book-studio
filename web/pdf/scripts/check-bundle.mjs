@@ -25,6 +25,7 @@ for (const contract of [
   "page.getTextContent(",
   "new TextLayer(",
   "moye-pdf-selection-changed",
+  "moye-pdf-request-page",
   "MAX_SELECTION_BYTES = 32 * 1024",
 ]) {
   if (!viewer.includes(contract)) throw new Error(`missing PDF viewer contract: ${contract}`);

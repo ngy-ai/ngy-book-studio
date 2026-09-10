@@ -304,6 +304,33 @@ window.addEventListener("message", (event) => {
   });
 });
 
+// Ctrl + Left/Up steps to the previous page and Ctrl + Right/Down to the next.
+// The host owns page state, reading progress and note re-binding, so the shell
+// only asks for a relative step instead of rendering a page on its own. Plain
+// arrows keep their native scrolling for the rendered page.
+window.addEventListener(
+  "keydown",
+  (event) => {
+    if (!event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
+    let delta;
+    switch (event.key) {
+      case "ArrowLeft":
+      case "ArrowUp":
+        delta = -1;
+        break;
+      case "ArrowRight":
+      case "ArrowDown":
+        delta = 1;
+        break;
+      default:
+        return;
+    }
+    event.preventDefault();
+    notify({ type: "moye-pdf-request-page", delta });
+  },
+  true,
+);
+
 async function openLocalDocument() {
   notify({ type: "moye-pdf-viewer-ready" });
   const response = await fetch(new URL("./document.pdf", location.href), {
