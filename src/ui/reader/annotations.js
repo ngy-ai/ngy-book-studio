@@ -27,6 +27,19 @@
   ]);
   const compact = (value) => value.replace(/\s/gu, "");
   const normalize = (value) => value.replace(/\s+/gu, " ").trim();
+  // Reading-time translations are a display layer, never book text. Excluding
+  // them keeps note offsets and quotes anchored to the immutable original.
+  const translationFreeText = (range) => {
+    const fragment = range.cloneContents();
+    if (fragment.querySelectorAll) {
+      for (const node of Array.from(
+        fragment.querySelectorAll("[data-moye-translation]"),
+      )) {
+        node.remove();
+      }
+    }
+    return fragment.textContent || "";
+  };
   const bounded = (value, bytes) => typeof value === "string" &&
     encoder.encode(value).byteLength <= bytes;
   const kinds = {
@@ -202,8 +215,9 @@
     let length = 0;
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
       acceptNode(node) {
-        return node.parentElement?.closest("script,style,noscript,template") ||
-          host?.contains(node) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+        return node.parentElement?.closest(
+          "script,style,noscript,template,[data-moye-translation]",
+        ) || host?.contains(node) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
       },
     });
     while (walker.nextNode()) {
@@ -218,13 +232,21 @@
     return index;
   }
 
+  function insideTranslation(node) {
+    const element = node && (node.nodeType === 1 ? node : node.parentElement);
+    return !!(element && element.closest?.("[data-moye-translation]"));
+  }
+
   function currentSelection() {
     const selection = window.getSelection();
     if (!selection || selection.isCollapsed || selection.rangeCount !== 1) return null;
     const range = selection.getRangeAt(0);
     if (!document.body.contains(range.startContainer) ||
         !document.body.contains(range.endContainer)) return null;
-    const quote = normalize(selection.toString());
+    // A range entirely or partly inside a translation is never book text.
+    if (insideTranslation(range.startContainer) ||
+        insideTranslation(range.endContainer)) return null;
+    const quote = normalize(translationFreeText(range));
     if (!quote || !bounded(quote, 32768)) return null;
     let start = null;
     let end = null;

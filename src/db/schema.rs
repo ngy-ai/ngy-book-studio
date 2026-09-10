@@ -6,7 +6,7 @@ use crate::document::{DocumentLocator, SourceLocator};
 /// Identifies SQLite files owned by this application (ASCII "MOYE").
 pub(super) const APPLICATION_ID: i64 = 0x4D4F_5945;
 /// Development schemas are deliberately rebuilt instead of migrated.
-pub(super) const SCHEMA_VERSION: i64 = 12;
+pub(super) const SCHEMA_VERSION: i64 = 13;
 
 #[derive(Clone, Copy)]
 struct ColumnSpec {
@@ -273,6 +273,22 @@ const ANNOTATION_COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("created_at", "INTEGER", true, 0),
     ColumnSpec::new("updated_at", "INTEGER", true, 0),
 ];
+const TRANSLATION_COLUMNS: &[ColumnSpec] = &[
+    ColumnSpec::new("id", "TEXT", false, 1),
+    ColumnSpec::new("book_id", "TEXT", true, 0),
+    ColumnSpec::new("content_unit_id", "TEXT", true, 0),
+    ColumnSpec::new("block_id", "TEXT", true, 0),
+    ColumnSpec::new("ordinal", "INTEGER", true, 0),
+    ColumnSpec::new("document_revision", "INTEGER", true, 0),
+    ColumnSpec::new("unit_revision", "INTEGER", true, 0),
+    ColumnSpec::new("target_language", "TEXT", true, 0),
+    ColumnSpec::new("source_language", "TEXT", false, 0),
+    ColumnSpec::new("model", "TEXT", true, 0),
+    ColumnSpec::new("source_text", "TEXT", true, 0),
+    ColumnSpec::new("translated_text", "TEXT", true, 0),
+    ColumnSpec::new("created_at", "INTEGER", true, 0),
+    ColumnSpec::new("updated_at", "INTEGER", true, 0),
+];
 const SETTING_COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("key", "TEXT", false, 1),
     ColumnSpec::new("value_json", "TEXT", true, 0),
@@ -361,6 +377,10 @@ const TABLE_SPECS: &[TableSpec] = &[
     TableSpec {
         name: "chat_citations",
         columns: CHAT_CITATION_COLUMNS,
+    },
+    TableSpec {
+        name: "translations",
+        columns: TRANSLATION_COLUMNS,
     },
     TableSpec {
         name: "settings",
@@ -620,6 +640,24 @@ const INDEX_SPECS: &[IndexSpec] = &[
         table: "chat_citations",
         name: "idx_chat_citations_search_chunk",
         columns: &["search_chunk_id"],
+        unique: false,
+    },
+    IndexSpec {
+        table: "translations",
+        name: "idx_translations_scope",
+        columns: &["book_id", "content_unit_id", "block_id", "target_language"],
+        unique: true,
+    },
+    IndexSpec {
+        table: "translations",
+        name: "idx_translations_book",
+        columns: &["book_id"],
+        unique: false,
+    },
+    IndexSpec {
+        table: "translations",
+        name: "idx_translations_unit_language",
+        columns: &["content_unit_id", "target_language"],
         unique: false,
     },
 ];
@@ -956,6 +994,27 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
          CREATE UNIQUE INDEX idx_annotations_one_mark_per_anchor
              ON annotations(book_id, content_unit_id, document_revision, unit_revision, start_offset, end_offset)
              WHERE kind IN ('highlight', 'wavy', 'underline');
+         CREATE TABLE translations (
+             id TEXT PRIMARY KEY,
+             book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+             content_unit_id TEXT NOT NULL REFERENCES content_units(id) ON DELETE CASCADE,
+             block_id TEXT NOT NULL CHECK(length(block_id) > 0),
+             ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+             document_revision INTEGER NOT NULL CHECK(document_revision >= 0),
+             unit_revision INTEGER NOT NULL CHECK(unit_revision >= 0),
+             target_language TEXT NOT NULL CHECK(length(target_language) > 0),
+             source_language TEXT,
+             model TEXT NOT NULL CHECK(length(model) > 0),
+             source_text TEXT NOT NULL CHECK(length(source_text) > 0),
+             translated_text TEXT NOT NULL CHECK(length(translated_text) > 0),
+             created_at INTEGER NOT NULL CHECK(created_at >= 0),
+             updated_at INTEGER NOT NULL CHECK(updated_at >= created_at)
+         );
+         CREATE UNIQUE INDEX idx_translations_scope
+             ON translations(book_id, content_unit_id, block_id, target_language);
+         CREATE INDEX idx_translations_book ON translations(book_id);
+         CREATE INDEX idx_translations_unit_language
+             ON translations(content_unit_id, target_language);
          CREATE TABLE settings (
              key TEXT PRIMARY KEY,
              value_json TEXT NOT NULL,
@@ -1503,6 +1562,14 @@ fn document_relations_are_valid(conn: &Connection) -> Result<bool> {
                             OR COALESCE(json_type(p.locator_json, '$.region'), 'null') <> 'null'
                         ELSE 1 END
                     ))
+                 UNION ALL
+                 SELECT 1 FROM translations t
+                 LEFT JOIN books b ON b.id = t.book_id
+                 LEFT JOIN content_units u ON u.id = t.content_unit_id
+                 WHERE b.id IS NULL OR u.id IS NULL
+                    OR u.book_id <> t.book_id
+                    OR t.document_revision > b.revision
+                    OR (t.document_revision = b.revision AND t.unit_revision <> u.revision)
              )",
             [],
             |row| row.get::<_, bool>(0),
@@ -1702,6 +1769,25 @@ mod tests {
              INSERT INTO annotations(id, book_id, content_unit_id, document_revision, unit_revision,
                 quote, start_offset, end_offset, kind, created_at, updated_at)
              VALUES ('note', 'book-a', 'unit-b', 1, 1, 'text', 0, 4, 'highlight', 1, 1);",
+        );
+    }
+
+    #[test]
+    fn missing_translation_index_rebuilds_same_version_database() {
+        assert_schema_mutation_triggers_rebuild("DROP INDEX idx_translations_scope;");
+    }
+
+    #[test]
+    fn translation_cross_book_unit_triggers_rebuild() {
+        assert_cross_book_source_triggers_rebuild(
+            "INSERT INTO content_units(id, book_id, source_id, ordinal, kind,
+                source_locator_json, block_json, revision, created_at, updated_at)
+             VALUES ('unit-b', 'book-b', 'source-b', 0, 'chapter', '{}', '{}', 1, 1, 1);
+             INSERT INTO translations(id, book_id, content_unit_id, block_id, ordinal,
+                document_revision, unit_revision, target_language, source_language, model,
+                source_text, translated_text, created_at, updated_at)
+             VALUES ('tr', 'book-a', 'unit-b', 'block-1', 0, 1, 1, 'zh-Hans', 'en', 'model',
+                'source', '译文', 1, 1);",
         );
     }
 

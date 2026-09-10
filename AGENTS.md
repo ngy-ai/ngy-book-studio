@@ -76,16 +76,26 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   修订或删除章节保留失效笔记，不按 quote 搜索重定位；删除图书级联清除笔记。
   同书/单元/双版本/精确起止范围的三种标记由部分唯一索引约束，改样式在事务中替换，
   不创建多条标记。删除划线只删除该范围的标记，人工与 AI 想法保持不变。
-  当前开发结构版本为 12，遵循重建策略，不编写迁移。
+  当前开发结构版本为 13，遵循重建策略，不编写迁移。
 - `src/db/`：SQLite 连接、当前结构、单表 CRUD/查询映射和跨表事务。每张表对应一个
   文件：`books.rs`、`book_sources.rs`、`content_units.rs`、`toc_entries.rs`、
   `blobs.rs`、`assets.rs`、`asset_refs.rs`、`progress.rs`、`search_chunks.rs`、
   `embeddings.rs`、`index_jobs.rs`、`visual_pages.rs`、`visual_page_staging.rs`、
-  `chat_threads.rs`、`chat_messages.rs`、`chat_citations.rs`、`groups.rs`、`settings.rs` 和
+  `chat_threads.rs`、`chat_messages.rs`、`chat_citations.rs`、`groups.rs`、`settings.rs`、
+  `translations.rs` 和
   `office_enhancements.rs`；跨表原子操作只放 `transactions.rs`，FTS 查询放
   `book_search.rs`，建表与完整性契约放 `schema.rs`。
 - `src/search.rs`、`src/indexing.rs`：作用域内 FTS5/`sqlite-vec` 精确 KNN、RRF 混合
-  召回，以及可恢复的 embedding/vision 后台任务。
+  召回，以及可恢复的 embedding/vision 后台任务。`indexing.rs` 另实现整本图书翻译任务
+  `kind="translation"`：任务标识为 `translation:<source_id>:<target_language>`，游标复用
+  `next_ordinal` 作为文本块序号，逐块调用对话模型 `chat_stream` 写入 `translations` 表，
+  可暂停/恢复/重试/取消；文本块按 `content_units.block_json` 的 `BlockDocument` 确定性
+  展平（段落、标题、引用、列表项、表格单元格；跳过代码块和 RawHtml），以
+  `(document_revision, unit_revision, target_language, 对话模型)` 判定失效并重译。目标语言
+  或对话模型变化由 `AppServices::configure_translations` 经
+  `transactions::reconfigure_translation_jobs` 重排；每本当前来源只保留一个目标语言任务。
+  源语言（`books.language` 主语言子标签）等于目标语言时跳过；翻译任务未配置对话模型时
+  失败而不猜测。模型调用不得逐 token 打日志，也不得记录正文或译文内容。
 - `src/preview.rs`、`src/windows_pdf_renderer.rs`：`VisualRenderer`、结构化页面 PNG 光栅化、
   Windows PDF 原页光栅化、可暂停/恢复/重试/取消的持久任务和本地 PDF.js 资产路由。
 - `src/ai.rs`、`src/credentials.rs`：OpenAI-compatible models/chat streaming/embeddings
@@ -122,6 +132,19 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   闭合 Shadow DOM 隔离正文 CSS，覆盖层绘制而不改写正文节点。
   `src/ui/reader/selection_menu.rs` 是 EPUB 与 PDF 共用的 WebView2 原生「AI解释」菜单，
   由调用方提供私有文档判定与事件构造，仍要求 page/frame 为同一私有文档。
+- `src/ui/reader/translations.rs`、`translations.js`：Reader 双语对照展示。宿主在
+  `sync_loaded_page` 之后按当前书/单元从 `translations` 表读取与当前
+  `(document_revision, unit_revision)` 和对话模型一致的译文，经 session/generation
+  单调门控 `evaluate_script` 注入；打开新章后的迟到完成不得覆盖当前章。前端按
+  “规范化原文文本（重复文本按文档顺序消歧）”匹配正文块级元素，译文块一律标记
+  `data-moye-translation` 并插入原文之前，默认「译文在上、虚线分隔、原文在下」，
+  点击译文切换该段的仅译文/双语；表格单元格把译文插到单元格内部且不参与切换。
+  译文节点必须从 `annotations.js` 的 `textIndex()`/`currentSelection()` 与
+  `READER_INITIALIZATION_SCRIPT` 的 `boundedSelection()` 中排除（选区跨译文时按
+  fragment 过滤译文后再取文本），原文文本节点始终保留在 `body`，使笔记 UTF-16 锚点、
+  版本校验和重叠标记语义不受翻译影响。译文文本只用 `textContent` 写入，不能当 HTML。
+  `src/ui/reader/translations.test.cjs` 是可选 DOM 门禁（Node + 已安装 Playwright），
+  覆盖双语顺序、重复文本消歧、嵌套块、单元格插入、点击切换与笔记/选区排除。
 - `src/ui/pdf_reader/annotations.rs`、`annotations.js`：PDF 页面笔记宿主与页面桥接，
   复用同一张 `annotations` 表、互斥标记规则、人工/AI 想法流程与展示清洗。锚点作用域
   是单页的 PDF.js 文字层：宿主无法复刻该投影，因此
@@ -579,6 +602,13 @@ EPUB/PDF/原件导出、重新打开及原件字节一致性。
   仍存在的差额（<0.5px 不动手），并用 `takeRecords()` 丢弃自己的两条记录；
   锚点页必须取“视口中心覆盖的那一页”（草稿钉住的页优先），不能用 `currentPage`——
   它只跟踪已绘制的页，刚滚到、仍在占位状态的页会让它滞后一页，补偿就会少算一个页间距。
+- 默认显示语言使用独立 settings key（`translation.preferences.v1`，默认关闭，AI 设置
+  “系统配置”中的下拉默认选“不翻译（仅原文）”，预设中/英/日/韩/法/德/西/俄等），同样
+  不得扩展 Provider JSON，且必须加入 `AI_SETTINGS_KEYS`。`ProviderSettings::validate`
+  只接受 `TRANSLATION_LANGUAGES` 中的标签，UI 与校验共用这份常量。目标语言变化或对话
+  模型/端点变化由 `configure_translation` + `reconfigure_translation_jobs` 重排翻译任务；
+  关闭翻译只取消任务，不删除已存译文（改回同一语言可立即复用）。源语言与目标语言按
+  主语言子标签比较后跳过整本翻译。
 - Agent 只允许 `search_books`、`read_passages`、`get_outline` 三个只读工具。宿主先
   计算授权 book IDs，模型参数只能缩小范围；保留工具轮次、结果数、上下文和超时限制。
   `AgentLimits::max_tool_rounds` 的既有计数单位是实际工具调用（默认 6 次），不是模型

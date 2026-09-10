@@ -11,7 +11,7 @@ use moye_epub_editor::{
     services::{
         ApiKeyUpdate, AppServices, DEFAULT_CHAT_MODEL, DEFAULT_EMBEDDING_DIMENSIONS,
         DEFAULT_EMBEDDING_MODEL, DEFAULT_VISION_MODEL, EndpointRoutingSettings, EndpointSettings,
-        ModelRole, ProviderSettings,
+        ModelRole, ProviderSettings, TRANSLATION_LANGUAGES, translation_language_label,
     },
 };
 
@@ -244,6 +244,8 @@ pub(super) struct AiSettingsWindow {
     auto_run_background_jobs: bool,
     /// Global PDF reading preference: no gap between pages when enabled.
     pdf_compact_reading: bool,
+    /// Target language for reading-time book translation. `None` disables it.
+    default_language: Option<String>,
     operation: PendingOperation,
     notice: Option<SettingsNotice>,
 }
@@ -366,6 +368,7 @@ impl AiSettingsWindow {
             delete_web_search_api_key: false,
             auto_run_background_jobs: settings.auto_run_background_jobs,
             pdf_compact_reading: settings.pdf_compact_reading,
+            default_language: settings.default_language.clone(),
             operation: PendingOperation::Idle,
             notice: None,
         }
@@ -459,9 +462,15 @@ impl AiSettingsWindow {
             web_search_max_results,
             auto_run_background_jobs: self.auto_run_background_jobs,
             pdf_compact_reading: self.pdf_compact_reading,
+            default_language: self.default_language.clone(),
         };
         settings.validate()?;
         Ok(settings)
+    }
+
+    fn set_default_language(&mut self, language: Option<String>, cx: &mut Context<Self>) {
+        self.default_language = language;
+        cx.notify();
     }
 
     fn new_endpoint_draft(
@@ -1666,44 +1675,117 @@ impl AiSettingsWindow {
     #[inline(never)]
     fn render_system_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let compact_view = cx.entity();
+        let language_view = cx.entity();
+        let selected_language = self.default_language.clone();
+        let current_label = selected_language
+            .as_deref()
+            .and_then(translation_language_label)
+            .unwrap_or("不翻译（仅原文）");
+        let language_button = Button::new("ai-default-language")
+            .debug_selector(|| "ai-default-language".into())
+            .outline()
+            .label(current_label)
+            .disabled(self.operation.busy())
+            .dropdown_menu(move |menu, _, _| {
+                let mut menu = menu.item(
+                    PopupMenuItem::new("不翻译（仅原文）")
+                        .checked(selected_language.is_none())
+                        .on_click({
+                            let view = language_view.clone();
+                            move |_, _, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.set_default_language(None, cx);
+                                });
+                            }
+                        }),
+                );
+                for (tag, label) in TRANSLATION_LANGUAGES {
+                    let selected = selected_language.as_deref() == Some(tag);
+                    let view = language_view.clone();
+                    let tag = tag.to_string();
+                    menu = menu.item(PopupMenuItem::new(label).checked(selected).on_click(
+                        move |_, _, cx| {
+                            let tag = tag.clone();
+                            view.update(cx, |this, cx| {
+                                this.set_default_language(Some(tag), cx);
+                            });
+                        },
+                    ));
+                }
+                menu
+            });
 
         div()
             .v_flex()
-            .gap_3()
-            .p_4()
-            .rounded(px(12.))
-            .border_1()
-            .border_color(rgb(BORDER))
-            .bg(rgb(SURFACE))
+            .gap_5()
             .child(
                 div()
-                    .text_sm()
-                    .font_semibold()
-                    .text_color(rgb(INK))
-                    .child("PDF 阅读"),
-            )
-            .child(
-                Checkbox::new("ai-pdf-compact-reading")
-                    .checked(self.pdf_compact_reading)
-                    .disabled(self.operation.busy())
-                    .label("PDF 紧凑阅读")
-                    .debug_selector(|| "ai-pdf-compact-reading".into())
-                    .on_click(move |checked, _, cx| {
-                        let checked = *checked;
-                        compact_view.update(cx, |this, cx| {
-                            this.pdf_compact_reading = checked;
-                            cx.notify();
-                        });
-                    }),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .line_height(gpui::relative(1.5))
-                    .text_color(rgb(MUTED))
+                    .v_flex()
+                    .gap_3()
+                    .p_4()
+                    .rounded(px(12.))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(SURFACE))
                     .child(
-                        "开启后 PDF 阅读窗口的页面上下贴合，不再保留页间留白；关闭时恢复默认间距。\
-                         页面投影、左右留白与阅读位置不变，标注与笔记仍按页面文字位置保存。",
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .text_color(rgb(INK))
+                            .child("PDF 阅读"),
+                    )
+                    .child(
+                        Checkbox::new("ai-pdf-compact-reading")
+                            .checked(self.pdf_compact_reading)
+                            .disabled(self.operation.busy())
+                            .label("PDF 紧凑阅读")
+                            .debug_selector(|| "ai-pdf-compact-reading".into())
+                            .on_click(move |checked, _, cx| {
+                                let checked = *checked;
+                                compact_view.update(cx, |this, cx| {
+                                    this.pdf_compact_reading = checked;
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .line_height(gpui::relative(1.5))
+                            .text_color(rgb(MUTED))
+                            .child(
+                                "开启后 PDF 阅读窗口的页面上下贴合，不再保留页间留白；关闭时恢复默认间距。\
+                                 页面投影、左右留白与阅读位置不变，标注与笔记仍按页面文字位置保存。",
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .v_flex()
+                    .gap_3()
+                    .p_4()
+                    .rounded(px(12.))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(SURFACE))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .text_color(rgb(INK))
+                            .child("图书翻译"),
+                    )
+                    .child(language_button)
+                    .child(
+                        div()
+                            .text_xs()
+                            .line_height(gpui::relative(1.5))
+                            .text_color(rgb(MUTED))
+                            .child(
+                                "选择语言后，导入或重新翻译的 EPUB、MOBI、AZW、AZW3、Word 图书会按文本块\
+                                 翻译为目标语言；阅读时默认显示“译文在上、原文在下”的双语对照，点击段落\
+                                 可在仅译文与双语之间切换，笔记仍锚定原文。选择“不翻译”则保持原文。",
+                            ),
                     ),
             )
             .into_any_element()
@@ -2296,6 +2378,45 @@ mod tests {
                 );
             });
         }
+    }
+
+    #[gpui::test]
+    fn system_tab_language_dropdown_updates_translation_draft(cx: &mut TestAppContext) {
+        let (_directory, settings, visual) = open_settings(cx);
+        click_tab(visual, SettingsTab::System);
+        settings.read_with(visual, |view, _| {
+            assert_eq!(view.active_tab, SettingsTab::System);
+            assert!(view.default_language.is_none());
+        });
+        let button = visual
+            .debug_bounds("ai-default-language")
+            .expect("default-language dropdown must be rendered");
+        assert!(button.size.width > px(0.) && button.size.height > px(0.));
+
+        visual.update(|_, cx| {
+            settings.update(cx, |view, cx| {
+                view.set_default_language(Some("ja".to_string()), cx);
+            });
+        });
+        redraw(visual);
+        settings.read_with(visual, |view, cx| {
+            assert_eq!(view.default_language.as_deref(), Some("ja"));
+            assert_eq!(
+                view.entered_settings(cx)
+                    .unwrap()
+                    .default_language
+                    .as_deref(),
+                Some("ja")
+            );
+            assert!(
+                view.services
+                    .provider_settings()
+                    .unwrap()
+                    .default_language
+                    .is_none(),
+                "changing the language must not save the draft",
+            );
+        });
     }
 
     #[gpui::test]

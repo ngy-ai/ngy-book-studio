@@ -23,6 +23,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 mod annotations;
 use annotations::{AnnotationAction, ReaderAnnotations};
 
+mod translations;
+use translations::ReaderTranslations;
+
 #[cfg(target_os = "windows")]
 pub(super) mod selection_menu;
 
@@ -53,6 +56,23 @@ const READER_INITIALIZATION_SCRIPT: &str = r#"
   const isChapterNode = (node) => node && node.getRootNode() === document &&
     document.body?.contains(node);
 
+  const insideTranslation = (node) => {
+    const element = node && (node.nodeType === 1 ? node : node.parentElement);
+    return !!(element && element.closest?.("[data-moye-translation]"));
+  };
+
+  // Reading-time translations are a display layer. Selections and AI references
+  // must only ever contain the immutable original book text.
+  const bookText = (range) => {
+    const fragment = range.cloneContents();
+    if (fragment.querySelectorAll) {
+      for (const node of Array.from(fragment.querySelectorAll("[data-moye-translation]"))) {
+        node.remove();
+      }
+    }
+    return fragment.textContent || "";
+  };
+
   const boundedSelection = () => {
     const selection = window.getSelection();
     if (!selection || selection.isCollapsed || selection.rangeCount !== 1) return "";
@@ -61,11 +81,12 @@ const READER_INITIALIZATION_SCRIPT: &str = r#"
     const range = selection.getRangeAt(0);
     if (range.collapsed || ![selection.anchorNode, selection.focusNode,
         range.startContainer, range.endContainer].every(isChapterNode)) return "";
+    if ([range.startContainer, range.endContainer].some(insideTranslation)) return "";
     // Focusing a notes input can leave the previous body Range in Selection.
     const active = document.activeElement;
     if (active && (!isChapterNode(active) ||
         active.matches("input,textarea,select,[contenteditable='true']"))) return "";
-    const value = range.toString()
+    const value = bookText(range)
       .replace(/\s+/gu, " ")
       .trim();
     if (!value) return "";
@@ -548,6 +569,7 @@ pub struct ReaderApp {
     search_results: Vec<SearchHit>,
     selected_text: Option<String>,
     annotations: ReaderAnnotations,
+    translations: ReaderTranslations,
     _annotation_ai_subscription: Subscription,
     _annotation_ai_submit_subscription: Subscription,
     _annotation_ai_failure_subscription: Subscription,
@@ -745,6 +767,7 @@ pub(super) async fn build_reader_webview(
         })
         .with_initialization_script(READER_INITIALIZATION_SCRIPT)
         .with_initialization_script(include_str!("reader/annotations.js"))
+        .with_initialization_script(include_str!("reader/translations.js"))
         .with_new_window_req_handler(|_, _| gpui_component::wry::NewWindowResponse::Deny)
         .with_on_page_load_handler(move |event, url| {
             if matches!(event, gpui_component::wry::PageLoadEvent::Finished) {
@@ -1433,6 +1456,7 @@ impl ReaderApp {
             search_results: Vec::new(),
             selected_text: None,
             annotations: ReaderAnnotations::new(annotation_revisions),
+            translations: ReaderTranslations::new(),
             _annotation_ai_subscription,
             _annotation_ai_submit_subscription,
             _annotation_ai_failure_subscription,
@@ -1784,6 +1808,7 @@ impl ReaderApp {
         self.queue_current_progress(cx);
         self.run_pending_citation_navigation(url, cx);
         self.configure_annotations(cx);
+        self.configure_translations(url, cx);
         cx.notify();
     }
 

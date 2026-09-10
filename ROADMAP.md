@@ -52,6 +52,25 @@
   - [x] AI 设置新增“系统配置”标签，提供“PDF 紧凑阅读”（默认关闭，独立 settings key
     持久化）：开启后所有 PDF 阅读窗口的页面上下贴合、不再保留页间留白，保存后立即
     对已打开的窗口生效，页面投影、左右留白与阅读位置不变
+  - [x] 同一“系统配置”标签提供“默认显示语言”（默认“不翻译”，独立 settings key
+    `translation.preferences.v1` 持久化；预设中文/英语/日语/韩语/法语/德语/西班牙语/
+    俄语等，UI 与校验共用同一标签常量，不扩展 Provider JSON）
+  - [x] EPUB/MOBI/AZW/AZW3/Word 结构化图书的整本后台翻译：以
+    `kind="translation"` 复用持久任务框架，按文本块（段落、标题、引用、列表项、表格
+    单元格；跳过代码块与 RawHtml）逐块调用对话模型 `chat_stream`，可暂停/恢复/重试/
+    取消并在重启后恢复；任务标识为 `translation:<source_id>:<目标语言>`，每本当前来源
+    只保留一个目标语言任务。译文按图书/章节/文本块与文档版本、单元版本、目标语言、
+    对话模型持久化到 `translations` 表，失效时重译；源语言主标签等于目标语言时跳过；
+    删除图书级联清除译文；目标语言或对话模型变化经事务重排并重排任务
+  - [x] 阅读器双语对照：打开章节时按当前单元读取与当前版本、对话模型一致的译文并经
+    session/generation 门控注入，译文在上、虚线分隔、原文在下，点击段落切换“仅译文/
+    双语”；译文按规范化原文文本匹配（重复文本按文档顺序消歧，列表项优先匹配内层段落，
+    表格单元格译文插入单元格内部且不参与切换）。译文节点一律标记
+    `data-moye-translation` 并从笔记文本索引、选区与 AI 引用中排除，原文文本节点始终
+    保留在 `body`，因此划线、人工/AI 想法与版本校验不受影响
+  - [x] 结构版本 12 → 13：新增 `translations` 表（部分唯一索引按
+    book/unit/block/language 约束）、`db/translations.rs` DAO 与完整性关系校验，遵循
+    重建策略、不编写迁移
   - [x] PDF 阅读器提供同一套选区菜单、三种互斥划线、删除划线、写想法、AI 解释、原生
     右键菜单、页面上层标记与“本书笔记”入口；已渲染页面上的标记常驻可见。笔记与章节
     笔记同表，按页面内容单元、双版本与页码校验，并限定在阅读器声明的已渲染页窗口内；
@@ -283,9 +302,32 @@ LangGraph 依赖。CLI 课程验证与桌面接入的验证分别列出。
 - [ ] 本轮新章节的真实 Windows 鼠标操作复验：自动化工具 native pipe 连接失败，
   重试与重置仍不可用。事件回归和真实 LPAC 执行不替代此项验收
 
+## 图书翻译（2026-09-10）
+
+- [x] 设置项：`translation.preferences.v1` 独立 key、`PersistedTranslationSettings`、
+  `TRANSLATION_LANGUAGES` 校验、`AI_SETTINGS_KEYS`（6 项）、`load/save/validate` 与
+  snapshot/restore；Provider JSON 不含该字段。回归覆盖默认关闭、往返持久化、非法标签拒绝
+- [x] 存储：结构版本 12 → 13、`translations` 表与唯一索引、`db/translations.rs` DAO、
+  `document_relations_are_valid` 新增跨书/版本关系校验；删除图书级联清除译文。
+  `translation` 任务并入 `index_jobs` 白名单并支持暂停/恢复/重试/取消、崩溃恢复与来源
+  superseded 取消；`reconfigure_translation_jobs` 覆盖模型/目标语言变化、源语言跳过与
+  关闭翻译；`translation_blocks` 覆盖段落/标题/引用/列表项/表格单元格并跳过代码块与 RawHtml
+- [x] 阅读器：`translations.rs` 宿主桥接与 `translations.js` 双语展示（译上原下、虚线分隔、
+  点击切换仅译文/双语）；译文节点标记 `data-moye-translation` 并从笔记文本索引、选区与
+  AI 引用中排除，原文文本节点保留在 `body`
+- [x] 本地门禁：`cargo fmt --all --check`、`cargo check --all-targets --locked`、
+  `cargo clippy --all-targets --locked` 通过（仅既有告警，触及范围无新增）；`cargo test
+  --lib` 446 项、`cargo test --bin moye-epub-editor` 260 项、集成测试 epub_flow 6、
+  multi_format_flow 4、openai_compatible_flow 22、multi_endpoint_flow 1 全部通过
+- [ ] 真实 Windows 窗口双语展示冒烟：未连接本地对话模型逐项核对段落匹配、点击切换、
+  笔记排除与后台任务进度；`src/ui/reader/translations.test.cjs` DOM 门禁已按
+  `annotations.test.cjs` 范式编写，但本机未安装 Node/Playwright，尚未执行
+
 ## 明确不在当前范围
 
 - [ ] Office 独立幻灯片上的选段笔记，以及笔记导出
+- [ ] PDF 页面与 Office 视觉预览页的段落翻译（两者使用 PDF.js 文本层/页面位图，不共享
+  流式正文渲染，不在当前翻译范围内）
 
 - [ ] S3 对象存储实现、本地/远程同步和多设备冲突处理
 - [ ] DRM Kindle 导入或 DRM 绕过

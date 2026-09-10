@@ -639,6 +639,7 @@ fn job_kind_label(kind: &str) -> &'static str {
         "embedding" => "向量索引",
         "vision" => "视觉理解",
         "visual_render" => "逻辑页面渲染",
+        "translation" => "图书翻译",
         _ => "未知任务",
     }
 }
@@ -709,6 +710,7 @@ fn progress_label(job: &BackgroundJobSnapshot) -> String {
     let unit = match job.kind.as_str() {
         "embedding" => "分块",
         "vision" | "visual_render" => "页面",
+        "translation" => "文本块",
         _ => "项",
     };
     match job.progress.total {

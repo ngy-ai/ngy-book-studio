@@ -54,6 +54,7 @@ const CHAT_GENERATION_SETTINGS_KEY: &str = "ai.openai_compatible.chat_generation
 const ENDPOINT_ROUTING_SETTINGS_KEY: &str = "ai.openai_compatible.endpoint_routing.v1";
 const BACKGROUND_JOB_SETTINGS_KEY: &str = "background_jobs.preferences.v1";
 const PDF_READER_SETTINGS_KEY: &str = "pdf.reader.preferences.v1";
+const TRANSLATION_SETTINGS_KEY: &str = "translation.preferences.v1";
 const WEB_SEARCH_CREDENTIAL_TARGET: &str = "ai.openai_compatible.web_search.v1";
 const MAX_MODEL_NAME_CHARS: usize = 256;
 #[cfg(target_os = "windows")]
@@ -69,6 +70,30 @@ pub const DEFAULT_VISION_MODEL: &str = "qwen3.5:0.8b";
 /// must be regenerated.
 pub const DEFAULT_EMBEDDING_DIMENSIONS: usize = 1024;
 pub const DEFAULT_ENDPOINT_ID: &str = "default";
+
+/// Preset target languages for the reading-time book translation, as
+/// `(tag, label)` pairs. The tag is persisted verbatim and validated on save;
+/// the label is only used by the AI settings window.
+pub const TRANSLATION_LANGUAGES: [(&str, &str); 9] = [
+    ("zh-Hans", "中文（简体）"),
+    ("zh-Hant", "中文（繁體）"),
+    ("en", "英语"),
+    ("ja", "日语"),
+    ("ko", "韩语"),
+    ("fr", "法语"),
+    ("de", "德语"),
+    ("es", "西班牙语"),
+    ("ru", "俄语"),
+];
+
+/// Human-readable label for one persisted language tag, or `None` when the tag
+/// is not part of [`TRANSLATION_LANGUAGES`].
+pub fn translation_language_label(tag: &str) -> Option<&'static str> {
+    TRANSLATION_LANGUAGES
+        .iter()
+        .find(|(candidate, _)| *candidate == tag)
+        .map(|(_, label)| *label)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModelRole {
@@ -200,6 +225,29 @@ impl Default for PersistedPdfReaderSettings {
     }
 }
 
+/// Target language for the reading-time book translation. `None` keeps the
+/// original text only; translation is opt-in through the AI settings window.
+pub(crate) const DEFAULT_TRANSLATION_LANGUAGE: Option<&str> = None;
+
+fn default_translation_language() -> Option<String> {
+    DEFAULT_TRANSLATION_LANGUAGE.map(str::to_string)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedTranslationSettings {
+    #[serde(default)]
+    default_language: Option<String>,
+}
+
+impl Default for PersistedTranslationSettings {
+    fn default() -> Self {
+        Self {
+            default_language: default_translation_language(),
+        }
+    }
+}
+
 /// Persisted provider choices. Secrets intentionally cannot be represented by
 /// this type; API keys live behind [`CredentialStore`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -222,6 +270,11 @@ pub struct ProviderSettings {
     /// like the background-job preference above.
     #[serde(skip, default = "default_pdf_compact_reading")]
     pub pdf_compact_reading: bool,
+    /// Target language for the reading-time book translation. `None` keeps the
+    /// original text. Stored under its own settings key so the established
+    /// provider JSON contract remains unchanged, like the preferences above.
+    #[serde(skip, default = "default_translation_language")]
+    pub default_language: Option<String>,
     pub embedding_model: String,
     /// Dimension override sent to the embedding provider. Changing this value
     /// invalidates all existing vector indices because stored vectors with the
@@ -286,6 +339,7 @@ impl Default for ProviderSettings {
             chat_generation: ChatGenerationSettings::default(),
             auto_run_background_jobs: default_auto_run_background_jobs(),
             pdf_compact_reading: default_pdf_compact_reading(),
+            default_language: default_translation_language(),
             embedding_model: DEFAULT_EMBEDDING_MODEL.to_string(),
             embedding_dimensions: DEFAULT_EMBEDDING_DIMENSIONS,
             vision_model: DEFAULT_VISION_MODEL.to_string(),
@@ -319,6 +373,14 @@ impl ProviderSettings {
             crate::ai::MAX_EMBEDDING_DIMENSIONS
         );
         self.chat_generation.validate()?;
+        if let Some(language) = &self.default_language {
+            ensure!(
+                TRANSLATION_LANGUAGES
+                    .iter()
+                    .any(|(tag, _)| *tag == language.as_str()),
+                "默认显示语言无效"
+            );
+        }
         let mut ids = BTreeSet::new();
         let mut urls = BTreeSet::new();
         for endpoint in self.endpoints() {
@@ -458,6 +520,35 @@ pub struct BackgroundJobSnapshot {
     /// for `visual_render` jobs so users can see which renderer profile and
     /// units were used; otherwise the cursor can be very large and noisy.
     pub cursor_json: Option<String>,
+}
+
+/// One current translation of a text block, keyed for the reader's DOM
+/// matching. `source` is the canonical source text used as a matching hint when
+/// the chapter HTML carries no block identifiers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranslatedBlock {
+    pub key: String,
+    pub source: String,
+    pub translated: String,
+}
+
+/// Whether a book's declared language already satisfies a target tag. Compares
+/// only the primary subtag so `en-US` matches `en` and `zh` matches `zh-Hans`.
+pub fn language_is_target(source: Option<&str>, target: &str) -> bool {
+    fn primary(tag: &str) -> String {
+        tag.trim()
+            .split(['-', '_'])
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+    }
+    match source {
+        Some(source) => {
+            let source = primary(source);
+            !source.is_empty() && source == primary(target)
+        }
+        None => false,
+    }
 }
 
 /// A verified Office-enhanced page loaded from the managed object store.
@@ -735,6 +826,13 @@ impl AppServices {
             Arc::clone(&ai.vision_provider),
             indexing_models,
         )?;
+        runtime.block_on(indexing.configure_translation(
+            Arc::clone(&ai.provider),
+            ai.settings.chat_model.clone(),
+            translation_execution_identity(&ai.settings)?,
+            ai.settings.default_language.clone(),
+            ai.settings.auto_run_background_jobs,
+        ))?;
 
         let source: Arc<dyn VisualDocumentSource> = Arc::new(LibraryVisualDocumentSource {
             library: Arc::clone(&library),
@@ -828,6 +926,61 @@ impl AppServices {
             .map_err(|_| anyhow::anyhow!("AI service lock is poisoned"))?
             .settings
             .clone())
+    }
+
+    /// Returns the current, revision-matched translations for one content unit
+    /// in the configured default display language. Returns an empty vector when
+    /// translation is disabled, the book already uses the target language, the
+    /// unit belongs to another book, or no up-to-date translations exist yet.
+    pub async fn translation_blocks_for_unit(
+        &self,
+        book_id: String,
+        content_unit_id: String,
+    ) -> Result<Vec<TranslatedBlock>> {
+        let settings = self.provider_settings()?;
+        let Some(target_language) = settings.default_language.clone() else {
+            return Ok(Vec::new());
+        };
+        let chat_model = settings.chat_model.clone();
+        let db_path = self.db_path.clone();
+        self.runtime
+            .handle()
+            .spawn_blocking(move || {
+                let conn = db::open_conn(&db_path)?;
+                let Some(book) = db::books::get(&conn, &book_id)? else {
+                    return Ok(Vec::new());
+                };
+                if book
+                    .language
+                    .as_deref()
+                    .is_some_and(|source| language_is_target(Some(source), &target_language))
+                {
+                    return Ok(Vec::new());
+                }
+                let Some(unit) = db::content_units::get(&conn, &content_unit_id)? else {
+                    return Ok(Vec::new());
+                };
+                if unit.book_id != book_id {
+                    return Ok(Vec::new());
+                }
+                let rows =
+                    db::translations::list_for_unit(&conn, &content_unit_id, &target_language)?;
+                Ok(rows
+                    .into_iter()
+                    .filter(|row| {
+                        row.document_revision == book.revision
+                            && row.unit_revision == unit.revision
+                            && row.model == chat_model
+                    })
+                    .map(|row| TranslatedBlock {
+                        key: row.block_id,
+                        source: row.source_text,
+                        translated: row.translated_text,
+                    })
+                    .collect())
+            })
+            .await
+            .context("译文查询线程异常退出")?
     }
 
     pub fn provider(&self) -> Result<Arc<dyn OpenAiCompatibleProvider>> {
@@ -1026,6 +1179,7 @@ impl AppServices {
             }
         }
         let indexing_models = indexing_model_config(&settings)?;
+        let translation_identity = translation_execution_identity(&settings)?;
         let db_path = self.db_path.clone();
         let credentials = Arc::clone(&self.credentials);
         let ai = Arc::clone(&self.ai);
@@ -1105,7 +1259,7 @@ impl AppServices {
                 .await
                 .context("AI settings worker stopped")??;
 
-                if let Err(error) = indexing
+                let reconfigure_result = match indexing
                     .reconfigure(
                         Arc::clone(&next.embedding_provider),
                         Arc::clone(&next.vision_provider),
@@ -1114,6 +1268,19 @@ impl AppServices {
                     .await
                     .context("failed to reconfigure derived indexing")
                 {
+                    Ok(()) => indexing
+                        .configure_translation(
+                            Arc::clone(&next.provider),
+                            next.settings.chat_model.clone(),
+                            translation_identity,
+                            next.settings.default_language.clone(),
+                            next.settings.auto_run_background_jobs,
+                        )
+                        .await
+                        .context("failed to reconfigure book translation"),
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = reconfigure_result {
                     let rollback = tokio::task::spawn_blocking(move || {
                         let settings_result = restore_ai_settings(&db_path, &previous_rows);
                         let credential_result =
@@ -1477,7 +1644,7 @@ impl AppServices {
                             BackgroundJobAction::Cancel => coordinator.cancel(&job_id).await,
                         }
                     }
-                    "embedding" | "vision" => match action {
+                    "embedding" | "vision" | "translation" => match action {
                         BackgroundJobAction::Pause => indexing.pause(&job_id).await,
                         BackgroundJobAction::Resume => indexing.resume(&job_id).await,
                         BackgroundJobAction::Retry => indexing.retry(&job_id).await,
@@ -1693,7 +1860,7 @@ fn background_job_snapshot(
             .as_ref()
             .and_then(|value| json_usize(value.get("completed_pages")))
             .unwrap_or_default(),
-        "embedding" | "vision" => cursor
+        "embedding" | "vision" | "translation" => cursor
             .as_ref()
             .and_then(|value| json_usize(value.get("next_ordinal")))
             .unwrap_or_default(),
@@ -1772,7 +1939,8 @@ fn background_kind_order(kind: &str) -> u8 {
         "visual_render" => 0,
         "vision" => 1,
         "embedding" => 2,
-        _ => 3,
+        "translation" => 3,
+        _ => 4,
     }
 }
 
@@ -1849,12 +2017,13 @@ fn restore_endpoint_keys(
     }
 }
 
-const AI_SETTINGS_KEYS: [&str; 5] = [
+const AI_SETTINGS_KEYS: [&str; 6] = [
     PROVIDER_SETTINGS_KEY,
     CHAT_GENERATION_SETTINGS_KEY,
     ENDPOINT_ROUTING_SETTINGS_KEY,
     BACKGROUND_JOB_SETTINGS_KEY,
     PDF_READER_SETTINGS_KEY,
+    TRANSLATION_SETTINGS_KEY,
 ];
 
 fn snapshot_ai_settings(db_path: &Path) -> Result<Vec<Option<db::settings::Setting>>> {
@@ -1894,6 +2063,17 @@ fn indexing_model_config(settings: &ProviderSettings) -> Result<IndexingModelCon
         &settings.vision_model,
         vision_execution_identity(settings)?,
     )
+}
+
+/// Non-secret identity for deciding whether persisted whole-book translations
+/// are stale. A changed chat endpoint or model restarts every translation job
+/// from the first block; the target language is part of each job's identity.
+fn translation_execution_identity(settings: &ProviderSettings) -> Result<String> {
+    let endpoint = normalize_provider_base_url(&settings.endpoint_for(ModelRole::Chat)?.base_url)?;
+    Ok(format!(
+        "translation-v1:{}",
+        blake3::hash(format!("{}\0{}", endpoint.as_str(), settings.chat_model).as_bytes()).to_hex()
+    ))
 }
 
 fn vision_execution_identity(settings: &ProviderSettings) -> Result<String> {
@@ -1960,6 +2140,14 @@ fn load_provider_settings(db_path: &Path) -> Result<ProviderSettings> {
         }
         None => default_pdf_compact_reading(),
     };
+    settings.default_language = match db::settings::get(&tx, TRANSLATION_SETTINGS_KEY)? {
+        Some(row) => {
+            serde_json::from_str::<PersistedTranslationSettings>(&row.value_json)
+                .context("保存的翻译设置无效")?
+                .default_language
+        }
+        None => default_translation_language(),
+    };
     settings.validate()?;
     tx.commit().context("无法完成 AI 设置快照读取")?;
     Ok(settings)
@@ -2007,6 +2195,14 @@ fn save_provider_settings(db_path: &Path, settings: &ProviderSettings) -> Result
         .context("无法序列化 PDF 阅读设置")?,
         updated_at,
     };
+    let translation = db::settings::Setting {
+        key: TRANSLATION_SETTINGS_KEY.to_string(),
+        value_json: serde_json::to_string(&PersistedTranslationSettings {
+            default_language: settings.default_language.clone(),
+        })
+        .context("无法序列化翻译设置")?,
+        updated_at,
+    };
     let routing = db::settings::Setting {
         key: ENDPOINT_ROUTING_SETTINGS_KEY.to_string(),
         value_json: serde_json::to_string(&settings.endpoint_routing)
@@ -2030,6 +2226,10 @@ fn save_provider_settings(db_path: &Path, settings: &ProviderSettings) -> Result
     ensure!(
         db::settings::upsert(&tx, &pdf_reader)? == 1,
         "PDF 阅读设置未能保存"
+    );
+    ensure!(
+        db::settings::upsert(&tx, &translation)? == 1,
+        "翻译设置未能保存"
     );
     ensure!(
         db::settings::upsert(&tx, &routing)? == 1,
@@ -3334,6 +3534,64 @@ mod tests {
             db::settings::get(&conn, PDF_READER_SETTINGS_KEY)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn translation_language_defaults_off_and_round_trips_through_its_own_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join(db::DATABASE_FILE);
+        let conn = db::open_or_recreate(&db_path).unwrap();
+        assert!(
+            db::settings::get(&conn, TRANSLATION_SETTINGS_KEY)
+                .unwrap()
+                .is_none()
+        );
+        drop(conn);
+
+        let services = AppServices::open_with_credentials(
+            temp.path(),
+            Arc::new(MemoryCredentialStore::default()),
+        )
+        .unwrap();
+        assert_eq!(services.provider_settings().unwrap().default_language, None);
+
+        let mut settings = services.provider_settings().unwrap();
+        settings.default_language = Some("ja".to_string());
+        block_on_without_tokio(services.configure_provider(settings.clone(), ApiKeyUpdate::Keep))
+            .unwrap();
+        assert_eq!(
+            services
+                .provider_settings()
+                .unwrap()
+                .default_language
+                .as_deref(),
+            Some("ja")
+        );
+
+        let invalid = ProviderSettings {
+            default_language: Some("not-a-preset".to_string()),
+            ..Default::default()
+        };
+        assert!(invalid.validate().is_err());
+
+        let conn = db::open_conn(services.database_path()).unwrap();
+        let stored = db::settings::get(&conn, TRANSLATION_SETTINGS_KEY)
+            .unwrap()
+            .expect("translation settings must be persisted under their own key");
+        assert_eq!(
+            serde_json::from_str::<PersistedTranslationSettings>(&stored.value_json)
+                .unwrap()
+                .default_language
+                .as_deref(),
+            Some("ja")
+        );
+        let provider = db::settings::get(&conn, PROVIDER_SETTINGS_KEY)
+            .unwrap()
+            .expect("provider settings must stay persisted");
+        assert!(
+            !provider.value_json.contains("default_language"),
+            "the translation language must not leak into the provider JSON contract",
         );
     }
 

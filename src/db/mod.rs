@@ -20,6 +20,7 @@ pub(crate) mod search_chunks;
 pub(crate) mod settings;
 pub(crate) mod toc_entries;
 pub(crate) mod transactions;
+pub(crate) mod translations;
 pub(crate) mod visual_page_staging;
 pub(crate) mod visual_pages;
 

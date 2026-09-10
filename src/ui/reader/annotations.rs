@@ -91,7 +91,7 @@ struct PendingAiNote {
 }
 
 pub(super) struct ReaderAnnotations {
-    revisions: (u64, Vec<u64>),
+    pub(super) revisions: (u64, Vec<u64>),
     session: String,
     last_request: u64,
     busy: bool,

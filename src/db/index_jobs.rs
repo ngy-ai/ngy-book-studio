@@ -107,10 +107,15 @@ pub(crate) fn list_for_source_kind(
 pub(crate) fn list_queued(conn: &Connection, limit: usize) -> Result<Vec<IndexJob>> {
     let mut stmt = conn
         .prepare(&format!(
-            "{SELECT} WHERE status = 'queued' AND kind IN ('embedding', 'vision')
+            "{SELECT} WHERE status = 'queued' AND kind IN ('embedding', 'vision', 'translation')
                AND (kind <> 'vision' OR id = 'vision:' || source_id)
              ORDER BY created_at,
-                      CASE kind WHEN 'embedding' THEN 0 WHEN 'vision' THEN 1 ELSE 2 END,
+                      CASE kind
+                          WHEN 'embedding' THEN 0
+                          WHEN 'vision' THEN 1
+                          WHEN 'translation' THEN 2
+                          ELSE 3
+                      END,
                       id
              LIMIT ?1"
         ))
@@ -139,6 +144,54 @@ pub(crate) fn list_queued_ids_for_kind(
         .context("无法读取分类待执行任务")?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .context("无法读取分类待执行任务记录")
+}
+
+pub(crate) fn list_by_kind(conn: &Connection, kind: &str) -> Result<Vec<IndexJob>> {
+    let mut stmt = conn
+        .prepare(&format!("{SELECT} WHERE kind = ?1 ORDER BY created_at, id"))
+        .context("无法准备同类索引任务查询")?;
+    let rows = stmt
+        .query_map([kind], job_from_row)
+        .context("无法读取同类索引任务")?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .context("无法读取同类索引任务记录")
+}
+
+/// Rewrites one derived job to a caller-supplied execution generation,
+/// regardless of its previous state. Used by translation reconfiguration to
+/// restart work whose model or target language changed. A worker still holding
+/// the old cursor observes the mismatch and abandons its in-flight attempt.
+pub(crate) fn reset_reconfigured(
+    conn: &Connection,
+    job_id: &str,
+    status: IndexJobStatus,
+    cursor_json: &str,
+    updated_at: u64,
+) -> Result<usize> {
+    conn.execute(
+        "UPDATE index_jobs SET status = ?2, cursor_json = ?3, pause_requested = 0,
+         cancel_requested = 0, error = NULL, updated_at = ?4, started_at = NULL,
+         finished_at = NULL
+         WHERE id = ?1",
+        params![job_id, status.as_str(), cursor_json, updated_at as i64],
+    )
+    .context("无法重置翻译任务")
+}
+
+/// Cancels one derived job that no longer matches the active configuration.
+pub(crate) fn cancel_reconfigured(
+    conn: &Connection,
+    job_id: &str,
+    error: Option<&str>,
+    updated_at: u64,
+) -> Result<usize> {
+    conn.execute(
+        "UPDATE index_jobs SET status = 'cancelled', pause_requested = 0,
+         cancel_requested = 0, error = ?2, updated_at = ?3, finished_at = ?3
+         WHERE id = ?1 AND status IN ('queued', 'running', 'paused', 'failed')",
+        params![job_id, error, updated_at as i64],
+    )
+    .context("无法取消过期翻译任务")
 }
 
 pub(crate) fn insert(conn: &Connection, job: &IndexJob) -> Result<usize> {
@@ -200,7 +253,7 @@ pub(crate) fn recover_interrupted(conn: &Connection, updated_at: u64) -> Result<
         "UPDATE index_jobs
          SET status = 'queued', updated_at = ?1, finished_at = NULL,
              error = '应用退出时任务仍在执行，已从持久游标恢复'
-         WHERE status = 'running' AND kind IN ('embedding', 'vision')",
+         WHERE status = 'running' AND kind IN ('embedding', 'vision', 'translation')",
         [updated_at as i64],
     )
     .context("无法恢复中断的索引任务")
@@ -341,7 +394,7 @@ pub(crate) fn cancel_superseded_for_book(
          SET status = 'cancelled', cancel_requested = 0, pause_requested = 0,
              updated_at = ?3, finished_at = ?3
          WHERE book_id = ?1 AND source_id <> ?2
-           AND kind IN ('embedding', 'vision', 'visual_render')
+           AND kind IN ('embedding', 'vision', 'visual_render', 'translation')
            AND status IN ('queued', 'running', 'paused')",
         params![book_id, current_source_id, updated_at as i64],
     )
