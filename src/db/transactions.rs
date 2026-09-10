@@ -442,6 +442,9 @@ pub(crate) fn reconfigure_translation_jobs(
     let mut desired: BTreeMap<String, BookSource> = BTreeMap::new();
     if let Some(language) = target_language {
         for source in book_sources::list_current(&tx)? {
+            if !format_supports_translation(&source.format) {
+                continue;
+            }
             let book = books::get(&tx, &source.book_id)?.context("翻译任务图书不存在")?;
             if book.revision != source.revision {
                 continue;
@@ -516,7 +519,7 @@ pub(crate) fn reconfigure_translation_jobs(
     Ok(changed)
 }
 
-fn translation_initial_status(auto_run: bool) -> IndexJobStatus {
+pub(crate) fn translation_initial_status(auto_run: bool) -> IndexJobStatus {
     if auto_run {
         IndexJobStatus::Queued
     } else {
@@ -555,6 +558,13 @@ fn valid_translation_cursor(job: &IndexJob, source: &BookSource) -> Option<Persi
         && cursor.revision == source.revision
         && cursor.kind == "translation")
         .then_some(cursor)
+}
+
+/// Whole-book translation targets reflowable prose only. Fixed-layout PDF and
+/// Office spreadsheet/presentation sources are outside the current scope and
+/// must not accumulate meaningless translation jobs.
+fn format_supports_translation(format: &str) -> bool {
+    matches!(format, "epub" | "mobi" | "azw" | "azw3" | "doc" | "docx")
 }
 
 /// Whether a book's declared language already satisfies the target. Compares
@@ -2754,6 +2764,49 @@ mod tests {
                 .unwrap()
                 .status,
             IndexJobStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn translation_format_gate_excludes_fixed_layout_sources() {
+        for format in ["epub", "mobi", "azw", "azw3", "doc", "docx"] {
+            assert!(
+                format_supports_translation(format),
+                "{format} must translate"
+            );
+        }
+        for format in ["pdf", "pptx", "xlsx"] {
+            assert!(
+                !format_supports_translation(format),
+                "{format} is outside the current translation scope"
+            );
+        }
+    }
+
+    #[test]
+    fn translation_jobs_skip_fixed_layout_formats() {
+        let (_temp, mut conn) = open_database();
+        let mut fixture = Fixture::new();
+        fixture.book.format = "pdf".to_string();
+        fixture.source.format = "pdf".to_string();
+        insert_document(&mut conn, &fixture.graph(), true).unwrap();
+
+        assert_eq!(
+            reconfigure_translation_jobs(
+                &mut conn,
+                Some("en"),
+                "chat-1",
+                "translation-v1:a",
+                true,
+                10
+            )
+            .unwrap(),
+            0
+        );
+        assert!(
+            index_jobs::list_by_kind(&conn, "translation")
+                .unwrap()
+                .is_empty()
         );
     }
 

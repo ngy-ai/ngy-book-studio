@@ -184,6 +184,30 @@ fn default_auto_run_background_jobs() -> bool {
     DEFAULT_AUTO_RUN_BACKGROUND_JOBS
 }
 
+/// Upper bound of background model jobs running at the same time. The indexing
+/// worker spawns this many tasks once and parks the ones above the configured
+/// concurrency, so raising or lowering the setting takes effect without a
+/// restart.
+pub const MAX_BACKGROUND_JOB_CONCURRENCY: usize = 8;
+/// Fewer than one worker cannot make progress.
+pub const MIN_BACKGROUND_JOB_CONCURRENCY: usize = 1;
+/// One job at a time keeps memory and network pressure predictable; users on
+/// capable machines can raise it deliberately.
+pub const DEFAULT_BACKGROUND_JOB_CONCURRENCY: usize = 1;
+/// Longest pause a worker waits between two background jobs.
+pub const MAX_BACKGROUND_JOB_INTERVAL_MS: u64 = 60_000;
+/// Default pause after a finished job. A short gap keeps a low-end machine from
+/// being saturated by back-to-back model calls.
+pub const DEFAULT_BACKGROUND_JOB_INTERVAL_MS: u64 = 10;
+
+fn default_background_job_concurrency() -> usize {
+    DEFAULT_BACKGROUND_JOB_CONCURRENCY
+}
+
+fn default_background_job_interval_ms() -> u64 {
+    DEFAULT_BACKGROUND_JOB_INTERVAL_MS
+}
+
 fn default_embedding_dimensions() -> usize {
     DEFAULT_EMBEDDING_DIMENSIONS
 }
@@ -192,12 +216,20 @@ fn default_embedding_dimensions() -> usize {
 #[serde(deny_unknown_fields)]
 struct PersistedBackgroundJobSettings {
     auto_run: bool,
+    /// `#[serde(default)]` keeps rows written before the scheduling options
+    /// existed loadable.
+    #[serde(default = "default_background_job_concurrency")]
+    concurrency: usize,
+    #[serde(default = "default_background_job_interval_ms")]
+    interval_ms: u64,
 }
 
 impl Default for PersistedBackgroundJobSettings {
     fn default() -> Self {
         Self {
             auto_run: default_auto_run_background_jobs(),
+            concurrency: default_background_job_concurrency(),
+            interval_ms: default_background_job_interval_ms(),
         }
     }
 }
@@ -265,6 +297,14 @@ pub struct ProviderSettings {
     /// contract remains unchanged.
     #[serde(skip, default = "default_auto_run_background_jobs")]
     pub auto_run_background_jobs: bool,
+    /// How many background model jobs may run at the same time. Stored in the
+    /// background-job settings row, like the auto-run preference above.
+    #[serde(skip, default = "default_background_job_concurrency")]
+    pub background_job_concurrency: usize,
+    /// Pause in milliseconds one worker waits after finishing a job before it
+    /// claims the next one. Stored in the background-job settings row.
+    #[serde(skip, default = "default_background_job_interval_ms")]
+    pub background_job_interval_ms: u64,
     /// Reading preference of the PDF reader: when enabled the continuous page
     /// column drops the gap between pages. Stored under its own settings key,
     /// like the background-job preference above.
@@ -338,6 +378,8 @@ impl Default for ProviderSettings {
             chat_model: DEFAULT_CHAT_MODEL.to_string(),
             chat_generation: ChatGenerationSettings::default(),
             auto_run_background_jobs: default_auto_run_background_jobs(),
+            background_job_concurrency: default_background_job_concurrency(),
+            background_job_interval_ms: default_background_job_interval_ms(),
             pdf_compact_reading: default_pdf_compact_reading(),
             default_language: default_translation_language(),
             embedding_model: DEFAULT_EMBEDDING_MODEL.to_string(),
@@ -381,6 +423,15 @@ impl ProviderSettings {
                 "默认显示语言无效"
             );
         }
+        ensure!(
+            (MIN_BACKGROUND_JOB_CONCURRENCY..=MAX_BACKGROUND_JOB_CONCURRENCY)
+                .contains(&self.background_job_concurrency),
+            "后台任务并发必须是 {MIN_BACKGROUND_JOB_CONCURRENCY} 到 {MAX_BACKGROUND_JOB_CONCURRENCY} 之间的整数"
+        );
+        ensure!(
+            self.background_job_interval_ms <= MAX_BACKGROUND_JOB_INTERVAL_MS,
+            "后台任务间隔必须是 0 到 {MAX_BACKGROUND_JOB_INTERVAL_MS} 之间的整数毫秒"
+        );
         let mut ids = BTreeSet::new();
         let mut urls = BTreeSet::new();
         for endpoint in self.endpoints() {
@@ -486,6 +537,9 @@ pub enum BackgroundJobAction {
     Resume,
     Retry,
     Cancel,
+    /// Re-runs a whole-book translation from the first block, discarding the
+    /// persisted译文 of that book and language.
+    Retranslate,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -826,6 +880,10 @@ impl AppServices {
             Arc::clone(&ai.vision_provider),
             indexing_models,
         )?;
+        indexing.configure_scheduling(
+            ai.settings.background_job_concurrency,
+            Duration::from_millis(ai.settings.background_job_interval_ms),
+        );
         runtime.block_on(indexing.configure_translation(
             Arc::clone(&ai.provider),
             ai.settings.chat_model.clone(),
@@ -1305,6 +1363,10 @@ impl AppServices {
                 }
 
                 auto_run.store(next.settings.auto_run_background_jobs, Ordering::Release);
+                indexing.configure_scheduling(
+                    next.settings.background_job_concurrency,
+                    Duration::from_millis(next.settings.background_job_interval_ms),
+                );
                 *ai.write().unwrap_or_else(|error| error.into_inner()) = next;
                 ai.clear_poison();
                 Ok(())
@@ -1642,13 +1704,24 @@ impl AppServices {
                             BackgroundJobAction::Resume => coordinator.resume(&job_id).await,
                             BackgroundJobAction::Retry => coordinator.retry(&job_id).await,
                             BackgroundJobAction::Cancel => coordinator.cancel(&job_id).await,
+                            // Only translation has a re-run; a page render is
+                            // rebuilt by re-importing a revision.
+                            BackgroundJobAction::Retranslate => Ok(false),
                         }
                     }
-                    "embedding" | "vision" | "translation" => match action {
+                    "translation" => match action {
                         BackgroundJobAction::Pause => indexing.pause(&job_id).await,
                         BackgroundJobAction::Resume => indexing.resume(&job_id).await,
                         BackgroundJobAction::Retry => indexing.retry(&job_id).await,
                         BackgroundJobAction::Cancel => indexing.cancel(&job_id).await,
+                        BackgroundJobAction::Retranslate => indexing.retranslate(&job_id).await,
+                    },
+                    "embedding" | "vision" => match action {
+                        BackgroundJobAction::Pause => indexing.pause(&job_id).await,
+                        BackgroundJobAction::Resume => indexing.resume(&job_id).await,
+                        BackgroundJobAction::Retry => indexing.retry(&job_id).await,
+                        BackgroundJobAction::Cancel => indexing.cancel(&job_id).await,
+                        BackgroundJobAction::Retranslate => Ok(false),
                     },
                     other => anyhow::bail!("不支持控制后台任务类型：{other}"),
                 }
@@ -2124,14 +2197,21 @@ fn load_provider_settings(db_path: &Path) -> Result<ProviderSettings> {
             .context("保存的 Endpoint 与模型绑定设置无效")?,
         None => EndpointRoutingSettings::default(),
     };
-    settings.auto_run_background_jobs = match db::settings::get(&tx, BACKGROUND_JOB_SETTINGS_KEY)? {
-        Some(row) => {
-            serde_json::from_str::<PersistedBackgroundJobSettings>(&row.value_json)
-                .context("保存的后台任务设置无效")?
-                .auto_run
-        }
-        None => default_auto_run_background_jobs(),
+    let background_jobs = match db::settings::get(&tx, BACKGROUND_JOB_SETTINGS_KEY)? {
+        Some(row) => serde_json::from_str::<PersistedBackgroundJobSettings>(&row.value_json)
+            .context("保存的后台任务设置无效")?,
+        None => PersistedBackgroundJobSettings::default(),
     };
+    settings.auto_run_background_jobs = background_jobs.auto_run;
+    // Clamp instead of failing: a hand-edited or truncated row must not prevent
+    // the library from opening.
+    settings.background_job_concurrency = background_jobs.concurrency.clamp(
+        MIN_BACKGROUND_JOB_CONCURRENCY,
+        MAX_BACKGROUND_JOB_CONCURRENCY,
+    );
+    settings.background_job_interval_ms = background_jobs
+        .interval_ms
+        .min(MAX_BACKGROUND_JOB_INTERVAL_MS);
     settings.pdf_compact_reading = match db::settings::get(&tx, PDF_READER_SETTINGS_KEY)? {
         Some(row) => {
             serde_json::from_str::<PersistedPdfReaderSettings>(&row.value_json)
@@ -2183,6 +2263,8 @@ fn save_provider_settings(db_path: &Path, settings: &ProviderSettings) -> Result
         key: BACKGROUND_JOB_SETTINGS_KEY.to_string(),
         value_json: serde_json::to_string(&PersistedBackgroundJobSettings {
             auto_run: settings.auto_run_background_jobs,
+            concurrency: settings.background_job_concurrency,
+            interval_ms: settings.background_job_interval_ms,
         })
         .context("无法序列化后台任务设置")?,
         updated_at,
@@ -3033,6 +3115,8 @@ mod tests {
                 frequency_penalty: Some(-0.4),
             },
             auto_run_background_jobs: false,
+            background_job_concurrency: 3,
+            background_job_interval_ms: 250,
             pdf_compact_reading: true,
             embedding_model: "embed-test".to_string(),
             vision_model: "vision-test".to_string(),
@@ -3090,7 +3174,11 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<PersistedBackgroundJobSettings>(&background_job_row.value_json)
                 .unwrap(),
-            PersistedBackgroundJobSettings { auto_run: false }
+            PersistedBackgroundJobSettings {
+                auto_run: false,
+                concurrency: 3,
+                interval_ms: 250,
+            }
         );
         let pdf_reader_row = db::settings::get(
             &db::open_conn(services.database_path()).unwrap(),
@@ -3650,6 +3738,70 @@ mod tests {
     }
 
     #[test]
+    fn background_job_scheduling_setting_is_validated_and_clamped_on_load() {
+        for settings in [
+            ProviderSettings {
+                background_job_concurrency: 0,
+                ..Default::default()
+            },
+            ProviderSettings {
+                background_job_concurrency: MAX_BACKGROUND_JOB_CONCURRENCY + 1,
+                ..Default::default()
+            },
+            ProviderSettings {
+                background_job_interval_ms: MAX_BACKGROUND_JOB_INTERVAL_MS + 1,
+                ..Default::default()
+            },
+        ] {
+            assert!(settings.validate().is_err());
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join(db::DATABASE_FILE);
+        let conn = db::open_or_recreate(&db_path).unwrap();
+        let out_of_range = db::settings::Setting {
+            key: BACKGROUND_JOB_SETTINGS_KEY.into(),
+            value_json: serde_json::json!({
+                "auto_run": true,
+                "concurrency": 0,
+                "interval_ms": u64::MAX,
+            })
+            .to_string(),
+            updated_at: 1,
+        };
+        db::settings::upsert(&conn, &out_of_range).unwrap();
+        // A damaged value must not make the library unopenable.
+        let settings = load_provider_settings(&db_path).unwrap();
+        assert!(settings.auto_run_background_jobs);
+        assert_eq!(
+            settings.background_job_concurrency,
+            MIN_BACKGROUND_JOB_CONCURRENCY
+        );
+        assert_eq!(
+            settings.background_job_interval_ms,
+            MAX_BACKGROUND_JOB_INTERVAL_MS
+        );
+
+        // A row written before the scheduling options existed still loads with
+        // the documented defaults.
+        let legacy = db::settings::Setting {
+            key: BACKGROUND_JOB_SETTINGS_KEY.into(),
+            value_json: serde_json::json!({ "auto_run": false }).to_string(),
+            updated_at: 2,
+        };
+        db::settings::upsert(&conn, &legacy).unwrap();
+        let settings = load_provider_settings(&db_path).unwrap();
+        assert_eq!(
+            settings.background_job_concurrency,
+            DEFAULT_BACKGROUND_JOB_CONCURRENCY
+        );
+        assert_eq!(
+            settings.background_job_interval_ms,
+            DEFAULT_BACKGROUND_JOB_INTERVAL_MS
+        );
+    }
+
+    #[test]
     fn generation_save_failure_rolls_back_provider_generation_and_credentials() {
         let temp = tempfile::tempdir().unwrap();
         let credentials = Arc::new(MemoryCredentialStore::default());
@@ -3985,6 +4137,66 @@ mod tests {
                 .block_on(services.background_jobs_for_books(Vec::new()))
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn configuring_a_default_language_enqueues_translation_for_existing_books() {
+        let temp = tempfile::tempdir().unwrap();
+        let services = AppServices::open_with_credentials(
+            temp.path(),
+            Arc::new(MemoryCredentialStore::default()),
+        )
+        .unwrap();
+        let runtime = services.runtime();
+        let book = runtime
+            .block_on(async {
+                services
+                    .spawn_library(|library| library.create_book("Translated", "Author"))
+                    .await
+                    .context("library test worker stopped")?
+            })
+            .unwrap();
+
+        // Translation is opt-in: nothing is queued while it is disabled.
+        let jobs = runtime
+            .block_on(services.background_jobs_for_books(vec![book.id.clone()]))
+            .unwrap();
+        assert!(jobs.iter().all(|job| job.kind != "translation"));
+
+        let mut settings = services.provider_settings().unwrap();
+        settings.default_language = Some("zh-Hans".to_string());
+        runtime
+            .block_on(services.configure_provider(settings, ApiKeyUpdate::Keep))
+            .unwrap();
+
+        let jobs = runtime
+            .block_on(services.background_jobs_for_books(vec![book.id.clone()]))
+            .unwrap();
+        let translation = jobs
+            .iter()
+            .find(|job| job.kind == "translation")
+            .expect("saving a default language must enqueue a translation job");
+        assert_eq!(
+            translation.status,
+            BackgroundJobStatus::Paused,
+            "auto-run is disabled by default, so the new task starts paused"
+        );
+
+        // The durable job survives a restart and is reconciled again on startup.
+        drop(services);
+        let reopened = AppServices::open_with_credentials(
+            temp.path(),
+            Arc::new(MemoryCredentialStore::default()),
+        )
+        .unwrap();
+        let jobs = reopened
+            .runtime()
+            .block_on(reopened.background_jobs_for_books(vec![book.id.clone()]))
+            .unwrap();
+        assert!(
+            jobs.iter().any(|job| job.kind == "translation"),
+            "startup reconciliation keeps one translation job per book and language"
         );
     }
 

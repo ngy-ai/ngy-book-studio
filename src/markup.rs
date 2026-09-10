@@ -76,6 +76,106 @@ pub fn serialize_xhtml(document: &BlockDocument) -> Result<String> {
     Ok(output)
 }
 
+/// Block-level element names whose visible text forms one translatable run.
+/// This is the same candidate set the reader's translation layer matches, so
+/// the persisted译文 and the rendered chapter stay aligned.
+const TRANSLATABLE_BLOCK_TAGS: [&str; 11] = [
+    "p",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "li",
+    "blockquote",
+    "td",
+    "th",
+];
+const SKIPPED_TEXT_TAGS: [&str; 4] = ["script", "style", "noscript", "template"];
+
+/// Extracts the visible text of every innermost block-level element of an HTML
+/// fragment, in document order.
+///
+/// EPUB chapters are persisted as one preserved `RawHtml` subtree per unit, so
+/// their paragraph structure only exists in the HTML source. Returning one
+/// whitespace-normalized entry per element lets the translation job and the
+/// reader's text-matching layer agree without re-parsing the AST, and keeps
+/// nested containers (a list item wrapping a paragraph) from being translated
+/// twice.
+pub fn block_texts_from_html(source: &str) -> Result<Vec<String>> {
+    if source.contains('\0') {
+        bail!("正文不能包含 NUL 字符");
+    }
+    let dom = parse_fragment(
+        RcDom::default(),
+        Default::default(),
+        QualName::new(None, XHTML_NAMESPACE.into(), "body".into()),
+        Vec::new(),
+    )
+    .one(source);
+    let mut output = Vec::new();
+    collect_block_texts(&dom.document, 0, &mut output)?;
+    Ok(output)
+}
+
+fn is_translatable_element(node: &Handle) -> bool {
+    matches!(&node.data, NodeData::Element { name, .. }
+        if TRANSLATABLE_BLOCK_TAGS.contains(&name.local.as_ref()))
+}
+
+fn is_skipped_element(node: &Handle) -> bool {
+    matches!(&node.data, NodeData::Element { name, .. }
+        if SKIPPED_TEXT_TAGS.contains(&name.local.as_ref()))
+}
+
+fn collect_block_texts(node: &Handle, depth: usize, output: &mut Vec<String>) -> Result<()> {
+    ensure_html_depth(depth)?;
+    if is_skipped_element(node) {
+        return Ok(());
+    }
+    if is_translatable_element(node) && !has_translatable_descendant(node, depth)? {
+        let text = html_text(node, depth)?
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !text.is_empty() {
+            output.push(text);
+        }
+        return Ok(());
+    }
+    for child in node.children.borrow().iter() {
+        let child_depth = if matches!(&child.data, NodeData::Element { .. }) {
+            depth + 1
+        } else {
+            depth
+        };
+        collect_block_texts(child, child_depth, output)?;
+    }
+    Ok(())
+}
+
+fn has_translatable_descendant(node: &Handle, depth: usize) -> Result<bool> {
+    fn scan(node: &Handle, depth: usize) -> Result<bool> {
+        ensure_html_depth(depth)?;
+        for child in node.children.borrow().iter() {
+            if is_translatable_element(child) {
+                return Ok(true);
+            }
+            let child_depth = if matches!(&child.data, NodeData::Element { .. }) {
+                depth + 1
+            } else {
+                depth
+            };
+            if scan(child, child_depth)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    scan(node, depth)
+}
+
 const XHTML_NAMESPACE: &str = "http://www.w3.org/1999/xhtml";
 const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
 
@@ -1117,6 +1217,34 @@ mod tests {
 
     fn xhtml_body(fragment: &str) -> String {
         format!("<body xmlns=\"{XHTML_NAMESPACE}\">{fragment}</body>")
+    }
+
+    #[test]
+    fn block_texts_extract_innermost_blocks_and_ignore_hidden_text() {
+        let source = r#"<div id="sbo-rt-content">
+            <h1>Rust Brain Teasers</h1>
+            <script>ignored()</script>
+            <p>Copyright 2022
+               second line</p>
+            <ul><li><p>Nested item</p></li></ul>
+            <table><tbody><tr><td>单元格</td></tr></tbody></table>
+        </div>"#;
+        assert_eq!(
+            block_texts_from_html(source).unwrap(),
+            vec![
+                "Rust Brain Teasers",
+                "Copyright 2022 second line",
+                "Nested item",
+                "单元格"
+            ],
+        );
+        // An image-only chapter has nothing to translate.
+        assert!(
+            block_texts_from_html(r#"<div id="Cover"><img src="moye-asset:cover"></div>"#)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(block_texts_from_html("a\0b").is_err());
     }
 
     #[test]

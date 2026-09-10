@@ -86,7 +86,11 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   `office_enhancements.rs`；跨表原子操作只放 `transactions.rs`，FTS 查询放
   `book_search.rs`，建表与完整性契约放 `schema.rs`。
 - `src/search.rs`、`src/indexing.rs`：作用域内 FTS5/`sqlite-vec` 精确 KNN、RRF 混合
-  召回，以及可恢复的 embedding/vision 后台任务。`indexing.rs` 另实现整本图书翻译任务
+  召回，以及可恢复的 embedding/vision 后台任务。执行器固定启动
+  `MAX_BACKGROUND_JOB_CONCURRENCY` 个 worker，只有序号小于当前并发的 worker 扫描队列，
+  每个任务提交后按配置间隔休眠；两者由 AI 设置“系统配置”经
+  `IndexingCoordinator::configure_scheduling` 实时发布，写坏的值按范围钳制。
+  `indexing.rs` 另实现整本图书翻译任务
   `kind="translation"`：任务标识为 `translation:<source_id>:<target_language>`，游标复用
   `next_ordinal` 作为文本块序号，逐块调用对话模型 `chat_stream` 写入 `translations` 表，
   可暂停/恢复/重试/取消；文本块按 `content_units.block_json` 的 `BlockDocument` 确定性
@@ -96,6 +100,14 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   `transactions::reconfigure_translation_jobs` 重排；每本当前来源只保留一个目标语言任务。
   源语言（`books.language` 主语言子标签）等于目标语言时跳过；翻译任务未配置对话模型时
   失败而不猜测。模型调用不得逐 token 打日志，也不得记录正文或译文内容。
+  **EPUB 章节在数据库里保存成单个 `RawHtml` 块**（`<div id="sbo-rt-content">…` 之类），
+  语义块结构只存在于 HTML 里：只走 `BlockDocument` 会得到 0 个文本块并让任务立刻“成功”。
+  因此 `collect_translation_blocks` 必须处理 `Block::RawHtml`，用
+  `markup::block_texts_from_html()` 取出最内层块级元素（`p`/`h1–h6`/`li`/`blockquote`/
+  `td`/`th`）归一化后的文本，这与阅读器前端匹配的候选集一致，且只翻译最内层避免重复。
+  「重新翻译」由 `IndexingCoordinator::retranslate` 实现：先把该书该语言的译文行删掉，
+  再把游标 `next_ordinal` 归零并重置为 queued/paused；只对 `translation` 生效，来源已
+  被替代或其它任务类型一律拒绝（不改状态）。
 - `src/preview.rs`、`src/windows_pdf_renderer.rs`：`VisualRenderer`、结构化页面 PNG 光栅化、
   Windows PDF 原页光栅化、可暂停/恢复/重试/取消的持久任务和本地 PDF.js 资产路由。
 - `src/ai.rs`、`src/credentials.rs`：OpenAI-compatible models/chat streaming/embeddings
@@ -587,6 +599,9 @@ EPUB/PDF/原件导出、重新打开及原件字节一致性。
   默认或关闭时，新导入、创建或保存编辑仍须在文档事务内创建 `visual_render`、`vision`、
   `embedding` 三类任务，但初始状态为 `Paused` 且未开始；已有任务不随设置切换改变状态，
   用户仍可在后台任务窗口逐项恢复。
+  同一 key 还保存后台任务调度（`concurrency` 1–8 默认 1、`interval_ms` 0–60000 默认 10），
+  读取时钳制而不是报错，坏行不得让图书库无法打开；两者不属于 Provider JSON，保存后经
+  `configure_scheduling` 立即作用于后续任务，正在运行的任务不被打断。
 - PDF 紧凑阅读使用独立 settings key（`pdf.reader.preferences.v1`，默认关闭，AI 设置
   “系统配置”中的“PDF 紧凑阅读”默认不勾选），同样不得扩展 Provider JSON；新 key 必须
   加入 `AI_SETTINGS_KEYS`，否则 `snapshot_ai_settings`/`restore_ai_settings` 的失败回滚

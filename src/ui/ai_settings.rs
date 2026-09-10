@@ -9,9 +9,12 @@ use moye_epub_editor::{
         MIN_AI_REQUEST_TIMEOUT_SECS, ModelInfo, normalize_provider_base_url,
     },
     services::{
-        ApiKeyUpdate, AppServices, DEFAULT_CHAT_MODEL, DEFAULT_EMBEDDING_DIMENSIONS,
+        ApiKeyUpdate, AppServices, DEFAULT_BACKGROUND_JOB_CONCURRENCY,
+        DEFAULT_BACKGROUND_JOB_INTERVAL_MS, DEFAULT_CHAT_MODEL, DEFAULT_EMBEDDING_DIMENSIONS,
         DEFAULT_EMBEDDING_MODEL, DEFAULT_VISION_MODEL, EndpointRoutingSettings, EndpointSettings,
-        ModelRole, ProviderSettings, TRANSLATION_LANGUAGES, translation_language_label,
+        MAX_BACKGROUND_JOB_CONCURRENCY, MAX_BACKGROUND_JOB_INTERVAL_MS,
+        MIN_BACKGROUND_JOB_CONCURRENCY, ModelRole, ProviderSettings, TRANSLATION_LANGUAGES,
+        translation_language_label,
     },
 };
 
@@ -242,6 +245,10 @@ pub(super) struct AiSettingsWindow {
     web_search_confirmed_remote_endpoint: String,
     delete_web_search_api_key: bool,
     auto_run_background_jobs: bool,
+    /// How many background model jobs may run at the same time.
+    background_job_concurrency_input: Entity<InputState>,
+    /// Milliseconds one worker pauses after finishing a job.
+    background_job_interval_input: Entity<InputState>,
     /// Global PDF reading preference: no gap between pages when enabled.
     pdf_compact_reading: bool,
     /// Target language for reading-time book translation. `None` disables it.
@@ -335,6 +342,18 @@ impl AiSettingsWindow {
                 .placeholder(moye_epub_editor::web_search::MAX_WEB_SEARCH_RESULTS.to_string())
                 .validate(|value, _| value.chars().all(|character| character.is_ascii_digit()))
         });
+        let background_job_concurrency_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(settings.background_job_concurrency.to_string())
+                .placeholder(DEFAULT_BACKGROUND_JOB_CONCURRENCY.to_string())
+                .validate(|value, _| value.chars().all(|character| character.is_ascii_digit()))
+        });
+        let background_job_interval_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(settings.background_job_interval_ms.to_string())
+                .placeholder(DEFAULT_BACKGROUND_JOB_INTERVAL_MS.to_string())
+                .validate(|value, _| value.chars().all(|character| character.is_ascii_digit()))
+        });
         Self {
             services,
             endpoints,
@@ -367,6 +386,8 @@ impl AiSettingsWindow {
             web_search_confirmed_remote_endpoint: settings.web_search_confirmed_remote_endpoint,
             delete_web_search_api_key: false,
             auto_run_background_jobs: settings.auto_run_background_jobs,
+            background_job_concurrency_input,
+            background_job_interval_input,
             pdf_compact_reading: settings.pdf_compact_reading,
             default_language: settings.default_language.clone(),
             operation: PendingOperation::Idle,
@@ -461,6 +482,15 @@ impl AiSettingsWindow {
             web_search_timeout_secs,
             web_search_max_results,
             auto_run_background_jobs: self.auto_run_background_jobs,
+            background_job_concurrency: parse_background_job_concurrency(
+                self.background_job_concurrency_input
+                    .read(cx)
+                    .value()
+                    .as_ref(),
+            )?,
+            background_job_interval_ms: parse_background_job_interval_ms(
+                self.background_job_interval_input.read(cx).value().as_ref(),
+            )?,
             pdf_compact_reading: self.pdf_compact_reading,
             default_language: self.default_language.clone(),
         };
@@ -1732,6 +1762,42 @@ impl AiSettingsWindow {
                             .text_sm()
                             .font_semibold()
                             .text_color(rgb(INK))
+                            .child("后台任务调度"),
+                    )
+                    .child(self.render_input_field(
+                        "任务并发",
+                        "同时运行的模型任务数量，1–8，默认 1。并发越高占用的内存与网络越多；配置较低的机器建议保持 1。",
+                        &self.background_job_concurrency_input,
+                    ))
+                    .child(self.render_input_field(
+                        "任务间隔（毫秒）",
+                        "一个任务完成后，休眠多久再开始下一个任务，0–60000 毫秒，默认 10。机器配置较差时增大该值可降低持续满载的风险。",
+                        &self.background_job_interval_input,
+                    ))
+                    .child(
+                        div()
+                            .text_xs()
+                            .line_height(gpui::relative(1.5))
+                            .text_color(rgb(MUTED))
+                            .child(
+                                "保存后对后续任务立即生效，不需要重启；正在运行的任务不会被打断。",
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .v_flex()
+                    .gap_3()
+                    .p_4()
+                    .rounded(px(12.))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(SURFACE))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .text_color(rgb(INK))
                             .child("PDF 阅读"),
                     )
                     .child(
@@ -2127,6 +2193,32 @@ fn parse_web_search_max_results(value: &str) -> Result<usize> {
         "联网搜索结果数必须是 1 到 {MAX_WEB_SEARCH_RESULTS} 之间的整数"
     );
     Ok(count)
+}
+
+fn parse_background_job_concurrency(value: &str) -> Result<usize> {
+    let value = value.trim();
+    let concurrency = value.parse::<usize>().map_err(|_| {
+        anyhow::anyhow!(
+            "后台任务并发必须是 {MIN_BACKGROUND_JOB_CONCURRENCY} 到 {MAX_BACKGROUND_JOB_CONCURRENCY} 之间的整数"
+        )
+    })?;
+    anyhow::ensure!(
+        (MIN_BACKGROUND_JOB_CONCURRENCY..=MAX_BACKGROUND_JOB_CONCURRENCY).contains(&concurrency),
+        "后台任务并发必须是 {MIN_BACKGROUND_JOB_CONCURRENCY} 到 {MAX_BACKGROUND_JOB_CONCURRENCY} 之间的整数"
+    );
+    Ok(concurrency)
+}
+
+fn parse_background_job_interval_ms(value: &str) -> Result<u64> {
+    let value = value.trim();
+    let interval_ms = value.parse::<u64>().map_err(|_| {
+        anyhow::anyhow!("后台任务间隔必须是 0 到 {MAX_BACKGROUND_JOB_INTERVAL_MS} 之间的整数毫秒")
+    })?;
+    anyhow::ensure!(
+        interval_ms <= MAX_BACKGROUND_JOB_INTERVAL_MS,
+        "后台任务间隔必须是 0 到 {MAX_BACKGROUND_JOB_INTERVAL_MS} 之间的整数毫秒"
+    );
+    Ok(interval_ms)
 }
 
 fn parse_embedding_dimensions(value: &str) -> Result<usize> {
@@ -2730,6 +2822,73 @@ mod tests {
         assert!(parse_chat_generation("", "1.1", "4096", "", "").is_err());
         assert!(parse_chat_generation("", "", "4096", "-2.1", "").is_err());
         assert!(parse_chat_generation("", "", "4096", "", "2.1").is_err());
+    }
+
+    #[test]
+    fn background_job_scheduling_parsing_enforces_supported_ranges() {
+        assert_eq!(
+            parse_background_job_concurrency(" 1 ").unwrap(),
+            MIN_BACKGROUND_JOB_CONCURRENCY
+        );
+        assert_eq!(
+            parse_background_job_concurrency(&MAX_BACKGROUND_JOB_CONCURRENCY.to_string()).unwrap(),
+            MAX_BACKGROUND_JOB_CONCURRENCY
+        );
+        for invalid in ["", "0", "-1", "1.5", "abc", "9"] {
+            assert!(
+                parse_background_job_concurrency(invalid).is_err(),
+                "invalid concurrency unexpectedly accepted: {invalid}"
+            );
+        }
+
+        assert_eq!(parse_background_job_interval_ms("0").unwrap(), 0);
+        assert_eq!(parse_background_job_interval_ms(" 10 ").unwrap(), 10);
+        assert_eq!(
+            parse_background_job_interval_ms(&MAX_BACKGROUND_JOB_INTERVAL_MS.to_string()).unwrap(),
+            MAX_BACKGROUND_JOB_INTERVAL_MS
+        );
+        for invalid in ["", "-1", "1.5", "abc", "60001"] {
+            assert!(
+                parse_background_job_interval_ms(invalid).is_err(),
+                "invalid interval unexpectedly accepted: {invalid}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn system_tab_background_job_scheduling_drafts_parse_without_saving(cx: &mut TestAppContext) {
+        let (_directory, settings, visual) = open_settings(cx);
+        click_tab(visual, SettingsTab::System);
+        let (concurrency, interval) = settings.read_with(visual, |view, _| {
+            (
+                view.background_job_concurrency_input.clone(),
+                view.background_job_interval_input.clone(),
+            )
+        });
+        edit_input(visual, &concurrency, "0");
+        settings.read_with(visual, |view, cx| {
+            assert!(
+                view.entered_settings(cx).is_err(),
+                "out-of-range concurrency must block saving"
+            );
+        });
+
+        edit_input(visual, &concurrency, "3");
+        edit_input(visual, &interval, "250");
+        settings.read_with(visual, |view, cx| {
+            let entered = view.entered_settings(cx).unwrap();
+            assert_eq!(entered.background_job_concurrency, 3);
+            assert_eq!(entered.background_job_interval_ms, 250);
+            let saved = view.services.provider_settings().unwrap();
+            assert_eq!(
+                saved.background_job_concurrency,
+                DEFAULT_BACKGROUND_JOB_CONCURRENCY
+            );
+            assert_eq!(
+                saved.background_job_interval_ms,
+                DEFAULT_BACKGROUND_JOB_INTERVAL_MS
+            );
+        });
     }
 
     #[gpui::test]

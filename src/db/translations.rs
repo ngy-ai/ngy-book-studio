@@ -114,6 +114,20 @@ pub(crate) fn upsert(conn: &Connection, translation: &NewTranslation) -> Result<
     Ok(())
 }
 
+/// Removes every persisted row for one book and language. Used before a
+/// deliberate re-translation so blocks that no longer exist cannot linger.
+pub(crate) fn delete_for_book_language(
+    conn: &Connection,
+    book_id: &str,
+    target_language: &str,
+) -> Result<usize> {
+    conn.execute(
+        "DELETE FROM translations WHERE book_id = ?1 AND target_language = ?2",
+        params![book_id, target_language],
+    )
+    .context("无法删除指定语言的译文")
+}
+
 fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Translation> {
     Ok(Translation {
         block_id: row.get(0)?,

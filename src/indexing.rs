@@ -128,6 +128,28 @@ struct ModelServices {
     translation: Option<TranslationServices>,
 }
 
+/// Live scheduling of the background model executor.
+///
+/// `concurrency` is how many jobs may run at the same time; `interval` is the
+/// pause one worker takes after finishing a job before it claims the next one.
+/// Both are published by [`IndexingCoordinator::configure_scheduling`] and read
+/// by every worker on each iteration, so a saved settings change applies without
+/// restarting the process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct JobScheduling {
+    concurrency: usize,
+    interval: Duration,
+}
+
+impl Default for JobScheduling {
+    fn default() -> Self {
+        Self {
+            concurrency: crate::services::DEFAULT_BACKGROUND_JOB_CONCURRENCY,
+            interval: Duration::from_millis(crate::services::DEFAULT_BACKGROUND_JOB_INTERVAL_MS),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct TranslationServices {
     provider: Arc<dyn OpenAiCompatibleProvider>,
@@ -145,6 +167,8 @@ struct IndexingInner {
     db_path: PathBuf,
     blobs: Arc<dyn BlobStore>,
     models: RwLock<ModelServices>,
+    /// User-configured concurrency and inter-job pause for the worker pool.
+    scheduling: RwLock<JobScheduling>,
     transitions: AsyncMutex<()>,
     wake: Notify,
     /// Set on every successful library mutation so the worker reconciles
@@ -153,12 +177,14 @@ struct IndexingInner {
     shutdown: AtomicBool,
 }
 
-/// One bounded process-level executor. It intentionally runs one model job at
-/// a time: this caps memory/network pressure and prevents a vision-derived
-/// chunk from racing the source's embedding pass.
+/// One bounded process-level executor. It spawns a fixed number of workers and
+/// lets at most the configured concurrency claim jobs, which caps
+/// memory/network pressure on low-end machines while allowing a deliberate
+/// increase on capable ones. Jobs claim their durable row one at a time, so a
+/// vision-derived chunk never races the source's embedding pass.
 pub struct IndexingCoordinator {
     inner: Arc<IndexingInner>,
-    worker: Mutex<Option<JoinHandle<()>>>,
+    workers: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl std::fmt::Debug for IndexingCoordinator {
@@ -167,7 +193,7 @@ impl std::fmt::Debug for IndexingCoordinator {
             .debug_struct("IndexingCoordinator")
             .field("db_path", &self.inner.db_path)
             .field("shutdown", &self.inner.shutdown.load(Ordering::Acquire))
-            .field("max_concurrent_jobs", &1)
+            .field("max_concurrent_jobs", &self.inner.scheduling().concurrency)
             .finish_non_exhaustive()
     }
 }
@@ -217,20 +243,51 @@ impl IndexingCoordinator {
                     config,
                     translation: None,
                 }),
+                scheduling: RwLock::new(JobScheduling::default()),
                 transitions: AsyncMutex::new(()),
                 wake: Notify::new(),
                 reconcile_translations: AtomicBool::new(false),
                 shutdown: AtomicBool::new(false),
             }),
-            worker: Mutex::new(None),
+            workers: Mutex::new(Vec::new()),
         });
-        let inner = Arc::clone(&coordinator.inner);
-        let task = runtime.spawn(async move { worker_loop(inner).await });
-        *coordinator
-            .worker
-            .lock()
-            .map_err(|_| anyhow::anyhow!("indexing worker lock is poisoned"))? = Some(task);
+        {
+            let mut workers = coordinator
+                .workers
+                .lock()
+                .map_err(|_| anyhow::anyhow!("indexing worker lock is poisoned"))?;
+            // Spawn every slot up front; workers above the configured
+            // concurrency stay parked so the setting can change at runtime.
+            for index in 0..crate::services::MAX_BACKGROUND_JOB_CONCURRENCY {
+                let inner = Arc::clone(&coordinator.inner);
+                workers.push(runtime.spawn(async move { worker_loop(inner, index).await }));
+            }
+        }
         Ok(coordinator)
+    }
+
+    /// Applies the configured background-job concurrency and inter-job pause.
+    /// Both values are clamped to the supported range so a damaged settings row
+    /// can never stall the worker or start unbounded model calls.
+    pub fn configure_scheduling(&self, concurrency: usize, interval: Duration) {
+        let next = JobScheduling {
+            concurrency: concurrency.clamp(
+                crate::services::MIN_BACKGROUND_JOB_CONCURRENCY,
+                crate::services::MAX_BACKGROUND_JOB_CONCURRENCY,
+            ),
+            interval: interval.min(Duration::from_millis(
+                crate::services::MAX_BACKGROUND_JOB_INTERVAL_MS,
+            )),
+        };
+        *self
+            .inner
+            .scheduling
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = next;
+        self.inner.scheduling.clear_poison();
+        // Parked workers poll once per idle interval, so this only shortens the
+        // wait for an already running worker picking up new work.
+        self.inner.wake.notify_one();
     }
 
     pub fn wake(&self) {
@@ -513,16 +570,76 @@ impl IndexingCoordinator {
         }
         Ok(changed)
     }
+
+    /// Restarts one translation job from its first block. The persisted译文 of
+    /// that book and language is discarded first, so a re-run cannot leave
+    /// blocks that no longer exist. A superseded source or a non-translation
+    /// job is rejected instead of modified.
+    pub async fn retranslate(&self, job_id: &str) -> Result<bool> {
+        let translation = self
+            .inner
+            .models
+            .read()
+            .map_err(|_| anyhow::anyhow!("indexing model lock is poisoned"))?
+            .translation
+            .clone();
+        let Some(translation) = translation else {
+            return Ok(false);
+        };
+        let _transition = self.inner.transitions.lock().await;
+        let job_id = job_id.to_string();
+        let db_path = self.inner.db_path.clone();
+        let changed = run_db_mut(db_path, move |conn| {
+            let Some(job) = db::index_jobs::get(&conn, &job_id)? else {
+                return Ok(0);
+            };
+            if job.kind != TRANSLATION_JOB_KIND {
+                return Ok(0);
+            }
+            let language = translation_target_language(&job)?;
+            let source_id = job.source_id.as_deref().context("翻译任务缺少来源")?;
+            let source = db::book_sources::get(&conn, source_id)?.context("翻译任务来源不存在")?;
+            let book = db::books::get(&conn, &job.book_id)?.context("翻译任务图书不存在")?;
+            if book.revision != source.revision {
+                return Ok(0);
+            }
+            let cursor = JobCursor {
+                schema_version: 1,
+                book_id: job.book_id.clone(),
+                source_id: source_id.to_string(),
+                revision: source.revision,
+                kind: TRANSLATION_JOB_KIND.to_string(),
+                model: Some(translation.model.clone()),
+                execution_identity: Some(translation.execution_identity.clone()),
+                input_execution_identity: None,
+                next_ordinal: 0,
+            };
+            let now = unix_timestamp()?;
+            db::translations::delete_for_book_language(&conn, &job.book_id, &language)?;
+            db::index_jobs::reset_reconfigured(
+                &conn,
+                &job_id,
+                db::transactions::translation_initial_status(translation.auto_run),
+                &cursor.encode()?,
+                now,
+            )
+        })
+        .await?;
+        if changed != 0 {
+            self.inner.wake.notify_one();
+        }
+        Ok(changed == 1)
+    }
 }
 
 impl Drop for IndexingCoordinator {
     fn drop(&mut self) {
         self.inner.shutdown.store(true, Ordering::Release);
         self.inner.wake.notify_waiters();
-        if let Ok(worker) = self.worker.get_mut()
-            && let Some(worker) = worker.take()
-        {
-            worker.abort();
+        if let Ok(workers) = self.workers.get_mut() {
+            for worker in workers.drain(..) {
+                worker.abort();
+            }
         }
     }
 }
@@ -592,10 +709,28 @@ enum RunOutcome {
     Abandoned,
 }
 
-async fn worker_loop(inner: Arc<IndexingInner>) {
+impl IndexingInner {
+    /// Current scheduling snapshot. A poisoned lock still yields the last
+    /// published value instead of stalling every worker.
+    fn scheduling(&self) -> JobScheduling {
+        *self
+            .scheduling
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+}
+
+async fn worker_loop(inner: Arc<IndexingInner>, index: usize) {
     loop {
         if inner.shutdown.load(Ordering::Acquire) {
             break;
+        }
+        // Workers above the configured concurrency stay parked. They poll once
+        // per idle interval instead of scanning the queue or consuming a wake
+        // permit that an active worker needs.
+        if index >= inner.scheduling().concurrency {
+            tokio::time::sleep(IDLE_POLL_INTERVAL).await;
+            continue;
         }
         let db_path = inner.db_path.clone();
         let jobs = match run_db(db_path, move |conn| {
@@ -622,6 +757,13 @@ async fn worker_loop(inner: Arc<IndexingInner>) {
         };
         if let Err(error) = run_queued_job(&inner, job).await {
             tracing::error!(%error, "后台索引任务状态提交失败");
+        }
+        // Configurable pause between two jobs on the same worker. This is the
+        // only thing protecting a low-end machine from back-to-back model
+        // calls when the concurrency is 1.
+        let interval = inner.scheduling().interval;
+        if !interval.is_zero() {
+            tokio::time::sleep(interval).await;
         }
     }
 }
@@ -1468,6 +1610,32 @@ fn translation_blocks(
     Ok(blocks)
 }
 
+/// EPUB chapters are persisted as one preserved `RawHtml` subtree per unit, so
+/// their paragraph structure only exists in the stored HTML. Extracting it with
+/// the reader's own candidate set keeps译文 and rendered paragraphs aligned.
+fn collect_html_text_blocks(
+    block_id: &str,
+    source: &str,
+    unit_id: &str,
+    unit_revision: u64,
+    ordinal: &mut usize,
+    out: &mut Vec<TranslationBlock>,
+) -> Result<()> {
+    let texts = crate::markup::block_texts_from_html(source)
+        .context("无法从保留的 HTML 中提取可翻译文本")?;
+    for (index, text) in texts.into_iter().enumerate() {
+        push_translation_block(
+            &format!("{block_id}::h{index}"),
+            text,
+            unit_id,
+            unit_revision,
+            ordinal,
+            out,
+        )?;
+    }
+    Ok(())
+}
+
 fn collect_translation_blocks(
     blocks: &[Block],
     unit_id: &str,
@@ -1523,12 +1691,14 @@ fn collect_translation_blocks(
                     }
                 }
             }
+            Block::RawHtml { id, source, .. } => {
+                collect_html_text_blocks(id, source, unit_id, unit_revision, ordinal, out)?;
+            }
             Block::CodeBlock { .. }
             | Block::ThematicBreak { .. }
             | Block::Image { .. }
             | Block::Audio { .. }
-            | Block::Video { .. }
-            | Block::RawHtml { .. } => {}
+            | Block::Video { .. } => {}
         }
     }
     Ok(())
@@ -2612,6 +2782,52 @@ mod tests {
             self.coordinator_with_providers(provider.clone(), provider)
         }
 
+        /// Creates one more book in the same data directory so the queue holds
+        /// two canonical embedding jobs for scheduling tests.
+        fn add_second_book(&self) -> String {
+            let data_dir = self
+                .db_path
+                .parent()
+                .expect("fixture database lives in the temporary data directory")
+                .to_path_buf();
+            let mut library =
+                LibraryStore::load_from_with_runtime(data_dir, self.runtime.clone()).unwrap();
+            library
+                .background_job_auto_run_flag()
+                .store(true, Ordering::Release);
+            let book = library.create_book("Second index test", "Author").unwrap();
+            let conn = db::open_conn(&self.db_path).unwrap();
+            db::book_sources::get_revision(&conn, &book.id, book.revision)
+                .unwrap()
+                .unwrap()
+                .id
+        }
+
+        fn embedding_status_count(&self, status: db::index_jobs::IndexJobStatus) -> usize {
+            let conn = db::open_conn(&self.db_path).unwrap();
+            db::index_jobs::list_by_kind(&conn, "embedding")
+                .unwrap()
+                .into_iter()
+                .filter(|job| job.status == status)
+                .count()
+        }
+
+        fn wait_until(
+            &self,
+            description: &str,
+            timeout: Duration,
+            predicate: impl Fn(&Self) -> bool,
+        ) {
+            let deadline = Instant::now() + timeout;
+            while !predicate(self) {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for {description}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
         fn coordinator_with_providers(
             &self,
             embedding_provider: Arc<dyn OpenAiCompatibleProvider>,
@@ -2651,6 +2867,7 @@ mod tests {
                     ),
                     translation: None,
                 }),
+                scheduling: RwLock::new(JobScheduling::default()),
                 transitions: AsyncMutex::new(()),
                 wake: Notify::new(),
                 reconcile_translations: AtomicBool::new(false),
@@ -3792,7 +4009,7 @@ mod tests {
         let fixture = Fixture::new();
         let coordinator = IndexingCoordinator {
             inner: fixture.indexing_inner(),
-            worker: Mutex::new(None),
+            workers: Mutex::new(Vec::new()),
         };
         let base_id = format!("embedding:{}", fixture.source_id);
         let cursor = JobCursor {
@@ -3849,7 +4066,7 @@ mod tests {
         let fixture = Fixture::new();
         let coordinator = IndexingCoordinator {
             inner: fixture.indexing_inner(),
-            worker: Mutex::new(None),
+            workers: Mutex::new(Vec::new()),
         };
         let model_job_id = format!("embedding:{}", fixture.source_id);
 
@@ -4357,7 +4574,7 @@ mod tests {
         let fixture = Fixture::new();
         let coordinator = IndexingCoordinator {
             inner: fixture.indexing_inner(),
-            worker: Mutex::new(None),
+            workers: Mutex::new(Vec::new()),
         };
         let vision_job_id = format!("vision:{}", fixture.source_id);
         let vision_cursor = JobCursor {
@@ -4515,7 +4732,7 @@ mod tests {
         let fixture = Fixture::new();
         let coordinator = IndexingCoordinator {
             inner: fixture.indexing_inner(),
-            worker: Mutex::new(None),
+            workers: Mutex::new(Vec::new()),
         };
         let canonical_id = format!("vision:{}", fixture.source_id);
         let first_ordinal = visual_chunk_ordinal(0, 0).unwrap();
@@ -5016,7 +5233,7 @@ mod tests {
         let fixture = Fixture::new();
         let coordinator = IndexingCoordinator {
             inner: fixture.indexing_inner(),
-            worker: Mutex::new(None),
+            workers: Mutex::new(Vec::new()),
         };
         let conn = db::open_conn(&fixture.db_path).unwrap();
         let job_id = format!("vision:{}", fixture.source_id);
@@ -5078,7 +5295,7 @@ mod tests {
         let fixture = Fixture::new();
         let coordinator = IndexingCoordinator {
             inner: fixture.indexing_inner(),
-            worker: Mutex::new(None),
+            workers: Mutex::new(Vec::new()),
         };
         let conn = db::open_conn(&fixture.db_path).unwrap();
         let job_id = format!("vision:{}", fixture.source_id);
@@ -5351,7 +5568,207 @@ mod tests {
     }
 
     #[test]
+    fn translation_blocks_parse_preserved_epub_html_when_the_ast_is_raw() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join(db::DATABASE_FILE);
+        let conn = db::open_or_recreate(&db_path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO blobs(object_key, media_type, byte_len, hash, created_at)
+                 VALUES ('objects/source', 'application/epub+zip', 1, 'h', 1);
+             INSERT INTO books(id, title, author, language, format, revision,
+                               source_object_key, added_at, updated_at)
+                 VALUES ('book', 'Book', '', 'en', 'epub', 1, 'objects/source', 1, 1);
+             INSERT INTO book_sources(id, book_id, revision, format, source_kind,
+                                      object_key, created_at)
+                 VALUES ('source', 'book', 1, 'epub', 'original', 'objects/source', 1);",
+        )
+        .unwrap();
+        // EPUB chapters are stored as one preserved RawHtml subtree; the visible
+        // paragraph structure only exists in the canonical HTML source.
+        let html = "<div id=\"sbo-rt-content\"><h1>Rust Brain Teasers</h1>
+                    <p>Copyright 2022</p>
+                    <p>Hello <b>world</b></p></div>";
+        let document = BlockDocument {
+            schema_version: 1,
+            blocks: vec![Block::RawHtml {
+                id: "raw".into(),
+                source: html.into(),
+                plain_text: String::new(),
+            }],
+        };
+        conn.execute(
+            "INSERT INTO content_units(id, book_id, source_id, ordinal, kind,
+                 source_locator_json, source_text, block_json, revision, created_at, updated_at)
+             VALUES ('unit', 'book', 'source', 0, 'chapter', '{}', ?1, ?2, 1, 1, 1)",
+            rusqlite::params![html, serde_json::to_string(&document).unwrap()],
+        )
+        .unwrap();
+
+        let blocks = translation_blocks(&conn, "book", "source", 1).unwrap();
+        assert_eq!(
+            blocks
+                .iter()
+                .map(|block| block.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Rust Brain Teasers", "Copyright 2022", "Hello world"],
+        );
+        assert!(blocks.iter().all(|block| block.unit_id == "unit"));
+
+        // Deterministic IDs keep repeated runs idempotent for the same source.
+        let again = translation_blocks(&conn, "book", "source", 1).unwrap();
+        assert_eq!(
+            again
+                .iter()
+                .map(|block| block.block_id.as_str())
+                .collect::<Vec<_>>(),
+            blocks
+                .iter()
+                .map(|block| block.block_id.as_str())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn retranslating_a_translation_job_resets_it_and_clears_its_rows() {
+        let fixture = Fixture::new();
+        let coordinator = IndexingCoordinator {
+            inner: fixture.indexing_inner(),
+            workers: Mutex::new(Vec::new()),
+        };
+        let provider: Arc<dyn OpenAiCompatibleProvider> = Arc::new(MockProvider::default());
+        let job_id = format!("translation:{}:zh-Hans", fixture.source_id);
+        fixture
+            .runtime
+            .block_on(coordinator.configure_translation(
+                provider,
+                "chat-test".to_string(),
+                "translation-v1:chat-test".to_string(),
+                Some("zh-Hans".to_string()),
+                false,
+            ))
+            .unwrap();
+
+        let conn = db::open_conn(&fixture.db_path).unwrap();
+        let cursor_json = db::index_jobs::get(&conn, &job_id)
+            .unwrap()
+            .unwrap()
+            .cursor_json;
+        db::index_jobs::update_state(
+            &conn,
+            &job_id,
+            db::index_jobs::IndexJobStatus::Succeeded,
+            &cursor_json,
+            None,
+            10,
+            Some(10),
+            Some(10),
+        )
+        .unwrap();
+        db::translations::upsert(
+            &conn,
+            &db::translations::NewTranslation {
+                book_id: fixture.book_id.clone(),
+                content_unit_id: fixture.unit_id.clone(),
+                block_id: "stale".into(),
+                ordinal: 0,
+                document_revision: fixture.revision,
+                unit_revision: fixture.revision,
+                target_language: "zh-Hans".into(),
+                source_language: Some("en".into()),
+                model: "chat-test".into(),
+                source_text: "Alpha".into(),
+                translated_text: "甲".into(),
+                created_at: 10,
+                updated_at: 10,
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(
+            fixture
+                .runtime
+                .block_on(coordinator.retranslate(&job_id))
+                .unwrap()
+        );
+        let conn = db::open_conn(&fixture.db_path).unwrap();
+        let job = db::index_jobs::get(&conn, &job_id).unwrap().unwrap();
+        assert_eq!(job.status, db::index_jobs::IndexJobStatus::Paused);
+        assert_eq!(job.error, None);
+        let cursor = serde_json::from_str::<JobCursor>(&job.cursor_json).unwrap();
+        assert_eq!(cursor.next_ordinal, 0);
+        assert!(
+            db::translations::list_for_unit(&conn, &fixture.unit_id, "zh-Hans")
+                .unwrap()
+                .is_empty(),
+            "re-translating discards the previous rows"
+        );
+
+        // Other kinds are never touched by a translation-only action.
+        let other = format!("embedding:{}", fixture.source_id);
+        assert!(
+            !fixture
+                .runtime
+                .block_on(coordinator.retranslate(&other))
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn byte_limits_do_not_split_utf8() {
         assert_eq!(truncate_utf8_bytes("中文abcdef", 5), "中");
+    }
+
+    #[test]
+    fn configured_concurrency_runs_two_queued_jobs_at_once() {
+        let fixture = Fixture::new();
+        fixture.add_second_book();
+        let provider = Arc::new(MockProvider::default());
+        provider.block_embeddings.store(true, Ordering::SeqCst);
+        let coordinator = fixture.coordinator(provider.clone());
+        coordinator.configure_scheduling(2, Duration::ZERO);
+
+        // The provider is blocked, so two in-flight calls can only exist when
+        // two jobs run at the same time.
+        fixture.wait_until(
+            "two concurrent provider calls",
+            Duration::from_secs(10),
+            |_| provider.embedding_calls.load(Ordering::SeqCst) >= 2,
+        );
+        provider.block_embeddings.store(false, Ordering::SeqCst);
+        fixture.wait_until("both embedding jobs", Duration::from_secs(10), |fixture| {
+            fixture.embedding_status_count(db::index_jobs::IndexJobStatus::Succeeded) == 2
+        });
+    }
+
+    #[test]
+    fn configured_interval_pauses_between_two_queued_jobs() {
+        let fixture = Fixture::new();
+        fixture.add_second_book();
+        let provider = Arc::new(MockProvider::default());
+        provider.block_embeddings.store(true, Ordering::SeqCst);
+        let coordinator = fixture.coordinator(provider.clone());
+        fixture.wait_until(
+            "one running embedding job",
+            Duration::from_secs(10),
+            |fixture| fixture.embedding_status_count(db::index_jobs::IndexJobStatus::Running) == 1,
+        );
+        // Configured while the first job is claimed, so the single worker reads
+        // the pause after that job finishes.
+        coordinator.configure_scheduling(1, Duration::from_millis(1_500));
+        provider.block_embeddings.store(false, Ordering::SeqCst);
+        fixture.wait_until(
+            "the first embedding job",
+            Duration::from_secs(10),
+            |fixture| {
+                fixture.embedding_status_count(db::index_jobs::IndexJobStatus::Succeeded) == 1
+            },
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            fixture.embedding_status_count(db::index_jobs::IndexJobStatus::Succeeded),
+            1,
+            "the configured pause must keep the worker idle between jobs"
+        );
     }
 }

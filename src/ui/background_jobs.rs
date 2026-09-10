@@ -665,7 +665,7 @@ fn available_actions(job: &BackgroundJobSnapshot) -> Vec<BackgroundJobAction> {
     if job.pause_requested || job.cancel_requested {
         return Vec::new();
     }
-    match job.status {
+    let mut actions = match job.status {
         BackgroundJobStatus::Queued | BackgroundJobStatus::Running => {
             vec![BackgroundJobAction::Pause, BackgroundJobAction::Cancel]
         }
@@ -676,7 +676,13 @@ fn available_actions(job: &BackgroundJobSnapshot) -> Vec<BackgroundJobAction> {
             vec![BackgroundJobAction::Retry]
         }
         BackgroundJobStatus::Succeeded => Vec::new(),
+    };
+    // A completed translation can be re-run from the first block; other kinds
+    // have no equivalent that would not discard published derived indexes.
+    if job.kind == "translation" {
+        actions.push(BackgroundJobAction::Retranslate);
     }
+    actions
 }
 
 fn action_label(action: BackgroundJobAction) -> &'static str {
@@ -685,6 +691,7 @@ fn action_label(action: BackgroundJobAction) -> &'static str {
         BackgroundJobAction::Resume => "恢复",
         BackgroundJobAction::Retry => "重试",
         BackgroundJobAction::Cancel => "取消",
+        BackgroundJobAction::Retranslate => "重新翻译",
     }
 }
 
@@ -694,6 +701,7 @@ fn action_verb(action: BackgroundJobAction) -> &'static str {
         BackgroundJobAction::Resume => "恢复",
         BackgroundJobAction::Retry => "重试",
         BackgroundJobAction::Cancel => "取消",
+        BackgroundJobAction::Retranslate => "重新翻译",
     }
 }
 
@@ -703,6 +711,7 @@ fn action_id(action: BackgroundJobAction) -> &'static str {
         BackgroundJobAction::Resume => "resume",
         BackgroundJobAction::Retry => "retry",
         BackgroundJobAction::Cancel => "cancel",
+        BackgroundJobAction::Retranslate => "retranslate",
     }
 }
 
