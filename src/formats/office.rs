@@ -110,7 +110,13 @@ impl DocumentImporter for OfficeImporter {
         let ir = parsed.to_ir();
         let original = original_asset(source, format, media_type);
         let book_id = deterministic_id("book", original.metadata.content_hash.as_bytes());
-        let title = safe_title(ir.metadata.title.as_deref(), source.stem().as_str());
+        // Excel 工作簿的 core properties 常常为空或沿用模板标题，导入时一律以
+        // 文件名作为书名，避免把模板里的标题当成用户图书名。
+        let title = if format == BookFormat::Xlsx {
+            safe_title(None, source.stem().as_str())
+        } else {
+            safe_title(ir.metadata.title.as_deref(), source.stem().as_str())
+        };
 
         let mut units = Vec::new();
         let mut total_text_bytes = 0;
@@ -1072,5 +1078,28 @@ mod tests {
         assert_eq!(rows[0].cells[1].plain_text(), "first\nsecond");
         assert_eq!(rows[1].cells[2].plain_text(), "=SUM(B2:C3)");
         assert_eq!(rows[2].cells[3].plain_text(), "bottom-right");
+    }
+
+    #[test]
+    fn xlsx_import_uses_the_file_name_as_the_book_title() {
+        let mut writer = XlsxWriter::new();
+        writer
+            .add_sheet("Quarterly Data")
+            .set_cell(1, 1, CellData::String("value".to_string()));
+        let mut output = Cursor::new(Vec::new());
+        writer.write_to(&mut output).expect("write XLSX fixture");
+        let source = ImportSource {
+            file_name: Some("2026 预算.xlsx".to_string()),
+            bytes: Arc::new(output.into_inner()),
+        };
+
+        let imported = OfficeImporter
+            .import(&source, &ImportLimits::default())
+            .expect("import XLSX");
+        // office_oxide 把第一个工作表名放进 IR metadata title；XLSX 书名必须
+        // 改用文件名，工作表名仍作为内容单元标题。
+        assert_eq!(imported.document.title, "2026 预算");
+        assert_eq!(imported.document.units.len(), 1);
+        assert_eq!(imported.document.units[0].title, "Quarterly Data");
     }
 }

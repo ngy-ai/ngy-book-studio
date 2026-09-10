@@ -22,7 +22,8 @@
   - [x] EPUB 2/3
   - [x] PDF（本地固定 PDF.js，禁用 JavaScript/XFA/联网；导入与逐页视觉共享
     256 MiB、4,096 页上限）
-  - [x] DOC/DOCX、PPTX、XLSX（`office_oxide` 转统一模型）
+  - [x] DOC/DOCX、PPTX、XLSX（`office_oxide` 转统一模型）；XLSX 导入直接以文件名
+    作为书名，不采用工作簿 core properties 中可能残留的模板标题
   - [x] DRM-free MOBI/AZW/AZW3（`ebook-rs`，加密内容明确拒绝）
   - [x] 所有导入格式保留字节一致的原文件
   - [x] Office/Kindle 结构化预览与 PDF 固定版式查看
