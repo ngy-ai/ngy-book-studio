@@ -19,3 +19,6 @@
 /WebView2/
 /gui-smoke-*/
 /exports/
+.codebuddy/
+PRD.md
+.env
