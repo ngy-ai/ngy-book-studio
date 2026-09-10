@@ -125,10 +125,16 @@ test("seven selection commands render mutually exclusive host marks at exact UTF
       const rect = range.getClientRects()[0];
       return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
     });
+    await page.evaluate(() => window.getSelection().removeAllRanges());
+    await page.waitForFunction(() => window.__notesRoot.querySelector(".toolbar").hidden);
     await page.mouse.click(markedPoint.x, markedPoint.y);
-    await page.waitForFunction(() => window.__notesRoot.querySelector(".drawer-title").textContent === "划线相关笔记");
-    assert.equal(await page.evaluate(() => window.__notesRoot.querySelectorAll(".note").length), 0);
-    assert.equal(await page.evaluate(() => window.__notesRoot.querySelector(".list-status").textContent), "这处划线还没有相关想法。");
+    // A mark without any thought becomes a real selection: the same toolbar can
+    // restyle or delete the mark, or start a thought on it.
+    await page.waitForFunction(() => window.getSelection()?.toString() === "Alpha beta 😀 gamma");
+    await page.waitForFunction(() => !window.__notesRoot.querySelector(".toolbar").hidden);
+    assert.equal(await page.evaluate(() => window.__notesRoot.querySelector(".drawer").hidden), true);
+    await page.evaluate(() => window.getSelection().removeAllRanges());
+    await page.waitForFunction(() => window.__notesRoot.querySelector(".toolbar").hidden);
     await click(page, ".toggle");
     assert.equal(await page.evaluate(() => window.__notesRoot.querySelector(".drawer-title").textContent), "本章笔记");
     assert.equal(await page.evaluate(() => window.__notesRoot.querySelectorAll(".note.underline").length), 1);
@@ -136,6 +142,49 @@ test("seven selection commands render mutually exclusive host marks at exact UTF
       await select(page);
       await page.screenshot({ path: process.env.MOYE_ANNOTATIONS_SCREENSHOT });
     }
+  } finally { await page.close(); }
+});
+
+test("clicking a mark lists its thoughts when it has any and selects the mark when it has none", async () => {
+  const page = await pageWithFixture();
+  try {
+    await select(page, "#second");
+    await click(page, '[data-action="highlight"]');
+    const mark = await lastMessage(page, "highlight");
+    await result(page, mark, { ok: true, notes: [{ id: "plain-mark", kind: "highlight", anchor: mark.anchor }] });
+    const clickMark = async () => {
+      const point = await page.evaluate(() => {
+        window.getSelection().removeAllRanges();
+        const rect = window.__notesRoot.querySelector(".mark.highlight").getBoundingClientRect();
+        return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+      });
+      await page.mouse.click(point.x, point.y);
+    };
+    await clickMark();
+    await page.waitForFunction(() => window.getSelection()?.toString() === "Alpha beta 😀 gamma");
+    await page.waitForFunction(() => !window.__notesRoot.querySelector(".toolbar").hidden);
+    assert.equal(await page.evaluate(() => window.__notesRoot.querySelector(".drawer").hidden), true);
+    assert.deepEqual(await page.evaluate(() => [...window.__notesRoot.querySelectorAll(".tool")]
+      .map((tool) => tool.getAttribute("aria-label"))),
+    ["复制", "马克笔", "波浪线", "直线", "删除划线", "写想法", "AI 解释"]);
+
+    // A thought on the very same range keeps the drawer, and the empty-state
+    // status is no longer reachable from a mark click.
+    await page.evaluate(() => window.getSelection().removeAllRanges());
+    await page.waitForFunction(() => window.__notesRoot.querySelector(".toolbar").hidden);
+    const notes = [
+      { id: "plain-mark", kind: "highlight", anchor: mark.anchor },
+      { id: "range-human", kind: "human_comment", anchor: mark.anchor, content: "这处划线的想法" },
+      { id: "other-human", kind: "human_comment", anchor: { ...mark.anchor, start: mark.anchor.start + 1 },
+        content: "同一句中另一个范围的其它想法" },
+    ];
+    await page.evaluate((notes) => window.moyeAnnotations.render({ session: "chapter-session", revision: 1, notes }), notes);
+    await clickMark();
+    await page.waitForFunction(() => window.__notesRoot.querySelector(".drawer-title").textContent === "划线相关笔记");
+    assert.deepEqual(await page.evaluate(() => [...window.__notesRoot.querySelectorAll(".note[data-note-id]")]
+      .map((note) => note.dataset.noteId)), ["range-human"]);
+    assert.equal(await page.evaluate(() => window.__notesRoot.querySelector(".toolbar").hidden), true);
+    assert.equal(await page.evaluate(() => window.__notesRoot.querySelector(".list-status").textContent), "");
   } finally { await page.close(); }
 });
 

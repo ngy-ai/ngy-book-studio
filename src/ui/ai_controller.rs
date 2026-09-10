@@ -1296,7 +1296,7 @@ mod tests {
         }
         let emitted = requests.borrow();
         assert_eq!(emitted.len(), 1);
-        assert_eq!(emitted[0].question, "详细解释一下");
+        assert_eq!(emitted[0].question, "用汉语详细解释一下");
         assert_eq!(emitted[0].reference_hints, vec![selected]);
         assert_eq!(runtime.block_on(backend.selected_thread_id()), None);
         assert!(!sidebar.read_with(visual, |sidebar, _| sidebar.is_collapsed()));

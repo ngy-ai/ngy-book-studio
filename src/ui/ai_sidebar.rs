@@ -3650,11 +3650,11 @@ mod tests {
 
         let request = state.begin_selection_explanation(selected.clone()).unwrap();
 
-        assert_eq!(request.question, "详细解释一下");
+        assert_eq!(request.question, "用汉语详细解释一下");
         assert_eq!(request.reference_hints, vec![selected.clone()]);
         assert_eq!(request.reference, Some(selected.clone()));
         assert_eq!(state.messages.len(), 1);
-        assert_eq!(state.messages[0].content, "详细解释一下");
+        assert_eq!(state.messages[0].content, "用汉语详细解释一下");
         assert!(request.request_id > previous.request_id);
         assert!(state.included_references.is_empty());
         assert!(state.reference_is_included(&selected));

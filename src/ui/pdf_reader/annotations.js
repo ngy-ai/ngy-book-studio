@@ -337,10 +337,45 @@
     toolbar.hidden = true;
   }
 
+  // Two anchors describe the same selection only when the compacted range and
+  // the quote agree; equal offsets over different text never merge.
+  function sameAnchor(left, right) {
+    return !!left && !!right && left.start === right.start && left.end === right.end &&
+      compact(left.quote) === compact(right.quote);
+  }
+
+  function inScope(note, scope) {
+    return scope === null || (!note.stale && note.anchor &&
+      scope.some((anchor) => sameAnchor(anchor, note.anchor)));
+  }
+
   function inNoteScope(note) {
-    return noteScope === null || (!note.stale && note.anchor && noteScope.some((anchor) =>
-      anchor.start === note.anchor.start && anchor.end === note.anchor.end &&
-      compact(anchor.quote) === compact(note.anchor.quote)));
+    return inScope(note, noteScope);
+  }
+
+  // The related-notes drawer lists thoughts only. An AI thought that is still
+  // generating or waiting to be saved also holds a card, so it counts here and
+  // the drawer opens instead of falling back to a page selection.
+  function hasRelatedThought(scope) {
+    if (failedAiSave && inScope(failedAiSave, scope)) return true;
+    for (const request of pending.values()) {
+      if (request.action === "ai_explain" && inScope(request, scope)) return true;
+    }
+    return notes.some((note) => (note.kind === "human_comment" || note.kind === "ai_comment") &&
+      inScope(note, scope));
+  }
+
+  // Clicking a mark that carries no thought selects exactly the marked range so
+  // the shared toolbar can restyle or delete the mark, or start a thought on it.
+  function selectMarkedRange(noteId) {
+    const note = notes.find((candidate) => candidate.id === noteId);
+    const range = note && !note.stale ? anchorRange(note.anchor) : null;
+    if (!range) return;
+    const selection = window.getSelection();
+    if (!selection) return;
+    selection.removeAllRanges();
+    selection.addRange(range);
+    showSelection();
   }
 
   function openDrawer(scope = noteScope) {
@@ -903,9 +938,14 @@
             event.clientX <= rect.right && event.clientY >= rect.top && event.clientY <= rect.bottom);
           if (hits.length) {
             const ids = new Set(hits.map((hit) => hit.id));
-            openDrawer(notes.filter((note) => ids.has(note.id)).map((note) => note.anchor));
-            const card = Array.from(list.children).find((node) => node.dataset.noteId === hits[0].id);
-            card?.scrollIntoView({ block: "nearest" });
+            const anchors = notes.filter((note) => ids.has(note.id)).map((note) => note.anchor);
+            if (hasRelatedThought(anchors)) {
+              openDrawer(anchors);
+              const card = Array.from(list.children).find((node) => node.dataset.noteId === hits[0].id);
+              card?.scrollIntoView({ block: "nearest" });
+            } else {
+              selectMarkedRange(hits[0].id);
+            }
           }
         }
       }, 40);
