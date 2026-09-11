@@ -438,6 +438,7 @@ fn office_page_reference_hints(
                     format!("第 {} 页", page.page_number)
                 },
                 frozen_text: None,
+                displayed_text: None,
                 revision: None,
             }
         })

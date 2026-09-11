@@ -26,6 +26,12 @@ const AI_REFERENCE_VISIBLE_ROWS: usize = 3;
 const AI_REFERENCE_ROW_HEIGHT: f32 = 28.;
 const MAX_QUESTION_BYTES: usize = 32 * 1024;
 const SELECTION_EXPLANATION_QUESTION: &str = "用汉语详细解释一下";
+/// Used when the reader selected text of a reading-time translation: the model
+/// must explain what the reader actually read, while the frozen quote it also
+/// receives stays the immutable original behind every citation and note.
+const SELECTION_TRANSLATION_QUESTION: &str =
+    "用汉语详细解释一下下面这段译文（原文见所选引用，请按译文解释）：\n\n";
+const SELECTION_TRANSLATION_QUESTION_TRUNCATED: &str = "…";
 const NO_KNOWLEDGE_BASE_SOURCE_WARNING_TITLE: &str = "没有可验证的知识库来源";
 const NO_KNOWLEDGE_BASE_SOURCE_WARNING_BODY: &str =
     "以下回答由大模型根据自身能力生成，不能视为基于所选图书的回答，请自行核实。";
@@ -334,6 +340,10 @@ pub(super) struct AiReferenceHint {
     /// A host-frozen selection. `None` means the backend should resolve the
     /// persisted unit after it receives the typed request.
     pub frozen_text: Option<String>,
+    /// What the reader actually displayed for that frozen selection, when it
+    /// differs from the stored book text (a reading-time translation). Only the
+    /// explanation question uses it: citations and notes stay on `frozen_text`.
+    pub displayed_text: Option<String>,
     pub revision: Option<u64>,
 }
 
@@ -351,9 +361,39 @@ impl AiReferenceHint {
             locator: None,
             label: label.into(),
             frozen_text: None,
+            displayed_text: None,
             revision: None,
         }
     }
+}
+
+/// The fixed explanation question, or the same request naming the译文 the reader
+/// displayed. The question must stay inside the sidebar's own byte budget even
+/// when the reader's selection cap allows more, so an oversized translation is
+/// truncated at a character boundary instead of rejecting the whole request.
+fn selection_explanation_question(reference: &AiReferenceHint) -> String {
+    let displayed = reference
+        .displayed_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    let Some(displayed) = displayed else {
+        return SELECTION_EXPLANATION_QUESTION.to_string();
+    };
+    let mut question = String::from(SELECTION_TRANSLATION_QUESTION);
+    let budget = MAX_QUESTION_BYTES
+        .saturating_sub(question.len() + SELECTION_TRANSLATION_QUESTION_TRUNCATED.len());
+    if displayed.len() <= budget {
+        question.push_str(displayed);
+        return question;
+    }
+    let mut end = budget;
+    while end > 0 && !displayed.is_char_boundary(end) {
+        end -= 1;
+    }
+    question.push_str(&displayed[..end]);
+    question.push_str(SELECTION_TRANSLATION_QUESTION_TRUNCATED);
+    question
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1166,11 +1206,12 @@ impl ConversationState {
         {
             return None;
         }
+        let question = selection_explanation_question(&reference);
         self.messages.clear();
         self.included_references.clear();
         self.automatic_reference = None;
         self.set_reference_hints(vec![reference]);
-        self.begin(SELECTION_EXPLANATION_QUESTION)
+        self.begin(&question)
     }
 
     fn cancel(&mut self) -> Option<u64> {
@@ -2886,6 +2927,36 @@ mod tests {
 
     fn book(id: &str) -> AiBookOption {
         AiBookOption::new(id, format!("Book {id}"))
+    }
+
+    fn explanation_reference(displayed: Option<&str>) -> AiReferenceHint {
+        let mut reference = AiReferenceHint::chapter("book", "unit", 0, "当前章节高亮 · One");
+        reference.frozen_text = Some("original passage".to_string());
+        reference.displayed_text = displayed.map(str::to_string);
+        reference
+    }
+
+    #[test]
+    fn explanation_question_names_the_displayed_translation_within_its_budget() {
+        assert_eq!(
+            selection_explanation_question(&explanation_reference(None)),
+            SELECTION_EXPLANATION_QUESTION
+        );
+        assert_eq!(
+            selection_explanation_question(&explanation_reference(Some(" \n\t "))),
+            SELECTION_EXPLANATION_QUESTION
+        );
+        let translated =
+            selection_explanation_question(&explanation_reference(Some("  译文段落  ")));
+        assert!(translated.starts_with(SELECTION_TRANSLATION_QUESTION));
+        assert!(translated.ends_with("译文段落"));
+        // The sidebar's own question budget wins over the reader's larger
+        // selection limit: an oversized译文 is truncated, never rejected.
+        let oversized = "译".repeat(MAX_QUESTION_BYTES);
+        let truncated = selection_explanation_question(&explanation_reference(Some(&oversized)));
+        assert!(truncated.ends_with(SELECTION_TRANSLATION_QUESTION_TRUNCATED));
+        assert!(truncated.len() <= MAX_QUESTION_BYTES);
+        assert!(truncated.is_char_boundary(truncated.len()));
     }
 
     #[gpui::test]

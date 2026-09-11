@@ -30,6 +30,7 @@ use super::{
     office_enhancements,
     progress::{self, ReadingProgress},
     search_chunks::{self, SearchChunk},
+    settings,
     toc_entries::{self, TocEntry},
     visual_page_staging,
     visual_pages::{self, VisualPage},
@@ -329,6 +330,10 @@ pub(crate) fn delete_document(conn: &mut Connection, book_id: &str) -> Result<Ve
     if books::delete(&tx, book_id)? == 0 {
         bail!("图书不存在");
     }
+    // The book's reading-window preferences live in `settings`, which no foreign
+    // key cascades: leaving them behind would apply a deleted book's choice to a
+    // later book that reuses the same ID.
+    settings::delete(&tx, &settings::translation_display_book_key(book_id))?;
     let unreferenced = blobs::list_unreferenced(&tx)?;
     tx.commit().context("无法提交文档删除事务")?;
     Ok(unreferenced)

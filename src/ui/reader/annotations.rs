@@ -56,6 +56,11 @@ pub(in crate::ui) struct AnnotationAction {
     id: Option<String>,
     #[serde(default)]
     content: Option<String>,
+    /// Text the reader actually displayed for the selection, sent only for an AI
+    /// explanation of reading-time translation text. The stored anchor, citation
+    /// and note stay the original; this only names the passage in the question.
+    #[serde(default)]
+    displayed_text: Option<String>,
     #[serde(default)]
     dirty: bool,
 }
@@ -73,6 +78,11 @@ impl AnnotationAction {
                 .content
                 .as_ref()
                 .is_none_or(|text| text.len() <= 64 * 1024)
+            && self
+                .displayed_text
+                .as_ref()
+                .is_none_or(|text| text.len() <= MAX_READER_SELECTION_BYTES)
+            && (self.action == NoteAction::AiExplain || self.displayed_text.is_none())
             && self.anchor.as_ref().is_none_or(|a| {
                 a.start < a.end
                     && !a.quote.trim().is_empty()
@@ -445,6 +455,7 @@ impl ReaderApp {
             self.current_spine,
             url,
             &draft.anchor.quote,
+            action.displayed_text.as_deref(),
         ) else {
             self.note_result(&action, Err("所选文本已失效，请重新选择。".into()), cx);
             return;
@@ -622,6 +633,15 @@ mod tests {
             body.replace("\"request_id\":1", "\"request_id\":0"),
             body.replace("人工想法", &"x".repeat(64 * 1024 + 1)),
             body.replace("\"end\":2", "\"end\":0"),
+            // Displayed译文 text belongs to an AI explanation only, and stays
+            // inside the reader's own selection limit.
+            body.replace(
+                r#""content":"人工想法""#,
+                &format!(
+                    r#""content":"人工想法","displayed_text":"{}""#,
+                    "译".repeat(MAX_READER_SELECTION_BYTES)
+                ),
+            ),
         ] {
             assert!(
                 reader_ipc_event(
@@ -631,6 +651,22 @@ mod tests {
                 .is_none()
             );
         }
+        // An explanation may name the译文 the reader saw.
+        let explained = r#"{"type":"annotation_action","action":"ai_explain","session":"1","revision":1,"request_id":1,"anchor":{"quote":"选区","start":0,"end":2},"displayed_text":"译文段落"}"#;
+        assert!(matches!(
+            reader_ipc_event(
+                &"http://epubreader.book/text/one.xhtml".parse().unwrap(),
+                explained
+            ),
+            Some(ReaderWebEvent::AnnotationAction {
+                action: AnnotationAction {
+                    action: NoteAction::AiExplain,
+                    displayed_text: Some(text),
+                    ..
+                },
+                ..
+            }) if text == "译文段落"
+        ));
     }
 
     #[test]

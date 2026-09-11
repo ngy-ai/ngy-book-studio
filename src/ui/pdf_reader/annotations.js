@@ -36,6 +36,16 @@
   const normalize = (value) => value.replace(/\s+/gu, " ").trim();
   const bounded = (value, bytes) => typeof value === "string" &&
     encoder.encode(value).byteLength <= bytes;
+  // WebView2 captures the native menu's selection through Blink's text iterator,
+  // which may insert '\n' or '\t' where the frozen range's text has none. Only
+  // the visible characters decide whether that menu still describes the frozen
+  // selection; the anchor always comes from the frozen range, so whitespace
+  // cannot move the note. A PDF page has no translation layer, so the frozen
+  // snapshot is always compared as plain text.
+  const sameReportedSelection = (selected, reported) => {
+    if (typeof reported !== "string" || selected.translated) return true;
+    return compact(reported) === compact(selected.anchor.quote);
+  };
   const pageNumber = (value) => Number.isSafeInteger(value) && value >= 1 &&
     value <= MAX_PAGE_NUMBER ? value : null;
   const kinds = {
@@ -841,8 +851,7 @@
     explainSelection(selectedText) {
       const selected = ready && context ?
         (typeof selectedText === "string" ? contextMenuSnapshot : currentSelection()) : null;
-      if (!selected || (typeof selectedText === "string" &&
-          normalize(selectedText) !== selected.anchor.quote) ||
+      if (!selected || !sameReportedSelection(selected, selectedText) ||
           !anchorRange(selected.anchor, selected.page)) {
         tell("选中文字已变化，请重新选择后再使用 AI 解释。", true);
         return false;

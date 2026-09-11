@@ -1222,7 +1222,7 @@ impl AiSettingsWindow {
             )
             .child(self.render_input_field(
                 "请求超时（秒）",
-                "单次 OpenAI-compatible HTTP 请求的总超时；可设置 1–600 秒，默认 120 秒。",
+                "可设置 1–600 秒，默认 120 秒。非流式请求按整段调用计时；流式回答按“多久没有新数据”计时，只要模型持续输出就不会被中途中断。",
                 &endpoint.request_timeout_input,
             ))
             .when_some(
@@ -1807,15 +1807,17 @@ impl AiSettingsWindow {
             .debug_selector(|| "ai-translation-display-mode".into())
             .outline()
             .label(match selected_mode {
-                TranslationDisplayMode::Bilingual => "双语对照",
-                TranslationDisplayMode::TranslationOnly => "仅译文",
+                TranslationDisplayMode::Bilingual => "双语",
+                TranslationDisplayMode::OriginalOnly => "原文",
+                TranslationDisplayMode::TranslationOnly => "译文",
             })
             .disabled(self.operation.busy())
             .dropdown_menu(move |menu, _, _| {
                 let mut menu = menu;
                 for (mode, label) in [
-                    (TranslationDisplayMode::TranslationOnly, "仅译文"),
-                    (TranslationDisplayMode::Bilingual, "双语对照"),
+                    (TranslationDisplayMode::TranslationOnly, "译文"),
+                    (TranslationDisplayMode::Bilingual, "双语"),
+                    (TranslationDisplayMode::OriginalOnly, "原文"),
                 ] {
                     let view = display_mode_view.clone();
                     let selected = selected_mode == mode;
@@ -1899,9 +1901,10 @@ impl AiSettingsWindow {
                             .text_color(rgb(MUTED))
                             .child(
                                 "选择语言后，导入或重新翻译的 EPUB、MOBI、AZW、AZW3、Word 图书会按文本块\
-                                 翻译为目标语言。默认“仅译文”只显示译文、隐藏原文，点击段落可在仅译文与\
-                                 双语之间切换，笔记仍锚定原文；选择“双语对照”则译文在上、原文在下同时显示。\
-                                 选择“不翻译”则保持原文。",
+                                翻译为目标语言。“译文”只显示译文、隐藏原文，点击段落可在译文与双语之间\
+                                切换，笔记仍锚定原文；“双语”则译文在上、原文在下同时显示；“原文”只显示\
+                                原文（后台翻译照常进行）。这里是全局默认，阅读窗口可以按图书切换，\
+                                图书自己的选择优先于它。选择“不翻译”则保持原文。",
                             ),
                     ),
             )
@@ -2920,7 +2923,9 @@ mod tests {
             "the system configuration tab must still render its remaining preferences"
         );
         assert!(
-            visual.debug_bounds("ai-background-job-scheduling").is_none(),
+            visual
+                .debug_bounds("ai-background-job-scheduling")
+                .is_none(),
             "task scheduling must not be rendered on the system configuration tab"
         );
 
@@ -2929,7 +2934,9 @@ mod tests {
             assert_eq!(view.active_tab, SettingsTab::BackgroundJobs);
         });
         assert!(
-            visual.debug_bounds("ai-background-job-scheduling").is_some(),
+            visual
+                .debug_bounds("ai-background-job-scheduling")
+                .is_some(),
             "task scheduling must live on the background jobs tab"
         );
         let (concurrency, interval) = settings.read_with(visual, |view, _| {

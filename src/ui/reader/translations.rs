@@ -29,20 +29,40 @@ pub(super) struct ReaderTranslations {
     pushed: Option<(String, u64)>,
     /// Set while a poll is in flight so a slow query cannot stack ticks.
     polling: bool,
+    /// Choice made in this reading window for this book. `None` means the book
+    /// still follows the global "system configuration" preference; a stored
+    /// choice always wins over it.
+    override_mode: Option<TranslationDisplayMode>,
+    /// Mode currently applied to the page: the book's choice, or the global
+    /// preference while the book has none.
+    effective: TranslationDisplayMode,
     /// Keeps the refresh task alive for the window's lifetime.
     _refresh_task: Option<Task<()>>,
 }
 
 impl ReaderTranslations {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(global: TranslationDisplayMode) -> Self {
         Self {
             session: String::new(),
             generation: 0,
             observed_progress: None,
             pushed: None,
             polling: false,
+            override_mode: None,
+            effective: global,
             _refresh_task: None,
         }
+    }
+
+    /// The mode the reading window switch shows and the page renders with.
+    pub(super) fn effective(&self) -> TranslationDisplayMode {
+        self.effective
+    }
+
+    /// Whether the book carries its own choice instead of following the global
+    /// preference. The reading window only offers "跟随全局" while it does.
+    pub(super) fn overrides_global(&self) -> bool {
+        self.override_mode.is_some()
     }
 }
 
@@ -92,6 +112,12 @@ impl ReaderApp {
         if !enabled {
             return;
         }
+        // The original-only mode shows no translation layer, so a moving cursor
+        // cannot change the page: switching back to a translated mode forces its
+        // own reload instead.
+        if self.translations.effective == TranslationDisplayMode::OriginalOnly {
+            return;
+        }
         let book_id = self.book_id.clone();
         let services = Arc::clone(&self.services);
         self.translations.polling = true;
@@ -116,12 +142,103 @@ impl ReaderApp {
         self.load_translations(url, true, cx);
     }
 
-    /// Re-applies the translation display preference to the currently loaded page
-    /// after it changes in the AI settings; new chapters pick it up automatically.
+    /// Re-resolves the display mode after the global preference changed in the
+    /// AI settings. A book that carries its own choice keeps it; every other book
+    /// follows the new default. New chapters pick the mode up on their own.
     pub(crate) fn apply_translation_display_mode(&mut self, cx: &mut Context<Self>) {
+        let global = self
+            .services
+            .provider_settings()
+            .map(|settings| settings.translation_display_mode)
+            .unwrap_or_default();
+        self.translations.effective = self.translations.override_mode.unwrap_or(global);
         if let Some(url) = self.current_reader_url.clone() {
             self.configure_translations(&url, cx);
         }
+        cx.notify();
+    }
+
+    /// Applies the choice made in this reading window. The choice belongs to the
+    /// book, so from here on it wins over the global preference.
+    pub(super) fn set_translation_display(
+        &mut self,
+        mode: TranslationDisplayMode,
+        cx: &mut Context<Self>,
+    ) {
+        if self.translations.override_mode == Some(mode) && self.translations.effective == mode {
+            return;
+        }
+        let changed = self.translations.effective != mode;
+        self.translations.override_mode = Some(mode);
+        self.translations.effective = mode;
+        if changed {
+            if let Some(url) = self.current_reader_url.clone() {
+                self.configure_translations(&url, cx);
+            }
+        }
+        let book_id = self.book_id.clone();
+        let services = Arc::clone(&self.services);
+        cx.spawn(async move |view, cx| {
+            let result = services
+                .set_translation_display_override(book_id, Some(mode))
+                .await;
+            let _ = view.update(cx, |this, cx| {
+                if let Err(error) = result {
+                    this.set_error(format!("无法保存本书的译文显示方式：{error:#}"), cx);
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Drops the book's own choice so it follows the global preference again,
+    /// which is also what the next window open will read back.
+    pub(super) fn follow_global_translation_display(&mut self, cx: &mut Context<Self>) {
+        if self.translations.override_mode.is_none() {
+            return;
+        }
+        self.translations.override_mode = None;
+        self.apply_translation_display_mode(cx);
+        let book_id = self.book_id.clone();
+        let services = Arc::clone(&self.services);
+        cx.spawn(async move |view, cx| {
+            let result = services
+                .set_translation_display_override(book_id, None)
+                .await;
+            let _ = view.update(cx, |this, cx| {
+                if let Err(error) = result {
+                    this.set_error(format!("无法恢复跟随全局显示方式：{error:#}"), cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Loads the book's stored display choice once per window. Until it arrives
+    /// the window shows the global preference, so an unreadable row keeps that
+    /// default rather than blocking the chapter.
+    pub(super) fn load_translation_display_override(&mut self, cx: &mut Context<Self>) {
+        let book_id = self.book_id.clone();
+        let services = Arc::clone(&self.services);
+        cx.spawn(async move |view, cx| {
+            let stored = services.translation_display_override(book_id).await;
+            let _ = view.update(cx, |this, cx| {
+                let stored = match stored {
+                    Ok(stored) => stored,
+                    Err(error) => {
+                        tracing::warn!(%error, "cannot read the book's translation display preference");
+                        return;
+                    }
+                };
+                if this.translations.override_mode == stored {
+                    return;
+                }
+                this.translations.override_mode = stored;
+                this.apply_translation_display_mode(cx);
+            });
+        })
+        .detach();
     }
 
     /// Reloads one chapter's translations. `force` marks the loads that must
@@ -144,12 +261,7 @@ impl ReaderApp {
             .get(spine_index)
             .copied()
             .unwrap_or(0);
-        let book_id = self.book_id.clone();
-        let display_mode = self
-            .services
-            .provider_settings()
-            .map(|settings| settings.translation_display_mode)
-            .unwrap_or_default();
+        let display_mode = self.translations.effective;
         // A forced load supersedes any in-flight load immediately. The
         // background refresh only supersedes one once it has something new to
         // push, so a skipped poll leaves the in-flight load alone.
@@ -159,6 +271,32 @@ impl ReaderApp {
         } else {
             self.translations.generation
         };
+        // The original-only mode shows no translation layer at all. Pushing an
+        // empty payload clears whatever the page still shows after a mode change
+        // without asking the database for blocks nobody will display.
+        if display_mode == TranslationDisplayMode::OriginalOnly {
+            let label = translation_display_mode_label(display_mode);
+            let fingerprint = translation_fingerprint(&unit_id, label, &[]);
+            if !force && self.translations.pushed.as_ref() == Some(&(unit_id.clone(), fingerprint))
+            {
+                return;
+            }
+            let session = NEXT_SESSION.fetch_add(1, Ordering::Relaxed).to_string();
+            self.translations.session = session.clone();
+            self.translations.pushed = Some((unit_id, fingerprint));
+            self.translation_script(
+                "configure",
+                serde_json::json!({
+                    "session": session,
+                    "revision": revision,
+                    "displayMode": label,
+                    "blocks": Vec::<serde_json::Value>::new(),
+                }),
+                cx,
+            );
+            return;
+        }
+        let book_id = self.book_id.clone();
         let url = url.to_string();
         let services = Arc::clone(&self.services);
         cx.spawn(async move |view, cx| {
@@ -243,6 +381,7 @@ fn translation_refresh_due(observed: &mut Option<usize>, current: Option<usize>)
 fn translation_display_mode_label(mode: TranslationDisplayMode) -> &'static str {
     match mode {
         TranslationDisplayMode::Bilingual => "bilingual",
+        TranslationDisplayMode::OriginalOnly => "original-only",
         TranslationDisplayMode::TranslationOnly => "translation-only",
     }
 }
@@ -294,6 +433,29 @@ mod tests {
         assert!(translation_refresh_due(&mut observed, None));
         assert_eq!(observed, None);
         assert!(!translation_refresh_due(&mut observed, None));
+    }
+
+    #[test]
+    fn every_display_mode_reaches_the_page_with_its_own_label() {
+        assert_eq!(
+            translation_display_mode_label(TranslationDisplayMode::Bilingual),
+            "bilingual"
+        );
+        assert_eq!(
+            translation_display_mode_label(TranslationDisplayMode::OriginalOnly),
+            "original-only"
+        );
+        assert_eq!(
+            translation_display_mode_label(TranslationDisplayMode::TranslationOnly),
+            "translation-only"
+        );
+        // Switching mode must rewrite the page even when the blocks are equal,
+        // so the label is part of the fingerprint.
+        let blocks = serde_json::json!([{ "key": "b1", "source": "one", "segments": [] }]);
+        assert_ne!(
+            translation_fingerprint("unit-1", "translation-only", std::slice::from_ref(&blocks)),
+            translation_fingerprint("unit-1", "original-only", std::slice::from_ref(&blocks))
+        );
     }
 
     #[test]

@@ -15,7 +15,7 @@ use moye_epub_editor::{
         AuthorizedReaderAsset, ReaderResourceAuthorizations, ResourceResponse,
         load_resource_with_range,
     },
-    services::AppServices,
+    services::{AppServices, TranslationDisplayMode},
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -73,15 +73,27 @@ const READER_INITIALIZATION_SCRIPT: &str = r#"
     return fragment.textContent || "";
   };
 
+  // A selection made on the translation layer stands for the original passage it
+  // was translated from; the translation runtime owns that mapping and returns
+  // null when the selection touches no applied translation.
+  const translationOriginalRange = (range) => {
+    const resolve = window.moyeTranslations?.originalRange;
+    return typeof resolve === "function" ? resolve(range) : null;
+  };
+
   const boundedSelection = () => {
     const selection = window.getSelection();
     if (!selection || selection.isCollapsed || selection.rangeCount !== 1) return "";
     // Notes live in a closed shadow root outside body. Their text (including
     // an identical quote) is never a chapter selection or an AI reference.
-    const range = selection.getRangeAt(0);
+    let range = selection.getRangeAt(0);
     if (range.collapsed || ![selection.anchorNode, selection.focusNode,
         range.startContainer, range.endContainer].every(isChapterNode)) return "";
-    if ([range.startContainer, range.endContainer].some(insideTranslation)) return "";
+    if ([range.startContainer, range.endContainer].some(insideTranslation)) {
+      const original = translationOriginalRange(range);
+      if (!original) return "";
+      range = original;
+    }
     // Focusing a notes input can leave the previous body Range in Selection.
     const active = document.activeElement;
     if (active && (!isChapterNode(active) ||
@@ -927,6 +939,29 @@ fn normalize_reader_selection(value: &str) -> Option<Option<String>> {
     Some((!normalized.is_empty()).then_some(normalized))
 }
 
+/// Reading-window switch order: the same three choices the system configuration
+/// offers, with the translation-only mode last because it is the default.
+const TRANSLATION_DISPLAY_MODES: [TranslationDisplayMode; 3] = [
+    TranslationDisplayMode::Bilingual,
+    TranslationDisplayMode::OriginalOnly,
+    TranslationDisplayMode::TranslationOnly,
+];
+
+fn translation_display_mode(index: usize) -> TranslationDisplayMode {
+    TRANSLATION_DISPLAY_MODES
+        .get(index)
+        .copied()
+        .unwrap_or_default()
+}
+
+fn translation_display_mode_name(mode: TranslationDisplayMode) -> &'static str {
+    match mode {
+        TranslationDisplayMode::Bilingual => "双语",
+        TranslationDisplayMode::OriginalOnly => "原文",
+        TranslationDisplayMode::TranslationOnly => "译文",
+    }
+}
+
 impl Render for ReaderApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.closing && self.progress_close_ready && !self.removal_scheduled {
@@ -981,6 +1016,53 @@ impl Render for ReaderApp {
         let previous_view = view.clone();
         let next_view = view.clone();
         let notes_view = view.clone();
+        // The reading window owns the display choice for this book: once chosen it
+        // wins over the global preference from the system configuration and is
+        // stored per book, and "跟随全局" hands it back to that default. Without a
+        // target language nothing is ever translated, so the switch stays hidden
+        // instead of offering a no-op.
+        let provider_settings = self.services.provider_settings().ok();
+        let global_display_mode = provider_settings
+            .as_ref()
+            .map(|settings| settings.translation_display_mode)
+            .unwrap_or_default();
+        let follow_global = self.translations.overrides_global().then(|| {
+            let follow_view = view.clone();
+            Button::new("reader-translation-follow-global")
+                .ghost()
+                .xsmall()
+                .label("跟随全局")
+                .tooltip(format!(
+                    "恢复跟随系统配置（当前为{}）",
+                    translation_display_mode_name(global_display_mode)
+                ))
+                .on_click(move |_, _, cx| {
+                    follow_view.update(cx, |this, cx| this.follow_global_translation_display(cx));
+                })
+        });
+        let display_switch = provider_settings
+            .as_ref()
+            .is_some_and(|settings| settings.default_language.is_some())
+            .then(|| {
+                let effective = self.translations.effective();
+                TabBar::new("reader-translation-display")
+                    .segmented()
+                    .small()
+                    .selected_index(
+                        TRANSLATION_DISPLAY_MODES
+                            .iter()
+                            .position(|mode| *mode == effective)
+                            .unwrap_or(TRANSLATION_DISPLAY_MODES.len() - 1),
+                    )
+                    .on_click(cx.listener(|this, index: &usize, _, cx| {
+                        this.set_translation_display(translation_display_mode(*index), cx);
+                    }))
+                    .children(
+                        TRANSLATION_DISPLAY_MODES
+                            .into_iter()
+                            .map(|mode| Tab::new().label(translation_display_mode_name(mode))),
+                    )
+            });
         let toolbar = div()
             .v_flex()
             .bg(rgb(SURFACE))
@@ -1041,6 +1123,8 @@ impl Render for ReaderApp {
                         div()
                             .h_flex()
                             .gap_2()
+                            .when_some(display_switch, |row, switch| row.child(switch))
+                            .when_some(follow_global, |row, button| row.child(button))
                             .child(
                                 Button::new("reader-book-notes")
                                     .ghost()
@@ -1439,6 +1523,10 @@ impl ReaderApp {
                     focus,
                 })
         });
+        let global_display_mode = services
+            .provider_settings()
+            .map(|settings| settings.translation_display_mode)
+            .unwrap_or_default();
         let mut reader = Self {
             book_id,
             book_incarnation,
@@ -1459,7 +1547,7 @@ impl ReaderApp {
             search_results: Vec::new(),
             selected_text: None,
             annotations: ReaderAnnotations::new(annotation_revisions),
-            translations: ReaderTranslations::new(),
+            translations: ReaderTranslations::new(global_display_mode),
             _annotation_ai_subscription,
             _annotation_ai_submit_subscription,
             _annotation_ai_failure_subscription,
@@ -1492,6 +1580,7 @@ impl ReaderApp {
             }
         }));
         reader.start_translation_refresh(cx);
+        reader.load_translation_display_override(cx);
         reader
     }
 
@@ -2289,13 +2378,14 @@ fn reader_explanation_reference(
     current_spine: usize,
     url: &str,
     selected_text: &str,
+    displayed_text: Option<&str>,
 ) -> Option<AiReferenceHint> {
     let uri = url.parse().ok()?;
     if !is_reader_document_uri(&uri) || book.spine_index_for_url(url) != Some(current_spine) {
         return None;
     }
     let selected_text = normalize_reader_selection(selected_text)??;
-    reader_reference_hints(
+    let mut reference = reader_reference_hints(
         book_id,
         &book.spine,
         progress_locators,
@@ -2303,7 +2393,17 @@ fn reader_explanation_reference(
         Some(&selected_text),
     )
     .into_iter()
-    .find(|reference| reference.frozen_text.is_some())
+    .find(|reference| reference.frozen_text.is_some())?;
+    // The reader may have selected text of a reading-time translation. The model
+    // then explains what the reader saw, while the frozen quote stays the
+    // original behind every citation, note anchor and version check. An empty or
+    // oversized report is simply dropped: the explanation falls back to the
+    // original passage.
+    reference.displayed_text = displayed_text
+        .and_then(normalize_reader_selection)
+        .flatten()
+        .filter(|text| text.len() <= MAX_READER_SELECTION_BYTES);
+    Some(reference)
 }
 
 fn reader_reference_hints(
@@ -2349,6 +2449,36 @@ fn reader_reference_hints(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reading_window_switch_maps_to_the_three_display_modes() {
+        assert_eq!(TRANSLATION_DISPLAY_MODES.len(), 3);
+        assert_eq!(
+            translation_display_mode(0),
+            TranslationDisplayMode::Bilingual
+        );
+        assert_eq!(
+            translation_display_mode(1),
+            TranslationDisplayMode::OriginalOnly
+        );
+        assert_eq!(
+            translation_display_mode(2),
+            TranslationDisplayMode::TranslationOnly
+        );
+        // An unknown index keeps the default instead of panicking.
+        assert_eq!(
+            translation_display_mode(99),
+            TranslationDisplayMode::TranslationOnly
+        );
+        assert_eq!(
+            [
+                translation_display_mode_name(TranslationDisplayMode::Bilingual),
+                translation_display_mode_name(TranslationDisplayMode::OriginalOnly),
+                translation_display_mode_name(TranslationDisplayMode::TranslationOnly),
+            ],
+            ["双语", "原文", "译文"]
+        );
+    }
 
     #[test]
     fn reader_pane_drag_preserves_width_at_the_handle_center() {
@@ -2780,11 +2910,50 @@ mod tests {
             .map(|unit| DocumentLocator::unit(&record.id, &unit.id))
             .collect::<Vec<_>>();
         let url = OpenedBook::navigation_url_for_href(&book.spine[0].href);
-        let reference =
-            reader_explanation_reference(&record.id, &book, &locators, 0, &url, "  所选\n\t文本  ")
-                .unwrap();
+        let reference = reader_explanation_reference(
+            &record.id,
+            &book,
+            &locators,
+            0,
+            &url,
+            "  所选\n\t文本  ",
+            None,
+        )
+        .unwrap();
         assert_eq!(reference.frozen_text.as_deref(), Some("所选 文本"));
         assert_eq!(reference.locator.as_ref(), Some(&locators[0]));
+        assert_eq!(reference.displayed_text, None);
+        // A reading-time translation travels with the reference: the question
+        // explains what the reader saw while the frozen quote stays the original.
+        let translated = reader_explanation_reference(
+            &record.id,
+            &book,
+            &locators,
+            0,
+            &url,
+            "  所选\n\t文本  ",
+            Some("  译文\n\t段落  "),
+        )
+        .unwrap();
+        assert_eq!(translated.frozen_text.as_deref(), Some("所选 文本"));
+        assert_eq!(translated.displayed_text.as_deref(), Some("译文 段落"));
+        // An empty or oversized report must not reject the explanation.
+        for displayed in [" \n\t ", &"x".repeat(MAX_READER_SELECTION_BYTES + 1)] {
+            assert_eq!(
+                reader_explanation_reference(
+                    &record.id,
+                    &book,
+                    &locators,
+                    0,
+                    &url,
+                    "  所选\n\t文本  ",
+                    Some(displayed),
+                )
+                .unwrap()
+                .displayed_text,
+                None
+            );
+        }
         for (spine_index, source_url, selection) in [
             (1, url.as_str(), "过期章节"),
             (0, "https://example.com/chapter.xhtml", "其它来源"),
@@ -2799,13 +2968,22 @@ mod tests {
                     spine_index,
                     source_url,
                     selection,
+                    None,
                 )
                 .is_none()
             );
         }
         assert!(
-            reader_explanation_reference("another-book", &book, &locators, 0, &url, "越权文本",)
-                .is_none()
+            reader_explanation_reference(
+                "another-book",
+                &book,
+                &locators,
+                0,
+                &url,
+                "越权文本",
+                None
+            )
+            .is_none()
         );
     }
 

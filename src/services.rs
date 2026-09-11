@@ -276,6 +276,9 @@ fn default_translation_language() -> Option<String> {
 pub enum TranslationDisplayMode {
     /// Translation text on top, original text below a divider.
     Bilingual,
+    /// The original text only. Stored translations stay valid and the background
+    /// task keeps running; the reader simply never inserts the layer.
+    OriginalOnly,
     /// Only the translated text; the original is hidden until the reader toggles.
     TranslationOnly,
 }
@@ -312,6 +315,16 @@ impl Default for PersistedTranslationSettings {
             display_mode: default_translation_display_mode(),
         }
     }
+}
+
+/// One book's own display choice, written by the reading window. It is kept
+/// under its own settings key (see `db::settings::translation_display_book_key`)
+/// so it never touches the global provider JSON, and the global preference
+/// stays the fallback for every book that was never switched by hand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedBookTranslationDisplay {
+    display_mode: TranslationDisplayMode,
 }
 
 /// Persisted provider choices. Secrets intentionally cannot be represented by
@@ -1089,6 +1102,74 @@ impl AppServices {
             })
             .await
             .context("译文查询线程异常退出")?
+    }
+
+    /// One book's own translation display choice, written by the reading window.
+    /// `None` means the book still follows the global preference, which is also
+    /// what an unreadable row falls back to: a corrupt display preference must
+    /// never stop a chapter from opening.
+    pub async fn translation_display_override(
+        &self,
+        book_id: String,
+    ) -> Result<Option<TranslationDisplayMode>> {
+        ensure!(!book_id.trim().is_empty(), "图书 ID 不能为空");
+        let key = db::settings::translation_display_book_key(&book_id);
+        let db_path = self.db_path.clone();
+        self.runtime
+            .handle()
+            .spawn_blocking(move || {
+                let conn = db::open_conn(&db_path)?;
+                Ok(db::settings::get(&conn, &key)?
+                    .and_then(|row| {
+                        serde_json::from_str::<PersistedBookTranslationDisplay>(&row.value_json)
+                            .ok()
+                    })
+                    .map(|persisted| persisted.display_mode))
+            })
+            .await
+            .context("译文显示方式查询线程异常退出")?
+    }
+
+    /// Stores one book's display choice, or clears it with `None` so the book
+    /// follows the global preference again. Book deletion removes the row with
+    /// the book; see `db::transactions::delete_document`.
+    pub async fn set_translation_display_override(
+        &self,
+        book_id: String,
+        mode: Option<TranslationDisplayMode>,
+    ) -> Result<()> {
+        ensure!(!book_id.trim().is_empty(), "图书 ID 不能为空");
+        let key = db::settings::translation_display_book_key(&book_id);
+        let db_path = self.db_path.clone();
+        self.runtime
+            .handle()
+            .spawn_blocking(move || {
+                let mut conn = db::open_conn(&db_path)?;
+                let tx = conn.transaction().context("无法开始保存译文显示方式")?;
+                match mode {
+                    Some(mode) => {
+                        let row = db::settings::Setting {
+                            key: key.clone(),
+                            value_json: serde_json::to_string(&PersistedBookTranslationDisplay {
+                                display_mode: mode,
+                            })
+                            .context("无法序列化译文显示方式")?,
+                            updated_at: unix_timestamp()?,
+                        };
+                        ensure!(
+                            db::settings::upsert(&tx, &row)? == 1,
+                            "译文显示方式未能保存"
+                        );
+                    }
+                    None => {
+                        db::settings::delete(&tx, &key)?;
+                    }
+                }
+                tx.commit().context("无法提交译文显示方式")?;
+                Ok(())
+            })
+            .await
+            .context("译文显示方式保存线程异常退出")?
     }
 
     pub fn provider(&self) -> Result<Arc<dyn OpenAiCompatibleProvider>> {
@@ -2971,6 +3052,107 @@ mod tests {
             })
             .unwrap();
         assert_eq!(title, "Service book");
+    }
+
+    #[test]
+    fn per_book_translation_display_override_beats_the_global_preference_and_leaves_with_the_book()
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let services = AppServices::open_with_credentials(
+            temp.path(),
+            Arc::new(MemoryCredentialStore::default()),
+        )
+        .unwrap();
+        let book_id = services
+            .runtime()
+            .block_on(async {
+                services
+                    .spawn_library(|library| {
+                        Ok(library.create_book("Preference book", "Author")?.id)
+                    })
+                    .await
+                    .context("library test worker stopped")?
+            })
+            .unwrap();
+
+        // A book the reading window never switched follows the global default.
+        assert_eq!(
+            block_on_without_tokio(services.translation_display_override(book_id.clone())).unwrap(),
+            None
+        );
+        block_on_without_tokio(services.set_translation_display_override(
+            book_id.clone(),
+            Some(TranslationDisplayMode::Bilingual),
+        ))
+        .unwrap();
+        assert_eq!(
+            block_on_without_tokio(services.translation_display_override(book_id.clone())).unwrap(),
+            Some(TranslationDisplayMode::Bilingual)
+        );
+
+        // An unreadable row means "no choice yet": the global preference still
+        // applies, and a chapter never fails to open because of it.
+        let key = db::settings::translation_display_book_key(&book_id);
+        db::settings::upsert(
+            &db::open_conn(&services.db_path).unwrap(),
+            &db::settings::Setting {
+                key: key.clone(),
+                value_json: "{\"display_mode\":\"side-by-side\"}".to_string(),
+                updated_at: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            block_on_without_tokio(services.translation_display_override(book_id.clone())).unwrap(),
+            None
+        );
+
+        block_on_without_tokio(services.set_translation_display_override(
+            book_id.clone(),
+            Some(TranslationDisplayMode::OriginalOnly),
+        ))
+        .unwrap();
+        assert_eq!(
+            block_on_without_tokio(services.translation_display_override(book_id.clone())).unwrap(),
+            Some(TranslationDisplayMode::OriginalOnly)
+        );
+
+        // "跟随全局" in the reading window is the same row being removed, so the
+        // next open follows the global preference again.
+        block_on_without_tokio(services.set_translation_display_override(book_id.clone(), None))
+            .unwrap();
+        assert!(
+            db::settings::get(&db::open_conn(&services.db_path).unwrap(), &key)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            block_on_without_tokio(services.translation_display_override(book_id.clone())).unwrap(),
+            None
+        );
+
+        // Deleting the book removes the row of a book that still carries one.
+        block_on_without_tokio(services.set_translation_display_override(
+            book_id.clone(),
+            Some(TranslationDisplayMode::Bilingual),
+        ))
+        .unwrap();
+        let removal = book_id.clone();
+        services
+            .runtime()
+            .block_on(async {
+                services
+                    .spawn_library(move |library| library.remove_book(&removal))
+                    .await
+                    .context("library mutation worker stopped")?
+            })
+            .unwrap();
+        assert!(
+            db::settings::get(&db::open_conn(&services.db_path).unwrap(), &key)
+                .unwrap()
+                .is_none(),
+            "a deleted book must not leave its display preference behind"
+        );
     }
 
     #[cfg(target_os = "windows")]

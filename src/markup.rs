@@ -158,6 +158,62 @@ fn is_code_element(node: &Handle) -> bool {
         if matches!(name.local.as_ref(), "pre" | "code"))
 }
 
+fn is_line_break_element(node: &Handle) -> bool {
+    matches!(&node.data, NodeData::Element { name, .. }
+        if name.local.as_ref() == "br")
+}
+
+/// Line endings only a statement ends a line with. Full-width CJK punctuation is
+/// deliberately absent: `；`/`：` end prose or quotes, never code.
+const CODE_LINE_ENDINGS: [char; 3] = [';', '{', '}'];
+/// Comment and preprocessor markers only a code line starts with.
+const CODE_LINE_PREFIXES: [&str; 8] = [
+    "//", "/*", "*/", "#!", "#include", "#define", "#pragma", "<!--",
+];
+/// Operators prose does not contain. A bare `=` is excluded: formulas and prose
+/// use it too.
+const CODE_OPERATORS: [&str; 16] = [
+    "=>", "->", "::", ":=", "==", "!=", "<=", ">=", "&&", "||", "+=", "-=", "*=", "/=", "</", "/>",
+];
+
+/// ECMAScript whitespace plus the invisible format characters EPUBs use to indent
+/// code lines, which `trim` alone would keep in front of `//` or `#`.
+fn trim_code_line(value: &str) -> &str {
+    value.trim_matches(|ch: char| {
+        ch.is_whitespace() || matches!(ch, '\u{200b}' | '\u{feff}' | '\u{00ad}')
+    })
+}
+
+fn is_code_line(line: &str) -> bool {
+    let trimmed = trim_code_line(line);
+    if trimmed.is_empty() {
+        return false;
+    }
+    trimmed.ends_with(CODE_LINE_ENDINGS)
+        // A whole line of markup is source, not prose.
+        || (trimmed.starts_with('<') && trimmed.ends_with('>'))
+        || CODE_LINE_PREFIXES
+            .iter()
+            .any(|prefix| trimmed.starts_with(prefix))
+        || CODE_OPERATORS
+            .iter()
+            .any(|operator| trimmed.contains(operator))
+}
+
+/// Whether one whole block is source code rather than prose.
+///
+/// Books that mark code up with `pre`/`code` never reach this: those subtrees are
+/// skipped before any block is formed. Conversions that keep every code line in an
+/// ordinary paragraph (Calibre/Word exports, and the ZWSP-indented lines of the
+/// acceptance EPUB) leave only the text shape, so a block counts as code when one
+/// of its own lines ends with `;`/`{`/`}`, starts with a comment marker, or
+/// contains a code operator. Prose never matches; a false negative only translates
+/// a code line as before, and a false positive keeps that block in its original
+/// language. `translations.js` implements the same rule and the same tables.
+fn looks_like_source_code(lines: &str) -> bool {
+    lines.lines().any(is_code_line)
+}
+
 fn collect_translation_sources(
     node: &Handle,
     depth: usize,
@@ -170,8 +226,11 @@ fn collect_translation_sources(
     if is_translatable_element(node) && !has_translatable_descendant(node, depth)? {
         let mut text = String::new();
         let mut segments = Vec::new();
-        collect_translation_leaves(node, depth, false, &mut text, &mut segments)?;
-        if !segments.is_empty() {
+        let mut lines = String::new();
+        collect_translation_leaves(node, depth, false, &mut text, &mut segments, &mut lines)?;
+        // Code never becomes a translation block: the task must not send it, and
+        // the reader must not look for a translation of it.
+        if !segments.is_empty() && !looks_like_source_code(&lines) {
             output.push(TranslationSource {
                 text: normalize_source_text(&text),
                 segments,
@@ -196,6 +255,7 @@ fn collect_translation_leaves(
     within_code: bool,
     text: &mut String,
     segments: &mut Vec<String>,
+    lines: &mut String,
 ) -> Result<()> {
     ensure_html_depth(depth)?;
     if is_skipped_element(node) {
@@ -207,17 +267,23 @@ fn collect_translation_leaves(
         text.push_str(&value);
         if !within_code && has_visible_text(&value) {
             segments.push(value.to_string());
+            // Line breaks only exist as `<br>` in the source, so the shape text
+            // keeps them; the matching text stays exactly what the page sees.
+            lines.push_str(&value);
         }
     }
     // Match DOM textContent: <br> has no text, while its original node remains
     // responsible for rendering the line break in the translated projection.
     for child in node.children.borrow().iter() {
+        if !within_code && is_line_break_element(child) {
+            lines.push('\n');
+        }
         let child_depth = if matches!(&child.data, NodeData::Element { .. }) {
             depth + 1
         } else {
             depth
         };
-        collect_translation_leaves(child, child_depth, within_code, text, segments)?;
+        collect_translation_leaves(child, child_depth, within_code, text, segments, lines)?;
     }
     Ok(())
 }
@@ -1362,21 +1428,47 @@ mod tests {
     fn translation_sources_skip_leaves_that_are_only_invisible_format_characters() {
         // 现场回归：代码行用 ZWSP 缩进，ZWSP 不属于 ECMAScript `\s`，旧过滤把它当成
         // 翻译槽；模型只能回空白，整块被 `empty_segment_text` 拒绝并停在 96 号块。
-        let source = "<p><span>\u{200b}\u{200b}</span><span>const</span>\
+        // 该块本身是代码，现在整块不再进入翻译（见 code_blocks_are_never_translated）。
+        let code_line = "<p><span>\u{200b}\u{200b}</span><span>const</span>\
             <span> THREE_AND_A_BIT : f32 = 3.4028236;</span></p>";
-        let blocks = translation_blocks_from_html(source).unwrap();
+        assert!(translation_blocks_from_html(code_line).unwrap().is_empty());
+        // 正文块保留同一保护：只由不可见格式字符组成的叶子不成为翻译槽，而不可见字符
+        // 仍留在匹配文本里（读者侧靠这段文本定位块级元素），所以只能排除翻译槽。
+        let prose = "<p><span>\u{200b}\u{200b}</span><span>甲</span><span> 乙</span></p>";
+        let blocks = translation_blocks_from_html(prose).unwrap();
         assert_eq!(blocks.len(), 1);
-        // 不可见格式字符仍留在匹配文本里（现场的 source_chars=42 就是它），读者侧
-        // 靠这段文本定位块级元素，所以只能排除翻译槽，不能改写原文。
-        assert_eq!(
-            blocks[0].text,
-            "\u{200b}\u{200b}const THREE_AND_A_BIT : f32 = 3.4028236;"
-        );
-        assert_eq!(blocks[0].text.chars().count(), 42);
-        assert_eq!(
-            blocks[0].segments,
-            ["const", " THREE_AND_A_BIT : f32 = 3.4028236;"]
-        );
+        assert_eq!(blocks[0].text, "\u{200b}\u{200b}甲 乙");
+        assert_eq!(blocks[0].segments, ["甲", " 乙"]);
+    }
+
+    #[test]
+    fn code_blocks_are_never_translated() {
+        // Code that is not marked up with pre/code is still code: Calibre/Word
+        // exports and the acceptance EPUB keep every code line in its own `<p>`.
+        for source in [
+            "<p>const THREE_AND_A_BIT : f32 = 3.4028236;</p>",
+            "<p>fn main() {</p><p>}</p>",
+            "<p>let a = 1<br>return a;</p>",
+            "<p>// 注释行</p>",
+            "<p>#include &lt;stdio.h&gt;</p>",
+            "<p>count =&gt; count + 1</p>",
+            "<p>total += 1</p>",
+            "<p>&lt;div class=\"code\"&gt;</p>",
+        ] {
+            assert!(
+                translation_blocks_from_html(source).unwrap().is_empty(),
+                "{source} must not be translated"
+            );
+        }
+        // Prose stays translatable, including the punctuation a code line carries
+        // and inline code that merely appears inside a sentence.
+        let prose = "<p>见上文（注 1）。</p><p>A note (see above)</p>\
+            <p>Read <code>x = 1;</code> now</p><p>https://example.test/a/b</p>\
+            <p>第一章：起步</p><p>a &lt; b 的关系</p>";
+        let blocks = translation_blocks_from_html(prose).unwrap();
+        assert_eq!(blocks.len(), 6);
+        assert_eq!(blocks[2].segments, ["Read ", " now"]);
+        assert_eq!(blocks[5].segments, ["a < b 的关系"]);
     }
 
     #[test]

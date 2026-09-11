@@ -42,6 +42,17 @@
   };
   const bounded = (value, bytes) => typeof value === "string" &&
     encoder.encode(value).byteLength <= bytes;
+  // WebView2 captures the native menu's selection through Blink's text iterator,
+  // which inserts '\n' for <br> and for block boundaries where the frozen
+  // range's textContent has no separator at all. Only the visible characters
+  // decide whether that menu still describes the frozen selection; the anchor
+  // always comes from the frozen range, so whitespace cannot move the note.
+  // A selection on a translation can never match its original quote, so that
+  // case is guarded by the frozen anchor's own validity instead.
+  const sameReportedSelection = (selected, reported) => {
+    if (typeof reported !== "string" || selected.translated) return true;
+    return compact(reported) === compact(selected.anchor.quote);
+  };
   const kinds = {
     highlight: "马克笔", wavy: "波浪线", underline: "直线",
     human_comment: "人工想法", ai_comment: "AI 想法",
@@ -237,15 +248,9 @@
     return !!(element && element.closest?.("[data-moye-translation]"));
   }
 
-  function currentSelection() {
-    const selection = window.getSelection();
-    if (!selection || selection.isCollapsed || selection.rangeCount !== 1) return null;
-    const range = selection.getRangeAt(0);
-    if (!document.body.contains(range.startContainer) ||
-        !document.body.contains(range.endContainer)) return null;
-    // A range entirely or partly inside a translation is never book text.
-    if (insideTranslation(range.startContainer) ||
-        insideTranslation(range.endContainer)) return null;
+  // Book-text offsets of one range. The reading-time translation layer is
+  // excluded from the index, so the range must only cover original text.
+  function anchorForRange(range) {
     const quote = normalize(translationFreeText(range));
     if (!quote || !bounded(quote, 32768)) return null;
     let start = null;
@@ -263,7 +268,45 @@
     }
     if (start === null || end === null || end <= start ||
         current.text.slice(start, end) !== compact(quote)) return null;
-    return { anchor: { quote, start, end }, range: range.cloneRange() };
+    return { quote, start, end };
+  }
+
+  /// The original book-text range a selection inside the translation layer
+  /// stands for; the translation runtime owns that mapping and returns `null`
+  /// when the selection touches no applied translation.
+  function translationOriginalRange(range) {
+    const resolve = window.moyeTranslations?.originalRange;
+    return typeof resolve === "function" ? resolve(range) : null;
+  }
+
+  function currentSelection() {
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || selection.rangeCount !== 1) return null;
+    const range = selection.getRangeAt(0);
+    if (!document.body.contains(range.startContainer) ||
+        !document.body.contains(range.endContainer)) return null;
+    // Translation text is never book text: a selection made on it is anchored to
+    // the original it was translated from, while the visible range still places
+    // the toolbar. Without a mapping there is nothing to annotate.
+    if (insideTranslation(range.startContainer) ||
+        insideTranslation(range.endContainer)) {
+      const original = translationOriginalRange(range);
+      const anchor = original && anchorForRange(original);
+      if (!anchor) return null;
+      // The reading window explains what the reader actually saw, so the
+      // displayed translation travels with the request while the anchor stays
+      // the original behind citations and notes.
+      const displayed = normalize(range.toString());
+      return {
+        anchor,
+        range: range.cloneRange(),
+        translated: true,
+        displayedText: bounded(displayed, 32768) ? displayed : null,
+      };
+    }
+    const anchor = anchorForRange(range);
+    if (!anchor) return null;
+    return { anchor, range: range.cloneRange(), translated: false };
   }
 
   function rawOffset(text, offset, after) {
@@ -323,14 +366,25 @@
     toolbar.style.top = `${Math.max(8, top)}px`;
   }
 
-  function choose(action) {
+  function choose(action, keepSnapshot = false) {
+    // A toolbar click can arrive before the 80 ms selection debounce replaced the
+    // snapshot, so toolbar actions act on what is selected right now. The native
+    // menu already froze the range it was opened on and must keep that one.
+    if (!keepSnapshot) {
+      const live = currentSelection();
+      if (live) selectionSnapshot = live;
+    }
     if (!selectionSnapshot) return;
     const anchor = selectionSnapshot.anchor;
     if (!anchorRange(anchor)) { tell("选中文字已变化，请重新选择。", true); return; }
     if (action === "human_comment") {
       openEditor({ anchor, value: "" });
     } else {
-      const requestId = post(action, { anchor });
+      const fields = { anchor };
+      if (action === "ai_explain" && selectionSnapshot.displayedText) {
+        fields.displayed_text = selectionSnapshot.displayedText;
+      }
+      const requestId = post(action, fields);
       if (requestId !== null) {
         if (action === "ai_explain") {
           openDrawer(null);
@@ -663,14 +717,20 @@
     explainSelection(selectedText) {
       const selected = ready && context ?
         (typeof selectedText === "string" ? contextMenuSnapshot : currentSelection()) : null;
-      if (!selected || (typeof selectedText === "string" &&
-          normalize(selectedText) !== selected.anchor.quote) || !anchorRange(selected.anchor)) {
+      if (!selected || !sameReportedSelection(selected, selectedText) ||
+          !anchorRange(selected.anchor)) {
         tell("选中文字已变化，请重新选择后再使用 AI 解释。", true);
         return false;
       }
+      // The native menu reports exactly the text the reader saw, which is the
+      // best description of the passage a translated selection must explain.
+      if (typeof selectedText === "string" && selected.translated) {
+        const displayed = normalize(selectedText);
+        selected.displayedText = bounded(displayed, 32768) ? displayed : null;
+      }
       selectionSnapshot = selected;
       contextMenuSnapshot = null;
-      choose("ai_explain");
+      choose("ai_explain", true);
       return true;
     },
   });

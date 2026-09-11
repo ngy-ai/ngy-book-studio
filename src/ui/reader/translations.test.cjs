@@ -149,7 +149,56 @@ test("clicking a translation toggles only that paragraph between bilingual and t
   } finally { await page.close(); }
 });
 
-test("translation nodes never become note text or reported selections", async () => {
+test("the original-only mode clears the layer and brings the hidden text back", async () => {
+  const page = await pageWithFixture();
+  try {
+    // The reading window pushes an empty payload for "原文": it must remove the
+    // layer of the previous mode and restore every hidden original.
+    await page.evaluate((value) => window.moyeTranslations.configure(value), {
+      ...payload, session: "translation-only-session", revision: 1, displayMode: "translation-only",
+    });
+    const collapsed = await page.evaluate(() => ({
+      applied: window.moyeTranslations.applied(),
+      paragraph: document.getElementById("a").style.display,
+      // The real list marker must stay visible; the list original is wrapped.
+      listItem: getComputedStyle(document.getElementById("li")).display,
+      listContent: document.getElementById("li").lastElementChild.style.display,
+    }));
+    assert.ok(collapsed.applied > 0);
+    assert.equal(collapsed.paragraph, "none", "the default mode hides the original paragraph");
+    assert.equal(collapsed.listItem, "list-item", "the list marker itself stays visible");
+    assert.equal(collapsed.listContent, "none");
+
+    await page.evaluate(() => window.moyeTranslations.configure({
+      session: "original-only-session", revision: 1, displayMode: "original-only", blocks: [],
+    }));
+    const state = await page.evaluate(() => ({
+      applied: window.moyeTranslations.applied(),
+      blocks: document.querySelectorAll("[data-moye-translation]").length,
+      hidden: [...document.querySelectorAll("body *")]
+        .filter((node) => node.style.display === "none").length,
+      paragraphDisplay: document.getElementById("a").style.display,
+      paragraphText: document.getElementById("a").textContent,
+      listItemDisplay: getComputedStyle(document.getElementById("li")).display,
+      listChildren: [...document.getElementById("li").children].map((node) => node.localName),
+      nestedDisplay: getComputedStyle(document.getElementById("nested")).display,
+      listText: document.getElementById("li").textContent,
+      nestedText: document.getElementById("nested").textContent,
+    }));
+    assert.equal(state.applied, 0);
+    assert.equal(state.blocks, 0);
+    assert.equal(state.hidden, 0, "no original may stay hidden once the layer is cleared");
+    assert.equal(state.paragraphDisplay, "", "the original paragraph is visible again");
+    assert.equal(state.paragraphText, "Alpha");
+    assert.equal(state.listItemDisplay, "list-item");
+    assert.deepEqual(state.listChildren, ["p"], "the list original is unwrapped again");
+    assert.notEqual(state.nestedDisplay, "none");
+    assert.equal(state.listText, "Nested item");
+    assert.equal(state.nestedText, "Nested item");
+  } finally { await page.close(); }
+});
+
+test("translation nodes never become book text and selections on them resolve to the originals", async () => {
   const page = await pageWithFixture();
   try {
     await configure(page);
@@ -195,22 +244,119 @@ test("translation nodes never become note text or reported selections", async ()
     });
     assert.equal(noteQuote, "Alpha Alpha", "annotation anchors exclude translation text");
 
-    // Selecting only a translation offers no note at all.
-    const hidden = await page.evaluate(async () => {
+    // A selection made on a translation stands for the original it was
+    // translated from, both for the chapter reference and for note anchors. The
+    // bridge debounces its report, so wait for the message this selection sends.
+    const translated = await page.evaluate(async () => {
       const text = document.getElementById("a").previousElementSibling
         .querySelector(".moye-translation-text");
+      const before = window.__messages
+        .filter((item) => item.type === "selection_changed").length;
       window.getSelection().removeAllRanges();
       const range = document.createRange();
       range.selectNodeContents(text);
       window.getSelection().addRange(range);
       document.dispatchEvent(new Event("selectionchange"));
       const toolbar = window.__notesRoot.querySelector(".toolbar");
-      for (let i = 0; i < 50 && !toolbar.hidden; i++) {
+      let reported;
+      for (let i = 0; i < 50; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        if (toolbar.hidden) continue;
+        const messages = window.__messages
+          .filter((item) => item.type === "selection_changed");
+        if (messages.length > before) { reported = messages.at(-1).selected_text; break; }
+      }
+      return { visible: !toolbar.hidden, selected: window.getSelection().toString(), reported };
+    });
+    assert.equal(translated.selected, "甲一", "the reader selected the translated text");
+    assert.equal(translated.visible, true, "a translated selection is annotatable");
+    assert.equal(translated.reported, "Alpha", "the chapter reference quotes the original");
+
+    // Two translated paragraphs resolve to both originals in document order.
+    const spanning = await page.evaluate(async () => {
+      const first = document.getElementById("a").previousElementSibling
+        .querySelector(".moye-translation-text");
+      const last = document.getElementById("b").previousElementSibling
+        .querySelector(".moye-translation-text");
+      const before = window.__messages
+        .filter((item) => item.type === "selection_changed").length;
+      const range = document.createRange();
+      range.setStart(first.firstChild, 0);
+      range.setEnd(last.firstChild, last.firstChild.length);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      document.dispatchEvent(new Event("selectionchange"));
+      for (let i = 0; i < 50; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        const messages = window.__messages
+          .filter((item) => item.type === "selection_changed");
+        if (messages.length > before) return messages.at(-1).selected_text;
+      }
+      return undefined;
+    });
+    assert.equal(spanning, "Alpha Alpha", "a translated span resolves to both originals");
+
+    // The native menu reports the text the user saw, which is the translation;
+    // the frozen anchor is still the original range it was translated from.
+    const explained = await page.evaluate(() => {
+      const layer = document.getElementById("a").previousElementSibling;
+      const text = layer.querySelector(".moye-translation-text");
+      window.getSelection().removeAllRanges();
+      const range = document.createRange();
+      range.selectNodeContents(text);
+      window.getSelection().addRange(range);
+      layer.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true }));
+      const accepted = window.moyeAnnotations.explainSelection(text.textContent);
+      const message = window.__messages.filter((item) => item.action === "ai_explain").at(-1);
+      return {
+        accepted,
+        quote: message?.anchor?.quote ?? null,
+        length: message ? message.anchor.end - message.anchor.start : null,
+        displayed: message?.displayed_text ?? null,
+        hasDisplayed: message ? Object.hasOwn(message, "displayed_text") : false,
+      };
+    });
+    assert.equal(explained.accepted, true, "the native menu accepts a translated selection");
+    assert.equal(explained.quote, "Alpha", "the explanation references the original passage");
+    assert.equal(explained.length, 5, "the anchor is the whole original leaf, not the translation");
+    assert.equal(explained.displayed, "甲一", "the model is told the译文 the reader selected");
+    assert.equal(explained.hasDisplayed, true);
+
+    // The floating selection menu takes the same path.
+    const viaToolbar = await page.evaluate(async () => {
+      const layer = document.getElementById("b").previousElementSibling;
+      const text = layer.querySelector(".moye-translation-text");
+      window.getSelection().removeAllRanges();
+      const range = document.createRange();
+      range.selectNodeContents(text);
+      window.getSelection().addRange(range);
+      document.dispatchEvent(new Event("selectionchange"));
+      const toolbar = window.__notesRoot.querySelector(".toolbar");
+      for (let i = 0; i < 50 && toolbar.hidden; i += 1) {
         await new Promise((resolve) => setTimeout(resolve, 20));
       }
-      return toolbar.hidden;
+      window.__notesRoot.querySelector('[data-action="ai_explain"]').click();
+      const message = window.__messages.filter((item) => item.action === "ai_explain").at(-1);
+      return { quote: message?.anchor?.quote ?? null, displayed: message?.displayed_text ?? null };
     });
-    assert.equal(hidden, true, "translation text is not annotatable");
+    assert.deepEqual(viaToolbar, { quote: "Alpha", displayed: "甲二" },
+      "the floating menu sends the译文 with the original anchor");
+
+    // Explaining original book text is unchanged: nothing extra is sent.
+    const plain = await page.evaluate(() => {
+      const paragraph = document.getElementById("a");
+      const range = document.createRange();
+      range.selectNodeContents(paragraph);
+      window.getSelection().removeAllRanges();
+      window.getSelection().addRange(range);
+      paragraph.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true }));
+      const accepted = window.moyeAnnotations.explainSelection("Alpha");
+      const message = window.__messages.filter((item) => item.action === "ai_explain").at(-1);
+      return { accepted, hasDisplayed: Object.hasOwn(message, "displayed_text") };
+    });
+    assert.equal(plain.accepted, true);
+    assert.equal(plain.hasDisplayed, false, "an original selection sends no译文");
   } finally { await page.close(); }
 });
 
@@ -411,7 +557,7 @@ for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; c
 
 for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; charset=utf-8"]) {
   const mode = contentType.startsWith("application") ? "XHTML" : "HTML";
-  test(`${mode}: wrapping list originals preserves note offsets and excludes translated selections`, async () => {
+  test(`${mode}: wrapping list originals preserves note offsets and resolves translated selections`, async () => {
     const page = await pageWithFixture('<!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><title>Anchors</title><style>body{font:24px/1.8 Arial;margin:30px}</style></head><body><p id="before">Before</p><ol start="4"><li id="list">A <strong>B</strong></li></ol><p id="end">End</p></body></html>', contentType);
     try {
       const readAnchor = async () => {
@@ -455,7 +601,8 @@ for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; c
         reported: window.__messages.filter((item) => item.type === "selection_changed").at(-1)?.selected_text,
         toolbarHidden: window.__notesRoot.querySelector(".toolbar").hidden,
       }));
-      assert.deepEqual(selection, { reported: "", toolbarHidden: true });
+      assert.deepEqual(selection, { reported: "A B", toolbarHidden: false },
+        "a selection on the translated list item resolves to the original list text");
       await page.evaluate(() => {
         window.getSelection().removeAllRanges();
         document.getElementById("list").querySelector(".moye-translation-text").click();
@@ -501,8 +648,9 @@ for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; c
   const mode = contentType.startsWith("application") ? "XHTML" : "HTML";
   test(`${mode}: invisible-format-only leaves are not translation slots on either side`, async () => {
     // 宿主现场回归：代码用 ZWSP 缩进，ZWSP 不属于 ECMAScript `\s`。旧叶子列表把它
-    // 当成片段，模型只能回空白，整块被 `empty_segment_text` 拒绝。
-    const page = await pageWithFixture('<!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><title>Invisible leaves</title></head><body><p id="code-line"><span id="indent">\u200b\u200b</span><span>const</span> THREE_AND_A_BIT : f32 = 3.4028236;</p><p id="blank">\u200b\u00ad</p></body></html>', contentType);
+    // 当成片段，模型只能回空白，整块被 `empty_segment_text` 拒绝；该块现在整体是代码，
+    // 不再进入翻译，正文块仍保留同一份叶子过滤。
+    const page = await pageWithFixture('<!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><title>Invisible leaves</title></head><body><p id="code-line"><span id="indent">\u200b\u200b</span><span>const</span> THREE_AND_A_BIT : f32 = 3.4028236;</p><p id="prose"><span id="prose-indent">\u200b\u200b</span><span>甲</span> 乙</p><p id="blank">\u200b\u00ad</p></body></html>', contentType);
     try {
       await page.evaluate((payload) => window.moyeTranslations.configure(payload), {
         session: "invisible-leaf-session", displayMode: "translation-only", blocks: [
@@ -510,20 +658,64 @@ for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; c
             ["const", "常量"],
             [" THREE_AND_A_BIT : f32 = 3.4028236;", "三分之一个字节的常量"],
           ]),
+          segmentBlock("prose", "\u200b\u200b甲 乙", [["甲", "甲组"], [" 乙", " 乙组"]]),
         ],
       });
       const state = await page.evaluate(() => ({
         applied: window.moyeTranslations.applied(),
         layers: document.querySelectorAll("[data-moye-translation]").length,
         indent: document.getElementById("indent").textContent,
-        translated: document.getElementById("code-line").previousElementSibling
+        codeTranslated: document.getElementById("code-line").previousElementSibling
+          ?.querySelector(".moye-translation-text")?.textContent,
+        proseIndent: document.getElementById("prose-indent").textContent,
+        proseTranslated: document.getElementById("prose").previousElementSibling
           ?.querySelector(".moye-translation-text")?.textContent,
       }));
       assert.deepEqual(state, {
         applied: 1, layers: 1,
-        indent: "\u200b\u200b",
-        translated: "\u200b\u200b常量 三分之一个字节的常量",
-      }, "the invisible indentation keeps its node and only visible leaves are replaced");
+        indent: "\u200b\u200b", codeTranslated: undefined,
+        proseIndent: "\u200b\u200b", proseTranslated: "\u200b\u200b甲组 乙组",
+      }, "the invisible indentation keeps its node, code is skipped whole and only visible prose leaves are replaced");
+    } finally { await page.close(); }
+  });
+}
+
+for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; charset=utf-8"]) {
+  const mode = contentType.startsWith("application") ? "XHTML" : "HTML";
+  test(`${mode}: code-shaped paragraphs keep their original text`, async () => {
+    // 未用 pre/code 标记的代码（Calibre/Word 转换、验收 EPUB 的缩进代码行）也必须
+    // 不翻译；正文句子即使带括号、URL 或全角标点仍然翻译。
+    const page = await pageWithFixture('<!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><title>Code shape</title></head><body><p id="statement">const TOTAL : f32 = 3.5;</p><p id="braces">fn main() {</p><p id="comment">// 注释</p><p id="operator">count =&gt; count + 1</p><p id="prose">Read the note (see above).</p><p id="url">https://example.test/a/b</p></body></html>', contentType);
+    try {
+      await page.evaluate((payload) => window.moyeTranslations.configure(payload), {
+        session: "code-shape-session", displayMode: "translation-only", blocks: [
+          segmentBlock("statement", "const TOTAL : f32 = 3.5;", [["const TOTAL : f32 = 3.5;", "常量"]]),
+          segmentBlock("braces", "fn main() {", [["fn main() {", "主函数 {"]]),
+          segmentBlock("comment", "// 注释", [["// 注释", "注释"]]),
+          segmentBlock("operator", "count => count + 1", [["count => count + 1", "计数递增"]]),
+          segmentBlock("prose", "Read the note (see above).", [["Read the note (see above).", "读上面的说明。"]]),
+          segmentBlock("url", "https://example.test/a/b", [["https://example.test/a/b", "示例链接"]]),
+        ],
+      });
+      const state = await page.evaluate(() => {
+        const layered = (id) => !!document.getElementById(id).previousElementSibling
+          ?.hasAttribute("data-moye-translation");
+        const text = (id) => document.getElementById(id).previousElementSibling
+          ?.querySelector(".moye-translation-text")?.textContent;
+        return {
+          applied: window.moyeTranslations.applied(),
+          statement: layered("statement"), braces: layered("braces"),
+          comment: layered("comment"), operator: layered("operator"),
+          prose: layered("prose"), url: layered("url"),
+          proseText: text("prose"), urlText: text("url"),
+        };
+      });
+      assert.deepEqual(state, {
+        applied: 2,
+        statement: false, braces: false, comment: false, operator: false,
+        prose: true, url: true,
+        proseText: "读上面的说明。", urlText: "示例链接",
+      }, "code keeps its original text while prose and a bare URL stay translatable");
     } finally { await page.close(); }
   });
 }

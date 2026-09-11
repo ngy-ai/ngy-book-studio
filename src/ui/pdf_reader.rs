@@ -1880,6 +1880,7 @@ fn pdf_reference_hints(
                     format!("第 {} 页 · {}", page.page_number, page.title)
                 },
                 frozen_text: selected_text,
+                displayed_text: None,
                 revision: None,
             })
         })

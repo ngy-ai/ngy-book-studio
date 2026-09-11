@@ -251,6 +251,60 @@ test("native AI explanation uses the frozen context-menu anchor and can retry a 
   } finally { await page.close(); }
 });
 
+test("native AI explanation accepts the block-separated text WebView2 reports", async () => {
+  // Minified block markup has no whitespace between the blocks, so the frozen
+  // quote is glued while the menu reports the boundary as newlines.
+  const page = await pageWithFixture('<!doctype html><html><body>' +
+    '<p id="second">Alpha <b>beta</b> 😀 gamma</p>' +
+    '<p id="last">最后一段，用于保持原文选择与导航。</p></body></html>');
+  const quote = "Alpha beta 😀 gamma最后一段，用于保持原文选择与导航。";
+  try {
+    // WebView2 captures the menu selection with Blink's text iterator, which
+    // emits '\n' at block boundaries where the frozen range's textContent has no
+    // separator. Chromium derives getSelection().toString() the same way, so it
+    // stands in for the text the host hands back to the page bridge.
+    const reported = await page.evaluate(() => {
+      const end = document.querySelector("#last").firstChild;
+      const range = document.createRange();
+      range.setStart(document.querySelector("#second").firstChild, 0);
+      range.setEnd(end, end.length);
+      window.getSelection().removeAllRanges();
+      window.getSelection().addRange(range);
+      document.querySelector("#second").dispatchEvent(new MouseEvent("contextmenu", { bubbles: true }));
+      return window.getSelection().toString();
+    });
+    assert.ok(reported.includes("\n"), `the menu text keeps the block separator: ${JSON.stringify(reported)}`);
+    assert.equal(reported.replace(/\s/gu, ""), quote.replace(/\s/gu, ""));
+    // The exact comparison the native menu used to be gated on: normalizing
+    // both sides still leaves a space where the frozen quote has none.
+    assert.notEqual(reported.replace(/\s+/gu, " ").trim(), quote);
+    assert.equal(await page.evaluate((text) => window.moyeAnnotations.explainSelection(text), reported), true);
+    const request = await lastMessage(page, "ai_explain");
+    assert.equal(request.anchor.quote, quote);
+    assert.deepEqual([request.anchor.start, request.anchor.end], [0, quote.replace(/\s/gu, "").length]);
+    assert.equal(await page.evaluate(() => window.__notesRoot.querySelector(".note.pending-note .quote").textContent),
+      quote);
+  } finally { await page.close(); }
+});
+
+test("native AI explanation accepts a <br> selection reported with a newline", async () => {
+  const page = await pageWithFixture('<!doctype html><html><body><p id="second">Alpha<br>beta</p></body></html>');
+  try {
+    const reported = await page.evaluate(() => {
+      const range = document.createRange();
+      range.selectNodeContents(document.querySelector("#second"));
+      window.getSelection().removeAllRanges();
+      window.getSelection().addRange(range);
+      document.querySelector("#second").dispatchEvent(new MouseEvent("contextmenu", { bubbles: true }));
+      return window.getSelection().toString();
+    });
+    assert.ok(reported.includes("\n"), `the menu text keeps the line break: ${JSON.stringify(reported)}`);
+    assert.notEqual(reported.replace(/\s+/gu, " ").trim(), "Alphabeta");
+    assert.equal(await page.evaluate((text) => window.moyeAnnotations.explainSelection(text), reported), true);
+    assert.equal((await lastMessage(page, "ai_explain")).anchor.quote, "Alphabeta");
+  } finally { await page.close(); }
+});
+
 test("stale sessions cannot mutate notes; deletion failure restores its button", async () => {
   const page = await pageWithFixture();
   try {

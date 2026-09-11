@@ -139,8 +139,26 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   流块分类计数（`content_events`、`empty_content_events`、`unrecognized_events`），
   不记录原文、译文、任意字段名或解析器错误正文。空 `content` 块与“本客户端不消费的块”
   必须分开计数：否则“120 秒超时、2886 个事件、0 字节正文”会被读成健康但缓慢的回答。
+  翻译流不再按总时长掐断：每 10 秒输出一条 `translation_stream_progress`（已用时、距上次
+  事件的静默、正文块数/字节数、完整 JSON 容器数、未闭合容器、片段标记数、思考块状态、
+  答案重复标记），流结束时把同一组形状计数写进 `translation_stream`，失败时另存
+  `translation_response_salvaged`。这些计数只说明“模型没写出答案 / 思考没结束 / 答案重复
+  输出 / 容器被打断”，不含任何正文；`MOYE_DUMP_TRANSLATION_RAW` 仍是唯一会打印响应与
+  冻结输入的开关，并且现在也覆盖流失败。流没有正常结束（含 `ProviderTimeout` 静默超时）
+  但已收到的字节能通过完整分段校验（只有一个完整容器、id 不多不少）时采用该答案并记警告；
+  两个答案、缺片段、容器被截断或校验失败一律不猜、按原样失败，此时 provider 失败仍让
+  整个任务失败。
   `pre/code` 内容计入全文匹配但不翻译，过滤 script/style/noscript/template；换行节点由
-  源 DOM 保留，空白规范化与 ECMAScript `\s` 一致。文本叶节点必须去掉 ECMAScript `\s`
+  源 DOM 保留，空白规范化与 ECMAScript `\s` 一致。**代码块整体不翻译**：除 `pre`/`code`
+  子树外，未标记但整段是代码的块（Calibre/Word 转换把每行代码放成独立 `<p>`，验收 EPUB
+  的 ZWSP 缩进代码行）也要跳过——`markup::looks_like_source_code` 与 `translations.js` 的
+  `looksLikeSourceCode` 必须使用同一套规则与同一份表：任一行去掉 ECMAScript 空白、ZWSP、
+  ZWNBSP、软连字符后以 `;`/`{`/`}` 结尾、以 `//`、`/*`、`*/`、`#!`、`#include`、`#define`、
+  `#pragma`、`<!--` 开头、整行是 `<…>` 标记，或含 `=>`/`->`/`::`/`:=`/`==`/`!=`/`<=`/`>=`/
+  `&&`/`||`/`+=`/`-=`/`*=`/`/=`/`</`/`/>` 之一即判为代码。裸 `=` 与全角 `；`/`：` 不算信号，
+  行内 `<code>`（正文提到代码）不影响该段翻译；两侧规则不一致会让代码块吃掉后续同文本
+  正文块的译文。判断只看非代码叶子的行（`<br>` 记为换行，匹配文本不变）。
+  文本叶节点必须去掉 ECMAScript `\s`
   和 Unicode `Cf` 格式字符后仍有可见字符，才能成为翻译槽：EPUB 常用 ZWSP 缩进代码行，
   ZWSP 不属于 `\s`，送进协议后模型只会回空白，`empty_segment_text` 会拒绝该文本块
   （现场 96 号代码行）。`markup` 与 `translations.js` 必须共用同一份字符表，两边叶节点
@@ -169,6 +187,15 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   Windows PDF 原页光栅化、可暂停/恢复/重试/取消的持久任务和本地 PDF.js 资产路由。
 - `src/ai.rs`、`src/credentials.rs`：OpenAI-compatible models/chat streaming/embeddings
   接口、端点策略和 Windows Credential Manager 密钥存储。
+  端点配置的“请求超时”不再作为 reqwest 的整段请求超时：`Client` 只保留 10 秒连接超时，
+  非流式调用（models/embeddings）由 `within_request_timeout` 按总时长约束，流式回答由
+  `ProviderTimeout::stream` 约束“两个数据块之间的静默”，因此持续输出数据的慢模型不会被
+  中途掐断（2026-09-11：120 秒整段超时切掉了一条仍有 1579 个正文块、7024 字节正文、
+  没有 `[DONE]` 的流，整本图书被判失败）。流的总规模仍由 `max_tokens`、32 MiB 字节上限和
+  65536 事件上限约束。`ProviderTimeout` 在 `ai_diagnostics` 中映射为固定分类
+  `http_timeout`，后台任务日志与 UI 不因超时改在块间生效而出现新类别。
+  `SseDiagnostics` 每 10 秒输出一条与内容无关的传输进度行（`sse_progress`：字节数、事件数、
+  正文块数、空块数、距上次事件的时间、最大间隔），结束时不再只给分类计数。
 - `src/agent.rs`、`src/agent_runtime.rs`、`src/agent_chat.rs`、`src/chat.rs`：只读 Agent
   工具、SSE/tool-call 循环、窗口授权范围、会话/消息/引用持久化与对话编排。
 - `src/office_com.rs`、`src/office_preview.rs`、`src/office_visual.rs`：可选 Office STA
@@ -223,14 +250,41 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   单调门控 `evaluate_script` 注入；打开新章后的迟到完成不得覆盖当前章。译文逐块写入，
   一章不必等整本任务结束：窗口按 2 秒轮询本书未完成翻译任务的游标 `completed`，前进时
   重新读取当前单元，并按（单元、显示方式、译文载荷）指纹跳过未变化的推送，任务结束再
-  补一次读取；轮询查询必须走应用 I/O runtime，不得阻塞 GPUI 回调。前端按
+  补一次读取；轮询查询必须走应用 I/O runtime，不得阻塞 GPUI 回调。
+  显示方式有“双语 / 原文 / 译文”三种。系统配置的 `translation.preferences.v1`
+  （`bilingual`/`original-only`/`translation-only`，默认 `translation-only`）只是全局默认；
+  阅读窗口工具栏的三态切换写入本书自己的 settings 行
+  （`db::settings::translation_display_book_key`，`delete_document` 必须随图书清掉），
+  **本书的选择优先于全局**，全局变化只影响没有自己选择的图书。一旦本书有自己的选择，
+  切换旁出现“跟随全局”按钮：它删掉该行、按当前全局重算并重推，使本书重新跟随系统配置。
+  窗口打开时先按全局渲染，
+  再异步读取本书选择（读失败保留全局，不得阻断章节）；模式只以
+  `ReaderTranslations::effective` 为准，`apply_translation_display_mode` 负责重算并重新推送。
+  原文模式不查询译文表：推送空 `blocks` 让前端 `clear()` 撤掉已有译文层并恢复被隐藏的
+  原文（列表包装也要还原），也不再轮询任务游标；指纹包含模式标签，因此同一批译文在
+  模式之间切换仍会重写页面。前端按
   “规范化原文文本（重复文本按文档顺序消歧）”匹配正文块级元素，译文块一律标记
   `data-moye-translation` 并插入原文之前，默认「译文在上、虚线分隔、原文在下」，
   点击译文切换该段的仅译文/双语；表格单元格把译文插到单元格内部且不参与切换。
-  译文节点必须从 `annotations.js` 的 `textIndex()`/`currentSelection()` 与
-  `READER_INITIALIZATION_SCRIPT` 的 `boundedSelection()` 中排除（选区跨译文时按
+  译文节点必须从 `annotations.js` 的 `textIndex()` 与选区文本中排除（跨译文选区按
   fragment 过滤译文后再取文本），原文文本节点始终保留在 `body`，使笔记 UTF-16 锚点、
-  版本校验和重叠标记语义不受翻译影响。译文文字只用 `textContent`/文字节点写入，不能当 HTML。
+  版本校验和重叠标记语义不受翻译影响。落在译文层内的选区**不能丢弃**：`currentSelection()`
+  与 `READER_INITIALIZATION_SCRIPT` 的 `boundedSelection()` 都先调用
+  `moyeTranslations.originalRange(range)`（`translations.js` 拥有该映射：记录每个译文叶子
+  由哪个原文叶子重建，取选区命中叶子中首个到最后一个原文叶子的跨度），拿不到映射才返回空。
+  译文与原文没有逐字符对应，粒度因此是“叶子”：单叶段落等于整段，行内 `<strong>` 等只映射
+  该叶子；`choose()` 对非 AI 解释动作改用当前选区，避免点击早于 80ms 防抖时用旧快照。
+  原生菜单回传的是用户看到的译文，与原文引文不可能相等，译文快照只按冻结锚点自身校验。
+  工具栏动作按当前选区执行（`choose(action)`），只有原生菜单保留冻结快照
+  （`choose(action, true)`），避免点击早于 80 ms 防抖时用旧快照。
+  「译文」模式原文被隐藏（`display:none`），标记没有 `getClientRects()` 可画，切到双语或
+  原文才会显示；笔记卡、AI 引用与宿主校验始终是原文。
+  解释译文时页面把所选译文作为 `displayed_text` 回传，只允许 `ai_explain` 且不超过
+  `MAX_READER_SELECTION_BYTES`（`AnnotationAction::valid()`）；`reader_explanation_reference`
+  把它放进 `AiReferenceHint.displayed_text`，`ai_sidebar::selection_explanation_question`
+  据此构造提问（空值回退固定问题，超长按 `MAX_QUESTION_BYTES` 在字符边界截断而不是拒绝）。
+  `frozen_text`、引用快照、来源与笔记始终是原文，`displayed_text` 只进提问，不进快照、
+  引用或存储。译文文字只用 `textContent`/文字节点写入，不能当 HTML。
   译文格式只从当前原文 DOM 的白名单元素与排版 computed style 重建，禁止复制 ID、事件和
   URL 属性；逐项核验源文字叶节点，匹配失败保留原文。直接列表项保留 li 和编号，内部
   原文包装必须可在 clear 时恢复；含媒体段落保持双语，不能隐藏图片。HTML/XHTML 均须支持。
@@ -314,6 +368,11 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   笔记引用隔离验收：真实窗口选择人工想法、与正文相同的笔记引文及编辑框文字时，AI
   侧栏保持“当前章节”且无自动引用；重新选择正文恢复“当前章节高亮”。HTML/XHTML
   联合桥接回归还覆盖选区复制、80ms 迟到事件及笔记右键清除旧正文解释快照。
+  原生右键“AI解释”回传的是 WebView2 按 Blink 文本迭代器提取的选区文字：跨段落或
+  含 `<br>` 时会插入 `\n`，而冻结范围的 `textContent` 没有任何分隔符，因此两者只能
+  按可见字符比较（`compact`），不能直接比对规范化文本；`\n`、制表符或首尾空白不一致
+  都会让合法选区被误判为“选中文字已变化”。锚点始终来自冻结范围，宿主仍按去空白后
+  的 UTF-16 范围校验，比较放宽不会改变笔记位置。
 - `web/pdf/` 与 `assets/pdfjs/`：固定版本 PDF.js shell、lockfile、清单和提交的本地
   资产；不得改为 CDN 或运行时联网获取。`web/pdf/src/viewer.mjs` 是上下连续滚动的实现：
   页列一次性布局，`IntersectionObserver` 按需绘制、远离阅读位置后回收为占位页；滚动

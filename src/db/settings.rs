@@ -1,6 +1,13 @@
 use anyhow::{Context as _, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
+/// Settings key of one book's reading-time translation display choice. The
+/// `settings` table has no foreign key, so whoever deletes a book must delete
+/// this key with it.
+pub(crate) fn translation_display_book_key(book_id: &str) -> String {
+    format!("translation.display.book.v1.{book_id}")
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Setting {
     pub(crate) key: String,
