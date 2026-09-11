@@ -13,6 +13,7 @@ mod epub_limits;
 pub mod export;
 pub mod formats;
 pub mod indexing;
+pub mod job_diagnostics;
 pub mod learning;
 pub mod learning_records;
 pub mod library;
@@ -28,6 +29,7 @@ pub mod runtime;
 pub mod search;
 pub mod services;
 pub mod storage;
+pub mod translation;
 pub mod web_search;
 #[cfg(target_os = "windows")]
 pub mod windows_pdf_renderer;

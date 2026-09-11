@@ -473,6 +473,16 @@ pub(crate) fn reconfigure_translation_jobs(
                 let cursor_json = translation_cursor_json(source, model, execution_identity, 0)?;
                 let status = translation_initial_status(auto_run);
                 if index_jobs::reset_reconfigured(&tx, &job.id, status, &cursor_json, now)? == 1 {
+                    // A changed endpoint, model or translation protocol cannot
+                    // reuse rows from the previous execution, even if the model
+                    // name happens to be the same on both endpoints.
+                    if let Some(language) = target_language {
+                        super::translations::delete_for_book_language(
+                            &tx,
+                            &source.book_id,
+                            language,
+                        )?;
+                    }
                     changed += 1;
                 }
             }

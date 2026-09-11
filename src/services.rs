@@ -18,6 +18,10 @@ use std::{
 use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 
+pub use crate::job_diagnostics::{
+    BACKGROUND_JOB_LOG_LIMIT, BackgroundJobLogEntry, BackgroundJobLogSnapshot, JobLogLevel,
+};
+
 #[cfg(target_os = "windows")]
 use crate::office_visual::{OFFICE_ENHANCED_RENDERER_NAME, OfficeEnhancedRenderer};
 #[cfg(target_os = "windows")]
@@ -618,7 +622,7 @@ pub struct BackgroundJobSnapshot {
 pub struct TranslatedBlock {
     pub key: String,
     pub source: String,
-    pub translated: String,
+    pub segments: Vec<crate::translation::TranslationSegment>,
 }
 
 /// Whether a book's declared language already satisfies a target tag. Compares
@@ -1035,6 +1039,7 @@ impl AppServices {
             return Ok(Vec::new());
         };
         let chat_model = settings.chat_model.clone();
+        let execution_identity = translation_execution_identity(&settings)?;
         let db_path = self.db_path.clone();
         self.runtime
             .handle()
@@ -1065,10 +1070,19 @@ impl AppServices {
                             && row.unit_revision == unit.revision
                             && row.model == chat_model
                     })
-                    .map(|row| TranslatedBlock {
-                        key: row.block_id,
-                        source: row.source_text,
-                        translated: row.translated_text,
+                    .filter_map(|row| {
+                        let translation = serde_json::from_str::<
+                            crate::translation::StoredTranslation,
+                        >(&row.translated_text)
+                        .ok()?;
+                        if translation.execution_identity != execution_identity {
+                            return None;
+                        }
+                        Some(TranslatedBlock {
+                            key: row.block_id,
+                            source: row.source_text,
+                            segments: translation.segments,
+                        })
                     })
                     .collect())
             })
@@ -1714,6 +1728,31 @@ impl AppServices {
             .context("后台任务查询线程异常退出")?
     }
 
+    /// Reads the most recent 500 diagnostic entries after checking the same
+    /// explicit book scope used by the task list. An empty scope grants no
+    /// access, and deleted jobs cannot expose leftover diagnostic history.
+    pub async fn background_job_logs(
+        &self,
+        job_id: String,
+        book_ids: Vec<String>,
+    ) -> Result<BackgroundJobLogSnapshot> {
+        ensure!(!job_id.trim().is_empty(), "后台任务 ID 不能为空");
+        let db_path = self.db_path.clone();
+        self.runtime
+            .handle()
+            .spawn_blocking(move || {
+                let conn = db::open_conn(&db_path)?;
+                let job = db::index_jobs::get(&conn, &job_id)?.context("后台任务已不存在")?;
+                ensure!(
+                    book_ids.iter().any(|book_id| book_id == &job.book_id),
+                    "后台任务不在当前图书范围内"
+                );
+                crate::job_diagnostics::JobDiagnosticStore::for_database(&db_path)?.read(&job_id)
+            })
+            .await
+            .context("后台任务日志查询线程异常退出")?
+    }
+
     /// Applies one state transition using the coordinator that owns the job
     /// kind. In particular, a running visual renderer must receive its in-memory
     /// control signal in addition to the durable SQLite flag.
@@ -1979,16 +2018,12 @@ fn background_job_snapshot(
             Some(db::search_chunks::count_for_source(conn, source_id)?)
         }
         ("vision", Some(source_id)) => Some(db::visual_pages::count_for_source(conn, source_id)?),
-        ("visual_render", Some(source_id)) => match cursor
-            .as_ref()
-            .and_then(|value| value.get("spec"))
-            .and_then(|spec| spec.get("unit_ids"))
-            .and_then(serde_json::Value::as_array)
-            .map(Vec::len)
-        {
-            Some(total) if total != 0 => Some(total),
-            _ => Some(db::content_units::count_for_source(conn, source_id)?),
-        },
+        // A content unit can render to several pages. The final page count
+        // is known only after publication succeeds; unit_ids is not a page total.
+        ("visual_render", _) if job.status == db::index_jobs::IndexJobStatus::Succeeded => {
+            Some(completed)
+        }
+        ("visual_render", _) => None,
         _ => None,
     };
     let kept_cursor = snapshot_cursor_json(&job.kind, job.status, &job.cursor_json);
@@ -2179,7 +2214,7 @@ fn indexing_model_config(settings: &ProviderSettings) -> Result<IndexingModelCon
 fn translation_execution_identity(settings: &ProviderSettings) -> Result<String> {
     let endpoint = normalize_provider_base_url(&settings.endpoint_for(ModelRole::Chat)?.base_url)?;
     Ok(format!(
-        "translation-v1:{}",
+        "translation-v2:{}",
         blake3::hash(format!("{}\0{}", endpoint.as_str(), settings.chat_model).as_bytes()).to_hex()
     ))
 }
@@ -3540,6 +3575,50 @@ mod tests {
     }
 
     #[test]
+    fn background_job_logs_enforce_book_scope_and_job_existence() {
+        use crate::job_diagnostics::{JobLogEvent, JobLogMetrics, record_for_database};
+
+        let temp = tempfile::tempdir().unwrap();
+        let services = AppServices::open_with_credentials(
+            temp.path(),
+            Arc::new(MemoryCredentialStore::default()),
+        )
+        .unwrap();
+        let created = block_on_without_tokio(async {
+            services
+                .spawn_library_projected(|library| library.create_book("日志范围", "作者"))
+                .await
+                .context("library mutation worker stopped")?
+        })
+        .unwrap();
+        let conn = db::open_conn(services.database_path()).unwrap();
+        let jobs = db::index_jobs::list_for_book(&conn, &created.value.id).unwrap();
+        let job_id = jobs[0].id.clone();
+        record_for_database(
+            services.database_path(),
+            &job_id,
+            JobLogEvent::RunStarted,
+            JobLogMetrics::default(),
+        );
+        let logs = block_on_without_tokio(
+            services.background_job_logs(job_id.clone(), vec![created.value.id.clone()]),
+        )
+        .unwrap();
+        assert_eq!(logs.entries.len(), 1);
+        for scope in [Vec::new(), vec!["another-book".into()]] {
+            assert!(
+                block_on_without_tokio(services.background_job_logs(job_id.clone(), scope))
+                    .is_err()
+            );
+        }
+        db::index_jobs::delete(&conn, &job_id).unwrap();
+        assert!(
+            block_on_without_tokio(services.background_job_logs(job_id, vec![created.value.id]))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn configured_background_job_policy_reaches_service_library_mutations() {
         let temp = tempfile::tempdir().unwrap();
         let services = AppServices::open_with_credentials(
@@ -4166,13 +4245,56 @@ mod tests {
             vec!["visual_render", "vision", "embedding"]
         );
         let visual = jobs.iter().find(|job| job.kind == "visual_render").unwrap();
-        assert_eq!(visual.progress.total, Some(1));
+        assert_eq!(visual.progress.total, None);
         assert!(
             runtime
                 .block_on(services.background_jobs_for_books(Vec::new()))
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn background_job_snapshots_use_actual_rendered_pages_instead_of_content_unit_count() {
+        use db::index_jobs::{IndexJob, IndexJobStatus};
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for status in [
+            IndexJobStatus::Queued,
+            IndexJobStatus::Running,
+            IndexJobStatus::Paused,
+            IndexJobStatus::Failed,
+            IndexJobStatus::Cancelled,
+            IndexJobStatus::Succeeded,
+        ] {
+            let job = IndexJob {
+                id: "visual-render:three-chapters".into(),
+                book_id: "book".into(),
+                source_id: Some("source".into()),
+                kind: "visual_render".into(),
+                status,
+                pause_requested: false,
+                cancel_requested: false,
+                attempts: 1,
+                cursor_json: serde_json::json!({
+                    "completed_pages": 7,
+                    "spec": { "unit_ids": ["chapter-1", "chapter-2", "chapter-3"] }
+                })
+                .to_string(),
+                error: None,
+                created_at: 1,
+                updated_at: 2,
+                started_at: Some(1),
+                finished_at: (status == IndexJobStatus::Succeeded).then_some(2),
+            };
+            let snapshot = background_job_snapshot(&conn, job).unwrap();
+            assert_eq!(snapshot.progress.completed, 7, "{status:?}");
+            assert_eq!(
+                snapshot.progress.total,
+                (status == IndexJobStatus::Succeeded).then_some(7),
+                "{status:?} must not treat three chapters as three pages"
+            );
+        }
     }
 
     #[test]

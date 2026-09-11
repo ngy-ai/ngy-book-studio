@@ -1,45 +1,65 @@
-// Trusted reading-time translation layer.
-//
-// Translations are matched to chapter blocks by normalized source text, so the
-// same runtime serves both the original EPUB XHTML and the synthesized EPUB the
-// importer produces for Office/Kindle formats. Inserted nodes are marked with
-// `data-moye-translation`; the notes runtime excludes them from its book-text
-// index and selection handling. Translation text is written with `textContent`
-// only, never as HTML.
+// Trusted reading-time translation layer. The model returns text leaves only;
+// formatting always comes from the current book DOM, never from model markup.
 (() => {
   "use strict";
 
   const MARK = "data-moye-translation";
-  const ORIGINAL_DISPLAY = "data-moye-original-display";
+  const XHTML = "http://www.w3.org/1999/xhtml";
   const SELECTOR = "p, h1, h2, h3, h4, h5, h6, li, blockquote, td, th";
+  const SKIPPED = new Set(["script", "style", "noscript", "template"]);
+  const PRESERVED = new Set(["code", "pre"]);
+  const MEDIA = "img,picture,svg,math,video,audio,canvas,iframe,object,embed,input,select,textarea,button";
+  const INLINE_TAGS = new Set([
+    "span", "b", "strong", "i", "em", "u", "s", "strike", "del", "ins",
+    "sub", "sup", "code", "pre", "br", "small", "mark", "kbd", "samp",
+    "var", "abbr", "cite", "q", "ruby", "rt", "rp", "bdi", "bdo", "time",
+  ]);
+  // All copied properties are inert: no URLs, generated content, positioning,
+  // event handlers, book IDs, classes or link targets enter the new subtree.
+  const TEXT_STYLES = [
+    "color", "background-color", "font-family", "font-size", "font-weight",
+    "font-style", "font-stretch", "font-variant", "line-height", "letter-spacing",
+    "word-spacing", "text-align", "text-indent", "text-transform", "direction",
+    "unicode-bidi", "white-space", "vertical-align", "text-decoration-line",
+    "text-decoration-style", "text-decoration-color", "text-decoration-thickness",
+    "text-underline-offset", "overflow-wrap", "word-break",
+  ];
+  const BOX_STYLES = [
+    "margin-top", "margin-right", "margin-bottom", "margin-left",
+    "padding-top", "padding-right", "padding-bottom", "padding-left",
+    ...["top", "right", "bottom", "left"].flatMap((side) =>
+      ["width", "style", "color"].map((part) => `border-${side}-${part}`)),
+  ];
 
   let session = "";
-  let appliedCount = 0;
+  const applied = [];
+  const normalize = (value) => (typeof value === "string" ? value : "").replace(/\s+/gu, " ").trim();
+  const tag = (element) => element.localName?.toLowerCase() || "";
+  const isCell = (element) => tag(element) === "td" || tag(element) === "th";
+  const create = (name) => document.createElementNS(XHTML, name);
 
-  const normalize = (value) => (value || "").replace(/\s+/gu, " ").trim();
-
-  const isCell = (element) =>
-    element.tagName === "TD" || element.tagName === "TH";
-
-  const clear = () => {
-    for (const node of Array.from(document.querySelectorAll(`[${MARK}]`))) {
-      const original = node.__moyeOriginal;
-      if (original && original.isConnected) {
-        const previous = original.getAttribute(ORIGINAL_DISPLAY);
-        if (previous !== null) {
-          original.style.display = previous;
-          original.removeAttribute(ORIGINAL_DISPLAY);
-        }
-      }
-      node.remove();
+  const copyStyles = (source, target, includeBox) => {
+    const style = getComputedStyle(source);
+    for (const name of includeBox ? [...TEXT_STYLES, ...BOX_STYLES] : TEXT_STYLES) {
+      const value = style.getPropertyValue(name);
+      if (value) target.style.setProperty(name, value, "important");
     }
-    appliedCount = 0;
   };
 
-  // Only the innermost block elements participate, so a list item that merely
-  // wraps a paragraph is matched once, on the paragraph.
+  const clear = () => {
+    for (const state of applied) {
+      if (state.hidden) restoreOriginal(state);
+      state.layer.remove();
+      if (state.wrapper?.parentNode) state.wrapper.replaceWith(...state.wrapper.childNodes);
+    }
+    applied.length = 0;
+  };
+
+  // Only innermost blocks participate. Skipped subtrees do not contribute text
+  // or prevent an otherwise innermost paragraph from being translated.
   const candidateElements = () => {
-    const all = Array.from(document.body.querySelectorAll(SELECTOR));
+    const all = Array.from(document.body.querySelectorAll(SELECTOR))
+      .filter((element) => !element.closest("script,style,noscript,template,pre,code"));
     const parents = new Set();
     for (const element of all) {
       const parent = element.parentElement?.closest(SELECTOR);
@@ -48,120 +68,166 @@
     return all.filter((element) => !parents.has(element));
   };
 
-  const toggle = (element, block, divider) => {
-    let collapsed = block.getAttribute("data-moye-collapsed") === "1";
-    return (event) => {
-      if (event) {
-        event.preventDefault();
-        event.stopPropagation();
+  const inspect = (element) => {
+    const leaves = [];
+    const text = [];
+    const visit = (node, preserved) => {
+      if (node.nodeType === Node.TEXT_NODE) {
+        text.push(node.data);
+        if (!preserved && normalize(node.data)) leaves.push(node);
+      } else if (node.nodeType === Node.ELEMENT_NODE && !SKIPPED.has(tag(node))) {
+        for (const child of node.childNodes) visit(child, preserved || PRESERVED.has(tag(node)));
       }
-      collapsed = !collapsed;
-      divider.style.display = collapsed ? "none" : "";
-      if (collapsed) {
-        if (element.getAttribute(ORIGINAL_DISPLAY) === null) {
-          element.setAttribute(ORIGINAL_DISPLAY, element.style.display || "");
-        }
-        element.style.display = "none";
-      } else {
-        const previous = element.getAttribute(ORIGINAL_DISPLAY);
-        if (previous !== null) {
-          element.style.display = previous;
-          element.removeAttribute(ORIGINAL_DISPLAY);
-        }
-      }
-      block.setAttribute("data-moye-collapsed", collapsed ? "1" : "0");
     };
+    visit(element, !!element.parentElement?.closest("pre,code"));
+    return { source: normalize(text.join("")), leaves };
   };
 
-  const buildBlock = (element, translated, collapsed) => {
-    const block = document.createElement("div");
-    block.setAttribute(MARK, "1");
-    block.className = "moye-translation-block";
-    block.style.cssText = "margin:0 0 0.35em 0;padding:0;";
-    block.setAttribute("data-moye-collapsed", collapsed ? "1" : "0");
+  const validatedLeaves = (entry, source) => {
+    if (!Array.isArray(entry.segments) || entry.segments.length !== source.leaves.length
+      || !entry.segments.length) return null;
+    const translated = new Map();
+    for (let index = 0; index < source.leaves.length; index += 1) {
+      const segment = entry.segments[index];
+      const leaf = source.leaves[index];
+      if (!segment || typeof segment.source !== "string"
+        || normalize(segment.source) !== normalize(leaf.data)
+        || typeof segment.translated !== "string" || !normalize(segment.translated)) return null;
+      translated.set(leaf, segment.translated);
+    }
+    return translated;
+  };
 
-    const text = document.createElement("div");
+  const rebuild = (node, translated) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      // Keep boundary whitespace even if a provider trims a translated leaf.
+      const value = translated.get(node);
+      if (value === undefined) return document.createTextNode(node.data);
+      const leading = node.data.match(/^\s*/u)[0];
+      const trailing = node.data.match(/\s*$/u)[0];
+      return document.createTextNode(leading + value.trim() + trailing);
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE || SKIPPED.has(tag(node)) || node.matches(MEDIA)) return null;
+    const copy = create(INLINE_TAGS.has(tag(node)) ? tag(node) : "span");
+    copyStyles(node, copy, true);
+    for (const child of node.childNodes) {
+      const result = rebuild(child, translated);
+      if (result) copy.append(result);
+    }
+    return copy;
+  };
+
+  const restoreOriginal = (state) => {
+    const { original, display, priority, hadStyle } = state;
+    if (display) original.style.setProperty("display", display, priority);
+    else original.style.removeProperty("display");
+    if (!hadStyle && !original.getAttribute("style")) original.removeAttribute("style");
+    state.hidden = false;
+  };
+
+  const setCollapsed = (state, collapsed) => {
+    if (collapsed) {
+      state.original.style.setProperty("display", "none", "important");
+      state.hidden = true;
+    } else if (state.hidden) restoreOriginal(state);
+    state.divider.style.display = collapsed ? "none" : "block";
+    state.layer.setAttribute("data-moye-collapsed", collapsed ? "1" : "0");
+  };
+
+  const insert = (element, translated, translateOnly) => {
+    const inPlace = isCell(element) || tag(element) === "li";
+    const layer = create("div");
+    layer.setAttribute(MARK, "1");
+    layer.className = "moye-translation-block";
+    layer.style.cssText = "display:block!important;margin:0!important;padding:0!important;";
+    const text = create(inPlace ? "div" : tag(element));
     text.className = "moye-translation-text";
-    text.setAttribute("dir", "auto");
-    text.textContent = translated;
-    text.style.cssText = "white-space:pre-wrap;";
-
-    const divider = document.createElement("div");
+    copyStyles(element, text, !inPlace);
+    text.style.setProperty("display", "block", "important");
+    if (inPlace) {
+      text.style.setProperty("margin", "0", "important");
+      text.style.setProperty("padding", "0", "important");
+      text.style.setProperty("border", "0", "important");
+    }
+    for (const child of element.childNodes) {
+      const result = rebuild(child, translated);
+      if (result) text.append(result);
+    }
+    const divider = create("div");
     divider.className = "moye-translation-divider";
-    divider.style.cssText =
-      "border-top:1px dashed rgba(120,120,120,0.5);margin:0.35em 0;";
+    divider.style.cssText = "display:block;border-top:1px dashed rgba(120,120,120,0.5);margin:0.35em 0;";
+    layer.append(text, divider);
 
-    block.append(text, divider);
-
-    // Hiding a table cell would hide its own translation, so cells stay
-    // bilingual and are not click-toggleable.
-    if (!isCell(element)) {
-      // When "only translation" is the preference, the original is hidden up
-      // front; a click still reveals it through the same toggle.
-      if (collapsed) {
-        element.setAttribute(ORIGINAL_DISPLAY, element.style.display || "");
-        element.style.display = "none";
-        divider.style.display = "none";
-      }
-      const onToggle = toggle(element, block, divider);
-      text.style.cursor = "pointer";
+    let original = element;
+    let wrapper = null;
+    if (tag(element) === "li") {
+      // Keep the real LI and its marker. Moving its existing nodes into a
+      // reversible wrapper retains their identities and book-text order.
+      wrapper = create("span");
+      wrapper.style.setProperty("display", "contents", "important");
+      wrapper.append(...element.childNodes);
+      element.append(wrapper);
+      original = wrapper;
+    }
+    const state = {
+      original, wrapper, layer, divider, hidden: false,
+      display: original.style.getPropertyValue("display"),
+      priority: original.style.getPropertyPriority("display"),
+      hadStyle: original.hasAttribute("style"),
+    };
+    const toggleable = !isCell(element) && !element.querySelector(MEDIA);
+    const onToggle = (event) => {
+      // Dragging to copy a translation must not collapse the paragraph.
+      if (window.getSelection()?.toString()) return;
+      event.preventDefault();
+      event.stopPropagation();
+      setCollapsed(state, !state.hidden);
+    };
+    if (toggleable) {
+      text.style.setProperty("cursor", "pointer", "important");
       text.addEventListener("click", onToggle);
-      block.addEventListener("click", (event) => {
-        if (event.target === block) onToggle(event);
+      layer.addEventListener("click", (event) => {
+        if (event.target === layer) onToggle(event);
       });
-      block.__moyeOriginal = element;
     }
-    return block;
-  };
-
-  const insert = (element, block) => {
-    if (isCell(element)) {
-      element.insertBefore(block, element.firstChild);
-    } else {
-      element.parentNode.insertBefore(block, element);
-    }
+    if (inPlace) element.insertBefore(layer, element.firstChild);
+    else element.parentNode.insertBefore(layer, element);
+    setCollapsed(state, translateOnly && toggleable);
+    applied.push(state);
   };
 
   const configure = (payload) => {
     if (!payload || typeof payload !== "object") return;
     session = typeof payload.session === "string" ? payload.session : "";
     clear();
-    const entries = Array.isArray(payload.blocks) ? payload.blocks : [];
-    if (!entries.length) return;
-
-    // "translation-only" hides the original text until the reader toggles a
-    // paragraph; every other value keeps the original visible (bilingual).
-    const translateOnly = payload.displayMode === "translation-only";
-
     const queues = new Map();
-    for (const entry of entries) {
-      if (!entry || typeof entry.translated !== "string") continue;
+    for (const entry of Array.isArray(payload.blocks) ? payload.blocks : []) {
+      if (!entry || typeof entry.source !== "string") continue;
       const key = normalize(entry.source);
       if (!key) continue;
       if (!queues.has(key)) queues.set(key, []);
-      queues.get(key).push(entry.translated);
+      queues.get(key).push(entry);
     }
-    if (!queues.size) return;
-
+    if (!queues.size || !document.body) return;
     for (const element of candidateElements()) {
-      const queue = queues.get(normalize(element.textContent));
-      if (!queue || !queue.length) continue;
-      const translated = queue.shift();
-      if (!translated) continue;
-      insert(element, buildBlock(element, translated, translateOnly && !isCell(element)));
-      appliedCount += 1;
+      const source = inspect(element);
+      // The host does not emit code-only blocks. They must not consume a
+      // later translatable paragraph's entry when both have the same text.
+      if (!source.leaves.length) continue;
+      const queue = queues.get(source.source);
+      if (!queue?.length) continue;
+      const translated = validatedLeaves(queue.shift(), source);
+      // A stale/invalid result never hides book text. Consume its position so
+      // repeated source blocks cannot silently borrow a later block's result.
+      if (!translated || getComputedStyle(element).display === "none") continue;
+      insert(element, translated, payload.displayMode === "translation-only");
     }
-  };
-
-  const reset = () => {
-    session = "";
-    clear();
   };
 
   window.moyeTranslations = Object.freeze({
     configure,
-    clear: reset,
-    applied: () => appliedCount,
+    clear: () => { session = ""; clear(); },
+    applied: () => applied.length,
     session: () => session,
   });
 })();

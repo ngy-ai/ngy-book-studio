@@ -14,9 +14,9 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context as _, Result, ensure};
@@ -29,6 +29,7 @@ use crate::{
         Block, BookDocument, ContentUnit, ContentUnitKind, DocumentLocator, Inline, Revision,
         SourceLocator, TableRow, deterministic_id,
     },
+    job_diagnostics::{JobLogEvent, JobLogMetrics, classify_error, record_for_database},
 };
 
 pub const PDFJS_VERSION: &str = "5.7.284";
@@ -46,6 +47,11 @@ const MAX_STRUCTURAL_PAGES_PER_UNIT: usize = 10_000;
 const MAX_XLSX_COLUMNS: u32 = 16_384;
 const MAX_XLSX_ROWS: u32 = 1_048_576;
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+static NEXT_VISUAL_LOG_RUN_ID: AtomicU64 = AtomicU64::new(1);
+
+tokio::task_local! {
+    static VISUAL_LOG_RUN: (u64, Instant, u32);
+}
 
 mod pdfjs_routes {
     include!(concat!(
@@ -1847,6 +1853,10 @@ impl VisualJobRecord {
 }
 
 pub trait VisualJobStore: Send + Sync {
+    /// Diagnostics follow this store's library identity. In-memory/custom
+    /// stores opt in explicitly, so independent coordinators cannot mix logs.
+    fn record_diagnostic(&self, _job_id: &str, _event: JobLogEvent, _metrics: JobLogMetrics) {}
+
     fn create(&self, record: &VisualJobRecord) -> Result<()>;
     fn get(&self, job_id: &str) -> Result<Option<VisualJobRecord>>;
     fn queued_ids(&self, limit: usize) -> Result<Vec<String>>;
@@ -2106,6 +2116,10 @@ pub(crate) fn decode_persisted_visual_job(value: &str) -> Result<(VisualJobSpec,
 }
 
 impl VisualJobStore for SqliteVisualJobStore {
+    fn record_diagnostic(&self, job_id: &str, event: JobLogEvent, metrics: JobLogMetrics) {
+        record_for_database(&self.database_path, job_id, event, metrics);
+    }
+
     fn create(&self, record: &VisualJobRecord) -> Result<()> {
         record.spec.validate()?;
         let cursor =
@@ -2339,6 +2353,19 @@ struct CoordinatorCore {
     controls: Mutex<HashMap<String, RenderControl>>,
 }
 
+fn record_visual_event(
+    core: &CoordinatorCore,
+    job_id: &str,
+    event: JobLogEvent,
+    mut metrics: JobLogMetrics,
+) {
+    if let Ok((run_id, _, attempt)) = VISUAL_LOG_RUN.try_with(|context| *context) {
+        metrics.run_id = Some(run_id);
+        metrics.attempt.get_or_insert(u64::from(attempt));
+    }
+    core.store.record_diagnostic(job_id, event, metrics);
+}
+
 pub struct VisualJobCoordinator {
     core: Arc<CoordinatorCore>,
     sender: async_channel::Sender<String>,
@@ -2452,6 +2479,12 @@ impl VisualJobCoordinator {
             .spawn_blocking(move || store.create(&record))
             .await
             .context("视觉任务持久化线程异常退出")??;
+        record_visual_event(
+            &self.core,
+            &spec.id,
+            JobLogEvent::Queued,
+            JobLogMetrics::default(),
+        );
         self.sender
             .send(spec.id)
             .await
@@ -2513,9 +2546,11 @@ impl VisualJobCoordinator {
 
     async fn store_control(&self, job_id: &str, pause: bool) -> Result<bool> {
         let store = Arc::clone(&self.core.store);
+        let diagnostic_id = job_id.to_string();
         let job_id = job_id.to_string();
         let now = unix_timestamp()?;
-        self.runtime
+        let changed = self
+            .runtime
             .spawn_blocking(move || {
                 if pause {
                     store.request_pause(&job_id, now)
@@ -2524,7 +2559,20 @@ impl VisualJobCoordinator {
                 }
             })
             .await
-            .context("视觉任务控制线程异常退出")?
+            .context("视觉任务控制线程异常退出")??;
+        if changed {
+            record_visual_event(
+                &self.core,
+                &diagnostic_id,
+                if pause {
+                    JobLogEvent::PauseRequested
+                } else {
+                    JobLogEvent::CancelRequested
+                },
+                JobLogMetrics::default(),
+            );
+        }
+        Ok(changed)
     }
 
     pub async fn resume(&self, job_id: &str) -> Result<bool> {
@@ -2563,6 +2611,16 @@ impl VisualJobCoordinator {
             .await
             .context("视觉任务重新入队线程异常退出")??;
         if changed {
+            record_visual_event(
+                &self.core,
+                job_id,
+                if retry {
+                    JobLogEvent::RetryRequested
+                } else {
+                    JobLogEvent::ResumeRequested
+                },
+                JobLogMetrics::default(),
+            );
             self.sender
                 .send(job_id.to_string())
                 .await
@@ -2622,6 +2680,12 @@ impl VisualJobCoordinator {
             .send(job_id.to_string())
             .await
             .context("视觉任务队列已经关闭")?;
+        record_visual_event(
+            &self.core,
+            job_id,
+            JobLogEvent::Recovered,
+            JobLogMetrics::default(),
+        );
         Ok(true)
     }
 
@@ -2673,6 +2737,12 @@ async fn process_visual_job(core: Arc<CoordinatorCore>, job_id: &str) -> Result<
             None,
         )
         .await?;
+        record_visual_event(
+            &core,
+            job_id,
+            JobLogEvent::Cancelled,
+            JobLogMetrics::default(),
+        );
         return Ok(());
     }
     if record.pause_requested {
@@ -2684,6 +2754,7 @@ async fn process_visual_job(core: Arc<CoordinatorCore>, job_id: &str) -> Result<
             None,
         )
         .await?;
+        record_visual_event(&core, job_id, JobLogEvent::Paused, JobLogMetrics::default());
         return Ok(());
     }
 
@@ -2695,57 +2766,110 @@ async fn process_visual_job(core: Arc<CoordinatorCore>, job_id: &str) -> Result<
         None,
     )
     .await?;
-    let control = RenderControl::default();
-    core.controls
-        .lock()
-        .map_err(|_| anyhow::anyhow!("视觉任务控制锁已损坏"))?
-        .insert(job_id.to_string(), control.clone());
+    let run_id = NEXT_VISUAL_LOG_RUN_ID.fetch_add(1, Ordering::Relaxed);
+    VISUAL_LOG_RUN
+        .scope(
+            (run_id, Instant::now(), record.attempts.saturating_add(1)),
+            async {
+                record_visual_event(
+                    &core,
+                    job_id,
+                    JobLogEvent::RunStarted,
+                    JobLogMetrics {
+                        ordinal: Some(record.completed_pages as u64),
+                        ..JobLogMetrics::default()
+                    },
+                );
+                let control = RenderControl::default();
+                core.controls
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("视觉任务控制锁已损坏"))?
+                    .insert(job_id.to_string(), control.clone());
 
-    // A pause/cancel request can land after the queued-state read but before
-    // the in-memory control is published. Re-read persisted flags once the
-    // control is visible so that narrow race cannot lose an accepted request.
-    if let Some(latest) = blocking_get(Arc::clone(&core.store), job_id).await? {
-        if latest.cancel_requested {
-            control.request_cancel();
-        } else if latest.pause_requested {
-            control.request_pause();
-        }
-    }
+                // A pause/cancel request can land after the queued-state read but before
+                // the in-memory control is published. Re-read persisted flags once the
+                // control is visible so that narrow race cannot lose an accepted request.
+                if let Some(latest) = blocking_get(Arc::clone(&core.store), job_id).await? {
+                    if latest.cancel_requested {
+                        control.request_cancel();
+                    } else if latest.pause_requested {
+                        control.request_pause();
+                    }
+                }
 
-    let result = execute_visual_job(&core, &record.spec, record.completed_pages, control).await;
-    core.controls
-        .lock()
-        .map_err(|_| anyhow::anyhow!("视觉任务控制锁已损坏"))?
-        .remove(job_id);
+                let result =
+                    execute_visual_job(&core, &record.spec, record.completed_pages, control).await;
+                core.controls
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("视觉任务控制锁已损坏"))?
+                    .remove(job_id);
 
-    match result {
-        // `commit_pages` is the single success commit point: production sinks
-        // publish final pages, clear staging, and mark the job succeeded in one
-        // SQLite transaction. A second state write here could turn a committed
-        // render into a reported failure.
-        Ok(_) => {}
-        Err(error) => {
-            let state = match error.downcast_ref::<RenderInterrupted>() {
-                Some(RenderInterrupted::Paused) => VisualJobState::Paused,
-                Some(RenderInterrupted::Cancelled) => VisualJobState::Cancelled,
-                None => VisualJobState::Failed,
-            };
-            let detail = truncate_error(&format!("{error:#}"));
-            let completed_pages = blocking_get(Arc::clone(&core.store), job_id)
-                .await?
-                .map(|latest| latest.completed_pages)
-                .unwrap_or(record.completed_pages);
-            blocking_transition(
-                Arc::clone(&core.store),
-                job_id,
-                state,
-                completed_pages,
-                (state == VisualJobState::Failed).then_some(detail.as_str()),
-            )
-            .await?;
-        }
-    }
-    Ok(())
+                match result {
+                    // `commit_pages` is the single success commit point: production sinks
+                    // publish final pages, clear staging, and mark the job succeeded in one
+                    // SQLite transaction. A second state write here could turn a committed
+                    // render into a reported failure.
+                    Ok(page_count) => {
+                        record_visual_event(
+                            &core,
+                            job_id,
+                            JobLogEvent::RunSucceeded,
+                            JobLogMetrics {
+                                actual_count: Some(page_count as u64),
+                                duration_ms: VISUAL_LOG_RUN
+                                    .try_with(|(_, started, _)| {
+                                        started.elapsed().as_millis() as u64
+                                    })
+                                    .ok(),
+                                ..JobLogMetrics::default()
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        let state = match error.downcast_ref::<RenderInterrupted>() {
+                            Some(RenderInterrupted::Paused) => VisualJobState::Paused,
+                            Some(RenderInterrupted::Cancelled) => VisualJobState::Cancelled,
+                            None => VisualJobState::Failed,
+                        };
+                        let detail = truncate_error(&format!("{error:#}"));
+                        let completed_pages = blocking_get(Arc::clone(&core.store), job_id)
+                            .await?
+                            .map(|latest| latest.completed_pages)
+                            .unwrap_or(record.completed_pages);
+                        blocking_transition(
+                            Arc::clone(&core.store),
+                            job_id,
+                            state,
+                            completed_pages,
+                            (state == VisualJobState::Failed).then_some(detail.as_str()),
+                        )
+                        .await?;
+                        record_visual_event(
+                            &core,
+                            job_id,
+                            match state {
+                                VisualJobState::Paused => JobLogEvent::Paused,
+                                VisualJobState::Cancelled => JobLogEvent::Cancelled,
+                                _ => JobLogEvent::RunFailed,
+                            },
+                            JobLogMetrics {
+                                ordinal: Some(completed_pages as u64),
+                                duration_ms: VISUAL_LOG_RUN
+                                    .try_with(|(_, started, _)| {
+                                        started.elapsed().as_millis() as u64
+                                    })
+                                    .ok(),
+                                error_kind: (state == VisualJobState::Failed)
+                                    .then(|| classify_error(&error)),
+                                ..JobLogMetrics::for_error(&error)
+                            },
+                        );
+                    }
+                }
+                Ok(())
+            },
+        )
+        .await
 }
 
 async fn execute_visual_job(
@@ -2773,6 +2897,16 @@ async fn execute_visual_job(
         document.revision == spec.document_revision,
         "视觉任务 revision 已过期；请重新投递"
     );
+    record_visual_event(
+        core,
+        &spec.id,
+        JobLogEvent::SourceLoaded,
+        JobLogMetrics {
+            ordinal: Some(completed_pages as u64),
+            expected_count: Some(spec.unit_ids.len() as u64),
+            ..JobLogMetrics::default()
+        },
+    );
     let (emitter, receiver) = RenderPageEmitter::bounded(completed_pages, 1);
     let render = renderer.render_units_resumable(
         RenderUnitsRequest {
@@ -2788,6 +2922,7 @@ async fn execute_visual_job(
     tokio::pin!(render);
     let mut render_result = None;
     let mut next_page = completed_pages;
+    let mut page_started = Instant::now();
     let mut control_poll = tokio::time::interval(Duration::from_millis(10));
     control_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -2815,12 +2950,34 @@ async fn execute_visual_job(
         let Ok(page) = received else {
             break;
         };
+        record_visual_event(
+            core,
+            &spec.id,
+            JobLogEvent::ItemStarted,
+            JobLogMetrics {
+                ordinal: Some(next_page as u64),
+                ..JobLogMetrics::default()
+            },
+        );
         validate_rendered_page(spec, &page, next_page)?;
         let checkpoint = next_page.checked_add(1).context("视觉页面断点数量溢出")?;
+        let response_bytes = page.bytes.len() as u64;
         core.sink
             .checkpoint_page(spec.clone(), page, checkpoint)
             .await?;
+        record_visual_event(
+            core,
+            &spec.id,
+            JobLogEvent::ItemSaved,
+            JobLogMetrics {
+                ordinal: Some(next_page as u64),
+                response_bytes: Some(response_bytes),
+                duration_ms: Some(page_started.elapsed().as_millis() as u64),
+                ..JobLogMetrics::default()
+            },
+        );
         next_page = checkpoint;
+        page_started = Instant::now();
         control.checkpoint().map_err(anyhow::Error::new)?;
     }
     let page_count = match render_result {
@@ -2829,6 +2986,15 @@ async fn execute_visual_job(
     };
     ensure!(page_count == next_page, "renderer 页面总数与持久断点不一致");
     control.checkpoint().map_err(anyhow::Error::new)?;
+    record_visual_event(
+        core,
+        &spec.id,
+        JobLogEvent::PublicationStarted,
+        JobLogMetrics {
+            actual_count: Some(page_count as u64),
+            ..JobLogMetrics::default()
+        },
+    );
     core.sink.commit_pages(spec.clone(), page_count).await?;
     Ok(page_count)
 }

@@ -94,7 +94,7 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   `kind="translation"`：任务标识为 `translation:<source_id>:<target_language>`，游标复用
   `next_ordinal` 作为文本块序号，逐块调用对话模型 `chat_stream` 写入 `translations` 表，
   可暂停/恢复/重试/取消；文本块按 `content_units.block_json` 的 `BlockDocument` 确定性
-  展平（段落、标题、引用、列表项、表格单元格；跳过代码块和 RawHtml），以
+  提取（段落、标题、引用、列表项、表格单元格；代码保持原样），以
   `(document_revision, unit_revision, target_language, 对话模型)` 判定失效并重译。目标语言
   或对话模型变化由 `AppServices::configure_translations` 经
   `transactions::reconfigure_translation_jobs` 重排；每本当前来源只保留一个目标语言任务。
@@ -102,9 +102,25 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   失败而不猜测。模型调用不得逐 token 打日志，也不得记录正文或译文内容。
   **EPUB 章节在数据库里保存成单个 `RawHtml` 块**（`<div id="sbo-rt-content">…` 之类），
   语义块结构只存在于 HTML 里：只走 `BlockDocument` 会得到 0 个文本块并让任务立刻“成功”。
-  因此 `collect_translation_blocks` 必须处理 `Block::RawHtml`，用
-  `markup::block_texts_from_html()` 取出最内层块级元素（`p`/`h1–h6`/`li`/`blockquote`/
-  `td`/`th`）归一化后的文本，这与阅读器前端匹配的候选集一致，且只翻译最内层避免重复。
+  因此必须处理 `Block::RawHtml`，用 `markup::translation_blocks_from_html()` 取出最内层
+  块级元素（`p`/`h1–h6`/`li`/`blockquote`/`td`/`th`）的规范化全文和非空白文字叶节点。
+  原生 EPUB 必须从当前 source blob 用 `OpenedBook`/`load_resource` 提取实际阅读章节的
+  body；校验 spine 数量、单元顺序与归属。不能用导入后的 AST 代替原生章节，它可能合并
+  链接、span 或列表文字叶节点。其它格式使用规范化 HTML；解析在后台执行。
+  `src/translation.rs` 定义只含文字的分段协议：每次提供整段上下文与整数 ID，模型必须
+  返回完整、唯一的 ID 集合；按原文顺序回排并恢复片段边界空白，不能用模型 HTML 替换正文。
+  响应允许完整的前置 `<think>`、Markdown 围栏和说明文字包裹一个完整 JSON 对象；
+  不深入数组、字符串或其它对象查找答案，多个答案、截断 JSON、缺失/重复/未知 ID 均拒绝。
+  分段协议校验失败时使用冻结的原始输入和服务额外纠正一次，不回传模型的错误输出，
+  不把纯文本猜分段，也不重试 HTTP、流中断或输出上限错误。重试前后检查任务控制与身份，
+  失败沿用本执行游标，不能读取新任务游标后将新任务标为失败。诊断使用 `moye_ai`、
+  `translation_run_id`、块序号、尝试次数、固定错误分类、JSON 行列/数量及响应字节数，
+  不记录原文、译文、任意字段名或解析器错误正文。
+  `pre/code` 内容计入全文匹配但不翻译，过滤 script/style/noscript/template；换行节点由
+  源 DOM 保留，空白规范化与 ECMAScript `\s` 一致。源文本超过既有上限明确失败，不能
+  截断后存成完整块。`translated_text` 保存校验后的 `StoredTranslation` JSON 和执行身份，
+  不增加表结构或旧字段回退。`translation-v2` 身份变化在重排事务中清除该书该语言旧译文；
+  缓存读取与执行均核验身份，避免同名模型换端点或格式协议后复用旧结果。
   「重新翻译」由 `IndexingCoordinator::retranslate` 实现：先把该书该语言的译文行删掉，
   再把游标 `next_ordinal` 归零并重置为 queued/paused；只对 `translation` 生效，来源已
   被替代或其它任务类型一律拒绝（不改状态）。
@@ -124,6 +140,19 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   的派生任务；后台任务窗口全应用只有一个，重复打开时激活现有窗口并按新的库范围刷新，
   不打开第二个；`mod.rs` 只保留跨窗口主题、窗口打开与安全关闭基础设施，其中包含按
   图书登记的窗口表：删除图书后关闭该书已打开的阅读、PDF/Office 预览和编辑窗口。
+  后台任务采用左分类、右任务列表与详情/日志面板；每页 12 项，按创建时间与 ID 稳定
+  排序，2 秒轮询不改变搜索和筛选。切换库范围须立即清空旧数据并使迟到查询失效，日志
+  查询独立门控，不得串到其他任务。`src/job_diagnostics.rs` 将闭合事件枚举和数值指标
+  写到数据目录 `job-logs/` 的独立 SQLite，不改图书数据库结构；按规范库路径和任务 ID
+  隔离，每任务 500 行、全库 50000 行、文件页数限制约 64 MiB。记录不依赖窗口打开，
+  日志失败不得改变任务结果；不接受任意正文、URL 或错误字符串，不逐 token 记录。
+  日志读取经服务重新核验当前任务归属，时间明确为 UTC，保留清理与无历史记录须可见。
+  `src/ui/background_jobs/layout_tests.rs` 以 56 个任务、500 条日志和长详情验证
+  900×640 / 1180×820 下的真实 GPUI 布局、鼠标分页和滚动归零。外层横排使用
+  `flex().flex_row()` 的默认 stretch；`h_flex()` 会注入 `items_center()`，不能用于
+  没有独立高度约束的左右主体，否则长列表会把标题及筛选栏挤出可视区域。
+  `visual_render` 一个单元可产生多页，运行时总页数未知，快照 `total=None`；仅成功后
+  使用持久游标 `completed_pages` 作为总页数，不能用 `unit_ids.len()` 或内容单元计数。
   `mod.rs` 另维护 `PdfReaderWindowRegistry`：保存“PDF 紧凑阅读”后向所有已打开的 PDF
   阅读窗口推送 `<html data-pdf-compact>`，这是唯一能枚举非单例 Office 预览窗口的登记表。
   这类关闭走各窗口的“图书已移除”路径，不写最终阅读进度、不保存草稿、不弹保存确认，
@@ -155,9 +184,16 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   译文节点必须从 `annotations.js` 的 `textIndex()`/`currentSelection()` 与
   `READER_INITIALIZATION_SCRIPT` 的 `boundedSelection()` 中排除（选区跨译文时按
   fragment 过滤译文后再取文本），原文文本节点始终保留在 `body`，使笔记 UTF-16 锚点、
-  版本校验和重叠标记语义不受翻译影响。译文文本只用 `textContent` 写入，不能当 HTML。
+  版本校验和重叠标记语义不受翻译影响。译文文字只用 `textContent`/文字节点写入，不能当 HTML。
+  译文格式只从当前原文 DOM 的白名单元素与排版 computed style 重建，禁止复制 ID、事件和
+  URL 属性；逐项核验源文字叶节点，匹配失败保留原文。直接列表项保留 li 和编号，内部
+  原文包装必须可在 clear 时恢复；含媒体段落保持双语，不能隐藏图片。HTML/XHTML 均须支持。
   `src/ui/reader/translations.test.cjs` 是可选 DOM 门禁（Node + 已安装 Playwright），
   覆盖双语顺序、重复文本消歧、嵌套块、单元格插入、点击切换与笔记/选区排除。
+  2026-09-11 格式回归：11 项 HTML/XHTML DOM 用例通过；`tests/translation_flow.rs`
+  通过本机 mock SSE 验证请求、严格回填、重启、缓存失效、切端点与重译。真实 Windows
+  独立 EPUB 的 14 块中文译文验证标题/强调/颜色/换行/列表/表格/上下标/代码和点击切换，
+  重启仍保留译文，取消/确认退出正常，两次错误日志为空；未连接真实模型或用户书库。
 - `src/ui/pdf_reader/annotations.rs`、`annotations.js`：PDF 页面笔记宿主与页面桥接，
   复用同一张 `annotations` 表、互斥标记规则、人工/AI 想法流程与展示清洗。锚点作用域
   是单页的 PDF.js 文字层：宿主无法复刻该投影，因此

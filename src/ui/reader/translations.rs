@@ -110,6 +110,6 @@ fn translated_block_json(block: &TranslatedBlock) -> serde_json::Value {
     serde_json::json!({
         "key": block.key,
         "source": block.source,
-        "translated": block.translated,
+        "segments": block.segments,
     })
 }

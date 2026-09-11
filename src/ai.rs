@@ -87,6 +87,28 @@ impl fmt::Display for IncompleteToolArguments {
 
 impl std::error::Error for IncompleteToolArguments {}
 
+/// An HTTP rejection that did not match a more specific provider protocol
+/// error. Diagnostics may read its numeric status, never its response detail.
+#[derive(Debug)]
+pub struct ProviderHttpError {
+    pub status: u16,
+    detail: String,
+}
+
+impl fmt::Display for ProviderHttpError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let status = StatusCode::from_u16(self.status).map_err(|_| fmt::Error)?;
+        write!(
+            formatter,
+            "AI endpoint returned {}: {}",
+            display_status(status),
+            self.detail
+        )
+    }
+}
+
+impl std::error::Error for ProviderHttpError {}
+
 /// Optional sampling controls are omitted from requests when unset so the
 /// endpoint can use its own defaults. The user chooses a positive output limit
 /// appropriate for the model; the host does not impose a model-specific ceiling.
@@ -708,11 +730,11 @@ async fn checked_response(response: reqwest::Response) -> Result<reqwest::Respon
         return Err(error.into());
     }
     let detail = String::from_utf8_lossy(&body);
-    bail!(
-        "AI endpoint returned {}: {}",
-        display_status(status),
-        detail.trim()
-    );
+    Err(ProviderHttpError {
+        status: status.as_u16(),
+        detail: detail.trim().to_owned(),
+    }
+    .into())
 }
 
 /// Only protocol identifiers can leave the error envelope through diagnostics.
@@ -1429,6 +1451,33 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_http_rejection_preserves_display_and_exposes_only_numeric_diagnostics() {
+        let private_detail = "provider echoed private body api-key=secret";
+        let error = ProviderHttpError {
+            status: 503,
+            detail: private_detail.into(),
+        };
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "AI endpoint returned {}: {private_detail}",
+                display_status(StatusCode::SERVICE_UNAVAILABLE)
+            )
+        );
+        let error = anyhow::Error::new(error).context("failed to start AI response stream");
+        assert_eq!(crate::ai_diagnostics::error_kind(&error), "http_rejected");
+        let metrics = crate::job_diagnostics::JobLogMetrics::for_error(&error);
+        assert_eq!(metrics.http_status, Some(503));
+        assert_eq!(
+            metrics.error_kind,
+            Some(crate::job_diagnostics::JobLogErrorKind::Provider)
+        );
+        let serialized = serde_json::to_string(&metrics).unwrap();
+        assert!(!serialized.contains(private_detail));
+        assert!(!serialized.contains("secret"));
+    }
 
     #[test]
     fn chat_generation_settings_validate_boundaries_and_reject_non_finite_numbers() {

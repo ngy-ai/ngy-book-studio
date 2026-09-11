@@ -1,8 +1,32 @@
 use super::*;
 
+use gpui::{ClipboardItem, ScrollHandle};
+
+#[cfg(test)]
+mod layout_tests;
+use moye_epub_editor::job_diagnostics::BackgroundJobLogSnapshot;
 use moye_epub_editor::services::{
     AppServices, BackgroundJobAction, BackgroundJobSnapshot, BackgroundJobStatus,
 };
+
+const JOBS_PER_PAGE: usize = 12;
+const JOB_KINDS: &[(&str, &str)] = &[
+    ("", "全部任务"),
+    ("translation", "图书翻译"),
+    ("embedding", "向量索引"),
+    ("vision", "视觉理解"),
+    ("visual_render", "页面渲染"),
+    ("other", "其他任务"),
+];
+const STATUS_FILTERS: &[(Option<BackgroundJobStatus>, &str)] = &[
+    (None, "全部状态"),
+    (Some(BackgroundJobStatus::Running), "运行中"),
+    (Some(BackgroundJobStatus::Queued), "排队中"),
+    (Some(BackgroundJobStatus::Paused), "已暂停"),
+    (Some(BackgroundJobStatus::Failed), "失败"),
+    (Some(BackgroundJobStatus::Succeeded), "已完成"),
+    (Some(BackgroundJobStatus::Cancelled), "已取消"),
+];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct BackgroundJobBook {
@@ -22,42 +46,134 @@ pub(super) struct BackgroundJobsWindow {
     scope_label: String,
     jobs: Vec<BackgroundJobSnapshot>,
     refresh_generation: u64,
+    scope_generation: u64,
     loading: bool,
+    loaded: bool,
+    auto_refresh: bool,
     pending_job_id: Option<String>,
-    /// Job whose details panel is currently expanded. Only one panel is shown
-    /// at a time so the list stays readable; clicking the same header again
-    /// collapses it.
-    expanded_job_id: Option<String>,
+    selected_job_id: Option<String>,
+    kind: &'static str,
+    status: Option<BackgroundJobStatus>,
+    search: Entity<InputState>,
+    query: String,
+    page: usize,
+    list_scroll: ScrollHandle,
+    detail_scroll: ScrollHandle,
+    show_logs: bool,
+    logs: Option<BackgroundJobLogSnapshot>,
+    logs_loading: bool,
+    logs_generation: u64,
+    logs_error: Option<String>,
     notice: Option<JobsNotice>,
+    refresh_error: Option<String>,
+    _search_subscription: Subscription,
+    _poll_task: Task<()>,
 }
 
 impl BackgroundJobsWindow {
-    fn new(services: Arc<AppServices>, books: Vec<BackgroundJobBook>, scope_label: String) -> Self {
+    fn new(
+        services: Arc<AppServices>,
+        books: Vec<BackgroundJobBook>,
+        scope_label: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索书名或任务 ID…"));
+        let subscription = cx.subscribe_in(&search, window, |this, _, event, window, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.query = this.search.read(cx).value().to_string();
+                this.filters_changed(window, cx);
+            }
+        });
+        let poll_task = cx.spawn_in(window, async move |view, cx| {
+            loop {
+                Timer::after(Duration::from_secs(2)).await;
+                let alive = cx.update(|window, cx| {
+                    view.update(cx, |this, cx| {
+                        if this.auto_refresh && !this.loading && this.pending_job_id.is_none() {
+                            this.refresh(window, cx);
+                        }
+                    })
+                });
+                if !matches!(alive, Ok(Ok(()))) {
+                    break;
+                }
+            }
+        });
         Self {
             services,
             books,
             scope_label,
             jobs: Vec::new(),
             refresh_generation: 0,
+            scope_generation: 0,
             loading: false,
+            loaded: false,
+            auto_refresh: true,
             pending_job_id: None,
-            expanded_job_id: None,
+            selected_job_id: None,
+            kind: "",
+            status: None,
+            search,
+            query: String::new(),
+            page: 0,
+            list_scroll: ScrollHandle::default(),
+            detail_scroll: ScrollHandle::default(),
+            show_logs: false,
+            logs: None,
+            logs_loading: false,
+            logs_generation: 0,
+            logs_error: None,
             notice: None,
+            refresh_error: None,
+            _search_subscription: subscription,
+            _poll_task: poll_task,
         }
     }
 
-    fn toggle_expanded(&mut self, job_id: String, cx: &mut Context<Self>) {
-        self.expanded_job_id = if self.expanded_job_id.as_deref() == Some(job_id.as_str()) {
-            None
-        } else {
-            Some(job_id)
-        };
+    fn filtered_jobs(&self) -> Vec<&BackgroundJobSnapshot> {
+        let query = self.query.trim().to_lowercase();
+        self.jobs
+            .iter()
+            .filter(|job| job_matches(job, &self.books, self.kind, self.status, &query))
+            .collect()
+    }
+
+    fn reconcile_selection(&mut self) {
+        let jobs = self.filtered_jobs();
+        let page_count = jobs.len().div_ceil(JOBS_PER_PAGE).max(1);
+        let page = self.page.min(page_count - 1);
+        let page_jobs = jobs.iter().skip(page * JOBS_PER_PAGE).take(JOBS_PER_PAGE);
+        let ids: Vec<_> = page_jobs.map(|job| job.id.clone()).collect();
+        let selected = self
+            .selected_job_id
+            .as_ref()
+            .filter(|id| ids.contains(id))
+            .cloned()
+            .or_else(|| ids.first().cloned());
+        self.page = page;
+        if self.selected_job_id != selected {
+            self.selected_job_id = selected;
+            self.clear_logs();
+        }
+    }
+
+    fn clear_logs(&mut self) {
+        self.detail_scroll.set_offset(gpui::point(px(0.), px(0.)));
+        self.logs_generation = self.logs_generation.wrapping_add(1);
+        self.logs_loading = false;
+        self.logs = None;
+        self.logs_error = None;
+    }
+
+    fn filters_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.page = 0;
+        self.list_scroll.set_offset(gpui::point(px(0.), px(0.)));
+        self.reconcile_selection();
+        self.refresh_logs(window, cx);
         cx.notify();
     }
 
-    /// Retarget the single live window at a new library scope. Called when the
-    /// user opens background tasks again from a different group/filter, so the
-    /// window follows the request instead of showing a stale book list.
     fn apply_scope(
         &mut self,
         books: Vec<BackgroundJobBook>,
@@ -65,14 +181,26 @@ impl BackgroundJobsWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.scope_generation = self.scope_generation.wrapping_add(1);
+        self.refresh_generation = self.refresh_generation.wrapping_add(1);
         self.books = books;
         self.scope_label = scope_label;
-        self.expanded_job_id = None;
+        self.jobs.clear();
+        self.selected_job_id = None;
+        self.clear_logs();
+        self.page = 0;
+        self.list_scroll.set_offset(gpui::point(px(0.), px(0.)));
+        self.loaded = false;
+        self.loading = false;
         self.notice = None;
+        self.refresh_error = None;
         self.refresh(window, cx);
     }
 
     fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.loading {
+            return;
+        }
         self.refresh_generation = self.refresh_generation.wrapping_add(1);
         let generation = self.refresh_generation;
         self.loading = true;
@@ -80,27 +208,66 @@ impl BackgroundJobsWindow {
         let book_ids = self.books.iter().map(|book| book.id.clone()).collect();
         cx.spawn_in(window, async move |view, cx| {
             let result = services.background_jobs_for_books(book_ids).await;
+            let _ = cx.update(|window, cx| {
+                view.update(cx, |this, cx| {
+                    if generation != this.refresh_generation {
+                        return;
+                    }
+                    this.loading = false;
+                    match result {
+                        Ok(mut jobs) => {
+                            this.refresh_error = None;
+                            // A stable order prevents polling from moving rows under the pointer.
+                            jobs.sort_by(|a, b| {
+                                b.created_at.cmp(&a.created_at).then(a.id.cmp(&b.id))
+                            });
+                            this.jobs = jobs;
+                            this.loaded = true;
+                            this.reconcile_selection();
+                            this.refresh_logs(window, cx);
+                        }
+                        Err(error) => {
+                            this.refresh_error = Some(format!("无法刷新后台任务：{error:#}"));
+                        }
+                    }
+                    cx.notify();
+                })
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn refresh_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.show_logs || self.logs_loading {
+            return;
+        }
+        let Some(job_id) = self.selected_job_id.clone() else {
+            return;
+        };
+        self.logs_generation = self.logs_generation.wrapping_add(1);
+        let generation = self.logs_generation;
+        self.logs_loading = true;
+        let services = Arc::clone(&self.services);
+        let book_ids = self.books.iter().map(|book| book.id.clone()).collect();
+        cx.spawn_in(window, async move |view, cx| {
+            let result = services.background_job_logs(job_id, book_ids).await;
             let _ = view.update(cx, |this, cx| {
-                if generation != this.refresh_generation {
+                if generation != this.logs_generation {
                     return;
                 }
-                this.loading = false;
+                this.logs_loading = false;
                 match result {
-                    Ok(jobs) => {
-                        this.jobs = jobs;
+                    Ok(logs) => {
+                        this.logs = Some(logs);
+                        this.logs_error = None;
                     }
-                    Err(error) => {
-                        this.notice = Some(JobsNotice {
-                            text: format!("无法刷新后台任务：{error:#}"),
-                            error: true,
-                        });
-                    }
+                    Err(error) => this.logs_error = Some(format!("无法读取运行日志：{error:#}")),
                 }
                 cx.notify();
             });
         })
         .detach();
-        cx.notify();
     }
 
     fn apply_action(
@@ -114,40 +281,39 @@ impl BackgroundJobsWindow {
             return;
         }
         self.pending_job_id = Some(job_id.clone());
+        let scope = self.scope_generation;
         self.notice = Some(JobsNotice {
             text: format!("正在{}任务…", action_verb(action)),
             error: false,
         });
         let services = Arc::clone(&self.services);
         cx.spawn_in(window, async move |view, cx| {
-            let result = services
-                .control_background_job(job_id.clone(), action)
-                .await;
+            let result = services.control_background_job(job_id, action).await;
             let _ = cx.update(|window, cx| {
-                let _ = view.update(cx, |this, cx| {
+                view.update(cx, |this, cx| {
                     this.pending_job_id = None;
-                    match result {
-                        Ok(true) => {
-                            this.notice = Some(JobsNotice {
+                    if scope == this.scope_generation {
+                        this.notice = Some(match result {
+                            Ok(true) => JobsNotice {
                                 text: format!("已请求{}任务。", action_verb(action)),
                                 error: false,
-                            });
-                        }
-                        Ok(false) => {
-                            this.notice = Some(JobsNotice {
-                                text: "任务状态已发生变化，未重复执行操作。".to_string(),
+                            },
+                            Ok(false) => JobsNotice {
+                                text: "任务状态已发生变化，未重复执行操作。".into(),
                                 error: false,
-                            });
-                        }
-                        Err(error) => {
-                            this.notice = Some(JobsNotice {
+                            },
+                            Err(error) => JobsNotice {
                                 text: format!("{}任务失败：{error:#}", action_verb(action)),
                                 error: true,
-                            });
-                        }
+                            },
+                        });
                     }
+                    // Invalidate any snapshot that began before the accepted operation.
+                    this.refresh_generation = this.refresh_generation.wrapping_add(1);
+                    this.loading = false;
+                    this.clear_logs();
                     this.refresh(window, cx);
-                });
+                })
             });
         })
         .detach();
@@ -155,14 +321,15 @@ impl BackgroundJobsWindow {
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let view = cx.entity().clone();
         div()
+            .debug_selector(|| "jobs-layout-header".into())
+            .flex_none()
             .h_flex()
             .items_center()
             .justify_between()
             .gap_4()
-            .px_6()
-            .py_4()
+            .px_5()
+            .py_3()
             .border_b_1()
             .border_color(rgb(BORDER))
             .bg(rgb(SURFACE))
@@ -170,183 +337,390 @@ impl BackgroundJobsWindow {
                 div()
                     .v_flex()
                     .min_w(px(0.))
-                    .gap_0p5()
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_semibold()
-                            .text_color(rgb(INK))
-                            .child("后台任务"),
-                    )
+                    .gap_1()
+                    .child(div().text_lg().font_semibold().child("后台任务"))
                     .child(
                         div()
                             .text_xs()
                             .text_color(rgb(MUTED))
                             .truncate()
                             .child(format!(
-                                "{} · {} 本图书",
+                                "{} · {} 本图书 · {} 个任务",
                                 self.scope_label,
-                                self.books.len()
+                                self.books.len(),
+                                self.jobs.len()
                             )),
                     ),
             )
             .child(
-                Button::new("background-jobs-refresh")
-                    .outline()
-                    .icon(IconName::Redo2)
-                    .label(if self.loading {
-                        "正在刷新…"
-                    } else {
-                        "刷新"
-                    })
-                    .disabled(self.loading || self.pending_job_id.is_some())
-                    .on_click(move |_, window, cx| {
-                        view.update(cx, |this, cx| {
-                            this.notice = None;
-                            this.refresh(window, cx);
-                        });
-                    }),
+                div()
+                    .h_flex()
+                    .gap_2()
+                    .flex_none()
+                    .child(
+                        Button::new("jobs-auto-refresh")
+                            .small()
+                            .ghost()
+                            .label(if self.auto_refresh {
+                                "自动刷新 · 2 秒"
+                            } else {
+                                "自动刷新已暂停"
+                            })
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.auto_refresh = !this.auto_refresh;
+                                if this.auto_refresh {
+                                    this.refresh(window, cx);
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("background-jobs-refresh")
+                            .small()
+                            .outline()
+                            .icon(IconName::Redo2)
+                            .label(if self.loading {
+                                "刷新中…"
+                            } else {
+                                "刷新"
+                            })
+                            .disabled(self.loading)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.notice = None;
+                                this.refresh(window, cx);
+                            })),
+                    ),
             )
             .into_any_element()
     }
 
-    fn render_summary(&self) -> gpui::AnyElement {
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let mut sidebar = div()
+            .v_flex()
+            .w(px(184.))
+            .flex_none()
+            .gap_2()
+            .p_3()
+            .border_r_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(SIDEBAR))
+            .child(
+                div()
+                    .px_2()
+                    .py_2()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child("任务分类"),
+            );
+        for &(kind, label) in JOB_KINDS {
+            let count = self
+                .jobs
+                .iter()
+                .filter(|job| kind_matches(&job.kind, kind))
+                .count();
+            if kind == "other" && count == 0 {
+                continue;
+            }
+            sidebar = sidebar.child(
+                div()
+                    .id(SharedString::from(format!("jobs-kind-{kind}")))
+                    .h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .px_3()
+                    .py_3()
+                    .rounded(px(8.))
+                    .cursor_pointer()
+                    .text_sm()
+                    .bg(rgb(if self.kind == kind {
+                        ACCENT_SOFT
+                    } else {
+                        SIDEBAR
+                    }))
+                    .text_color(rgb(if self.kind == kind { ACCENT_DARK } else { INK }))
+                    .child(label)
+                    .child(div().text_xs().child(count.to_string()))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.kind = kind;
+                        this.filters_changed(window, cx);
+                    })),
+            );
+        }
+        sidebar
+            .child(div().flex_1())
+            .child(
+                div()
+                    .p_2()
+                    .text_xs()
+                    .line_height(gpui::relative(1.6))
+                    .text_color(rgb(MUTED))
+                    .child("选择右侧任务查看详情与运行日志。\n关闭此窗口后，后台任务仍继续运行。"),
+            )
+            .into_any_element()
+    }
+
+    fn render_filters(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let running = self
             .jobs
             .iter()
             .filter(|job| job.status == BackgroundJobStatus::Running)
-            .count();
-        let queued = self
-            .jobs
-            .iter()
-            .filter(|job| job.status == BackgroundJobStatus::Queued)
             .count();
         let failed = self
             .jobs
             .iter()
             .filter(|job| job.status == BackgroundJobStatus::Failed)
             .count();
+        let mut filters = div().h_flex().flex_wrap().gap_1();
+        for &(status, label) in STATUS_FILTERS {
+            filters = filters.child(
+                Button::new(SharedString::from(format!("jobs-filter-{label}")))
+                    .small()
+                    .ghost()
+                    .label(label)
+                    .when(self.status == status, |button| {
+                        button.custom(
+                            ButtonCustomVariant::new(cx)
+                                .color(rgb(ACCENT_SOFT).into())
+                                .foreground(rgb(ACCENT_DARK).into()),
+                        )
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.status = status;
+                        this.filters_changed(window, cx);
+                    })),
+            );
+        }
         div()
-            .h_flex()
-            .items_center()
-            .justify_between()
-            .gap_4()
-            .px_6()
+            .debug_selector(|| "jobs-layout-filters".into())
+            .flex_none()
+            .v_flex()
+            .gap_2()
+            .px_4()
             .py_3()
             .border_b_1()
             .border_color(rgb(BORDER))
-            .bg(rgb(PAPER))
-            .text_sm()
-            .child(
-                div()
-                    .font_semibold()
-                    .text_color(rgb(INK))
-                    .child(format!("{} 个任务", self.jobs.len())),
-            )
-            .child(
-                div()
-                    .h_flex()
-                    .gap_4()
-                    .text_color(rgb(MUTED))
-                    .child(format!("排队 {queued} · 运行 {running} · 失败 {failed}")),
-            )
-            .into_any_element()
-    }
-
-    fn render_notice(&self) -> Option<gpui::AnyElement> {
-        let notice = self.notice.as_ref()?;
-        let (background, foreground, icon) = if notice.error {
-            (rgb(0xf8e2de), rgb(DANGER), IconName::TriangleAlert)
-        } else {
-            (rgb(ACCENT_SOFT), rgb(ACCENT_DARK), IconName::Info)
-        };
-        Some(
-            div()
-                .h_flex()
-                .items_center()
-                .gap_2()
-                .mx_6()
-                .mt_4()
-                .px_3()
-                .py_2()
-                .rounded(px(8.))
-                .bg(background)
-                .text_sm()
-                .text_color(foreground)
-                .child(Icon::new(icon).small())
-                .child(notice.text.clone())
-                .into_any_element(),
-        )
-    }
-
-    fn render_book_section(
-        &self,
-        book: &BackgroundJobBook,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let jobs = self
-            .jobs
-            .iter()
-            .filter(|job| job.book_id == book.id)
-            .collect::<Vec<_>>();
-        let mut body = div()
-            .v_flex()
-            .gap_3()
-            .p_4()
-            .rounded(px(12.))
-            .border_1()
-            .border_color(rgb(BORDER))
-            .bg(rgb(SURFACE))
             .child(
                 div()
                     .h_flex()
                     .items_center()
+                    .gap_4()
                     .justify_between()
-                    .gap_3()
+                    .child(div().text_sm().font_semibold().child(format!(
+                            "{} · 运行 {running} · 失败 {failed}",
+                            JOB_KINDS
+                                .iter()
+                                .find(|(kind, _)| *kind == self.kind)
+                                .map(|(_, name)| *name)
+                                .unwrap_or("任务")
+                        )))
                     .child(
                         div()
-                            .min_w(px(0.))
-                            .font_semibold()
-                            .text_color(rgb(INK))
-                            .truncate()
-                            .child(book.title.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child(format!("{} 个任务", jobs.len())),
+                            .w(px(280.))
+                            .child(Input::new(&self.search).small().prefix(IconName::Search)),
                     ),
-            );
-        if jobs.is_empty() {
-            body = body.child(
-                div()
-                    .py_2()
-                    .text_sm()
-                    .text_color(rgb(MUTED))
-                    .child("当前图书没有后台任务。"),
-            );
-        } else {
-            for job in jobs {
-                body = body.child(self.render_job(job, cx));
-            }
-        }
-        body.into_any_element()
+            )
+            .child(filters)
+            .into_any_element()
     }
 
-    fn render_job(&self, job: &BackgroundJobSnapshot, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let (status_text, status_color, status_background) = status_presentation(job);
-        let actions = available_actions(job);
-        let has_actions = !actions.is_empty();
-        let pending = self.pending_job_id.as_deref() == Some(job.id.as_str());
-        let any_pending = self.pending_job_id.is_some();
-        let view = cx.entity().clone();
-        let mut action_row = div().h_flex().flex_none().gap_2();
-        for action in actions {
-            let action_view = view.clone();
-            let job_id = job.id.clone();
-            action_row = action_row.child(
+    fn render_list(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let jobs = self.filtered_jobs();
+        let count = jobs.len();
+        let mut list = div()
+            .id("background-jobs-list")
+            .debug_selector(|| "jobs-layout-list".into())
+            .v_flex()
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .track_scroll(&self.list_scroll)
+            .px_3()
+            .py_2()
+            .gap_1();
+        if count == 0 {
+            list = list.child(div().p_6().text_sm().text_color(rgb(MUTED)).child(
+                if self.loading && !self.loaded {
+                    "正在读取任务…"
+                } else if !self.loaded && self.refresh_error.is_some() {
+                    "读取失败，请刷新重试。"
+                } else if self.books.is_empty() {
+                    "当前范围没有图书。"
+                } else if self.jobs.is_empty() {
+                    "当前范围还没有后台任务。"
+                } else {
+                    "没有符合搜索或筛选条件的任务。"
+                },
+            ));
+        }
+        for job in jobs
+            .into_iter()
+            .skip(self.page * JOBS_PER_PAGE)
+            .take(JOBS_PER_PAGE)
+        {
+            let id = job.id.clone();
+            let selected = self.selected_job_id.as_deref() == Some(&job.id);
+            let (label, color, background) = status_presentation(job);
+            let title = self
+                .books
+                .iter()
+                .find(|book| book.id == job.book_id)
+                .map(|book| book.title.as_str())
+                .unwrap_or("图书已移除");
+            list =
+                list.child(
+                    div()
+                        .id(SharedString::from(format!("job-row-{}", job.id)))
+                        .flex_none()
+                        .h_flex()
+                        .items_center()
+                        .gap_3()
+                        .px_3()
+                        .py_2()
+                        .rounded(px(7.))
+                        .border_1()
+                        .border_color(rgb(if selected { ACCENT } else { BORDER }))
+                        .bg(rgb(if selected { ACCENT_SOFT } else { SURFACE }))
+                        .cursor_pointer()
+                        .child(
+                            div()
+                                .v_flex()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_semibold()
+                                        .truncate()
+                                        .child(title.to_string()),
+                                )
+                                .child(
+                                    div().text_xs().text_color(rgb(MUTED)).truncate().child(
+                                        format!("{} · {}", job_kind_label(&job.kind), job.id),
+                                    ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .v_flex()
+                                .gap_1()
+                                .items_end()
+                                .flex_none()
+                                .child(
+                                    div()
+                                        .px_2()
+                                        .rounded_full()
+                                        .bg(background)
+                                        .text_xs()
+                                        .text_color(color)
+                                        .child(label),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(MUTED))
+                                        .child(progress_label(job)),
+                                ),
+                        )
+                        .child(Icon::new(IconName::ChevronRight).small())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if this.selected_job_id.as_ref() != Some(&id) {
+                                this.selected_job_id = Some(id.clone());
+                                this.clear_logs();
+                            }
+                            this.refresh_logs(window, cx);
+                            cx.notify();
+                        })),
+                );
+        }
+        let pages = count.div_ceil(JOBS_PER_PAGE).max(1);
+        div()
+            .v_flex()
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_hidden()
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_hidden()
+                    .child(list.size_full())
+                    .vertical_scrollbar(&self.list_scroll),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "jobs-layout-footer".into())
+                    .flex_none()
+                    .h_flex()
+                    .items_center()
+                    .justify_between()
+                    .px_4()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(rgb(BORDER))
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(format!(
+                        "共 {count} 个任务 · 第 {} / {pages} 页",
+                        self.page + 1
+                    ))
+                    .child(
+                        div()
+                            .h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("jobs-previous")
+                                    .small()
+                                    .ghost()
+                                    .label("上一页")
+                                    .disabled(self.page == 0)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.page = this.page.saturating_sub(1);
+                                        this.list_scroll.set_offset(gpui::point(px(0.), px(0.)));
+                                        this.reconcile_selection();
+                                        this.refresh_logs(window, cx);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("jobs-next")
+                                    .debug_selector(|| "jobs-next".into())
+                                    .small()
+                                    .ghost()
+                                    .label("下一页")
+                                    .disabled(self.page + 1 >= pages)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.page += 1;
+                                        this.list_scroll.set_offset(gpui::point(px(0.), px(0.)));
+                                        this.reconcile_selection();
+                                        this.refresh_logs(window, cx);
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_detail(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(job) = self
+            .jobs
+            .iter()
+            .find(|job| Some(&job.id) == self.selected_job_id.as_ref())
+        else {
+            return div()
+                .p_5()
+                .text_sm()
+                .text_color(rgb(MUTED))
+                .child("选择任务查看运行情况。")
+                .into_any_element();
+        };
+        let mut actions = div().h_flex().gap_1().flex_wrap();
+        for action in available_actions(job) {
+            let id = job.id.clone();
+            actions = actions.child(
                 Button::new(SharedString::from(format!(
                     "background-job-{}-{}",
                     job.id,
@@ -355,267 +729,344 @@ impl BackgroundJobsWindow {
                 .small()
                 .outline()
                 .label(action_label(action))
-                .disabled(any_pending || self.loading)
-                .on_click(move |_, window, cx| {
-                    action_view.update(cx, |this, cx| {
-                        this.apply_action(job_id.clone(), action, window, cx)
-                    });
-                }),
+                .disabled(self.pending_job_id.is_some())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.apply_action(id.clone(), action, window, cx)
+                })),
             );
         }
-
-        let expanded = self.expanded_job_id.as_deref() == Some(job.id.as_str());
-        let toggle_view = view.clone();
-        let toggle_job_id = job.id.clone();
-        let details_toggle = Button::new(SharedString::from(format!(
-            "background-job-{}-details",
-            job.id
-        )))
-        .small()
-        .ghost()
-        .icon(if expanded {
-            IconName::ChevronDown
+        let mut tabs = div().h_flex().gap_1();
+        for (logs, label) in [(false, "任务详情"), (true, "运行日志")] {
+            tabs = tabs.child(
+                Button::new(SharedString::from(format!("jobs-tab-{logs}")))
+                    .small()
+                    .ghost()
+                    .label(label)
+                    .when(self.show_logs == logs, |button| {
+                        button.custom(
+                            ButtonCustomVariant::new(cx)
+                                .color(rgb(ACCENT_SOFT).into())
+                                .foreground(rgb(ACCENT_DARK).into()),
+                        )
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.show_logs = logs;
+                        this.detail_scroll.set_offset(gpui::point(px(0.), px(0.)));
+                        this.refresh_logs(window, cx);
+                        cx.notify();
+                    })),
+            );
+        }
+        let copy_text = if self.show_logs {
+            self.logs
+                .as_ref()
+                .map(|logs| diagnostic_log_copy(job, logs))
         } else {
-            IconName::ChevronRight
-        })
-        .label(if expanded {
-            "收起详情"
-        } else {
-            "查看详情"
-        })
-        .disabled(self.loading)
-        .on_click(move |_, _, cx| {
-            toggle_view.update(cx, |this, cx| {
-                this.toggle_expanded(toggle_job_id.clone(), cx);
-            });
-        });
-
-        let mut card = div()
-            .v_flex()
+            Some(diagnostic_summary(job))
+        };
+        let copy_disabled = copy_text.is_none()
+            || (self.show_logs && (self.logs_error.is_some() || self.logs_loading));
+        let copy_view = cx.entity().clone();
+        let header = div()
+            .flex_none()
+            .h_flex()
+            .items_center()
+            .justify_between()
+            .flex_wrap()
             .gap_2()
-            .p_3()
-            .rounded(px(9.))
-            .border_1()
+            .px_4()
+            .py_2()
+            .border_b_1()
             .border_color(rgb(BORDER))
-            .bg(rgb(PAPER))
+            .child(tabs)
+            .child(actions)
             .child(
+                Button::new("jobs-copy-diagnostics")
+                    .small()
+                    .ghost()
+                    .icon(IconName::Copy)
+                    .label(if self.show_logs {
+                        "复制日志"
+                    } else {
+                        "复制详情"
+                    })
+                    .disabled(copy_disabled)
+                    .on_click(move |_, _, cx| {
+                        if let Some(text) = &copy_text {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                            copy_view.update(cx, |this, cx| {
+                                this.notice = Some(JobsNotice {
+                                    text: "已复制所选任务的诊断信息。".into(),
+                                    error: false,
+                                });
+                                cx.notify();
+                            });
+                        }
+                    }),
+            );
+        let mut content = div()
+            .id(SharedString::from(format!(
+                "job-detail-{}-{}",
+                job.id, self.show_logs
+            )))
+            .v_flex()
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .track_scroll(&self.detail_scroll)
+            .p_4()
+            .gap_2()
+            .text_xs();
+        if self.show_logs {
+            content = content.child(
                 div()
-                    .h_flex()
-                    .items_start()
-                    .justify_between()
-                    .gap_3()
-                    .child(
+                    .text_color(rgb(MUTED))
+                    .child("最新记录在前 · 时间为 UTC · ordinal 从 0 开始 · 复制按时间正序排列。"),
+            );
+            if let Some(error) = &self.logs_error {
+                content = content.child(div().text_color(rgb(DANGER)).child(error.clone()));
+            }
+            if let Some(logs) = &self.logs {
+                if logs.truncated {
+                    content = content.child(
                         div()
-                            .v_flex()
-                            .min_w(px(0.))
-                            .gap_1()
-                            .child(
-                                div()
-                                    .h_flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .font_semibold()
-                                            .text_color(rgb(INK))
-                                            .child(job_kind_label(&job.kind)),
-                                    )
-                                    .child(
-                                        div()
-                                            .px_2()
-                                            .py_0p5()
-                                            .rounded_full()
-                                            .bg(status_background)
-                                            .text_xs()
-                                            .text_color(status_color)
-                                            .child(status_text),
-                                    ),
-                            )
-                            .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
-                                "{} · 已尝试 {} 次",
-                                progress_label(job),
-                                job.attempts
-                            ))),
-                    )
-                    .child(
+                            .text_color(rgb(MUTED))
+                            .child("较早的记录已按保留上限清理，以下为最近的运行日志。"),
+                    );
+                }
+                if logs.entries.is_empty() {
+                    content = content.child(div().py_3().text_color(rgb(MUTED)).child(
+                        "暂无保留的运行日志。任务可能尚未开始、在升级前执行，或记录已清理；后续运行会自动记录。",
+                    ));
+                }
+                for entry in logs.entries.iter().rev() {
+                    content = content.child(
                         div()
-                            .v_flex()
                             .flex_none()
-                            .items_end()
-                            .gap_2()
-                            .when(has_actions, |this| this.child(action_row))
-                            .child(details_toggle),
-                    ),
-            )
-            .when_some(job.error.as_ref(), |this, error| {
-                this.child(
+                            .line_height(gpui::relative(1.5))
+                            .border_b_1()
+                            .border_color(rgb(BORDER))
+                            .py_1()
+                            .child(entry.format_line()),
+                    );
+                }
+            } else if self.logs_loading {
+                content = content.child("正在读取日志…");
+            }
+        } else {
+            for (label, value) in detail_rows(job) {
+                content = content.child(
                     div()
-                        .px_2()
-                        .py_1p5()
+                        .h_flex()
+                        .items_start()
+                        .gap_3()
+                        .child(
+                            div()
+                                .w(px(96.))
+                                .flex_none()
+                                .text_color(rgb(MUTED))
+                                .child(label),
+                        )
+                        .child(div().flex_1().min_w(px(0.)).child(value)),
+                );
+            }
+            if let Some(error) = &job.error {
+                content = content.child(
+                    div()
+                        .p_2()
                         .rounded(px(6.))
                         .bg(rgb(0xf8e2de))
-                        .text_xs()
-                        .line_height(gpui::relative(1.5))
                         .text_color(rgb(DANGER))
                         .child(error.clone()),
-                )
-            })
-            .when(pending, |this| {
-                this.child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(ACCENT_DARK))
-                        .child("正在提交操作，请稍候…"),
-                )
-            });
-        if expanded {
-            card = card.child(self.render_job_details(job));
+                );
+            }
+            if let Some(cursor) = &job.cursor_json {
+                content = content
+                    .child(div().text_color(rgb(MUTED)).child("执行游标"))
+                    .child(div().p_2().bg(rgb(SIDEBAR)).child(prettify_cursor(cursor)));
+            }
         }
-        card.into_any_element()
-    }
-
-    fn render_job_details(&self, job: &BackgroundJobSnapshot) -> gpui::AnyElement {
-        let mut rows: Vec<(&'static str, String)> = Vec::new();
-        rows.push(("任务 ID", truncate_middle(&job.id, 28)));
-        rows.push(("图书 ID", truncate_middle(&job.book_id, 28)));
-        if let Some(source_id) = job.source_id.as_deref() {
-            rows.push(("来源 ID", truncate_middle(source_id, 28)));
-        }
-        rows.push(("任务类型", job_kind_label(&job.kind).to_string()));
-        rows.push(("数据库状态", status_database_label(job.status).to_string()));
-        rows.push(("已尝试次数", job.attempts.to_string()));
-        rows.push((
-            "进度",
-            match job.progress.total {
-                Some(total) => format!(
-                    "{} / {}（已完成 {}）",
-                    job.progress.completed.min(total),
-                    total,
-                    job.progress.completed
-                ),
-                None => format!("已处理 {}", job.progress.completed),
-            },
-        ));
-        rows.push(("创建时间", format_timestamp(job.created_at)));
-        rows.push(("更新时间", format_timestamp(job.updated_at)));
-        rows.push((
-            "开始时间",
-            job.started_at.map(format_timestamp).unwrap_or_else(not_set),
-        ));
-        rows.push((
-            "结束时间",
-            job.finished_at
-                .map(format_timestamp)
-                .unwrap_or_else(not_set),
-        ));
-        rows.push((
-            "挂起请求",
-            if job.cancel_requested {
-                "已请求取消".to_string()
-            } else if job.pause_requested {
-                "已请求暂停".to_string()
-            } else {
-                "无".to_string()
-            },
-        ));
-
-        let mut body = div()
+        div()
+            .debug_selector(|| "jobs-layout-detail".into())
             .v_flex()
-            .gap_1p5()
-            .p_3()
-            .rounded(px(7.))
-            .border_1()
+            .flex_1()
+            .min_h(px(150.))
+            .overflow_hidden()
+            .border_t_1()
             .border_color(rgb(BORDER))
             .bg(rgb(SURFACE))
-            .text_sm();
-        for (label, value) in rows {
-            body = body.child(
+            .child(header)
+            .child(
                 div()
-                    .h_flex()
-                    .items_start()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(96.))
-                            .text_color(rgb(MUTED))
-                            .child(label),
-                    )
-                    .child(
-                        div()
-                            .min_w(px(0.))
-                            .flex_1()
-                            .text_color(rgb(INK))
-                            .child(value),
-                    ),
-            );
-        }
-        if let Some(cursor) = job.cursor_json.as_deref() {
-            body = body.child(
-                div()
-                    .v_flex()
-                    .gap_1()
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(96.))
-                            .text_color(rgb(MUTED))
-                            .child("游标"),
-                    )
-                    .child(
-                        div()
-                            .px_2()
-                            .py_1p5()
-                            .rounded(px(6.))
-                            .bg(rgb(SIDEBAR))
-                            .text_xs()
-                            .line_height(gpui::relative(1.5))
-                            .text_color(rgb(INK))
-                            .overflow_x_scrollbar()
-                            .child(prettify_cursor(cursor)),
-                    ),
-            );
-        }
-        body.into_any_element()
+                    .relative()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_hidden()
+                    .child(content.size_full())
+                    .vertical_scrollbar(&self.detail_scroll),
+            )
+            .into_any_element()
     }
 }
 
 impl Render for BackgroundJobsWindow {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut list = div()
-            .v_flex()
-            .flex_1()
-            .min_h(px(0.))
-            .gap_4()
-            .p_6()
-            .overflow_y_scrollbar();
-        if self.books.is_empty() {
-            list = list.child(
-                div()
-                    .flex_1()
-                    .v_flex()
-                    .items_center()
-                    .justify_center()
-                    .gap_2()
-                    .text_color(rgb(MUTED))
-                    .child(Icon::new(IconName::Inbox))
-                    .child("当前范围没有图书。"),
-            );
-        } else {
-            for book in &self.books {
-                list = list.child(self.render_book_section(book, cx));
-            }
-        }
-
         div()
+            .debug_selector(|| "jobs-layout-root".into())
             .v_flex()
             .size_full()
+            .overflow_hidden()
             .bg(rgb(PAPER))
+            .text_color(rgb(INK))
             .child(self.render_header(cx))
-            .child(self.render_summary())
-            .when_some(self.render_notice(), |this, notice| this.child(notice))
-            .child(list)
+            .when_some(self.refresh_error.as_ref(), |this, error| {
+                this.child(
+                    div()
+                        .px_5()
+                        .py_2()
+                        .text_xs()
+                        .bg(rgb(0xf8e2de))
+                        .text_color(rgb(DANGER))
+                        .child(error.clone()),
+                )
+            })
+            .when_some(self.notice.as_ref(), |this, notice| {
+                this.child(
+                    div()
+                        .px_5()
+                        .py_2()
+                        .text_xs()
+                        .bg(rgb(if notice.error { 0xf8e2de } else { ACCENT_SOFT }))
+                        .text_color(rgb(if notice.error { DANGER } else { ACCENT_DARK }))
+                        .child(notice.text.clone()),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_hidden()
+                    .child(self.render_sidebar(cx))
+                    .child(
+                        div()
+                            .v_flex()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .min_h(px(0.))
+                            .overflow_hidden()
+                            .child(self.render_filters(cx))
+                            .child(self.render_list(cx))
+                            .child(self.render_detail(cx)),
+                    ),
+            )
     }
+}
+
+fn kind_matches(kind: &str, filter: &str) -> bool {
+    match filter {
+        "" => true,
+        "other" => !matches!(
+            kind,
+            "translation" | "embedding" | "vision" | "visual_render"
+        ),
+        _ => kind == filter,
+    }
+}
+
+fn job_matches(
+    job: &BackgroundJobSnapshot,
+    books: &[BackgroundJobBook],
+    kind: &str,
+    status: Option<BackgroundJobStatus>,
+    query: &str,
+) -> bool {
+    kind_matches(&job.kind, kind)
+        && status.is_none_or(|status| job.status == status)
+        && (query.is_empty()
+            || job.id.to_lowercase().contains(query)
+            || books
+                .iter()
+                .any(|book| book.id == job.book_id && book.title.to_lowercase().contains(query)))
+}
+
+fn detail_rows(job: &BackgroundJobSnapshot) -> Vec<(&'static str, String)> {
+    vec![
+        ("任务 ID", job.id.clone()),
+        ("图书 ID", job.book_id.clone()),
+        ("来源 ID", job.source_id.clone().unwrap_or_else(not_set)),
+        ("任务类型", job_kind_label(&job.kind).into()),
+        (
+            "状态 / 尝试",
+            format!(
+                "{} / {} 次",
+                status_database_label(job.status),
+                job.attempts
+            ),
+        ),
+        ("处理进度", progress_label(job)),
+        ("创建时间 UTC", format_timestamp(job.created_at)),
+        ("更新时间 UTC", format_timestamp(job.updated_at)),
+        (
+            "开始时间 UTC",
+            job.started_at.map(format_timestamp).unwrap_or_else(not_set),
+        ),
+        (
+            "结束时间 UTC",
+            job.finished_at
+                .map(format_timestamp)
+                .unwrap_or_else(not_set),
+        ),
+        (
+            "控制请求",
+            if job.cancel_requested {
+                "正在取消"
+            } else if job.pause_requested {
+                "正在暂停"
+            } else {
+                "无"
+            }
+            .into(),
+        ),
+    ]
+}
+
+fn diagnostic_log_copy(job: &BackgroundJobSnapshot, logs: &BackgroundJobLogSnapshot) -> String {
+    let summary = detail_rows(job)
+        .into_iter()
+        .map(|(name, value)| format!("{name}: {value}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let lines = logs
+        .entries
+        .iter()
+        .map(|entry| entry.format_line())
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "{summary}\n\n最近保留的日志：{} 条；较早记录{}清理；时间正序，ordinal 从 0 开始。\n{lines}",
+        logs.entries.len(),
+        if logs.truncated {
+            "已"
+        } else {
+            "可能按全局上限"
+        }
+    )
+}
+
+fn diagnostic_summary(job: &BackgroundJobSnapshot) -> String {
+    let mut lines = detail_rows(job)
+        .into_iter()
+        .map(|(name, value)| format!("{name}: {value}"))
+        .collect::<Vec<_>>();
+    if let Some(error) = &job.error {
+        lines.push(format!("错误: {error}"));
+    }
+    if let Some(cursor) = &job.cursor_json {
+        lines.push(format!("执行游标:\n{}", prettify_cursor(cursor)));
+    }
+    lines.join("\n")
 }
 
 pub(super) fn open_background_jobs_window(
@@ -648,11 +1099,11 @@ pub(super) fn open_background_jobs_window(
         SingletonWindowReservation::InFlight => return Ok(()),
         SingletonWindowReservation::Reserved => {}
     }
-    let bounds = Bounds::centered(None, size(px(820.), px(720.)), cx);
+    let bounds = Bounds::centered(None, size(px(1180.), px(820.)), cx);
     let opened = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            window_min_size: Some(size(px(640.), px(520.))),
+            window_min_size: Some(size(px(900.), px(640.))),
             titlebar: Some(TitlebarOptions {
                 title: Some("墨页 · 后台任务".into()),
                 ..Default::default()
@@ -661,8 +1112,9 @@ pub(super) fn open_background_jobs_window(
             ..Default::default()
         },
         move |window, cx| {
-            let jobs =
-                cx.new(|_| BackgroundJobsWindow::new(Arc::clone(&services), books, scope_label));
+            let jobs = cx.new(|cx| {
+                BackgroundJobsWindow::new(Arc::clone(&services), books, scope_label, window, cx)
+            });
             jobs.update(cx, |jobs, cx| jobs.refresh(window, cx));
             register_background_jobs_window(jobs.downgrade(), cx);
             on_window_close(window, cx, |_, _| true);
@@ -793,40 +1245,16 @@ fn status_database_label(status: BackgroundJobStatus) -> &'static str {
     }
 }
 
-/// Truncate an opaque identifier to `max_chars` characters, keeping both ends
-/// visible. UUIDs and source IDs are easier to copy when the prefix/suffix are
-/// still readable; full IDs are still available in the `cursor` row of the
-/// details panel when the service exposes them.
-fn truncate_middle(value: &str, max_chars: usize) -> String {
-    let chars: Vec<char> = value.chars().collect();
-    if chars.len() <= max_chars || max_chars <= 4 {
-        return value.to_string();
-    }
-    let head = max_chars / 2 - 1;
-    let tail = max_chars - head - 3;
-    let prefix: String = chars.iter().take(head).collect();
-    let suffix: String = chars
-        .iter()
-        .rev()
-        .take(tail)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("{prefix}…{suffix}")
-}
-
-/// Format a Unix timestamp (seconds) as `YYYY-MM-DD HH:MM:SS` in the local
-/// time zone without depending on `chrono` or `time` crates.
+/// Format a Unix timestamp (seconds) as `YYYY-MM-DD HH:MM:SS` in UTC without depending on `chrono` or `time` crates.
 fn format_timestamp(unix_seconds: u64) -> String {
-    format_local_datetime(unix_seconds).unwrap_or_else(|| "—".to_string())
+    format_utc_datetime(unix_seconds).unwrap_or_else(|| "—".to_string())
 }
 
 fn not_set() -> String {
     "—".to_string()
 }
 
-fn format_local_datetime(unix_seconds: u64) -> Option<String> {
+fn format_utc_datetime(unix_seconds: u64) -> Option<String> {
     let secs = i64::try_from(unix_seconds).ok()?;
     let days = secs.div_euclid(86_400);
     let secs_of_day = secs.rem_euclid(86_400) as u32;
@@ -845,7 +1273,7 @@ fn format_local_datetime(unix_seconds: u64) -> Option<String> {
 fn civil_from_days(days_since_epoch: i64) -> Option<(i32, u32, u32)> {
     let z = days_since_epoch + 719_468;
     let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097) as i64;
+    let doe = z.rem_euclid(146_097);
     let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
@@ -924,6 +1352,57 @@ mod tests {
     }
 
     #[test]
+    fn task_filters_combine_kind_status_and_owning_book() {
+        let snapshot = job(BackgroundJobStatus::Failed);
+        let books = vec![
+            BackgroundJobBook {
+                id: "book-1".into(),
+                title: "Rust 开发".into(),
+            },
+            BackgroundJobBook {
+                id: "book-2".into(),
+                title: "其他图书".into(),
+            },
+        ];
+        assert!(job_matches(
+            &snapshot,
+            &books,
+            "embedding",
+            Some(BackgroundJobStatus::Failed),
+            "rust"
+        ));
+        assert!(job_matches(&snapshot, &books, "", None, "job-1"));
+        assert!(!job_matches(&snapshot, &books, "translation", None, ""));
+        assert!(!job_matches(
+            &snapshot,
+            &books,
+            "",
+            Some(BackgroundJobStatus::Running),
+            ""
+        ));
+        assert!(!job_matches(&snapshot, &books, "", None, "其他图书"));
+        assert!(kind_matches("future-job", "other"));
+        assert!(!kind_matches("translation", "other"));
+    }
+
+    #[test]
+    fn copied_details_preserve_full_identifiers_and_failure_context() {
+        let mut snapshot = job(BackgroundJobStatus::Failed);
+        snapshot.id = "translation:0123456789abcdef0123456789abcdef:zh-Hans".into();
+        snapshot.error = Some("HTTP 请求失败".into());
+        snapshot.cursor_json = Some(r#"{"next_ordinal":17}"#.into());
+        let copied = diagnostic_summary(&snapshot);
+        assert!(copied.contains(&snapshot.id));
+        assert!(copied.contains("HTTP 请求失败"));
+        assert!(copied.contains("\"next_ordinal\": 17"));
+        assert!(copied.contains("UTC"));
+        let logs = diagnostic_log_copy(&snapshot, &BackgroundJobLogSnapshot::default());
+        assert!(!logs.contains("HTTP 请求失败"));
+        assert!(!logs.contains("next_ordinal"));
+        assert!(logs.contains(&snapshot.id));
+    }
+
+    #[test]
     fn pending_control_hides_duplicate_actions_and_updates_status() {
         let mut pending = job(BackgroundJobStatus::Running);
         pending.pause_requested = true;
@@ -972,17 +1451,6 @@ mod tests {
         let formatted = format_timestamp(1_700_000_000);
         assert!(formatted.starts_with("2023-11-14 "));
         assert_eq!(formatted.len(), "YYYY-MM-DD HH:MM:SS".len());
-    }
-
-    #[test]
-    fn truncate_middle_keeps_both_ends_visible() {
-        let long = "0123456789abcdef0123456789abcdef";
-        let truncated = truncate_middle(long, 12);
-        assert!(truncated.starts_with("0123"));
-        assert!(truncated.ends_with("cdef"));
-        assert!(truncated.contains('…'));
-        // Short inputs pass through unchanged.
-        assert_eq!(truncate_middle("short", 12), "short");
     }
 
     #[test]

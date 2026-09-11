@@ -55,6 +55,12 @@ pub fn error_kind(error: &anyhow::Error) -> &'static str {
     if error.is::<IncompleteToolArguments>() {
         return "incomplete_tool_arguments";
     }
+    if error.is::<crate::ai::ProviderHttpError>() {
+        return "http_rejected";
+    }
+    if let Some(error) = error.downcast_ref::<crate::translation::ResponseError>() {
+        return error.kind();
+    }
     if let Some(error) = error.downcast_ref::<AgentError>() {
         return match error {
             AgentError::InvalidConfiguration(_) => "agent_configuration",

@@ -18,6 +18,7 @@ use crate::document::{
     Block, BlockDocument, Inline, ListItem, MAX_DOCUMENT_DEPTH, TableCell, TableRow,
     deterministic_id, raw_html_plain_text,
 };
+use crate::translation::{TranslationSource, is_matching_whitespace, normalize_source_text};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParsedSource {
@@ -104,6 +105,16 @@ const SKIPPED_TEXT_TAGS: [&str; 4] = ["script", "style", "noscript", "template"]
 /// nested containers (a list item wrapping a paragraph) from being translated
 /// twice.
 pub fn block_texts_from_html(source: &str) -> Result<Vec<String>> {
+    Ok(translation_blocks_from_html(source)?
+        .into_iter()
+        .map(|block| block.text)
+        .collect())
+}
+
+/// Extracts text leaves without losing the boundaries of original formatting.
+/// The model translates only these leaves; the reader retains the source DOM.
+/// Code is included in the matching text but never becomes a translation slot.
+pub fn translation_blocks_from_html(source: &str) -> Result<Vec<TranslationSource>> {
     if source.contains('\0') {
         bail!("正文不能包含 NUL 字符");
     }
@@ -115,7 +126,20 @@ pub fn block_texts_from_html(source: &str) -> Result<Vec<String>> {
     )
     .one(source);
     let mut output = Vec::new();
-    collect_block_texts(&dom.document, 0, &mut output)?;
+    collect_translation_sources(&dom.document, 0, &mut output)?;
+    Ok(output)
+}
+
+/// Extracts from the exact full document served by the EPUB reader. Metadata in
+/// the head is never considered part of a chapter's translation or slot indices.
+pub fn translation_blocks_from_document_html(source: &str) -> Result<Vec<TranslationSource>> {
+    if source.contains('\0') {
+        bail!("正文不能包含 NUL 字符");
+    }
+    let dom = parse_document(RcDom::default(), Default::default()).one(source);
+    let body = find_html_element(&dom.document, "body").context("阅读章节没有正文元素")?;
+    let mut output = Vec::new();
+    collect_translation_sources(&body, 0, &mut output)?;
     Ok(output)
 }
 
@@ -129,18 +153,29 @@ fn is_skipped_element(node: &Handle) -> bool {
         if SKIPPED_TEXT_TAGS.contains(&name.local.as_ref()))
 }
 
-fn collect_block_texts(node: &Handle, depth: usize, output: &mut Vec<String>) -> Result<()> {
+fn is_code_element(node: &Handle) -> bool {
+    matches!(&node.data, NodeData::Element { name, .. }
+        if matches!(name.local.as_ref(), "pre" | "code"))
+}
+
+fn collect_translation_sources(
+    node: &Handle,
+    depth: usize,
+    output: &mut Vec<TranslationSource>,
+) -> Result<()> {
     ensure_html_depth(depth)?;
-    if is_skipped_element(node) {
+    if is_skipped_element(node) || is_code_element(node) {
         return Ok(());
     }
     if is_translatable_element(node) && !has_translatable_descendant(node, depth)? {
-        let text = html_text(node, depth)?
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        if !text.is_empty() {
-            output.push(text);
+        let mut text = String::new();
+        let mut segments = Vec::new();
+        collect_translation_leaves(node, depth, false, &mut text, &mut segments)?;
+        if !segments.is_empty() {
+            output.push(TranslationSource {
+                text: normalize_source_text(&text),
+                segments,
+            });
         }
         return Ok(());
     }
@@ -150,7 +185,39 @@ fn collect_block_texts(node: &Handle, depth: usize, output: &mut Vec<String>) ->
         } else {
             depth
         };
-        collect_block_texts(child, child_depth, output)?;
+        collect_translation_sources(child, child_depth, output)?;
+    }
+    Ok(())
+}
+
+fn collect_translation_leaves(
+    node: &Handle,
+    depth: usize,
+    within_code: bool,
+    text: &mut String,
+    segments: &mut Vec<String>,
+) -> Result<()> {
+    ensure_html_depth(depth)?;
+    if is_skipped_element(node) {
+        return Ok(());
+    }
+    let within_code = within_code || is_code_element(node);
+    if let NodeData::Text { contents } = &node.data {
+        let value = contents.borrow();
+        text.push_str(&value);
+        if !within_code && !value.trim_matches(is_matching_whitespace).is_empty() {
+            segments.push(value.to_string());
+        }
+    }
+    // Match DOM textContent: <br> has no text, while its original node remains
+    // responsible for rendering the line break in the translated projection.
+    for child in node.children.borrow().iter() {
+        let child_depth = if matches!(&child.data, NodeData::Element { .. }) {
+            depth + 1
+        } else {
+            depth
+        };
+        collect_translation_leaves(child, child_depth, within_code, text, segments)?;
     }
     Ok(())
 }
@@ -159,6 +226,9 @@ fn has_translatable_descendant(node: &Handle, depth: usize) -> Result<bool> {
     fn scan(node: &Handle, depth: usize) -> Result<bool> {
         ensure_html_depth(depth)?;
         for child in node.children.borrow().iter() {
+            if is_skipped_element(child) || is_code_element(child) {
+                continue;
+            }
             if is_translatable_element(child) {
                 return Ok(true);
             }
@@ -1245,6 +1315,90 @@ mod tests {
                 .is_empty()
         );
         assert!(block_texts_from_html("a\0b").is_err());
+    }
+
+    #[test]
+    fn translation_sources_keep_formatting_slots_breaks_and_code_context() {
+        let source = "<h2>Chapter <em>one</em></h2>\
+            <p>Read <strong>very <em>carefully</em></strong>: \
+            <code>call(&quot;x&quot;)</code><br>Next <sup>2</sup>\u{a0}line.</p>\
+            <p><code>untranslated()</code></p>\
+            <pre><code>never translate this</code></pre>";
+        let blocks = translation_blocks_from_html(source).unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].text, "Chapter one");
+        assert_eq!(blocks[0].segments, ["Chapter ", "one"]);
+        assert_eq!(
+            blocks[1].text,
+            "Read very carefully: call(\"x\")Next 2 line."
+        );
+        assert_eq!(
+            blocks[1].segments,
+            [
+                "Read ",
+                "very ",
+                "carefully",
+                ": ",
+                "Next ",
+                "2",
+                "\u{a0}line."
+            ]
+        );
+    }
+
+    #[test]
+    fn translation_sources_exclude_inert_descendants_and_blank_leaves() {
+        let source = "<p>Alpha<script>secret()</script><style>ignored{}</style>\
+            <noscript>fallback</noscript><template><p>inert</p></template>\
+            <strong>Beta</strong><span>\u{feff}\u{a0}</span>Gamma</p>\
+            <p>\u{feff}\u{a0}</p>";
+        let blocks = translation_blocks_from_html(source).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].text, "AlphaBeta Gamma");
+        assert_eq!(blocks[0].segments, ["Alpha", "Beta", "Gamma"]);
+    }
+
+    #[test]
+    fn translation_sources_preserve_repeated_blocks_and_nested_cell_order() {
+        let source = "<ul><li><p>Same <b>text</b></p></li><li>Same <b>text</b></li></ul>\
+            <blockquote><p>Quote</p></blockquote>\
+            <table><tr><th>Title</th><td><p>Cell <i>value</i></p></td></tr></table>";
+        let blocks = translation_blocks_from_html(source).unwrap();
+        assert_eq!(
+            blocks
+                .iter()
+                .map(|block| block.text.as_str())
+                .collect::<Vec<_>>(),
+            ["Same text", "Same text", "Quote", "Title", "Cell value"]
+        );
+        assert_eq!(blocks[0].segments, blocks[1].segments);
+        assert_eq!(blocks[4].segments, ["Cell ", "value"]);
+    }
+
+    #[test]
+    fn translation_sources_reject_invalid_or_excessively_deep_source() {
+        assert!(translation_blocks_from_html("<p>bad\0source</p>").is_err());
+        let source = format!(
+            "<p>{}text{}</p>",
+            "<span>".repeat(MAX_DOCUMENT_DEPTH + 1),
+            "</span>".repeat(MAX_DOCUMENT_DEPTH + 1)
+        );
+        assert!(translation_blocks_from_html(&source).is_err());
+    }
+
+    #[test]
+    fn reader_document_translation_slots_follow_original_body_without_ast_rewriting() {
+        let source = r#"<!doctype html><html><head><title>Metadata</title>
+            <script>ignore()</script></head><body>
+            <p>Read <a href="https://example.test">this</a> now</p>
+            <p><span>One</span><span>two</span></p>
+            <ul><li>First <em>item</em></li></ul></body></html>"#;
+        let blocks = translation_blocks_from_document_html(source).unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].segments, ["Read ", "this", " now"]);
+        assert_eq!(blocks[1].text, "Onetwo");
+        assert_eq!(blocks[1].segments, ["One", "two"]);
+        assert_eq!(blocks[2].segments, ["First ", "item"]);
     }
 
     #[test]

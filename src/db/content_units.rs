@@ -41,17 +41,6 @@ pub(crate) fn list_for_source(conn: &Connection, source_id: &str) -> Result<Vec<
         .context("无法读取内容单元记录")
 }
 
-pub(crate) fn count_for_source(conn: &Connection, source_id: &str) -> Result<usize> {
-    let count = conn
-        .query_row(
-            "SELECT COUNT(*) FROM content_units WHERE source_id = ?1",
-            [source_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .context("无法统计来源内容单元")?;
-    usize::try_from(count).context("来源内容单元数量超出支持范围")
-}
-
 pub(crate) fn insert(conn: &Connection, unit: &ContentUnit) -> Result<usize> {
     conn.execute(
         "INSERT INTO content_units
