@@ -496,3 +496,34 @@ for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; c
     } finally { await page.close(); }
   });
 }
+
+for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; charset=utf-8"]) {
+  const mode = contentType.startsWith("application") ? "XHTML" : "HTML";
+  test(`${mode}: invisible-format-only leaves are not translation slots on either side`, async () => {
+    // 宿主现场回归：代码用 ZWSP 缩进，ZWSP 不属于 ECMAScript `\s`。旧叶子列表把它
+    // 当成片段，模型只能回空白，整块被 `empty_segment_text` 拒绝。
+    const page = await pageWithFixture('<!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><title>Invisible leaves</title></head><body><p id="code-line"><span id="indent">\u200b\u200b</span><span>const</span> THREE_AND_A_BIT : f32 = 3.4028236;</p><p id="blank">\u200b\u00ad</p></body></html>', contentType);
+    try {
+      await page.evaluate((payload) => window.moyeTranslations.configure(payload), {
+        session: "invisible-leaf-session", displayMode: "translation-only", blocks: [
+          segmentBlock("code-line", "\u200b\u200bconst THREE_AND_A_BIT : f32 = 3.4028236;", [
+            ["const", "常量"],
+            [" THREE_AND_A_BIT : f32 = 3.4028236;", "三分之一个字节的常量"],
+          ]),
+        ],
+      });
+      const state = await page.evaluate(() => ({
+        applied: window.moyeTranslations.applied(),
+        layers: document.querySelectorAll("[data-moye-translation]").length,
+        indent: document.getElementById("indent").textContent,
+        translated: document.getElementById("code-line").previousElementSibling
+          ?.querySelector(".moye-translation-text")?.textContent,
+      }));
+      assert.deepEqual(state, {
+        applied: 1, layers: 1,
+        indent: "\u200b\u200b",
+        translated: "\u200b\u200b常量 三分之一个字节的常量",
+      }, "the invisible indentation keeps its node and only visible leaves are replaced");
+    } finally { await page.close(); }
+  });
+}

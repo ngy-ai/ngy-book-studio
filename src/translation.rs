@@ -345,6 +345,46 @@ pub(crate) fn is_matching_whitespace(value: char) -> bool {
     )
 }
 
+/// Unicode `Cf` format characters that render as nothing but are not
+/// ECMAScript `\s`. A known EPUB code listing indents lines with ZWSP, which
+/// survives the whitespace filter alone and then has nothing to translate.
+pub(crate) fn is_invisible_format(value: char) -> bool {
+    matches!(
+        value,
+        '\u{00ad}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061c}'
+            | '\u{06dd}'
+            | '\u{070f}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08e2}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206f}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+            | '\u{13430}'..='\u{1343f}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0001}'
+            | '\u{e0020}'..='\u{e007f}'
+    )
+}
+
+/// A text leaf owns a translation slot only when it has visible content.
+/// Whitespace-only or invisible-format-only leaves have nothing to translate:
+/// a model answers them with blanks, and the protocol rejects blank segment
+/// text for the whole block. `src/ui/reader/translations.js` filters its leaves
+/// with the same rule, so both sides agree on which leaves are slots.
+pub(crate) fn has_visible_text(value: &str) -> bool {
+    value
+        .chars()
+        .any(|value| !is_matching_whitespace(value) && !is_invisible_format(value))
+}
+
 pub(crate) fn normalize_source_text(value: &str) -> String {
     value
         .split(is_matching_whitespace)
@@ -638,5 +678,38 @@ mod tests {
             "a b c"
         );
         assert_eq!(normalize_source_text("a\u{85}b"), "a\u{85}b");
+    }
+
+    #[test]
+    fn only_leaves_with_visible_text_own_a_translation_slot() {
+        // 空白与不可见格式字符都没有可翻译内容；模型对它们只会回空白，而空片段
+        // 会让整个文本块被拒绝，因此两端都必须把它们排除在片段列表之外。
+        for invisible in [
+            "   ",
+            "\t\n",
+            "\u{a0}\u{3000}",
+            "\u{feff}",
+            "\u{200b}",
+            "\u{200b}\u{200c}",
+            "\u{00ad}",
+            "\u{0600}",
+            "\u{0605}",
+            "\u{06dd}",
+            "\u{070f}",
+            "\u{0890}\u{0891}",
+            "\u{08e2}",
+            "\u{2060}",
+            "\u{202a}\u{200b}",
+            "\u{110bd}\u{110cd}",
+            "\u{13430}\u{1343f}",
+            "\u{1bca0}\u{1bca3}",
+            "\u{1d173}\u{1d17a}",
+            "\u{e0001}\u{e0020}\u{e007f}",
+        ] {
+            assert!(!has_visible_text(invisible), "{invisible:?} 不应成为片段");
+        }
+        for visible in ["a", "1.", "—", "\u{200b}字", "\u{a0}x", "x\u{00ad}"] {
+            assert!(has_visible_text(visible), "{visible:?} 应当成为片段");
+        }
     }
 }

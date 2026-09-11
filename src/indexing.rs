@@ -31,7 +31,7 @@ use tracing::Instrument as _;
 use crate::{
     ai::{
         ChatMessage, ChatRequest, ChatRole, ContentPart, EmbeddingRequest, ImageUrl,
-        MessageContent, OpenAiCompatibleProvider,
+        MessageContent, OpenAiCompatibleProvider, ReasoningEffort,
     },
     db,
     document::{BlockDocument, DocumentLocator, NormalizedRect, SourceLocator, deterministic_id},
@@ -65,6 +65,8 @@ const MAX_TRANSLATION_SOURCE_CHARS: usize = 8_000;
 const MAX_TRANSLATION_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_TRANSLATION_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_TRANSLATION_BLOCKS: usize = 500_000;
+/// Display-only preview length of one block in the task window.
+const TRANSLATION_BLOCK_PREVIEW_CHARS: usize = 96;
 const TRANSLATION_MAX_OUTPUT_TOKENS: u32 = 4_096;
 const TRANSLATION_RESPONSE_ATTEMPTS: usize = 2;
 static NEXT_TRANSLATION_RUN_ID: AtomicU64 = AtomicU64::new(1);
@@ -338,6 +340,57 @@ impl IndexingCoordinator {
         .map(|jobs| jobs.into_iter().map(snapshot_from_row).collect())
     }
 
+    /// Enumerates the translatable blocks of one whole-book translation task
+    /// with the same revision-pinned extraction the worker uses. This is a
+    /// read-only inspection path: it never claims, advances, or publishes the
+    /// job, so it can be called while the task is running. Expensive EPUB
+    /// parsing happens once per call, so callers should cache the result per
+    /// task identity instead of polling it.
+    pub async fn translation_blocks(&self, job_id: &str) -> Result<TranslationBlockList> {
+        let job_id = job_id.to_string();
+        let db_path = self.inner.db_path.clone();
+        let job = run_db_on(self.inner.runtime.clone(), db_path, move |conn| {
+            db::index_jobs::get(&conn, &job_id)
+        })
+        .await?
+        .context("后台任务已不存在")?;
+
+        ensure!(
+            job.kind == TRANSLATION_JOB_KIND,
+            "只有图书翻译任务可以查看文本块明细"
+        );
+        let source_id = job.source_id.clone().context("翻译任务缺少来源")?;
+        let target_language = translation_target_language(&job)?;
+        let cursor =
+            serde_json::from_str::<JobCursor>(&job.cursor_json).context("翻译任务游标无效")?;
+        ensure!(
+            cursor.schema_version == 1
+                && cursor.book_id == job.book_id
+                && cursor.source_id == source_id
+                && cursor.kind == TRANSLATION_JOB_KIND,
+            "翻译任务游标与任务身份不匹配"
+        );
+
+        let blocks =
+            load_translation_blocks(&self.inner, &job.book_id, &source_id, cursor.revision).await?;
+        let total = blocks.len();
+        let infos = blocks
+            .into_iter()
+            .map(|block| TranslationBlockInfo {
+                ordinal: block.ordinal,
+                unit_ordinal: block.unit_ordinal,
+                unit_title: block.unit_title,
+                source_preview: translation_block_preview(&block.source.text),
+            })
+            .collect();
+        Ok(TranslationBlockList {
+            target_language,
+            total,
+            next_ordinal: cursor.next_ordinal.min(total),
+            blocks: infos,
+        })
+    }
+
     pub async fn pause(&self, job_id: &str) -> Result<bool> {
         self.request_control(job_id, ControlRequest::Pause).await
     }
@@ -541,7 +594,7 @@ impl IndexingCoordinator {
         self.inner.models.clear_poison();
         let db_path = self.inner.db_path.clone();
         let reconcile = services.clone();
-        let changed = run_db_mut(db_path, move |mut conn| {
+        let changed = run_db_on(self.inner.runtime.clone(), db_path, move |mut conn| {
             let now = unix_timestamp()?;
             db::transactions::reconfigure_translation_jobs(
                 &mut conn,
@@ -635,7 +688,7 @@ impl IndexingCoordinator {
         let _transition = self.inner.transitions.lock().await;
         let job_id = job_id.to_string();
         let db_path = self.inner.db_path.clone();
-        let changed = run_db_mut(db_path, move |conn| {
+        let changed = run_db_on(self.inner.runtime.clone(), db_path, move |conn| {
             let Some(job) = db::index_jobs::get(&conn, &job_id)? else {
                 return Ok(0);
             };
@@ -1595,9 +1648,35 @@ async fn run_vision(
 struct TranslationBlock {
     unit_id: String,
     unit_revision: u64,
+    unit_title: String,
+    unit_ordinal: usize,
     block_id: String,
     ordinal: usize,
     source: TranslationSource,
+}
+
+/// One block of a whole-book translation task as inspected from the task
+/// window. The preview is derived from the revision-pinned source text and is
+/// never persisted; whether the block is done, in flight, or pending stays a
+/// pure function of the live durable cursor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranslationBlockInfo {
+    pub ordinal: usize,
+    pub unit_ordinal: usize,
+    pub unit_title: String,
+    pub source_preview: String,
+}
+
+/// Structural block list of one whole-book translation task. `next_ordinal` is
+/// the durable cursor observed while inspecting, so the caller can tell a
+/// processed block from the one currently in flight without re-parsing the
+/// book on every poll.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranslationBlockList {
+    pub target_language: String,
+    pub total: usize,
+    pub next_ordinal: usize,
+    pub blocks: Vec<TranslationBlockInfo>,
 }
 
 fn translation_target_language(job: &db::index_jobs::IndexJob) -> Result<String> {
@@ -1948,7 +2027,7 @@ async fn load_translation_blocks(
     let source = {
         let source_id = source_id.clone();
         let book_id = book_id.clone();
-        run_db(inner.db_path.clone(), move |conn| {
+        run_db_on(inner.runtime.clone(), inner.db_path.clone(), move |conn| {
             let source = db::book_sources::get(&conn, &source_id)?.context("翻译来源不存在")?;
             ensure!(
                 source.book_id == book_id && source.revision == revision,
@@ -1968,9 +2047,11 @@ async fn load_translation_blocks(
     } else {
         None
     };
-    // Both EPUB parsing and canonical HTML conversion are CPU work. run_db
-    // executes this closure on spawn_blocking, away from the Tokio workers.
-    run_db(inner.db_path.clone(), move |conn| {
+    // Both EPUB parsing and canonical HTML conversion are CPU work.
+    // `run_db_on` executes this closure on spawn_blocking, away from the Tokio
+    // workers, and locates the runtime from the coordinator instead of the
+    // caller: this path is also reached from inspection APIs the UI awaits.
+    run_db_on(inner.runtime.clone(), inner.db_path.clone(), move |conn| {
         if let Some(bytes) = epub_bytes {
             let opened = crate::reader::OpenedBook::open_bytes(bytes)?;
             translation_blocks_with_epub(
@@ -2054,6 +2135,8 @@ fn translation_blocks_with_epub(
             blocks.push(TranslationBlock {
                 unit_id: unit.id.clone(),
                 unit_revision: unit.revision,
+                unit_title: unit.title.clone().unwrap_or_default(),
+                unit_ordinal: unit.ordinal,
                 block_id: format!("{}::h{index}", unit.id),
                 ordinal,
                 source,
@@ -2098,6 +2181,22 @@ fn validate_translation_source(source: &TranslationSource) -> Result<()> {
         "段落格式片段超过翻译请求大小上限，请先拆分长段落后重试"
     );
     Ok(())
+}
+
+/// Collapse whitespace and truncate one block for the task window preview.
+/// The result is display-only data derived from the pinned revision; it is
+/// never persisted or written to diagnostics.
+fn translation_block_preview(text: &str) -> String {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= TRANSLATION_BLOCK_PREVIEW_CHARS {
+        return normalized;
+    }
+    let mut preview = normalized
+        .chars()
+        .take(TRANSLATION_BLOCK_PREVIEW_CHARS)
+        .collect::<String>();
+    preview.push('…');
+    preview
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2166,7 +2265,12 @@ fn translation_request(
         presence_penalty: None,
         frequency_penalty: None,
         max_tokens: Some(TRANSLATION_MAX_OUTPUT_TOKENS),
-        reasoning_effort: None,
+        // 译文只能是 content 里的严格 JSON，所以翻译请求必须像 Agent 路径一样关闭
+        // 推理：思考模型会把整个输出预算和请求超时都花在推理上。本机 9B 模型实测
+        // 在整段请求超时内只回空 content 增量（2886 个空块、0 字节正文），一个文本块
+        // 都翻不出来；Ollama 的 OpenAI 兼容端点把 `reasoning_effort="none"` 作为
+        // 关闭思考的取值，服务端自行隐藏的推理不会进入 content。
+        reasoning_effort: Some(ReasoningEffort::None),
     }
 }
 
@@ -2412,7 +2516,11 @@ async fn translate_block(
 #[derive(Default)]
 struct TranslationStreamStats {
     events: usize,
+    /// 携带正文的增量块数。
     content_events: usize,
+    /// `content` 字段存在但为空的增量块数：服务端隐藏推理（例如 Ollama 兼容层对
+    /// 思考模型的处理）会长时间只回这类空块，必须与“慢但正常的回答”区分开。
+    empty_content_events: usize,
     content_bytes: usize,
     first_event_ms: Option<u64>,
     finish_reason: Option<&'static str>,
@@ -2491,13 +2599,19 @@ async fn collect_translation_response(
                     ));
                 }
                 if let Some(delta) = event.content_delta {
-                    stats.content_events = stats.content_events.saturating_add(1);
-                    if response.len().saturating_add(delta.len()) > MAX_TRANSLATION_RESPONSE_BYTES {
-                        stats.end = "response_too_large";
-                        break Err(anyhow::anyhow!("翻译模型响应超过大小上限"));
+                    if delta.is_empty() {
+                        stats.empty_content_events = stats.empty_content_events.saturating_add(1);
+                    } else {
+                        stats.content_events = stats.content_events.saturating_add(1);
+                        if response.len().saturating_add(delta.len())
+                            > MAX_TRANSLATION_RESPONSE_BYTES
+                        {
+                            stats.end = "response_too_large";
+                            break Err(anyhow::anyhow!("翻译模型响应超过大小上限"));
+                        }
+                        stats.content_bytes = stats.content_bytes.saturating_add(delta.len());
+                        response.push_str(&delta);
                     }
-                    stats.content_bytes = stats.content_bytes.saturating_add(delta.len());
-                    response.push_str(&delta);
                 }
                 if event.done {
                     stats.done = true;
@@ -2562,6 +2676,7 @@ async fn collect_translation_response(
             end = stats.end,
             events = stats.events,
             content_events = stats.content_events,
+            empty_content_events = stats.empty_content_events,
             response_bytes = stats.content_bytes,
             first_event_ms = stats.first_event_ms,
             finish_reason = stats.finish_reason,
@@ -2579,6 +2694,7 @@ async fn collect_translation_response(
             end = stats.end,
             events = stats.events,
             content_events = stats.content_events,
+            empty_content_events = stats.empty_content_events,
             response_bytes = stats.content_bytes,
             first_event_ms = stats.first_event_ms,
             finish_reason = stats.finish_reason,
@@ -2597,6 +2713,7 @@ async fn collect_translation_response(
             end = stats.end,
             events = stats.events,
             content_events = stats.content_events,
+            empty_content_events = stats.empty_content_events,
             response_bytes = stats.content_bytes,
             first_event_ms = stats.first_event_ms,
             finish_reason = stats.finish_reason,
@@ -2648,7 +2765,9 @@ fn vision_request(model: &str, image_url: String) -> ChatRequest {
         presence_penalty: None,
         frequency_penalty: None,
         max_tokens: Some(1_500),
-        reasoning_effort: None,
+        // 视觉任务同样只认 `content` 里的严格 JSON，思考模型会把 1500 token 的输出
+        // 预算和整段请求超时花在推理上，最终只回空 `content`（与翻译请求同一类失败）。
+        reasoning_effort: Some(ReasoningEffort::None),
     }
 }
 
@@ -3365,6 +3484,14 @@ fn snapshot_from_row(job: db::index_jobs::IndexJob) -> IndexingJobSnapshot {
     }
 }
 
+/// Runs one blocking database operation on the ambient Tokio runtime.
+///
+/// This resolves the runtime with [`Handle::current`], so it may only be
+/// awaited by work the coordinator spawned itself: the worker loop and the
+/// steps it drives. Anything the UI can await must pass the handle explicitly
+/// through [`run_db_on`] instead. GPUI callbacks run on their own executor,
+/// not on a Tokio runtime, and resolving the ambient handle there panics in a
+/// function that cannot unwind, which aborts the whole application.
 async fn run_db<T, F>(db_path: PathBuf, operation: F) -> Result<T>
 where
     T: Send + 'static,
@@ -3519,6 +3646,20 @@ mod tests {
             }
             .boxed()
         }
+    }
+
+    #[test]
+    fn vision_request_disables_model_reasoning() {
+        // 视觉识别同样只消费 `content` 里的严格 JSON，必须与翻译、Agent 路径一致地
+        // 关闭推理，否则思考模型会在整段请求超时内只回空增量。
+        let request = vision_request("vision:test", "data:image/png;base64,AAAA".to_string());
+        assert_eq!(request.reasoning_effort, Some(ReasoningEffort::None));
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["reasoning_effort"],
+            serde_json::json!("none")
+        );
+        assert_eq!(request.temperature, Some(0.0));
+        assert_eq!(request.max_tokens, Some(1_500));
     }
 
     #[test]
@@ -6412,6 +6553,30 @@ mod tests {
     }
 
     #[test]
+    fn translation_request_disables_model_reasoning() {
+        // 思考模型会把整个输出预算和请求超时花在推理上，而 Ollama 的 OpenAI 兼容
+        // 端点只回空 content 增量：本地 9B 模型实测在整段请求超时内产出 0 字节正文。
+        // 翻译只要 content 里的严格 JSON，所以必须像 Agent 路径一样显式关闭推理。
+        let source = TranslationSource {
+            text: "第一章 起点".to_string(),
+            segments: vec!["起点".to_string()],
+        };
+        let request = translation_request("model:test", "zh-Hans", None, &source, false);
+        assert_eq!(request.reasoning_effort, Some(ReasoningEffort::None));
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["reasoning_effort"],
+            serde_json::json!("none"),
+            "关闭推理只有出现在请求体里才对服务端生效"
+        );
+        assert_eq!(request.temperature, Some(0.0));
+        assert_eq!(request.max_tokens, Some(TRANSLATION_MAX_OUTPUT_TOKENS));
+
+        // 格式纠正重试沿用同一组生成参数。
+        let correction = translation_request("model:test", "zh-Hans", None, &source, true);
+        assert_eq!(correction.reasoning_effort, Some(ReasoningEffort::None));
+    }
+
+    #[test]
     fn translation_source_limits_count_raw_whitespace_and_encoded_slot_overhead() {
         let exact = "a".repeat(MAX_TRANSLATION_SOURCE_CHARS);
         assert!(
@@ -6462,6 +6627,16 @@ mod tests {
     }
 
     #[test]
+    fn translation_block_previews_collapse_whitespace_and_truncate() {
+        assert_eq!(translation_block_preview("  a\n\tb  "), "a b");
+        let exact = "字".repeat(TRANSLATION_BLOCK_PREVIEW_CHARS);
+        assert_eq!(translation_block_preview(&exact), exact);
+        let preview = translation_block_preview(&"字".repeat(TRANSLATION_BLOCK_PREVIEW_CHARS + 10));
+        assert_eq!(preview.chars().count(), TRANSLATION_BLOCK_PREVIEW_CHARS + 1);
+        assert!(preview.ends_with('…'));
+    }
+
+    #[test]
     fn translation_blocks_flatten_text_blocks_in_document_order() {
         use crate::document::{Block, ListItem, TableCell, TableRow};
 
@@ -6507,8 +6682,8 @@ mod tests {
         };
         conn.execute(
             "INSERT INTO content_units(id, book_id, source_id, ordinal, kind,
-                 source_locator_json, block_json, revision, created_at, updated_at)
-             VALUES ('unit', 'book', 'source', 0, 'chapter', '{}', ?1, 1, 1, 1)",
+                 source_locator_json, title, block_json, revision, created_at, updated_at)
+             VALUES ('unit', 'book', 'source', 0, 'chapter', '{}', '第一章', ?1, 1, 1, 1)",
             rusqlite::params![serde_json::to_string(&document).unwrap()],
         )
         .unwrap();
@@ -6523,6 +6698,8 @@ mod tests {
                 "unit::h0", "unit::h1", "unit::h2", "unit::h3", "unit::h4", "unit::h5"
             ],
         );
+        assert!(blocks.iter().all(|block| block.unit_title == "第一章"));
+        assert!(blocks.iter().all(|block| block.unit_ordinal == 0));
         assert_eq!(
             blocks.iter().map(|block| block.ordinal).collect::<Vec<_>>(),
             vec![0, 1, 2, 3, 4, 5],
@@ -6683,6 +6860,84 @@ mod tests {
                 .runtime
                 .block_on(coordinator.retranslate(&other))
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn translation_block_inspection_is_revision_pinned_and_read_only() {
+        let fixture = Fixture::new();
+        let coordinator = IndexingCoordinator {
+            inner: fixture.indexing_inner(),
+            workers: Mutex::new(Vec::new()),
+        };
+        let provider: Arc<dyn OpenAiCompatibleProvider> = Arc::new(MockProvider::default());
+        let job_id = format!("translation:{}:zh-Hans", fixture.source_id);
+        fixture
+            .runtime
+            .block_on(coordinator.configure_translation(
+                provider,
+                "chat-test".to_string(),
+                "translation-v1:chat-test".to_string(),
+                Some("zh-Hans".to_string()),
+                false,
+            ))
+            .unwrap();
+
+        let before = {
+            let conn = db::open_conn(&fixture.db_path).unwrap();
+            db::index_jobs::get(&conn, &job_id).unwrap().unwrap()
+        };
+        let list = fixture
+            .runtime
+            .block_on(coordinator.translation_blocks(&job_id))
+            .unwrap();
+        assert_eq!(list.target_language, "zh-Hans");
+        assert!(
+            list.total >= 2,
+            "created book has a heading and a paragraph"
+        );
+        assert_eq!(list.total, list.blocks.len());
+        assert_eq!(list.next_ordinal, 0);
+        assert_eq!(list.blocks[0].ordinal, 0);
+        assert_eq!(list.blocks[0].unit_ordinal, 0);
+        assert_eq!(list.blocks[0].unit_title, "第一章");
+        assert!(list.blocks[0].source_preview.contains("第一章"));
+        assert!(
+            list.blocks
+                .iter()
+                .all(|block| !block.source_preview.is_empty())
+        );
+        assert_eq!(
+            list.blocks
+                .iter()
+                .map(|block| block.ordinal)
+                .collect::<Vec<_>>(),
+            (0..list.total).collect::<Vec<_>>(),
+        );
+
+        // Inspection must never claim, advance, or publish the inspected job.
+        let after = {
+            let conn = db::open_conn(&fixture.db_path).unwrap();
+            db::index_jobs::get(&conn, &job_id).unwrap().unwrap()
+        };
+        assert_eq!(before.status, after.status);
+        assert_eq!(before.cursor_json, after.cursor_json);
+        assert_eq!(before.updated_at, after.updated_at);
+
+        // Only translation tasks expose blocks, and an unknown task is rejected.
+        assert!(
+            fixture
+                .runtime
+                .block_on(
+                    coordinator.translation_blocks(&format!("embedding:{}", fixture.source_id))
+                )
+                .is_err()
+        );
+        assert!(
+            fixture
+                .runtime
+                .block_on(coordinator.translation_blocks("translation:missing:zh-Hans"))
+                .is_err()
         );
     }
 

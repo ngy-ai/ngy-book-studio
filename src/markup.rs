@@ -18,7 +18,7 @@ use crate::document::{
     Block, BlockDocument, Inline, ListItem, MAX_DOCUMENT_DEPTH, TableCell, TableRow,
     deterministic_id, raw_html_plain_text,
 };
-use crate::translation::{TranslationSource, is_matching_whitespace, normalize_source_text};
+use crate::translation::{TranslationSource, has_visible_text, normalize_source_text};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParsedSource {
@@ -205,7 +205,7 @@ fn collect_translation_leaves(
     if let NodeData::Text { contents } = &node.data {
         let value = contents.borrow();
         text.push_str(&value);
-        if !within_code && !value.trim_matches(is_matching_whitespace).is_empty() {
+        if !within_code && has_visible_text(&value) {
             segments.push(value.to_string());
         }
     }
@@ -1356,6 +1356,27 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].text, "AlphaBeta Gamma");
         assert_eq!(blocks[0].segments, ["Alpha", "Beta", "Gamma"]);
+    }
+
+    #[test]
+    fn translation_sources_skip_leaves_that_are_only_invisible_format_characters() {
+        // 现场回归：代码行用 ZWSP 缩进，ZWSP 不属于 ECMAScript `\s`，旧过滤把它当成
+        // 翻译槽；模型只能回空白，整块被 `empty_segment_text` 拒绝并停在 96 号块。
+        let source = "<p><span>\u{200b}\u{200b}</span><span>const</span>\
+            <span> THREE_AND_A_BIT : f32 = 3.4028236;</span></p>";
+        let blocks = translation_blocks_from_html(source).unwrap();
+        assert_eq!(blocks.len(), 1);
+        // 不可见格式字符仍留在匹配文本里（现场的 source_chars=42 就是它），读者侧
+        // 靠这段文本定位块级元素，所以只能排除翻译槽，不能改写原文。
+        assert_eq!(
+            blocks[0].text,
+            "\u{200b}\u{200b}const THREE_AND_A_BIT : f32 = 3.4028236;"
+        );
+        assert_eq!(blocks[0].text.chars().count(), 42);
+        assert_eq!(
+            blocks[0].segments,
+            ["const", " THREE_AND_A_BIT : f32 = 3.4028236;"]
+        );
     }
 
     #[test]

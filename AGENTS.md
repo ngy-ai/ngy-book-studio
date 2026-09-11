@@ -37,7 +37,14 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
 - `src/main.rs`：日志、数据目录、WebView2 探测、`AppServices`/GPUI 初始化和图书库
   主窗口。
 - `src/services.rs`、`src/runtime.rs`：进程级服务组合与独立 Tokio runtime；统一持有
-  图书库、对象存储、格式注册表、搜索、AI、Office 和后台任务。
+  图书库、对象存储、格式注册表、搜索、AI、Office 和后台任务。GPUI 回调跑在自己的
+  executor 上，不是 Tokio 上下文：UI 可达的服务方法必须把数据库、对象存储、`tokio::fs`
+  和解析工作放到应用 I/O runtime（`IoRuntime::spawn`）上再 await，`runtime.rs` 的
+  `block_on` 只用于启动、测试与后台线程。索引协调器内部 `run_db`/`run_db_mut` 解析
+  环境句柄，只允许它自己派发的工作使用；公共路径用 `run_db_on` 显式传入句柄，否则会
+  在 GPUI future 里 panic，而 GPUI 回调不可 unwind，会直接终止整个进程。
+  `src/services.rs` 测试里的 `block_on_without_tokio` 用非 Tokio 执行器驱动服务方法，
+  用于固定这条约定（后台任务窗口的文本块明细读取曾因此崩溃）。
 - `src/learning.rs`、`src/learning_records.rs`、`src/learning_catalog.rs`、
   `src/ui/learning.rs`：学习中心异步服务、逐章目录、
   独立 JSON 学习档案和原生 GPUI 训练窗口。记录不进入图书数据库；运行前保存不可变
@@ -100,6 +107,10 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   `transactions::reconfigure_translation_jobs` 重排；每本当前来源只保留一个目标语言任务。
   源语言（`books.language` 主语言子标签）等于目标语言时跳过；翻译任务未配置对话模型时
   失败而不猜测。模型调用不得逐 token 打日志，也不得记录正文或译文内容。
+ 凡是只认 `content` 里严格 JSON 的调用（翻译、vision、Agent）都固定发送
+ `reasoning_effort="none"`：思考模型会把整段输出预算和请求超时全花在推理上，Ollama 的
+ OpenAI 兼容端点对思考模型只回空 `content` 增量，表现为整段超时里 0 字节正文（本机 9B
+ 模型实测 2886 个空块）。三条路径不得各自漂移。
   **EPUB 章节在数据库里保存成单个 `RawHtml` 块**（`<div id="sbo-rt-content">…` 之类），
   语义块结构只存在于 HTML 里：只走 `BlockDocument` 会得到 0 个文本块并让任务立刻“成功”。
   因此必须处理 `Block::RawHtml`，用 `markup::translation_blocks_from_html()` 取出最内层
@@ -114,10 +125,17 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   分段协议校验失败时使用冻结的原始输入和服务额外纠正一次，不回传模型的错误输出，
   不把纯文本猜分段，也不重试 HTTP、流中断或输出上限错误。重试前后检查任务控制与身份，
   失败沿用本执行游标，不能读取新任务游标后将新任务标为失败。诊断使用 `moye_ai`、
-  `translation_run_id`、块序号、尝试次数、固定错误分类、JSON 行列/数量及响应字节数，
-  不记录原文、译文、任意字段名或解析器错误正文。
+  `translation_run_id`、块序号、尝试次数、固定错误分类、JSON 行列/数量、响应字节数与
+  流块分类计数（`content_events`、`empty_content_events`、`unrecognized_events`），
+  不记录原文、译文、任意字段名或解析器错误正文。空 `content` 块与“本客户端不消费的块”
+  必须分开计数：否则“120 秒超时、2886 个事件、0 字节正文”会被读成健康但缓慢的回答。
   `pre/code` 内容计入全文匹配但不翻译，过滤 script/style/noscript/template；换行节点由
-  源 DOM 保留，空白规范化与 ECMAScript `\s` 一致。源文本超过既有上限明确失败，不能
+  源 DOM 保留，空白规范化与 ECMAScript `\s` 一致。文本叶节点必须去掉 ECMAScript `\s`
+  和 Unicode `Cf` 格式字符后仍有可见字符，才能成为翻译槽：EPUB 常用 ZWSP 缩进代码行，
+  ZWSP 不属于 `\s`，送进协议后模型只会回空白，`empty_segment_text` 会拒绝并停下整段任务
+  （现场 96 号代码行）。`markup` 与 `translations.js` 必须共用同一份字符表，两边叶节点
+  数量不一致会让回填整体对齐失败而保留原文。该规则只会减少槽位，命中旧缓存的块最多回退
+  原文，因此不提升 `translation-v2` 身份、不重译整库。源文本超过既有上限明确失败，不能
   截断后存成完整块。`translated_text` 保存校验后的 `StoredTranslation` JSON 和执行身份，
   不增加表结构或旧字段回退。`translation-v2` 身份变化在重排事务中清除该书该语言旧译文；
   缓存读取与执行均核验身份，避免同名模型换端点或格式协议后复用旧结果。

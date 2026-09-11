@@ -18,6 +18,7 @@ use std::{
 use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 
+pub use crate::indexing::{TranslationBlockInfo, TranslationBlockList};
 pub use crate::job_diagnostics::{
     BACKGROUND_JOB_LOG_LIMIT, BackgroundJobLogEntry, BackgroundJobLogSnapshot, JobLogLevel,
 };
@@ -1751,6 +1752,45 @@ impl AppServices {
             })
             .await
             .context("后台任务日志查询线程异常退出")?
+    }
+
+    /// Structural text-block list of one whole-book translation task, used by
+    /// the task window to show which blocks are done, in flight, or pending.
+    /// The scope check mirrors the task list and logs: an empty scope grants no
+    /// access, and a task outside the current scope is rejected. Parsing the
+    /// pinned revision is expensive, so callers should cache the result per
+    /// task instead of polling it.
+    ///
+    /// Reading the blocks touches the database and, for EPUB sources, the blob
+    /// store, so the work runs on the application I/O runtime: callers such as
+    /// the task window await this from a GPUI callback, which is not a Tokio
+    /// context of its own.
+    pub async fn background_job_translation_blocks(
+        &self,
+        job_id: String,
+        book_ids: Vec<String>,
+    ) -> Result<TranslationBlockList> {
+        ensure!(!job_id.trim().is_empty(), "后台任务 ID 不能为空");
+        let indexing = Arc::clone(&self.indexing);
+        let db_path = self.db_path.clone();
+        let scope_job_id = job_id.clone();
+        self.runtime
+            .handle()
+            .spawn_blocking(move || {
+                let conn = db::open_conn(&db_path)?;
+                let job = db::index_jobs::get(&conn, &scope_job_id)?.context("后台任务已不存在")?;
+                ensure!(
+                    book_ids.iter().any(|book_id| book_id == &job.book_id),
+                    "后台任务不在当前图书范围内"
+                );
+                Ok(())
+            })
+            .await
+            .context("后台任务明细查询线程异常退出")??;
+        self.runtime
+            .spawn(async move { indexing.translation_blocks(&job_id).await })
+            .await
+            .context("后台任务明细线程异常退出")?
     }
 
     /// Applies one state transition using the coordinator that owns the job
@@ -4354,6 +4394,75 @@ mod tests {
         assert!(
             jobs.iter().any(|job| job.kind == "translation"),
             "startup reconciliation keeps one translation job per book and language"
+        );
+    }
+
+    #[test]
+    fn translation_block_inspection_runs_off_the_callers_runtime() {
+        // The task window requests the block list from a GPUI callback, and GPUI
+        // runs its futures on its own executor rather than the application I/O
+        // runtime. The service must therefore move the scope check and the whole
+        // revision-pinned extraction, blob read included, onto its own runtime:
+        // resolving the ambient Tokio handle from a GPUI task panics in a
+        // function that cannot unwind, which aborts the process.
+        let temp = tempfile::tempdir().unwrap();
+        let services = AppServices::open_with_credentials(
+            temp.path(),
+            Arc::new(MemoryCredentialStore::default()),
+        )
+        .unwrap();
+        let runtime = services.runtime();
+        let book = runtime
+            .block_on(async {
+                services
+                    .spawn_library(|library| library.create_book("Blocks", "Author"))
+                    .await
+                    .context("library test worker stopped")?
+            })
+            .unwrap();
+
+        // Saving a default language is the product path that enqueues the
+        // whole-book translation task this window inspects.
+        let mut settings = services.provider_settings().unwrap();
+        settings.default_language = Some("zh-Hans".to_string());
+        runtime
+            .block_on(services.configure_provider(settings, ApiKeyUpdate::Keep))
+            .unwrap();
+
+        let job_id = {
+            let conn = db::open_conn(services.database_path()).unwrap();
+            let source = db::book_sources::get_revision(&conn, &book.id, book.revision)
+                .unwrap()
+                .unwrap();
+            let job_id = format!("translation:{}:zh-Hans", source.id);
+            let job = db::index_jobs::get(&conn, &job_id)
+                .unwrap()
+                .expect("saving a default language must enqueue a translation task");
+            assert_eq!(job.status, db::index_jobs::IndexJobStatus::Paused);
+            assert_eq!(job.source_id.as_deref(), Some(source.id.as_str()));
+            job_id
+        };
+
+        let list = block_on_without_tokio(
+            services.background_job_translation_blocks(job_id.clone(), vec![book.id.clone()]),
+        )
+        .unwrap();
+        assert_eq!(list.target_language, "zh-Hans");
+        assert!(
+            list.total >= 2,
+            "a created book has a heading and a paragraph"
+        );
+        assert_eq!(list.total, list.blocks.len());
+        assert_eq!(list.next_ordinal, 0);
+        assert_eq!(list.blocks[0].unit_title, "第一章");
+
+        // The read-only inspection keeps the same scope rules as the task list
+        // and the logs: a task outside the current scope grants no access.
+        assert!(
+            block_on_without_tokio(
+                services.background_job_translation_blocks(job_id, vec!["other-book".to_string()],)
+            )
+            .is_err()
         );
     }
 

@@ -56,6 +56,31 @@ fn snapshots() -> Vec<BackgroundJobSnapshot> {
         .collect()
 }
 
+/// Synthetic block list matching the snapshot progress: a book long enough to
+/// need several inspector pages, with empty chapter titles to exercise the
+/// fallback label.
+fn block_list(total: usize) -> TranslationBlockList {
+    TranslationBlockList {
+        target_language: "zh-Hans".into(),
+        total,
+        next_ordinal: 17,
+        blocks: (0..total)
+            .map(|ordinal| TranslationBlockInfo {
+                ordinal,
+                unit_ordinal: ordinal / 4,
+                unit_title: if ordinal % 4 == 0 {
+                    String::new()
+                } else {
+                    format!("第 {} 节 — 用于验证标题截断的长章节名", ordinal / 4 + 1)
+                },
+                source_preview: format!(
+                    "文本块 {ordinal} 的原文预览内容，用于验证单行截断与状态徽章的对齐"
+                ),
+            })
+            .collect(),
+    }
+}
+
 fn open_fixture(
     cx: &mut TestAppContext,
 ) -> (
@@ -155,10 +180,10 @@ fn complete_background_task_layout_keeps_all_controls_inside_both_window_sizes(
     let (_directory, view, visual) = open_fixture(cx);
     for (width, height) in [(900., 640.), (1180., 820.)] {
         visual.simulate_resize(size(px(width), px(height)));
-        for show_logs in [false, true] {
+        for tab in [DetailTab::Summary, DetailTab::Logs, DetailTab::Blocks] {
             visual.update(|_, cx| {
                 view.update(cx, |jobs, cx| {
-                    jobs.show_logs = show_logs;
+                    jobs.tab = tab;
                     jobs.logs = Some(BackgroundJobLogSnapshot {
                         entries: (0..500)
                             .map(|ordinal| BackgroundJobLogEntry {
@@ -175,6 +200,10 @@ fn complete_background_task_layout_keeps_all_controls_inside_both_window_sizes(
                             .collect(),
                         truncated: true,
                     });
+                    jobs.blocks = Some(block_list(78));
+                    if let Some(job) = jobs.jobs.first_mut() {
+                        job.status = BackgroundJobStatus::Running;
+                    }
                     cx.notify();
                 });
             });
@@ -182,6 +211,58 @@ fn complete_background_task_layout_keeps_all_controls_inside_both_window_sizes(
             assert_regions_fit(visual, width, height);
         }
     }
+}
+
+#[test]
+fn translation_block_inspector_pages_filters_and_marks_the_in_flight_block() {
+    let blocks = block_list(78);
+    let mut job = snapshots().remove(0);
+    job.status = BackgroundJobStatus::Running;
+    let progress = translation_progress(&job, blocks.total);
+    assert_eq!(
+        (progress.done, progress.processing, progress.pending),
+        (17, 1, 60)
+    );
+
+    let first = block_page_indices(&blocks, progress, None, 0);
+    assert_eq!(first, (0..BLOCKS_PER_PAGE).collect::<Vec<_>>());
+    let second = block_page_indices(&blocks, progress, None, 1);
+    assert_eq!(second.first(), Some(&50));
+    assert_eq!(second.last(), Some(&77));
+
+    assert_eq!(
+        block_page_indices(&blocks, progress, Some(BlockState::Done), 0),
+        (0..17).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        block_page_indices(&blocks, progress, Some(BlockState::Processing), 0),
+        vec![17]
+    );
+    let pending = block_page_indices(&blocks, progress, Some(BlockState::Pending), 0);
+    assert_eq!(pending.first(), Some(&18));
+    assert_eq!(pending.len(), BLOCKS_PER_PAGE);
+
+    // A finished task leaves no block in flight, and the page controls cannot
+    // scroll past the last block.
+    job.progress.completed = blocks.total;
+    let finished = translation_progress(&job, blocks.total);
+    assert_eq!(
+        (
+            finished.done,
+            finished.processing,
+            finished.pending,
+            finished.running
+        ),
+        (78, 0, 0, false)
+    );
+    assert!(block_page_indices(&blocks, finished, Some(BlockState::Processing), 0).is_empty());
+    // Past the last page there is nothing left to show.
+    assert!(block_page_indices(&blocks, finished, None, 2).is_empty());
+
+    // A stale snapshot that overran the current block list stays consistent.
+    job.progress.completed = 200;
+    let stale = translation_progress(&job, blocks.total);
+    assert_eq!((stale.done, stale.processing, stale.pending), (78, 0, 0));
 }
 
 #[gpui::test]

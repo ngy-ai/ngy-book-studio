@@ -393,6 +393,21 @@ pub enum ReasoningEffort {
     High,
 }
 
+impl ReasoningEffort {
+    /// Stable diagnostics label. `None` here means "explicitly send `none`", which
+    /// is how a request turns thinking off; an omitted parameter is reported
+    /// separately as `unset`, so a Debug dump like `Some(None)` never appears in
+    /// the logs where it reads like "nothing was sent".
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     #[serde(default)]
@@ -569,7 +584,10 @@ impl OpenAiCompatibleProvider for OpenAiHttpProvider {
             tool_count = request.tools.len(),
             max_tokens = request.max_tokens,
             temperature = request.temperature,
-            reasoning_effort = ?request.reasoning_effort,
+            reasoning_effort = request
+                .reasoning_effort
+                .map(ReasoningEffort::label)
+                .unwrap_or("unset"),
             request_body_bytes = tracing::field::Empty,
         );
         async move {
@@ -1272,6 +1290,17 @@ struct SseDiagnostics {
     started_at: Instant,
     first_event_ms: Option<u64>,
     content_bytes: usize,
+    /// Chunks that carried answer text.
+    content_events: usize,
+    /// Chunks whose `content` delta was present but empty. Providers that hide a
+    /// hidden reasoning trace server-side (for example an Ollama thinking model
+    /// on the OpenAI-compatible endpoint) stream a long run of these without any
+    /// error, so they must be distinguishable from a slow but healthy answer.
+    empty_content_events: usize,
+    /// Chunks that carried nothing this client consumes: no content delta, no
+    /// tool call, no finish reason and no usage. A provider-specific reasoning
+    /// field would be counted here instead of being silently discarded.
+    unrecognized_events: usize,
     tool_delta_count: usize,
     tool_argument_bytes: usize,
     finish_reason: Option<&'static str>,
@@ -1285,6 +1314,9 @@ impl SseDiagnostics {
             started_at: Instant::now(),
             first_event_ms: None,
             content_bytes: 0,
+            content_events: 0,
+            empty_content_events: 0,
+            unrecognized_events: 0,
             tool_delta_count: 0,
             tool_argument_bytes: 0,
             finish_reason: None,
@@ -1296,9 +1328,24 @@ impl SseDiagnostics {
     fn observe(&mut self, event: &ChatStreamEvent) {
         self.first_event_ms
             .get_or_insert_with(|| self.started_at.elapsed().as_millis() as u64);
-        self.content_bytes = self
-            .content_bytes
-            .saturating_add(event.content_delta.as_ref().map_or(0, String::len));
+        match event.content_delta.as_deref() {
+            Some("") => {
+                self.empty_content_events = self.empty_content_events.saturating_add(1);
+            }
+            Some(delta) => {
+                self.content_events = self.content_events.saturating_add(1);
+                self.content_bytes = self.content_bytes.saturating_add(delta.len());
+            }
+            None => {}
+        }
+        if event.content_delta.is_none()
+            && !event.done
+            && event.tool_call_deltas.is_empty()
+            && event.finish_reason.is_none()
+            && event.usage.is_none()
+        {
+            self.unrecognized_events = self.unrecognized_events.saturating_add(1);
+        }
         self.tool_delta_count = self
             .tool_delta_count
             .saturating_add(event.tool_call_deltas.len());
@@ -1341,6 +1388,9 @@ impl SseDiagnostics {
                 json_error_column = json_error.map(serde_json::Error::column),
                 wire_bytes,
                 event_count,
+                content_events = self.content_events,
+                empty_content_events = self.empty_content_events,
+                unrecognized_events = self.unrecognized_events,
                 elapsed_ms = self.started_at.elapsed().as_millis() as u64,
                 "AI response stream failed"
             );
@@ -1352,6 +1402,9 @@ impl SseDiagnostics {
             wire_bytes,
             event_count,
             content_bytes = self.content_bytes,
+            content_events = self.content_events,
+            empty_content_events = self.empty_content_events,
+            unrecognized_events = self.unrecognized_events,
             tool_delta_count = self.tool_delta_count,
             tool_argument_bytes = self.tool_argument_bytes,
             finish_reason = ?self.finish_reason,
@@ -1869,6 +1922,36 @@ mod tests {
             Some("search_books")
         );
         assert_eq!(event.usage.unwrap().total_tokens, 3);
+    }
+
+    #[test]
+    fn separates_empty_and_unrecognized_stream_chunks() {
+        // Ollama 的 OpenAI 兼容端点对思考模型只回 `content: ""` 的空块。如果这些块
+        // 与正文块混在一起计数，一次 120 秒超时就会表现为「2886 个内容事件、0 字节
+        // 正文」，看不出模型根本没有开始回答。
+        let mut diagnostics = SseDiagnostics::new();
+        for _ in 0..2 {
+            diagnostics.observe(&ChatStreamEvent {
+                content_delta: Some(String::new()),
+                ..ChatStreamEvent::default()
+            });
+        }
+        diagnostics.observe(&ChatStreamEvent {
+            content_delta: Some("答".to_string()),
+            ..ChatStreamEvent::default()
+        });
+        // 流的首块通常只带 role；provider 私有的推理字段同样落在这里：本客户端
+        // 不消费的字段不会伪装成正文。
+        diagnostics.observe(&ChatStreamEvent::default());
+        // `[DONE]` 本身没有载荷，不能计入「无法识别」。
+        diagnostics.observe(&ChatStreamEvent {
+            done: true,
+            ..ChatStreamEvent::default()
+        });
+        assert_eq!(diagnostics.content_events, 1);
+        assert_eq!(diagnostics.content_bytes, "答".len());
+        assert_eq!(diagnostics.empty_content_events, 2);
+        assert_eq!(diagnostics.unrecognized_events, 1);
     }
 
     #[test]

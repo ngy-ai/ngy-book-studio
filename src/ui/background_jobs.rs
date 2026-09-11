@@ -7,9 +7,13 @@ mod layout_tests;
 use moye_epub_editor::job_diagnostics::BackgroundJobLogSnapshot;
 use moye_epub_editor::services::{
     AppServices, BackgroundJobAction, BackgroundJobSnapshot, BackgroundJobStatus,
+    TranslationBlockInfo, TranslationBlockList, translation_language_label,
 };
 
 const JOBS_PER_PAGE: usize = 12;
+/// One page of the translation block inspector. Blocks are rendered without
+/// virtual scrolling, so the page bounds what one frame has to build.
+const BLOCKS_PER_PAGE: usize = 50;
 const JOB_KINDS: &[(&str, &str)] = &[
     ("", "全部任务"),
     ("translation", "图书翻译"),
@@ -32,6 +36,79 @@ const STATUS_FILTERS: &[(Option<BackgroundJobStatus>, &str)] = &[
 pub(super) struct BackgroundJobBook {
     pub id: String,
     pub title: String,
+}
+
+/// Which detail panel is open for the selected task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DetailTab {
+    Summary,
+    Logs,
+    /// Per-block view of a whole-book translation task.
+    Blocks,
+}
+
+/// Whether one translatable block was already processed, is being translated
+/// right now, or is still waiting. Derived from the live durable cursor so the
+/// inspector never needs a second source of truth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockState {
+    Done,
+    Processing,
+    Pending,
+}
+
+impl BlockState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Done => "已处理",
+            Self::Processing => "处理中",
+            Self::Pending => "待处理",
+        }
+    }
+
+    fn colors(self) -> (gpui::Rgba, gpui::Rgba) {
+        match self {
+            Self::Done => (rgb(0x376441), rgb(0xe3efe5)),
+            Self::Processing => (rgb(ACCENT_DARK), rgb(ACCENT_SOFT)),
+            Self::Pending => (rgb(0x5e6572), rgb(0xe7e9ed)),
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Processing => "processing",
+            Self::Pending => "pending",
+        }
+    }
+}
+
+/// Live translation counters for one job. `done` mirrors the durable cursor:
+/// the block at the cursor is the one the running worker is translating.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TranslationProgress {
+    total: usize,
+    done: usize,
+    processing: usize,
+    pending: usize,
+    running: bool,
+}
+
+impl TranslationProgress {
+    fn count(self, state: BlockState) -> usize {
+        match state {
+            BlockState::Done => self.done,
+            BlockState::Processing => self.processing,
+            BlockState::Pending => self.pending,
+        }
+    }
+
+    fn filtered(self, filter: Option<BlockState>) -> usize {
+        match filter {
+            Some(state) => self.count(state),
+            None => self.total,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -59,11 +136,21 @@ pub(super) struct BackgroundJobsWindow {
     page: usize,
     list_scroll: ScrollHandle,
     detail_scroll: ScrollHandle,
-    show_logs: bool,
+    tab: DetailTab,
     logs: Option<BackgroundJobLogSnapshot>,
     logs_loading: bool,
     logs_generation: u64,
     logs_error: Option<String>,
+    blocks: Option<TranslationBlockList>,
+    /// Task identity the cached block list was loaded for. The list is pinned
+    /// to the source revision, so one successful load per task is enough and
+    /// polling never re-parses the book.
+    blocks_job_id: Option<String>,
+    blocks_loading: bool,
+    blocks_generation: u64,
+    blocks_error: Option<String>,
+    blocks_state: Option<BlockState>,
+    blocks_page: usize,
     notice: Option<JobsNotice>,
     refresh_error: Option<String>,
     _search_subscription: Subscription,
@@ -119,11 +206,18 @@ impl BackgroundJobsWindow {
             page: 0,
             list_scroll: ScrollHandle::default(),
             detail_scroll: ScrollHandle::default(),
-            show_logs: false,
+            tab: DetailTab::Summary,
             logs: None,
             logs_loading: false,
             logs_generation: 0,
             logs_error: None,
+            blocks: None,
+            blocks_job_id: None,
+            blocks_loading: false,
+            blocks_generation: 0,
+            blocks_error: None,
+            blocks_state: None,
+            blocks_page: 0,
             notice: None,
             refresh_error: None,
             _search_subscription: subscription,
@@ -154,16 +248,29 @@ impl BackgroundJobsWindow {
         self.page = page;
         if self.selected_job_id != selected {
             self.selected_job_id = selected;
-            self.clear_logs();
+            self.clear_detail_cache();
         }
     }
 
-    fn clear_logs(&mut self) {
+    /// Drops every cached per-task payload. Called whenever the inspected task
+    /// changes or its identity may have been rewritten.
+    fn clear_detail_cache(&mut self) {
         self.detail_scroll.set_offset(gpui::point(px(0.), px(0.)));
         self.logs_generation = self.logs_generation.wrapping_add(1);
         self.logs_loading = false;
         self.logs = None;
         self.logs_error = None;
+        self.clear_blocks();
+    }
+
+    fn clear_blocks(&mut self) {
+        self.blocks_generation = self.blocks_generation.wrapping_add(1);
+        self.blocks_loading = false;
+        self.blocks = None;
+        self.blocks_job_id = None;
+        self.blocks_error = None;
+        self.blocks_state = None;
+        self.blocks_page = 0;
     }
 
     fn filters_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -171,6 +278,7 @@ impl BackgroundJobsWindow {
         self.list_scroll.set_offset(gpui::point(px(0.), px(0.)));
         self.reconcile_selection();
         self.refresh_logs(window, cx);
+        self.refresh_blocks(window, cx);
         cx.notify();
     }
 
@@ -187,7 +295,7 @@ impl BackgroundJobsWindow {
         self.scope_label = scope_label;
         self.jobs.clear();
         self.selected_job_id = None;
-        self.clear_logs();
+        self.clear_detail_cache();
         self.page = 0;
         self.list_scroll.set_offset(gpui::point(px(0.), px(0.)));
         self.loaded = false;
@@ -225,6 +333,7 @@ impl BackgroundJobsWindow {
                             this.loaded = true;
                             this.reconcile_selection();
                             this.refresh_logs(window, cx);
+                            this.refresh_blocks(window, cx);
                         }
                         Err(error) => {
                             this.refresh_error = Some(format!("无法刷新后台任务：{error:#}"));
@@ -239,7 +348,7 @@ impl BackgroundJobsWindow {
     }
 
     fn refresh_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.show_logs || self.logs_loading {
+        if self.tab != DetailTab::Logs || self.logs_loading {
             return;
         }
         let Some(job_id) = self.selected_job_id.clone() else {
@@ -263,6 +372,70 @@ impl BackgroundJobsWindow {
                         this.logs_error = None;
                     }
                     Err(error) => this.logs_error = Some(format!("无法读取运行日志：{error:#}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Loads the block list of the selected translation task. The structural
+    /// list is pinned to the source revision and never changes while the task
+    /// runs, so one successful load per task is cached; only the live progress
+    /// shown next to it keeps updating.
+    fn refresh_blocks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab != DetailTab::Blocks || self.blocks_loading {
+            return;
+        }
+        let Some(job_id) = self.selected_job_id.clone() else {
+            return;
+        };
+        let Some(job) = self.jobs.iter().find(|job| job.id == job_id) else {
+            return;
+        };
+        if job.kind != "translation" {
+            return;
+        }
+        if self.blocks_job_id.as_deref() == Some(job_id.as_str()) {
+            return;
+        }
+        self.blocks_job_id = Some(job_id.clone());
+        self.blocks_generation = self.blocks_generation.wrapping_add(1);
+        let generation = self.blocks_generation;
+        self.blocks_loading = true;
+        let detail_job_id = job_id.clone();
+        let services = Arc::clone(&self.services);
+        let book_ids = self.books.iter().map(|book| book.id.clone()).collect();
+        cx.spawn_in(window, async move |view, cx| {
+            let result = services
+                .background_job_translation_blocks(job_id, book_ids)
+                .await;
+            let _ = view.update(cx, |this, cx| {
+                if generation != this.blocks_generation {
+                    return;
+                }
+                this.blocks_loading = false;
+                this.detail_scroll.set_offset(gpui::point(px(0.), px(0.)));
+                match result {
+                    Ok(list) => {
+                        // Open on the page holding the block being translated so
+                        // the running position is visible without scrolling.
+                        let done = this
+                            .jobs
+                            .iter()
+                            .find(|job| job.id == detail_job_id)
+                            .map(|job| job.progress.completed)
+                            .unwrap_or_default()
+                            .min(list.total);
+                        let pages = list.total.div_ceil(BLOCKS_PER_PAGE).max(1);
+                        this.blocks_page = (done / BLOCKS_PER_PAGE).min(pages - 1);
+                        this.blocks = Some(list);
+                        this.blocks_error = None;
+                    }
+                    Err(error) => {
+                        this.blocks = None;
+                        this.blocks_error = Some(format!("无法读取文本块明细：{error:#}"));
+                    }
                 }
                 cx.notify();
             });
@@ -311,7 +484,7 @@ impl BackgroundJobsWindow {
                     // Invalidate any snapshot that began before the accepted operation.
                     this.refresh_generation = this.refresh_generation.wrapping_add(1);
                     this.loading = false;
-                    this.clear_logs();
+                    this.clear_detail_cache();
                     this.refresh(window, cx);
                 })
             });
@@ -627,9 +800,10 @@ impl BackgroundJobsWindow {
                         .on_click(cx.listener(move |this, _, window, cx| {
                             if this.selected_job_id.as_ref() != Some(&id) {
                                 this.selected_job_id = Some(id.clone());
-                                this.clear_logs();
+                                this.clear_detail_cache();
                             }
                             this.refresh_logs(window, cx);
+                            this.refresh_blocks(window, cx);
                             cx.notify();
                         })),
                 );
@@ -681,6 +855,7 @@ impl BackgroundJobsWindow {
                                         this.list_scroll.set_offset(gpui::point(px(0.), px(0.)));
                                         this.reconcile_selection();
                                         this.refresh_logs(window, cx);
+                                        this.refresh_blocks(window, cx);
                                         cx.notify();
                                     })),
                             )
@@ -696,6 +871,7 @@ impl BackgroundJobsWindow {
                                         this.list_scroll.set_offset(gpui::point(px(0.), px(0.)));
                                         this.reconcile_selection();
                                         this.refresh_logs(window, cx);
+                                        this.refresh_blocks(window, cx);
                                         cx.notify();
                                     })),
                             ),
@@ -736,13 +912,20 @@ impl BackgroundJobsWindow {
             );
         }
         let mut tabs = div().h_flex().gap_1();
-        for (logs, label) in [(false, "任务详情"), (true, "运行日志")] {
+        let mut tab_items = vec![
+            (DetailTab::Summary, "任务详情"),
+            (DetailTab::Logs, "运行日志"),
+        ];
+        if job.kind == "translation" {
+            tab_items.push((DetailTab::Blocks, "文本块明细"));
+        }
+        for (tab, label) in tab_items {
             tabs = tabs.child(
-                Button::new(SharedString::from(format!("jobs-tab-{logs}")))
+                Button::new(SharedString::from(format!("jobs-tab-{}", tab_id(tab))))
                     .small()
                     .ghost()
                     .label(label)
-                    .when(self.show_logs == logs, |button| {
+                    .when(self.tab == tab, |button| {
                         button.custom(
                             ButtonCustomVariant::new(cx)
                                 .color(rgb(ACCENT_SOFT).into())
@@ -750,22 +933,31 @@ impl BackgroundJobsWindow {
                         )
                     })
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.show_logs = logs;
+                        this.tab = tab;
                         this.detail_scroll.set_offset(gpui::point(px(0.), px(0.)));
                         this.refresh_logs(window, cx);
+                        this.refresh_blocks(window, cx);
                         cx.notify();
                     })),
             );
         }
-        let copy_text = if self.show_logs {
-            self.logs
+        let copy_text = match self.tab {
+            DetailTab::Logs => self
+                .logs
                 .as_ref()
-                .map(|logs| diagnostic_log_copy(job, logs))
-        } else {
-            Some(diagnostic_summary(job))
+                .map(|logs| diagnostic_log_copy(job, logs)),
+            DetailTab::Blocks => self
+                .blocks
+                .as_ref()
+                .map(|blocks| translation_blocks_copy(job, blocks)),
+            DetailTab::Summary => Some(diagnostic_summary(job)),
         };
         let copy_disabled = copy_text.is_none()
-            || (self.show_logs && (self.logs_error.is_some() || self.logs_loading));
+            || match self.tab {
+                DetailTab::Logs => self.logs_error.is_some() || self.logs_loading,
+                DetailTab::Blocks => self.blocks_loading,
+                DetailTab::Summary => false,
+            };
         let copy_view = cx.entity().clone();
         let header = div()
             .flex_none()
@@ -785,10 +977,10 @@ impl BackgroundJobsWindow {
                     .small()
                     .ghost()
                     .icon(IconName::Copy)
-                    .label(if self.show_logs {
-                        "复制日志"
-                    } else {
-                        "复制详情"
+                    .label(match self.tab {
+                        DetailTab::Logs => "复制日志",
+                        DetailTab::Blocks => "复制概览",
+                        DetailTab::Summary => "复制详情",
                     })
                     .disabled(copy_disabled)
                     .on_click(move |_, _, cx| {
@@ -807,7 +999,8 @@ impl BackgroundJobsWindow {
         let mut content = div()
             .id(SharedString::from(format!(
                 "job-detail-{}-{}",
-                job.id, self.show_logs
+                job.id,
+                tab_id(self.tab)
             )))
             .v_flex()
             .flex_1()
@@ -817,7 +1010,11 @@ impl BackgroundJobsWindow {
             .p_4()
             .gap_2()
             .text_xs();
-        if self.show_logs {
+        if self.tab == DetailTab::Blocks {
+            for row in self.translation_block_rows(job, cx) {
+                content = content.child(row);
+            }
+        } else if self.tab == DetailTab::Logs {
             content = content.child(
                 div()
                     .text_color(rgb(MUTED))
@@ -907,6 +1104,246 @@ impl BackgroundJobsWindow {
             )
             .into_any_element()
     }
+
+    /// Rows of the translation block inspector: live counters, state filters,
+    /// the current page of blocks, and the page controls. Blocks are listed by
+    /// ascending task cursor so `#n` matches the `ordinal` in the run log.
+    fn translation_block_rows(
+        &self,
+        job: &BackgroundJobSnapshot,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let mut rows: Vec<gpui::AnyElement> = Vec::new();
+        rows.push(
+            div()
+                .text_color(rgb(MUTED))
+                .child(
+                    "文本块按任务游标顺序排列，序号从 0 开始，与运行日志的 ordinal 一致；预览为原文开头。状态随任务进度实时更新。",
+                )
+                .into_any_element(),
+        );
+        if let Some(error) = &self.blocks_error {
+            rows.push(
+                div()
+                    .text_color(rgb(DANGER))
+                    .child(error.clone())
+                    .into_any_element(),
+            );
+            rows.push(
+                Button::new("jobs-blocks-reload")
+                    .small()
+                    .outline()
+                    .label("重新加载文本块明细")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.clear_blocks();
+                        this.refresh_blocks(window, cx);
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+            return rows;
+        }
+        let Some(blocks) = &self.blocks else {
+            rows.push(
+                div()
+                    .text_color(rgb(MUTED))
+                    .child(if self.blocks_loading {
+                        "正在读取文本块明细…"
+                    } else {
+                        "尚未加载文本块明细。"
+                    })
+                    .into_any_element(),
+            );
+            return rows;
+        };
+
+        let progress = translation_progress(job, blocks.total);
+        rows.push(
+            div()
+                .h_flex()
+                .flex_wrap()
+                .gap_2()
+                .text_color(rgb(INK))
+                .child(format!(
+                    "共 {} 个文本块 · 已处理 {} · 处理中 {} · 待处理 {}",
+                    progress.total, progress.done, progress.processing, progress.pending
+                ))
+                .into_any_element(),
+        );
+        rows.push(
+            div()
+                .text_color(rgb(MUTED))
+                .child(format!(
+                    "目标语言：{}",
+                    translation_language_label(&blocks.target_language)
+                        .unwrap_or(blocks.target_language.as_str())
+                ))
+                .into_any_element(),
+        );
+
+        let mut filters = div().h_flex().flex_wrap().gap_1();
+        for (state, label) in [
+            (None, format!("全部 {}", progress.total)),
+            (Some(BlockState::Done), format!("已处理 {}", progress.done)),
+            (
+                Some(BlockState::Processing),
+                format!("处理中 {}", progress.processing),
+            ),
+            (
+                Some(BlockState::Pending),
+                format!("待处理 {}", progress.pending),
+            ),
+        ] {
+            let id = state.map(BlockState::id).unwrap_or("all");
+            filters = filters.child(
+                Button::new(SharedString::from(format!("jobs-blocks-filter-{id}")))
+                    .small()
+                    .ghost()
+                    .label(label)
+                    .when(self.blocks_state == state, |button| {
+                        button.custom(
+                            ButtonCustomVariant::new(cx)
+                                .color(rgb(ACCENT_SOFT).into())
+                                .foreground(rgb(ACCENT_DARK).into()),
+                        )
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.blocks_state = state;
+                        this.blocks_page = 0;
+                        this.detail_scroll.set_offset(gpui::point(px(0.), px(0.)));
+                        cx.notify();
+                    })),
+            );
+        }
+        rows.push(filters.into_any_element());
+
+        let filtered = progress.filtered(self.blocks_state);
+        let pages = filtered.div_ceil(BLOCKS_PER_PAGE).max(1);
+        let page = self.blocks_page.min(pages - 1);
+        let indices = block_page_indices(blocks, progress, self.blocks_state, page);
+        rows.push(
+            div()
+                .h_flex()
+                .gap_2()
+                .text_color(rgb(MUTED))
+                .child(match (indices.first(), indices.last()) {
+                    (Some(first), Some(last)) => format!(
+                        "显示 #{first}–#{last}（筛选后 {filtered} 块 · 第 {}/{} 页）",
+                        page + 1,
+                        pages
+                    ),
+                    _ => format!("筛选后 0 块 · 第 {}/{} 页", page + 1, pages),
+                })
+                .into_any_element(),
+        );
+        if indices.is_empty() {
+            rows.push(
+                div()
+                    .py_2()
+                    .text_color(rgb(MUTED))
+                    .child("当前筛选下没有文本块。")
+                    .into_any_element(),
+            );
+        }
+        for index in indices {
+            let Some(block) = blocks.blocks.get(index) else {
+                continue;
+            };
+            let state = translation_block_state(index, progress.done, progress.running);
+            let (foreground, background) = state.colors();
+            rows.push(
+                div()
+                    .h_flex()
+                    .items_start()
+                    .gap_2()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .child(
+                        div()
+                            .w(px(52.))
+                            .flex_none()
+                            .text_color(rgb(MUTED))
+                            .child(format!("#{}", block.ordinal)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .px_2()
+                            .rounded(px(4.))
+                            .bg(background)
+                            .text_color(foreground)
+                            .child(state.label()),
+                    )
+                    .child(
+                        div()
+                            .w(px(128.))
+                            .flex_none()
+                            .truncate()
+                            .text_color(rgb(INK))
+                            .child(block_chapter_label(block)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_color(rgb(MUTED))
+                            .child(if block.source_preview.is_empty() {
+                                "（无文字内容）".to_string()
+                            } else {
+                                block.source_preview.clone()
+                            }),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        rows.push(
+            div()
+                .h_flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    Button::new("jobs-blocks-prev")
+                        .small()
+                        .outline()
+                        .label("上一页")
+                        .disabled(page == 0)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.blocks_page = this.blocks_page.saturating_sub(1);
+                            this.detail_scroll.set_offset(gpui::point(px(0.), px(0.)));
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("jobs-blocks-next")
+                        .small()
+                        .outline()
+                        .label("下一页")
+                        .disabled(page + 1 >= pages)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.blocks_page = (this.blocks_page + 1).min(pages - 1);
+                            this.detail_scroll.set_offset(gpui::point(px(0.), px(0.)));
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("jobs-blocks-current")
+                        .small()
+                        .ghost()
+                        .label("跳到当前进度")
+                        .disabled(progress.total == 0)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.blocks_page = (progress.done / BLOCKS_PER_PAGE).min(pages - 1);
+                            this.detail_scroll.set_offset(gpui::point(px(0.), px(0.)));
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        );
+        rows
+    }
 }
 
 impl Render for BackgroundJobsWindow {
@@ -989,6 +1426,97 @@ fn job_matches(
             || books
                 .iter()
                 .any(|book| book.id == job.book_id && book.title.to_lowercase().contains(query)))
+}
+
+fn tab_id(tab: DetailTab) -> &'static str {
+    match tab {
+        DetailTab::Summary => "summary",
+        DetailTab::Logs => "logs",
+        DetailTab::Blocks => "blocks",
+    }
+}
+
+/// Which block the durable cursor currently points at. `done` counts the
+/// processed blocks, so the block at that index is the one the running worker
+/// is translating; that is the only block without a final state.
+fn translation_block_state(index: usize, done: usize, running: bool) -> BlockState {
+    if index < done {
+        BlockState::Done
+    } else if running && index == done {
+        BlockState::Processing
+    } else {
+        BlockState::Pending
+    }
+}
+
+/// Live counters of one translation task. `completed` is the durable cursor,
+/// so clamping it against the block count keeps stale snapshots consistent.
+fn translation_progress(job: &BackgroundJobSnapshot, total: usize) -> TranslationProgress {
+    let done = job.progress.completed.min(total);
+    let running = job.status == BackgroundJobStatus::Running && done < total;
+    let processing = usize::from(running);
+    TranslationProgress {
+        total,
+        done,
+        processing,
+        pending: total - done - processing,
+        running,
+    }
+}
+
+/// Indices of the blocks on one page of the inspector. The scan stops as soon
+/// as the page is filled, so a large book never materializes every match.
+fn block_page_indices(
+    blocks: &TranslationBlockList,
+    progress: TranslationProgress,
+    filter: Option<BlockState>,
+    page: usize,
+) -> Vec<usize> {
+    let start = page.saturating_mul(BLOCKS_PER_PAGE);
+    let end = start.saturating_add(BLOCKS_PER_PAGE);
+    let mut matched = 0usize;
+    let mut indices = Vec::new();
+    for index in 0..blocks.total {
+        let state = translation_block_state(index, progress.done, progress.running);
+        if filter.is_some_and(|filter| filter != state) {
+            continue;
+        }
+        if matched >= start {
+            indices.push(index);
+        }
+        matched += 1;
+        if matched >= end {
+            break;
+        }
+    }
+    indices
+}
+
+fn block_chapter_label(block: &TranslationBlockInfo) -> String {
+    if block.unit_title.trim().is_empty() {
+        format!("第 {} 章", block.unit_ordinal + 1)
+    } else {
+        block.unit_title.clone()
+    }
+}
+
+fn translation_blocks_copy(job: &BackgroundJobSnapshot, blocks: &TranslationBlockList) -> String {
+    let progress = translation_progress(job, blocks.total);
+    [
+        format!("任务 ID: {}", job.id),
+        format!("图书 ID: {}", job.book_id),
+        format!(
+            "目标语言: {}",
+            translation_language_label(&blocks.target_language)
+                .unwrap_or(blocks.target_language.as_str())
+        ),
+        format!(
+            "文本块: 共 {} · 已处理 {} · 处理中 {} · 待处理 {}",
+            progress.total, progress.done, progress.processing, progress.pending
+        ),
+        "序号与任务游标一致，从 0 开始。".to_string(),
+    ]
+    .join("\n")
 }
 
 fn detail_rows(job: &BackgroundJobSnapshot) -> Vec<(&'static str, String)> {
