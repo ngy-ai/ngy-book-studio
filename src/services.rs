@@ -265,17 +265,46 @@ fn default_translation_language() -> Option<String> {
     DEFAULT_TRANSLATION_LANGUAGE.map(str::to_string)
 }
 
+/// How reading-time translations are presented relative to the original text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TranslationDisplayMode {
+    /// Translation text on top, original text below a divider.
+    Bilingual,
+    /// Only the translated text; the original is hidden until the reader toggles.
+    TranslationOnly,
+}
+
+impl Default for TranslationDisplayMode {
+    fn default() -> Self {
+        DEFAULT_TRANSLATION_DISPLAY_MODE
+    }
+}
+
+/// Reading-time translations hide the original text by default; the reader can
+/// still toggle a paragraph back to bilingual. `Bilingual` restores the old
+/// side-by-side view.
+pub(crate) const DEFAULT_TRANSLATION_DISPLAY_MODE: TranslationDisplayMode =
+    TranslationDisplayMode::TranslationOnly;
+
+fn default_translation_display_mode() -> TranslationDisplayMode {
+    DEFAULT_TRANSLATION_DISPLAY_MODE
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedTranslationSettings {
     #[serde(default)]
     default_language: Option<String>,
+    #[serde(default)]
+    display_mode: TranslationDisplayMode,
 }
 
 impl Default for PersistedTranslationSettings {
     fn default() -> Self {
         Self {
             default_language: default_translation_language(),
+            display_mode: default_translation_display_mode(),
         }
     }
 }
@@ -315,6 +344,11 @@ pub struct ProviderSettings {
     /// provider JSON contract remains unchanged, like the preferences above.
     #[serde(skip, default = "default_translation_language")]
     pub default_language: Option<String>,
+    /// Reading-time translation display: bilingual by default off, only the
+    /// translated text by default on. Stored under the translation settings key
+    /// like the target language above.
+    #[serde(skip, default = "default_translation_display_mode")]
+    pub translation_display_mode: TranslationDisplayMode,
     pub embedding_model: String,
     /// Dimension override sent to the embedding provider. Changing this value
     /// invalidates all existing vector indices because stored vectors with the
@@ -382,6 +416,7 @@ impl Default for ProviderSettings {
             background_job_interval_ms: default_background_job_interval_ms(),
             pdf_compact_reading: default_pdf_compact_reading(),
             default_language: default_translation_language(),
+            translation_display_mode: default_translation_display_mode(),
             embedding_model: DEFAULT_EMBEDDING_MODEL.to_string(),
             embedding_dimensions: DEFAULT_EMBEDDING_DIMENSIONS,
             vision_model: DEFAULT_VISION_MODEL.to_string(),
@@ -2220,14 +2255,13 @@ fn load_provider_settings(db_path: &Path) -> Result<ProviderSettings> {
         }
         None => default_pdf_compact_reading(),
     };
-    settings.default_language = match db::settings::get(&tx, TRANSLATION_SETTINGS_KEY)? {
-        Some(row) => {
-            serde_json::from_str::<PersistedTranslationSettings>(&row.value_json)
-                .context("保存的翻译设置无效")?
-                .default_language
-        }
-        None => default_translation_language(),
+    let translation_settings = match db::settings::get(&tx, TRANSLATION_SETTINGS_KEY)? {
+        Some(row) => serde_json::from_str::<PersistedTranslationSettings>(&row.value_json)
+            .context("保存的翻译设置无效")?,
+        None => PersistedTranslationSettings::default(),
     };
+    settings.default_language = translation_settings.default_language;
+    settings.translation_display_mode = translation_settings.display_mode;
     settings.validate()?;
     tx.commit().context("无法完成 AI 设置快照读取")?;
     Ok(settings)
@@ -2281,6 +2315,7 @@ fn save_provider_settings(db_path: &Path, settings: &ProviderSettings) -> Result
         key: TRANSLATION_SETTINGS_KEY.to_string(),
         value_json: serde_json::to_string(&PersistedTranslationSettings {
             default_language: settings.default_language.clone(),
+            display_mode: settings.translation_display_mode,
         })
         .context("无法序列化翻译设置")?,
         updated_at,

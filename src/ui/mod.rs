@@ -687,7 +687,10 @@ fn existing_background_jobs_window(cx: &mut App) -> Option<Entity<BackgroundJobs
         return None;
     }
     let registry = cx.global_mut::<SingletonWindowRegistry>();
-    let upgraded = registry.background_jobs.as_ref().and_then(WeakEntity::upgrade);
+    let upgraded = registry
+        .background_jobs
+        .as_ref()
+        .and_then(WeakEntity::upgrade);
     if upgraded.is_none() {
         registry.background_jobs = None;
     }
@@ -749,6 +752,27 @@ fn apply_pdf_compact_reading(compact_reading: bool, cx: &mut App) {
         remaining.push(weak);
     }
     cx.global_mut::<PdfReaderWindowRegistry>().readers = remaining;
+}
+
+/// Re-applies the translation display preference to every open EPUB reader so a
+/// settings change takes effect on already-loaded chapters without reopening.
+fn apply_translation_display_mode(cx: &mut App) {
+    if !cx.has_global::<SingletonWindowRegistry>() {
+        return;
+    }
+    let readers = cx
+        .global::<SingletonWindowRegistry>()
+        .readers
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    for weak in readers {
+        if let Some(reader) = weak.upgrade() {
+            reader.update(cx, |reader, cx| {
+                reader.apply_translation_display_mode(cx);
+            });
+        }
+    }
 }
 
 struct Notice {

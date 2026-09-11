@@ -5,7 +5,7 @@
 //! treats as book text. The host keeps only a monotonic session/generation so a
 //! late completion for a previous chapter can never overwrite the current one.
 use super::*;
-use moye_epub_editor::services::TranslatedBlock;
+use moye_epub_editor::services::{TranslatedBlock, TranslationDisplayMode};
 
 pub(super) struct ReaderTranslations {
     session: String,
@@ -60,6 +60,11 @@ impl ReaderApp {
             .copied()
             .unwrap_or(0);
         let book_id = self.book_id.clone();
+        let display_mode = self
+            .services
+            .provider_settings()
+            .map(|settings| settings.translation_display_mode)
+            .unwrap_or_default();
         let services = Arc::clone(&self.services);
         cx.spawn(async move |view, cx| {
             let result = services.translation_blocks_for_unit(book_id, unit_id).await;
@@ -79,6 +84,10 @@ impl ReaderApp {
                     serde_json::json!({
                         "session": session,
                         "revision": revision,
+                        "displayMode": match display_mode {
+                            TranslationDisplayMode::Bilingual => "bilingual",
+                            TranslationDisplayMode::TranslationOnly => "translation-only",
+                        },
                         "blocks": blocks.iter().map(translated_block_json).collect::<Vec<_>>(),
                     }),
                     cx,
@@ -86,6 +95,14 @@ impl ReaderApp {
             });
         })
         .detach();
+    }
+
+    /// Re-applies the translation display preference to the currently loaded page
+    /// after it changes in the AI settings; new chapters pick it up automatically.
+    pub(crate) fn apply_translation_display_mode(&mut self, cx: &mut Context<Self>) {
+        if let Some(url) = self.current_reader_url.clone() {
+            self.configure_translations(&url, cx);
+        }
     }
 }
 

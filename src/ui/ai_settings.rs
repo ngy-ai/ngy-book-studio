@@ -14,7 +14,7 @@ use moye_epub_editor::{
         DEFAULT_EMBEDDING_MODEL, DEFAULT_VISION_MODEL, EndpointRoutingSettings, EndpointSettings,
         MAX_BACKGROUND_JOB_CONCURRENCY, MAX_BACKGROUND_JOB_INTERVAL_MS,
         MIN_BACKGROUND_JOB_CONCURRENCY, ModelRole, ProviderSettings, TRANSLATION_LANGUAGES,
-        translation_language_label,
+        TranslationDisplayMode, translation_language_label,
     },
 };
 
@@ -253,6 +253,8 @@ pub(super) struct AiSettingsWindow {
     pdf_compact_reading: bool,
     /// Target language for reading-time book translation. `None` disables it.
     default_language: Option<String>,
+    /// How reading-time translations are displayed relative to the original text.
+    translation_display_mode: TranslationDisplayMode,
     operation: PendingOperation,
     notice: Option<SettingsNotice>,
 }
@@ -390,6 +392,7 @@ impl AiSettingsWindow {
             background_job_interval_input,
             pdf_compact_reading: settings.pdf_compact_reading,
             default_language: settings.default_language.clone(),
+            translation_display_mode: settings.translation_display_mode,
             operation: PendingOperation::Idle,
             notice: None,
         }
@@ -493,6 +496,7 @@ impl AiSettingsWindow {
             )?,
             pdf_compact_reading: self.pdf_compact_reading,
             default_language: self.default_language.clone(),
+            translation_display_mode: self.translation_display_mode,
         };
         settings.validate()?;
         Ok(settings)
@@ -500,6 +504,15 @@ impl AiSettingsWindow {
 
     fn set_default_language(&mut self, language: Option<String>, cx: &mut Context<Self>) {
         self.default_language = language;
+        cx.notify();
+    }
+
+    fn set_translation_display_mode(
+        &mut self,
+        mode: TranslationDisplayMode,
+        cx: &mut Context<Self>,
+    ) {
+        self.translation_display_mode = mode;
         cx.notify();
     }
 
@@ -943,6 +956,7 @@ impl AiSettingsWindow {
                         // Saved settings now reach documents that are already
                         // open; the write above is the source of truth.
                         apply_pdf_compact_reading(pdf_compact_reading, cx);
+                        apply_translation_display_mode(cx);
                         cx.spawn(async move |_entity, cx| {
                             let _ = window_handle.update(cx, |_, window, cx| {
                                 remove_window_after_current_frame(window, cx, None);
@@ -1706,6 +1720,7 @@ impl AiSettingsWindow {
     fn render_system_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let compact_view = cx.entity();
         let language_view = cx.entity();
+        let display_mode_view = cx.entity();
         let selected_language = self.default_language.clone();
         let current_label = selected_language
             .as_deref()
@@ -1738,6 +1753,34 @@ impl AiSettingsWindow {
                             let tag = tag.clone();
                             view.update(cx, |this, cx| {
                                 this.set_default_language(Some(tag), cx);
+                            });
+                        },
+                    ));
+                }
+                menu
+            });
+
+        let selected_mode = self.translation_display_mode;
+        let display_mode_button = Button::new("ai-translation-display-mode")
+            .debug_selector(|| "ai-translation-display-mode".into())
+            .outline()
+            .label(match selected_mode {
+                TranslationDisplayMode::Bilingual => "双语对照",
+                TranslationDisplayMode::TranslationOnly => "仅译文",
+            })
+            .disabled(self.operation.busy())
+            .dropdown_menu(move |menu, _, _| {
+                let mut menu = menu;
+                for (mode, label) in [
+                    (TranslationDisplayMode::TranslationOnly, "仅译文"),
+                    (TranslationDisplayMode::Bilingual, "双语对照"),
+                ] {
+                    let view = display_mode_view.clone();
+                    let selected = selected_mode == mode;
+                    menu = menu.item(PopupMenuItem::new(label).checked(selected).on_click(
+                        move |_, _, cx| {
+                            view.update(cx, |this, cx| {
+                                this.set_translation_display_mode(mode, cx);
                             });
                         },
                     ));
@@ -1842,6 +1885,7 @@ impl AiSettingsWindow {
                             .child("图书翻译"),
                     )
                     .child(language_button)
+                    .child(display_mode_button)
                     .child(
                         div()
                             .text_xs()
@@ -1849,8 +1893,9 @@ impl AiSettingsWindow {
                             .text_color(rgb(MUTED))
                             .child(
                                 "选择语言后，导入或重新翻译的 EPUB、MOBI、AZW、AZW3、Word 图书会按文本块\
-                                 翻译为目标语言；阅读时默认显示“译文在上、原文在下”的双语对照，点击段落\
-                                 可在仅译文与双语之间切换，笔记仍锚定原文。选择“不翻译”则保持原文。",
+                                 翻译为目标语言。默认“仅译文”只显示译文、隐藏原文，点击段落可在仅译文与\
+                                 双语之间切换，笔记仍锚定原文；选择“双语对照”则译文在上、原文在下同时显示。\
+                                 选择“不翻译”则保持原文。",
                             ),
                     ),
             )

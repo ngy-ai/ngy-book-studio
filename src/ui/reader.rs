@@ -585,6 +585,9 @@ pub struct ReaderApp {
     protocol_gate: Option<ReaderProtocolGate>,
     closing_webview: Option<WeakEntity<WebView>>,
     closing: bool,
+    /// URL of the page currently shown, so the translation display preference can
+    /// be re-applied live when it changes in the AI settings.
+    current_reader_url: Option<String>,
     /// Set when the window closes because its book left the library: the final
     /// reading position belongs to a document that no longer exists.
     closing_for_removed_book: bool,
@@ -1472,6 +1475,7 @@ impl ReaderApp {
             protocol_gate: None,
             closing_webview: None,
             closing: false,
+            current_reader_url: None,
             closing_for_removed_book: false,
             progress_close_ready: false,
             removal_scheduled: false,
@@ -1797,6 +1801,7 @@ impl ReaderApp {
             return;
         };
         self.current_spine = spine_index;
+        self.current_reader_url = Some(url.to_string());
         self.selected_toc = self
             .book
             .toc

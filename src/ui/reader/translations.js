@@ -49,7 +49,7 @@
   };
 
   const toggle = (element, block, divider) => {
-    let collapsed = false;
+    let collapsed = block.getAttribute("data-moye-collapsed") === "1";
     return (event) => {
       if (event) {
         event.preventDefault();
@@ -73,11 +73,12 @@
     };
   };
 
-  const buildBlock = (element, translated) => {
+  const buildBlock = (element, translated, collapsed) => {
     const block = document.createElement("div");
     block.setAttribute(MARK, "1");
     block.className = "moye-translation-block";
     block.style.cssText = "margin:0 0 0.35em 0;padding:0;";
+    block.setAttribute("data-moye-collapsed", collapsed ? "1" : "0");
 
     const text = document.createElement("div");
     text.className = "moye-translation-text";
@@ -95,6 +96,13 @@
     // Hiding a table cell would hide its own translation, so cells stay
     // bilingual and are not click-toggleable.
     if (!isCell(element)) {
+      // When "only translation" is the preference, the original is hidden up
+      // front; a click still reveals it through the same toggle.
+      if (collapsed) {
+        element.setAttribute(ORIGINAL_DISPLAY, element.style.display || "");
+        element.style.display = "none";
+        divider.style.display = "none";
+      }
       const onToggle = toggle(element, block, divider);
       text.style.cursor = "pointer";
       text.addEventListener("click", onToggle);
@@ -121,6 +129,10 @@
     const entries = Array.isArray(payload.blocks) ? payload.blocks : [];
     if (!entries.length) return;
 
+    // "translation-only" hides the original text until the reader toggles a
+    // paragraph; every other value keeps the original visible (bilingual).
+    const translateOnly = payload.displayMode === "translation-only";
+
     const queues = new Map();
     for (const entry of entries) {
       if (!entry || typeof entry.translated !== "string") continue;
@@ -136,7 +148,7 @@
       if (!queue || !queue.length) continue;
       const translated = queue.shift();
       if (!translated) continue;
-      insert(element, buildBlock(element, translated));
+      insert(element, buildBlock(element, translated, translateOnly && !isCell(element)));
       appliedCount += 1;
     }
   };
