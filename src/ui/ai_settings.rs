@@ -1704,6 +1704,7 @@ impl AiSettingsWindow {
             )
             .child(
                 div()
+                    .debug_selector(|| "ai-background-job-scheduling".into())
                     .v_flex()
                     .gap_3()
                     .p_4()
@@ -2908,10 +2909,29 @@ mod tests {
     #[gpui::test]
     fn background_jobs_tab_scheduling_drafts_parse_without_saving(cx: &mut TestAppContext) {
         let (_directory, settings, visual) = open_settings(cx);
+        // `debug_bounds` accumulates across frames, so the negative check must run
+        // before the card is ever drawn: visit the system tab first.
+        click_tab(visual, SettingsTab::System);
+        settings.read_with(visual, |view, _| {
+            assert_eq!(view.active_tab, SettingsTab::System);
+        });
+        assert!(
+            visual.debug_bounds("ai-pdf-compact-reading").is_some(),
+            "the system configuration tab must still render its remaining preferences"
+        );
+        assert!(
+            visual.debug_bounds("ai-background-job-scheduling").is_none(),
+            "task scheduling must not be rendered on the system configuration tab"
+        );
+
         click_tab(visual, SettingsTab::BackgroundJobs);
         settings.read_with(visual, |view, _| {
             assert_eq!(view.active_tab, SettingsTab::BackgroundJobs);
         });
+        assert!(
+            visual.debug_bounds("ai-background-job-scheduling").is_some(),
+            "task scheduling must live on the background jobs tab"
+        );
         let (concurrency, interval) = settings.read_with(visual, |view, _| {
             (
                 view.background_job_concurrency_input.clone(),

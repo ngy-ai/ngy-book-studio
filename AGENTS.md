@@ -95,7 +95,7 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
 - `src/search.rs`、`src/indexing.rs`：作用域内 FTS5/`sqlite-vec` 精确 KNN、RRF 混合
   召回，以及可恢复的 embedding/vision 后台任务。执行器固定启动
   `MAX_BACKGROUND_JOB_CONCURRENCY` 个 worker，只有序号小于当前并发的 worker 扫描队列，
-  每个任务提交后按配置间隔休眠；两者由 AI 设置“系统配置”经
+  每个任务提交后按配置间隔休眠；两者由 AI 设置“后台任务”经
   `IndexingCoordinator::configure_scheduling` 实时发布，写坏的值按范围钳制。
   `indexing.rs` 另实现整本图书翻译任务
   `kind="translation"`：任务标识为 `translation:<source_id>:<target_language>`，游标复用
