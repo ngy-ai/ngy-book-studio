@@ -55,6 +55,23 @@ impl BackgroundJobsWindow {
         cx.notify();
     }
 
+    /// Retarget the single live window at a new library scope. Called when the
+    /// user opens background tasks again from a different group/filter, so the
+    /// window follows the request instead of showing a stale book list.
+    fn apply_scope(
+        &mut self,
+        books: Vec<BackgroundJobBook>,
+        scope_label: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.books = books;
+        self.scope_label = scope_label;
+        self.expanded_job_id = None;
+        self.notice = None;
+        self.refresh(window, cx);
+    }
+
     fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_generation = self.refresh_generation.wrapping_add(1);
         let generation = self.refresh_generation;
@@ -610,8 +627,29 @@ pub(super) fn open_background_jobs_window(
     if application_is_exiting(cx) {
         return Ok(());
     }
+    // One background task window for the whole application: every window would
+    // only drive the same shared job queue. A repeat request activates the live
+    // window and retargets it at the new library scope.
+    let key = background_jobs_window_key();
+    match reserve_singleton_window(&key, cx) {
+        SingletonWindowReservation::Activate(handle) => {
+            if let Some(view) = existing_background_jobs_window(cx) {
+                let _ = handle.update(cx, |_, window, cx| {
+                    view.update(cx, |this, cx| {
+                        this.apply_scope(books, scope_label, window, cx);
+                    });
+                    window.activate_window();
+                });
+            } else {
+                activate_singleton_window(handle, cx);
+            }
+            return Ok(());
+        }
+        SingletonWindowReservation::InFlight => return Ok(()),
+        SingletonWindowReservation::Reserved => {}
+    }
     let bounds = Bounds::centered(None, size(px(820.), px(720.)), cx);
-    cx.open_window(
+    let opened = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             window_min_size: Some(size(px(640.), px(520.))),
@@ -626,12 +664,21 @@ pub(super) fn open_background_jobs_window(
             let jobs =
                 cx.new(|_| BackgroundJobsWindow::new(Arc::clone(&services), books, scope_label));
             jobs.update(cx, |jobs, cx| jobs.refresh(window, cx));
+            register_background_jobs_window(jobs.downgrade(), cx);
             on_window_close(window, cx, |_, _| true);
             cx.new(|cx| Root::new(jobs, window, cx))
         },
-    )
-    .context("无法创建后台任务窗口")?;
-    Ok(())
+    );
+    match opened {
+        Ok(handle) => {
+            complete_singleton_window(&key, handle.into(), cx);
+            Ok(())
+        }
+        Err(error) => {
+            release_singleton_window(&key, cx);
+            Err(error).context("无法创建后台任务窗口")
+        }
+    }
 }
 
 fn job_kind_label(kind: &str) -> &'static str {

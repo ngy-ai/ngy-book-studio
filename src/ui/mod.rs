@@ -21,7 +21,7 @@ use ai_sidebar::{
     AI_SIDEBAR_COLLAPSED_WIDTH, AI_SIDEBAR_MAX_WIDTH, AI_SIDEBAR_MIN_WIDTH, AI_SIDEBAR_WIDTH,
     AiBookOption, AiReferenceHint, AiSidebar, AiSidebarEvent, AiSidebarScope, AiSourceLink,
 };
-use background_jobs::{BackgroundJobBook, open_background_jobs_window};
+use background_jobs::{BackgroundJobBook, BackgroundJobsWindow, open_background_jobs_window};
 use editor::{
     EditorApp, EditorWebState, build_editor_webview, editor_chapters_from_document,
     suggested_epub_filename,
@@ -573,6 +573,10 @@ struct SingletonWindowRegistry {
     /// activate the window and navigate it instead of opening a duplicate.
     readers: BTreeMap<String, WeakEntity<ReaderApp>>,
     pdf_readers: BTreeMap<String, WeakEntity<PdfReaderApp>>,
+    /// The single background task window. A repeat request retargets it at the
+    /// new library scope instead of opening a second window, because every
+    /// window would only drive the same shared job queue.
+    background_jobs: Option<WeakEntity<BackgroundJobsWindow>>,
 }
 
 impl gpui::Global for SingletonWindowRegistry {}
@@ -668,6 +672,35 @@ fn existing_singleton_pdf_reader(key: &str, cx: &mut App) -> Option<Entity<PdfRe
         .pdf_readers
         .get(key)
         .and_then(WeakEntity::upgrade)
+}
+
+/// The single background task window's registry key. The window is app-global,
+/// so it is not keyed by book or group.
+fn background_jobs_window_key() -> String {
+    singleton_window_key("background-jobs", "app")
+}
+
+/// The live background task window, if any; prunes a dead registration so a
+/// later open is not blocked by a closed window.
+fn existing_background_jobs_window(cx: &mut App) -> Option<Entity<BackgroundJobsWindow>> {
+    if !cx.has_global::<SingletonWindowRegistry>() {
+        return None;
+    }
+    let registry = cx.global_mut::<SingletonWindowRegistry>();
+    let upgraded = registry.background_jobs.as_ref().and_then(WeakEntity::upgrade);
+    if upgraded.is_none() {
+        registry.background_jobs = None;
+    }
+    upgraded
+}
+
+/// Remembers the background task window entity; the registration is weak so a
+/// closed window naturally frees its single slot.
+fn register_background_jobs_window(view: WeakEntity<BackgroundJobsWindow>, cx: &mut App) {
+    if !cx.has_global::<SingletonWindowRegistry>() {
+        cx.set_global(SingletonWindowRegistry::default());
+    }
+    cx.global_mut::<SingletonWindowRegistry>().background_jobs = Some(view);
 }
 
 /// Every live PDF reading window, including the non-singleton Office preview.

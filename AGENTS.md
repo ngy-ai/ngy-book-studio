@@ -121,7 +121,8 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
 - `src/ui/`：按窗口/职责拆分的 GPUI 界面。`library.rs`、`reader.rs`、`pdf_reader.rs`、
   `editor.rs`、`office_slides.rs` 分别管理对应窗口；`ai_sidebar.rs`、
   `ai_controller.rs`、`ai_settings.rs` 管理 AI 交互；`background_jobs.rs` 管理当前图书范围
-  的派生任务；`mod.rs` 只保留跨窗口主题、窗口打开与安全关闭基础设施，其中包含按
+  的派生任务；后台任务窗口全应用只有一个，重复打开时激活现有窗口并按新的库范围刷新，
+  不打开第二个；`mod.rs` 只保留跨窗口主题、窗口打开与安全关闭基础设施，其中包含按
   图书登记的窗口表：删除图书后关闭该书已打开的阅读、PDF/Office 预览和编辑窗口。
   `mod.rs` 另维护 `PdfReaderWindowRegistry`：保存“PDF 紧凑阅读”后向所有已打开的 PDF
   阅读窗口推送 `<html data-pdf-compact>`，这是唯一能枚举非单例 Office 预览窗口的登记表。
