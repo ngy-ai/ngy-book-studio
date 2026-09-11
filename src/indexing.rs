@@ -69,6 +69,10 @@ const MAX_TRANSLATION_BLOCKS: usize = 500_000;
 const TRANSLATION_BLOCK_PREVIEW_CHARS: usize = 96;
 const TRANSLATION_MAX_OUTPUT_TOKENS: u32 = 4_096;
 const TRANSLATION_RESPONSE_ATTEMPTS: usize = 2;
+/// Interval of the content-free progress line of one translation stream. A slow
+/// local model can answer one block for minutes; without a periodic line a
+/// truncated run cannot be told apart from a stalled provider.
+const TRANSLATION_STREAM_PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
 /// How many text blocks in a row may be left untranslated because the model
 /// never returned a valid segmented JSON before the run is reported as failed.
 /// One pathological block must not block a whole book, but a model that cannot
@@ -1719,6 +1723,9 @@ async fn run_translation(
         execution_identity = %crate::ai_diagnostics::safe_label(&translation.execution_identity),
         attempts = job.attempts,
         next_ordinal = cursor.next_ordinal,
+        max_output_tokens = TRANSLATION_MAX_OUTPUT_TOKENS,
+        response_attempts = TRANSLATION_RESPONSE_ATTEMPTS,
+        consecutive_skip_limit = MAX_CONSECUTIVE_TRANSLATION_SKIPS,
         "Translation run started"
     );
     match run_translation_blocks(inner, job, &translation, &target_language, &mut cursor).await {
@@ -1811,6 +1818,7 @@ async fn run_translation_blocks(
         total_blocks = blocks.len(),
         next_ordinal = cursor.next_ordinal,
         document_revision = revision,
+        max_output_tokens = TRANSLATION_MAX_OUTPUT_TOKENS,
         source_language = %source_language
             .as_deref()
             .map(crate::ai_diagnostics::safe_label)
@@ -1873,6 +1881,7 @@ async fn run_translation_blocks(
             stage = "translation_block_start",
             block_ordinal = cursor.next_ordinal,
             total_blocks = blocks.len(),
+            unit_ordinal = block.unit_ordinal,
             segments = block.source.segments.len(),
             source_chars = block.source.text.chars().count(),
             "Translation block started"
@@ -2104,6 +2113,9 @@ async fn run_translation_blocks(
             block_ordinal = block.ordinal,
             segments = response.segments.len(),
             next_ordinal = cursor.next_ordinal,
+            duration_ms = block_started.elapsed().as_millis() as u64,
+            saved_blocks,
+            untranslated_blocks,
             "Translation block saved"
         );
     }
@@ -2526,6 +2538,7 @@ async fn translate_block(
             parent: &span,
             stage = "translation_attempt_start",
             correction = attempt > 1,
+            correction_kind = ?correction_kind,
             segments = source.segments.len(),
             source_chars = source.text.chars().count(),
             request_bytes = source.request_input().len(),
@@ -2553,7 +2566,16 @@ async fn translate_block(
                 Controlled::Value(stream) => stream,
                 Controlled::Interrupted(outcome) => return Ok(Controlled::Interrupted(outcome)),
             };
-            collect_translation_response(inner, job, cursor, attempt, stream).await
+            collect_translation_response(
+                inner,
+                job,
+                cursor,
+                attempt,
+                source,
+                &translation.execution_identity,
+                stream,
+            )
+            .await
         }
         .instrument(span.clone())
         .await;
@@ -2661,8 +2683,7 @@ async fn translate_block(
                         ..JobLogMetrics::for_error(&error)
                     },
                 );
-                let (_parsed_as, top_level_keys, longest_string_leaf) =
-                    translation_response_shape(&response);
+                let shape = translation_response_shape(&response);
                 tracing::warn!(
                     target: "moye_ai",
                     parent: &span,
@@ -2673,39 +2694,25 @@ async fn translate_block(
                     expected_segments = detail.expected_segments(),
                     actual_segments = detail.actual_segments(),
                     response_bytes = response.len(),
-                    parsed_as = _parsed_as,
-                    top_level_keys,
-                    longest_string_leaf,
+                    parsed_as = shape.parsed_as,
+                    top_level_keys = shape.top_level_keys,
+                    longest_string_leaf = shape.longest_string_leaf,
+                    containers = shape.containers,
+                    open_container = shape.open_container,
+                    segment_markers = shape.segment_markers,
+                    thinking_open = shape.thinking_open,
+                    repeated_container = shape.repeated_container,
                     retry,
                     "Translation response rejected"
                 );
-                // TEMPORARY debugging aid: only emits when MOYE_DUMP_TRANSLATION_RAW is
-                // set, so default diagnostics never log response content. It prints the
-                // frozen model input as well, so one field failure can be replayed
-                // against the same model. Remove once the provider error cause is
-                // confirmed.
-                if std::env::var_os("MOYE_DUMP_TRANSLATION_RAW").is_some() {
-                    tracing::warn!(
-                        target: "moye_ai",
-                        parent: &span,
-                        stage = "translation_response_dump",
-                        block_ordinal = cursor.next_ordinal,
-                        attempt,
-                        response = %response,
-                        "Raw rejected translation response (MOYE_DUMP_TRANSLATION_RAW)"
-                    );
-                    tracing::warn!(
-                        target: "moye_ai",
-                        parent: &span,
-                        stage = "translation_request_dump",
-                        block_ordinal = cursor.next_ordinal,
-                        attempt,
-                        source_chars = source.text.chars().count(),
-                        request_bytes = source.request_input().len(),
-                        input = %source.request_input(),
-                        "Frozen translation request input (MOYE_DUMP_TRANSLATION_RAW)"
-                    );
-                }
+                dump_raw_translation_response(
+                    &span,
+                    cursor.next_ordinal,
+                    attempt,
+                    &response,
+                    source,
+                    "protocol_rejected",
+                );
                 if !retry {
                     return Err(error.context(
                         "翻译响应在自动纠正一次后仍不符合格式要求，请重试或更换支持指令的对话模型",
@@ -2720,7 +2727,6 @@ async fn translate_block(
 
 /// Constant-size diagnostics for one translation SSE response. Neither the
 /// prompt, the document text nor any provider field name is retained here.
-#[derive(Default)]
 struct TranslationStreamStats {
     events: usize,
     /// 携带正文的增量块数。
@@ -2730,45 +2736,236 @@ struct TranslationStreamStats {
     empty_content_events: usize,
     content_bytes: usize,
     first_event_ms: Option<u64>,
+    /// 最近一个流的到达时间：周期进度行用它区分“仍在慢慢产出”和“已经静默”。
+    last_event_at: Instant,
     finish_reason: Option<&'static str>,
     usage: Option<crate::ai::Usage>,
     done: bool,
     end: &'static str,
 }
 
-/// Safe shape summary of a rejected translation response. Only the JSON container
-/// kind and counts are retained; field names and content are never exposed (see
-/// AGENTS.md translation diagnostics constraints).
-fn translation_response_shape(response: &str) -> (&'static str, Option<usize>, Option<usize>) {
-    match serde_json::from_str::<serde_json::Value>(response) {
-        Ok(serde_json::Value::Object(map)) => {
-            let longest = map
-                .values()
-                .filter_map(|value| value.as_str())
-                .map(|text| text.len())
-                .max()
-                .unwrap_or(0);
-            ("object", Some(map.len()), Some(longest))
+impl TranslationStreamStats {
+    fn new(started: Instant) -> Self {
+        Self {
+            last_event_at: started,
+            end: "unknown",
+            ..Self::default()
         }
-        Ok(serde_json::Value::Array(items)) => ("array", Some(items.len()), None),
-        Ok(_) => ("scalar", None, None),
-        Err(_) => ("none", None, None),
+    }
+
+    /// 距离上一个流事件过去了多少毫秒。
+    fn since_last_event_ms(&self) -> u64 {
+        self.last_event_at.elapsed().as_millis() as u64
     }
 }
 
+impl Default for TranslationStreamStats {
+    fn default() -> Self {
+        Self {
+            events: 0,
+            content_events: 0,
+            empty_content_events: 0,
+            content_bytes: 0,
+            first_event_ms: None,
+            last_event_at: Instant::now(),
+            finish_reason: None,
+            usage: None,
+            done: false,
+            end: "unknown",
+        }
+    }
+}
+
+/// Safe shape summary of one translation response. Only the JSON container kind,
+/// structural flags and counts are retained; field names, 原文 and 译文 are never
+/// exposed (see the translation diagnostics constraints in AGENTS.md). The extra
+/// counters exist to tell apart the three ways a block can fail to produce an
+/// answer: the model never wrote a container, it wrote an answer and then kept
+/// generating (repetition), or it never closed the thinking block it opened.
+#[derive(Debug, Default)]
+struct TranslationResponseShape {
+    /// `object`, `array`, `scalar` or `none` for a response that is not JSON.
+    parsed_as: &'static str,
+    top_level_keys: Option<usize>,
+    longest_string_leaf: Option<usize>,
+    /// Complete top-level JSON containers in document order.
+    containers: usize,
+    /// A structural container was still open when the stream stopped.
+    open_container: bool,
+    /// Segment objects the model already wrote, counted by the protocol key.
+    segment_markers: usize,
+    /// An explicitly opened thinking block that was never closed.
+    thinking_open: bool,
+    /// The first complete container appears again later in the stream, i.e. the
+    /// model repeated an answer instead of finishing.
+    repeated_container: bool,
+}
+
+fn translation_response_shape(response: &str) -> TranslationResponseShape {
+    let mut shape = TranslationResponseShape {
+        parsed_as: "none",
+        ..TranslationResponseShape::default()
+    };
+    match serde_json::from_str::<serde_json::Value>(response) {
+        Ok(serde_json::Value::Object(map)) => {
+            shape.parsed_as = "object";
+            shape.top_level_keys = Some(map.len());
+            shape.longest_string_leaf = Some(
+                map.values()
+                    .filter_map(|value| value.as_str())
+                    .map(str::len)
+                    .max()
+                    .unwrap_or(0),
+            );
+        }
+        Ok(serde_json::Value::Array(items)) => {
+            shape.parsed_as = "array";
+            shape.top_level_keys = Some(items.len());
+        }
+        Ok(_) => shape.parsed_as = "scalar",
+        Err(_) => {}
+    }
+    let (containers, open_container, first_container) = top_level_containers(response);
+    shape.containers = containers;
+    shape.open_container = open_container;
+    if let Some(first) = first_container.filter(|container| !container.is_empty())
+        && response.matches(first).count() > 1
+    {
+        shape.repeated_container = true;
+    }
+    shape.segment_markers = response.matches("\"id\"").count();
+    shape.thinking_open = unclosed_thinking_block(response);
+    shape
+}
+
+/// Count every complete top-level `{…}`/`[…]` container and report the first one
+/// together with whether one was still open at the end. A byte that is inside a
+/// string literal never opens or closes a container.
+fn top_level_containers(response: &str) -> (usize, bool, Option<&str>) {
+    let mut stack = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut containers = 0;
+    let mut first = None;
+    for (offset, byte) in response.bytes().enumerate() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => quoted = true,
+            b'{' | b'[' => {
+                if stack.is_empty() {
+                    start = offset;
+                }
+                stack.push(byte);
+            }
+            b'}' | b']' if !stack.is_empty() => {
+                let expected = if byte == b'}' { b'{' } else { b'[' };
+                if stack.pop() != Some(expected) {
+                    return (containers, true, first);
+                }
+                if stack.is_empty() {
+                    containers += 1;
+                    if first.is_none() {
+                        first = Some(&response[start..=offset]);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (containers, !stack.is_empty(), first)
+}
+
+/// Whether the response opens a `<think>` block it never closes. The protocol
+/// accepts a closed leading thinking block and nothing else, so an unclosed one
+/// is the signature of a reasoning model that spent the whole output budget.
+fn unclosed_thinking_block(response: &str) -> bool {
+    let mut body = response.trim_matches(crate::translation::is_matching_whitespace);
+    loop {
+        let Some(thinking) = body.strip_prefix("<think>") else {
+            return false;
+        };
+        match thinking.find("</think>") {
+            Some(end) => {
+                body = thinking[end + "</think>".len()..]
+                    .trim_matches(crate::translation::is_matching_whitespace)
+            }
+            None => return true,
+        }
+    }
+}
+
+/// TEMPORARY debugging aid: only emits when `MOYE_DUMP_TRANSLATION_RAW` is set,
+/// so default diagnostics never log response content. It prints the frozen model
+/// input as well, so one failure can be replayed against the same model. Remove
+/// once the provider failure modes are settled.
+fn dump_raw_translation_response(
+    span: &tracing::Span,
+    block_ordinal: usize,
+    attempt: usize,
+    response: &str,
+    source: &TranslationSource,
+    reason: &'static str,
+) {
+    if std::env::var_os("MOYE_DUMP_TRANSLATION_RAW").is_none() {
+        return;
+    }
+    tracing::warn!(
+        target: "moye_ai",
+        parent: span,
+        stage = "translation_response_dump",
+        block_ordinal,
+        attempt,
+        reason,
+        response_bytes = response.len(),
+        response = %response,
+        "Raw rejected translation response (MOYE_DUMP_TRANSLATION_RAW)"
+    );
+    tracing::warn!(
+        target: "moye_ai",
+        parent: span,
+        stage = "translation_request_dump",
+        block_ordinal,
+        attempt,
+        reason,
+        source_chars = source.text.chars().count(),
+        request_bytes = source.request_input().len(),
+        input = %source.request_input(),
+        "Frozen translation request input (MOYE_DUMP_TRANSLATION_RAW)"
+    );
+}
+
+/// Collects one streaming translation answer.
+///
+/// There is deliberately no total-duration deadline: a slow local model may need
+/// minutes for one block, and the observed failure (2026-09-11, block 1269) was a
+/// *healthy* 120-second stream — 1579 content chunks, 7024 bytes, no `[DONE]` —
+/// that the old whole-request timeout cut in half. Silence is bounded by the
+/// provider layer, and the reply itself by `MAX_TRANSLATION_RESPONSE_BYTES`.
+/// Progress lines and the end-of-stream shape keep such a run diagnosable.
 async fn collect_translation_response(
     inner: &Arc<IndexingInner>,
     job: &db::index_jobs::IndexJob,
     cursor: &JobCursor,
     request_attempt: usize,
+    source: &TranslationSource,
+    identity: &str,
     mut stream: crate::ai::ChatEventStream,
 ) -> Result<Controlled<String>> {
     let started = Instant::now();
+    let span = tracing::Span::current();
     let mut response = String::new();
-    let mut stats = TranslationStreamStats {
-        end: "unknown",
-        ..TranslationStreamStats::default()
-    };
+    let mut stats = TranslationStreamStats::new(started);
+    let mut next_progress_at = started + TRANSLATION_STREAM_PROGRESS_INTERVAL;
     let collected = loop {
         tokio::select! {
             event = stream.next() => {
@@ -2777,9 +2974,11 @@ async fn collect_translation_response(
                     break Ok(None);
                 };
                 stats.events = stats.events.saturating_add(1);
+                let now = Instant::now();
                 stats
                     .first_event_ms
-                    .get_or_insert_with(|| started.elapsed().as_millis() as u64);
+                    .get_or_insert_with(|| (now - started).as_millis() as u64);
+                stats.last_event_at = now;
                 let event = match event.context("翻译模型流式响应失败") {
                     Ok(event) => event,
                     Err(error) => {
@@ -2838,101 +3037,165 @@ async fn collect_translation_response(
                         break Err(error);
                     }
                 }
-                if started.elapsed() >= PROVIDER_STEP_TIMEOUT {
-                    stats.end = "timeout";
-                    break Err(anyhow::anyhow!("翻译模型响应超时"));
+                // 只记录进度，不设总时长上限：继续产出数据的流必须能翻完这一块。
+                // 静默由 provider 层的空闲超时负责，输出规模由 max_tokens 与响应字节上限约束。
+                if Instant::now() >= next_progress_at {
+                    next_progress_at = Instant::now() + TRANSLATION_STREAM_PROGRESS_INTERVAL;
+                    let shape = translation_response_shape(&response);
+                    tracing::debug!(
+                        target: "moye_ai",
+                        parent: &span,
+                        stage = "translation_stream_progress",
+                        block_ordinal = cursor.next_ordinal,
+                        request_attempt,
+                        elapsed_ms = (Instant::now() - started).as_millis() as u64,
+                        since_last_event_ms = stats.since_last_event_ms(),
+                        events = stats.events,
+                        content_events = stats.content_events,
+                        empty_content_events = stats.empty_content_events,
+                        content_bytes = stats.content_bytes,
+                        response_bytes = response.len(),
+                        containers = shape.containers,
+                        open_container = shape.open_container,
+                        segment_markers = shape.segment_markers,
+                        thinking_open = shape.thinking_open,
+                        repeated_container = shape.repeated_container,
+                        "Translation response stream progress"
+                    );
                 }
             }
         }
     };
-    let result = match collected {
-        Ok(None) => Ok(Controlled::Value(response)),
-        Ok(Some(outcome)) => Ok(Controlled::Interrupted(outcome)),
-        Err(error) => Err(error),
-    };
-
     let elapsed_ms = started.elapsed().as_millis() as u64;
-    let error_kind = result.as_ref().err().map(crate::ai_diagnostics::error_kind);
-    if let Err(error) = &result {
-        record_index_event(
-            inner,
-            job,
-            JobLogEvent::StepFailed,
-            JobLogMetrics {
-                ordinal: Some(cursor.next_ordinal as u64),
-                request_attempt: Some(request_attempt as u64),
-                response_bytes: Some(stats.content_bytes as u64),
-                actual_count: Some(stats.events as u64),
-                duration_ms: Some(elapsed_ms),
-                error_kind: Some(match stats.end {
-                    "timeout" => JobLogErrorKind::Timeout,
-                    "response_too_large" => JobLogErrorKind::InvalidData,
-                    "tool_call" | "unexpected_finish_reason" => JobLogErrorKind::StreamProtocol,
-                    "control_error" => JobLogErrorKind::Database,
-                    _ => classify_error(error),
-                }),
-                ..JobLogMetrics::for_error(error)
-            },
-        );
+    match collected {
+        Ok(None) => {
+            let shape = translation_response_shape(&response);
+            tracing::debug!(
+                target: "moye_ai",
+                parent: &span,
+                stage = "translation_stream",
+                outcome = "collected",
+                end = stats.end,
+                events = stats.events,
+                content_events = stats.content_events,
+                empty_content_events = stats.empty_content_events,
+                response_bytes = stats.content_bytes,
+                first_event_ms = stats.first_event_ms,
+                since_last_event_ms = stats.since_last_event_ms(),
+                finish_reason = stats.finish_reason,
+                prompt_tokens = stats.usage.as_ref().map(|usage| usage.prompt_tokens),
+                completion_tokens = stats.usage.as_ref().map(|usage| usage.completion_tokens),
+                total_tokens = stats.usage.as_ref().map(|usage| usage.total_tokens),
+                done = stats.done,
+                containers = shape.containers,
+                open_container = shape.open_container,
+                segment_markers = shape.segment_markers,
+                thinking_open = shape.thinking_open,
+                repeated_container = shape.repeated_container,
+                elapsed_ms,
+                "Translation response stream collected"
+            );
+            Ok(Controlled::Value(response))
+        }
+        Ok(Some(outcome)) => {
+            tracing::info!(
+                target: "moye_ai",
+                parent: &span,
+                stage = "translation_stream",
+                outcome = "interrupted",
+                end = stats.end,
+                events = stats.events,
+                content_events = stats.content_events,
+                empty_content_events = stats.empty_content_events,
+                response_bytes = stats.content_bytes,
+                first_event_ms = stats.first_event_ms,
+                since_last_event_ms = stats.since_last_event_ms(),
+                finish_reason = stats.finish_reason,
+                prompt_tokens = stats.usage.as_ref().map(|usage| usage.prompt_tokens),
+                completion_tokens = stats.usage.as_ref().map(|usage| usage.completion_tokens),
+                total_tokens = stats.usage.as_ref().map(|usage| usage.total_tokens),
+                done = stats.done,
+                elapsed_ms,
+                "Translation response stream interrupted"
+            );
+            Ok(Controlled::Interrupted(outcome))
+        }
+        Err(error) => {
+            let shape = translation_response_shape(&response);
+            tracing::warn!(
+                target: "moye_ai",
+                parent: &span,
+                stage = "translation_stream",
+                outcome = "failed",
+                error_kind = crate::ai_diagnostics::error_kind(&error),
+                end = stats.end,
+                events = stats.events,
+                content_events = stats.content_events,
+                empty_content_events = stats.empty_content_events,
+                response_bytes = stats.content_bytes,
+                first_event_ms = stats.first_event_ms,
+                since_last_event_ms = stats.since_last_event_ms(),
+                finish_reason = stats.finish_reason,
+                prompt_tokens = stats.usage.as_ref().map(|usage| usage.prompt_tokens),
+                completion_tokens = stats.usage.as_ref().map(|usage| usage.completion_tokens),
+                total_tokens = stats.usage.as_ref().map(|usage| usage.total_tokens),
+                done = stats.done,
+                parsed_as = shape.parsed_as,
+                containers = shape.containers,
+                open_container = shape.open_container,
+                segment_markers = shape.segment_markers,
+                thinking_open = shape.thinking_open,
+                repeated_container = shape.repeated_container,
+                elapsed_ms,
+                "Translation response stream failed"
+            );
+            dump_raw_translation_response(
+                &span,
+                cursor.next_ordinal,
+                request_attempt,
+                &response,
+                source,
+                stats.end,
+            );
+            // 流没有正常结束，但已经收到的字节可能包含一个完整、能通过全部片段校验的
+            // 答案（模型答完继续啰嗦、或服务端在收尾前断开）。整段文本仍走原来的严格
+            // 解码：只有一个完整容器、id 不多不少时才会被采用，不会猜模型意图。
+            if crate::translation::parse_response(source, &response, identity).is_ok() {
+                tracing::warn!(
+                    target: "moye_ai",
+                    parent: &span,
+                    stage = "translation_response_salvaged",
+                    block_ordinal = cursor.next_ordinal,
+                    request_attempt,
+                    end = stats.end,
+                    response_bytes = response.len(),
+                    containers = shape.containers,
+                    "Translation response salvaged from an unfinished stream"
+                );
+                return Ok(Controlled::Value(response));
+            }
+            record_index_event(
+                inner,
+                job,
+                JobLogEvent::StepFailed,
+                JobLogMetrics {
+                    ordinal: Some(cursor.next_ordinal as u64),
+                    request_attempt: Some(request_attempt as u64),
+                    response_bytes: Some(stats.content_bytes as u64),
+                    actual_count: Some(stats.events as u64),
+                    duration_ms: Some(elapsed_ms),
+                    error_kind: Some(match stats.end {
+                        "response_too_large" => JobLogErrorKind::InvalidData,
+                        "tool_call" | "unexpected_finish_reason" => JobLogErrorKind::StreamProtocol,
+                        "control_error" => JobLogErrorKind::Database,
+                        _ => classify_error(&error),
+                    }),
+                    ..JobLogMetrics::for_error(&error)
+                },
+            );
+            Err(error)
+        }
     }
-    match &result {
-        Ok(Controlled::Value(_)) => tracing::debug!(
-            target: "moye_ai",
-            stage = "translation_stream",
-            outcome = "collected",
-            end = stats.end,
-            events = stats.events,
-            content_events = stats.content_events,
-            empty_content_events = stats.empty_content_events,
-            response_bytes = stats.content_bytes,
-            first_event_ms = stats.first_event_ms,
-            finish_reason = stats.finish_reason,
-            prompt_tokens = stats.usage.as_ref().map(|usage| usage.prompt_tokens),
-            completion_tokens = stats.usage.as_ref().map(|usage| usage.completion_tokens),
-            total_tokens = stats.usage.as_ref().map(|usage| usage.total_tokens),
-            done = stats.done,
-            elapsed_ms,
-            "Translation response stream collected"
-        ),
-        Ok(Controlled::Interrupted(_)) => tracing::info!(
-            target: "moye_ai",
-            stage = "translation_stream",
-            outcome = "interrupted",
-            end = stats.end,
-            events = stats.events,
-            content_events = stats.content_events,
-            empty_content_events = stats.empty_content_events,
-            response_bytes = stats.content_bytes,
-            first_event_ms = stats.first_event_ms,
-            finish_reason = stats.finish_reason,
-            prompt_tokens = stats.usage.as_ref().map(|usage| usage.prompt_tokens),
-            completion_tokens = stats.usage.as_ref().map(|usage| usage.completion_tokens),
-            total_tokens = stats.usage.as_ref().map(|usage| usage.total_tokens),
-            done = stats.done,
-            elapsed_ms,
-            "Translation response stream interrupted"
-        ),
-        Err(_) => tracing::warn!(
-            target: "moye_ai",
-            stage = "translation_stream",
-            outcome = "failed",
-            error_kind,
-            end = stats.end,
-            events = stats.events,
-            content_events = stats.content_events,
-            empty_content_events = stats.empty_content_events,
-            response_bytes = stats.content_bytes,
-            first_event_ms = stats.first_event_ms,
-            finish_reason = stats.finish_reason,
-            prompt_tokens = stats.usage.as_ref().map(|usage| usage.prompt_tokens),
-            completion_tokens = stats.usage.as_ref().map(|usage| usage.completion_tokens),
-            total_tokens = stats.usage.as_ref().map(|usage| usage.total_tokens),
-            done = stats.done,
-            elapsed_ms,
-            "Translation response stream failed"
-        ),
-    }
-    result
 }
 
 fn visual_page_is_citation_eligible(
@@ -6787,6 +7050,87 @@ mod tests {
             Some("invalid_schema"),
         );
         assert_eq!(correction.reasoning_effort, Some(ReasoningEffort::None));
+    }
+
+    #[test]
+    fn translation_stream_shape_separates_missing_repeating_and_thinking_answers() {
+        // 2026-09-11 现场：一条仍在稳定输出的流被整体请求超时切断，日志只能看到
+        // 「1579 个正文块、7024 字节」；要判断模型是没写出答案、思考没结束还是把答案
+        // 重复输出，必须同时记录完整容器数、未闭合容器、片段标记、思考块与重复标记。
+        let empty = translation_response_shape("");
+        assert_eq!(empty.parsed_as, "none");
+        assert_eq!(empty.containers, 0);
+        assert!(!empty.open_container);
+        assert!(!empty.thinking_open);
+        assert!(!empty.repeated_container);
+
+        // 只打开了思考块：整个输出预算都花在推理上时就是这个形状。
+        let thinking = translation_response_shape("<think>正在逐句推敲术语……");
+        assert!(thinking.thinking_open);
+        assert_eq!(thinking.containers, 0);
+
+        // 关闭的思考块加完整答案仍然是合法响应，不能误报为未闭合。`parsed_as` 描述的
+        // 是整段原始文本（带前缀时不是 JSON），答案本身由容器数与片段标记体现。
+        let closed = translation_response_shape(
+            "<think>想好了</think>{\"translations\":[{\"id\":0,\"text\":\"甲\"}]}",
+        );
+        assert!(!closed.thinking_open);
+        assert_eq!(closed.containers, 1);
+        assert_eq!(closed.segment_markers, 1);
+        assert_eq!(closed.parsed_as, "none");
+
+        // 答案重复输出：模型答完继续复读，诊断必须能指出来。
+        let answer = "{\"translations\":[{\"id\":0,\"text\":\"甲\"}]}";
+        let repeated = translation_response_shape(&format!("{answer}{answer}"));
+        assert_eq!(repeated.containers, 2);
+        assert!(repeated.repeated_container);
+        assert_eq!(repeated.segment_markers, 2);
+
+        // 截断在容器中间：没有任何完整答案，只能看到未闭合容器。
+        let truncated = translation_response_shape(&format!("{answer}{{\"translations\":["));
+        assert_eq!(truncated.containers, 1);
+        assert!(truncated.open_container);
+        assert!(!truncated.repeated_container);
+
+        // 字符串里的括号不参与容器计数。
+        let quoted =
+            translation_response_shape("{\"translations\":[{\"id\":0,\"text\":\"} {[ } ]\"}]}");
+        assert_eq!(quoted.containers, 1);
+        assert!(!quoted.open_container);
+    }
+
+    #[test]
+    fn an_unfinished_stream_is_only_salvaged_by_one_complete_valid_answer() {
+        let source = TranslationSource {
+            text: "Hello".to_string(),
+            segments: vec!["Hello".to_string()],
+        };
+        let identity = "translation-v2:test";
+        let answer = "{\"translations\":[{\"id\":0,\"text\":\"你好\"}]}";
+
+        // 答完之后继续输出普通说明：整段仍能严格解码成一个答案，可以沿用。
+        assert!(
+            crate::translation::parse_response(
+                &source,
+                &format!("{answer}\n希望这些译文对你有帮助。"),
+                identity
+            )
+            .is_ok()
+        );
+
+        // 两个完整答案：协议拒绝在多个答案之间猜测，截断也不能放宽这条规则。
+        let two = format!("{answer}{answer}");
+        assert!(translation_response_shape(&two).repeated_container);
+        assert!(crate::translation::parse_response(&source, &two, identity).is_err());
+
+        // 片段不完整或容器没写完整都不是答案。
+        assert!(
+            crate::translation::parse_response(&source, r#"{"translations":[]}"#, identity)
+                .is_err()
+        );
+        let truncated = format!("{answer}{{\"translations\":[");
+        assert!(translation_response_shape(&truncated).open_container);
+        assert!(crate::translation::parse_response(&source, &truncated, identity).is_err());
     }
 
     #[test]

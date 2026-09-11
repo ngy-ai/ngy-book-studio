@@ -58,6 +58,12 @@ pub fn error_kind(error: &anyhow::Error) -> &'static str {
     if error.is::<crate::ai::ProviderHttpError>() {
         return "http_rejected";
     }
+    // A request deadline and a silent stream are the same fixed category for
+    // every caller: the job log and the UI must not learn a new label because
+    // the deadline was applied between two chunks instead of to a whole call.
+    if error.is::<crate::ai::ProviderTimeout>() {
+        return "http_timeout";
+    }
     if let Some(error) = error.downcast_ref::<crate::translation::ResponseError>() {
         return error.kind();
     }
@@ -179,6 +185,22 @@ mod tests {
             "unclassified",
             "arbitrary backend text must not masquerade as host cancellation"
         );
+
+        // 请求截止时间与流静默必须归入同一个固定分类，否则后台任务日志和 UI 会因为
+        // 超时改在「两个数据块之间」生效而出现新的错误类别。
+        for timeout in [
+            crate::ai::ProviderTimeout::request(120),
+            crate::ai::ProviderTimeout::stream(120),
+        ] {
+            let scope = timeout.scope();
+            let wrapped = anyhow::Error::new(timeout).context("failed to read AI chat stream");
+            assert_eq!(error_kind(&wrapped), "http_timeout", "{scope}");
+            assert_eq!(
+                crate::job_diagnostics::classify_error(&wrapped),
+                crate::job_diagnostics::JobLogErrorKind::Timeout,
+                "{scope}"
+            );
+        }
     }
 
     #[test]

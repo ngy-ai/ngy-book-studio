@@ -740,26 +740,32 @@ impl BackgroundJobsWindow {
                 });
                 cx.new(|_| EmptyView)
             })
-            .on_drag_move(
-                cx.listener(move |this, event: &DragMoveEvent<JobsListResizeDrag>, window, cx| {
+            .on_drag_move(cx.listener(
+                move |this, event: &DragMoveEvent<JobsListResizeDrag>, window, cx| {
                     if this.resize_list_from_pointer(
                         event.event.position.x,
                         window.viewport_size().width,
                     ) {
                         cx.notify();
                     }
+                },
+            ))
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.finish_list_resize() {
+                        cx.notify();
+                    }
                 }),
             )
-            .on_mouse_up(gpui::MouseButton::Left, cx.listener(|this, _, _, cx| {
-                if this.finish_list_resize() {
-                    cx.notify();
-                }
-            }))
-            .on_mouse_up_out(gpui::MouseButton::Left, cx.listener(|this, _, _, cx| {
-                if this.finish_list_resize() {
-                    cx.notify();
-                }
-            }))
+            .on_mouse_up_out(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.finish_list_resize() {
+                        cx.notify();
+                    }
+                }),
+            )
             .child(
                 div()
                     .h_full()

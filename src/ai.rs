@@ -25,6 +25,11 @@ pub const DEFAULT_AI_REQUEST_TIMEOUT_SECS: u64 = 120;
 pub const MIN_AI_REQUEST_TIMEOUT_SECS: u64 = 1;
 pub const MAX_AI_REQUEST_TIMEOUT_SECS: u64 = 600;
 pub const DEFAULT_CHAT_OUTPUT_TOKENS: u32 = 4096;
+/// Deadline for the TCP/TLS handshake only. Every other deadline is expressed
+/// through [`ProviderConfig::request_timeout_secs`].
+const AI_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Interval of the content-free transport progress line of one streaming reply.
+const STREAM_PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_CONTEXT_ERROR_DEPTH: usize = 8;
 const MAX_MODELS_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
@@ -108,6 +113,67 @@ impl fmt::Display for ProviderHttpError {
 }
 
 impl std::error::Error for ProviderHttpError {}
+
+/// A configured provider deadline expired without usable data.
+///
+/// `scope` distinguishes the two policies: a whole non-streaming call
+/// (`request`) or the silence between two chunks of one streaming reply
+/// (`stream`). A streaming reply is deliberately **not** bounded by a total
+/// deadline: a local model can stream a healthy answer for minutes, and killing
+/// it at the request timeout turned "slow" into "failed" (observed 2026-09-11:
+/// 120 s, 1579 content chunks, 7024 bytes of answer and no `[DONE]`). Only a
+/// silence longer than the configured timeout is an error; the reply stays
+/// bounded by the output-token, byte and event limits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderTimeout {
+    scope: &'static str,
+    secs: u64,
+}
+
+impl ProviderTimeout {
+    /// Deadline of one non-streaming provider call.
+    pub fn request(secs: u64) -> Self {
+        Self {
+            scope: "request",
+            secs,
+        }
+    }
+
+    /// Maximum silence between two chunks of one streaming reply.
+    pub fn stream(secs: u64) -> Self {
+        Self {
+            scope: "stream",
+            secs,
+        }
+    }
+
+    pub fn scope(&self) -> &'static str {
+        self.scope
+    }
+
+    pub fn secs(&self) -> u64 {
+        self.secs
+    }
+}
+
+impl fmt::Display for ProviderTimeout {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.scope {
+            "stream" => write!(
+                formatter,
+                "模型在 {} 秒内没有继续返回响应数据，连接已中断；请重试，或在该 Endpoint 设置中提高请求超时",
+                self.secs
+            ),
+            _ => write!(
+                formatter,
+                "模型请求在 {} 秒内没有完成，已中断；请重试，或在该 Endpoint 设置中提高请求超时",
+                self.secs
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProviderTimeout {}
 
 /// Optional sampling controls are omitted from requests when unset so the
 /// endpoint can use its own defaults. The user chooses a positive output limit
@@ -509,9 +575,12 @@ impl std::fmt::Debug for OpenAiHttpProvider {
 impl OpenAiHttpProvider {
     pub fn new(config: ProviderConfig) -> Result<Self> {
         let base_url = config.validated_base_url()?;
+        // No client-wide `.timeout()`: reqwest applies that deadline to the whole
+        // request *including the response body*, so it cut healthy generations in
+        // half. Non-streaming calls are bounded by `within_request_timeout` and
+        // streaming replies by the silence between two chunks.
         let client = Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(config.request_timeout_secs))
+            .connect_timeout(AI_CONNECT_TIMEOUT)
             .build()
             .context("failed to build AI HTTP client")?;
         Ok(Self {
@@ -519,6 +588,20 @@ impl OpenAiHttpProvider {
             client,
             base_url,
         })
+    }
+
+    /// Bounds one non-streaming provider call with the configured request
+    /// timeout. Streaming replies use [`ProviderTimeout::stream`] instead: their
+    /// total duration is bounded by the output-token, byte and event limits.
+    async fn within_request_timeout<T>(
+        &self,
+        future: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let secs = self.config.request_timeout_secs;
+        match tokio::time::timeout(Duration::from_secs(secs), future).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::Error::new(ProviderTimeout::request(secs))),
+        }
     }
 
     pub fn config(&self) -> &ProviderConfig {
@@ -547,22 +630,25 @@ impl OpenAiCompatibleProvider for OpenAiHttpProvider {
                 data: Vec<ModelInfo>,
             }
 
-            let response = self
-                .authorized(self.client.get(self.endpoint("models")?))
-                .send()
-                .await
-                .context("failed to query AI models")?;
-            let response = checked_response(response).await?;
-            let bytes = read_success_body_limited(
-                response,
-                MAX_MODELS_RESPONSE_BYTES,
-                "AI models response",
-            )
-            .await?;
-            let data = serde_json::from_slice::<ModelsResponse>(&bytes)
-                .context("AI models response is not valid OpenAI-compatible JSON")?
-                .data;
-            validate_and_normalize_models(data)
+            self.within_request_timeout(async {
+                let response = self
+                    .authorized(self.client.get(self.endpoint("models")?))
+                    .send()
+                    .await
+                    .context("failed to query AI models")?;
+                let response = checked_response(response).await?;
+                let bytes = read_success_body_limited(
+                    response,
+                    MAX_MODELS_RESPONSE_BYTES,
+                    "AI models response",
+                )
+                .await?;
+                let data = serde_json::from_slice::<ModelsResponse>(&bytes)
+                    .context("AI models response is not valid OpenAI-compatible JSON")?
+                    .data;
+                validate_and_normalize_models(data)
+            })
+            .await
         }
         .boxed()
     }
@@ -579,7 +665,10 @@ impl OpenAiCompatibleProvider for OpenAiHttpProvider {
             endpoint_scheme = self.base_url.scheme(),
             endpoint_host = self.base_url.host_str().unwrap_or(""),
             endpoint_port = self.base_url.port_or_known_default(),
+            timeout_mode = "stream_idle",
             timeout_secs = self.config.request_timeout_secs,
+            max_stream_bytes = MAX_CHAT_STREAM_BYTES,
+            max_stream_events = MAX_CHAT_EVENTS,
             message_count = request.messages.len(),
             tool_count = request.tools.len(),
             max_tokens = request.max_tokens,
@@ -628,12 +717,19 @@ impl OpenAiCompatibleProvider for OpenAiHttpProvider {
                     .map_or(0, <[u8]>::len);
                 tracing::Span::current().record("request_body_bytes", request_body_bytes);
                 tracing::debug!(target: "moye_ai", stage = "http_send", "Sending AI chat request");
+                // Only the wait for the response headers is bounded by the
+                // configured request timeout; the body that follows is bounded by
+                // the silence between its chunks.
                 let response = self
-                    .client
-                    .execute(http_request)
-                    .await
-                    .context("failed to start streaming chat completion")?;
-                let response = checked_response(response).await?;
+                    .within_request_timeout(async {
+                        let response = self
+                            .client
+                            .execute(http_request)
+                            .await
+                            .context("failed to start streaming chat completion")?;
+                        checked_response(response).await
+                    })
+                    .await?;
                 if response
                     .content_length()
                     .is_some_and(|length| length > MAX_CHAT_STREAM_BYTES as u64)
@@ -647,7 +743,11 @@ impl OpenAiCompatibleProvider for OpenAiHttpProvider {
                     elapsed_ms = started_at.elapsed().as_millis() as u64,
                     "AI chat response stream started"
                 );
-                Ok(bounded_chat_sse_stream(response, SseLimits::CHAT))
+                Ok(bounded_chat_sse_stream(
+                    response,
+                    SseLimits::CHAT,
+                    Duration::from_secs(self.config.request_timeout_secs),
+                ))
             }
             .await;
             if let Err(error) = &result {
@@ -679,22 +779,25 @@ impl OpenAiCompatibleProvider for OpenAiHttpProvider {
                 expected <= MAX_EMBEDDING_COUNT,
                 "embedding request exceeds the {MAX_EMBEDDING_COUNT}-input limit"
             );
-            let response = self
-                .authorized(self.client.post(self.endpoint("embeddings")?))
-                .json(&request)
-                .send()
-                .await
-                .context("failed to request embeddings")?;
-            let response = checked_response(response).await?;
-            let bytes = read_success_body_limited(
-                response,
-                MAX_EMBEDDINGS_RESPONSE_BYTES,
-                "embedding response",
-            )
-            .await?;
-            let body = serde_json::from_slice::<WireEmbeddingResponse>(&bytes)
-                .context("embedding response is not valid OpenAI-compatible JSON")?;
-            validate_embedding_response(body, expected)
+            self.within_request_timeout(async {
+                let response = self
+                    .authorized(self.client.post(self.endpoint("embeddings")?))
+                    .json(&request)
+                    .send()
+                    .await
+                    .context("failed to request embeddings")?;
+                let response = checked_response(response).await?;
+                let bytes = read_success_body_limited(
+                    response,
+                    MAX_EMBEDDINGS_RESPONSE_BYTES,
+                    "embedding response",
+                )
+                .await?;
+                let body = serde_json::from_slice::<WireEmbeddingResponse>(&bytes)
+                    .context("embedding response is not valid OpenAI-compatible JSON")?;
+                validate_embedding_response(body, expected)
+            })
+            .await
         }
         .boxed()
     }
@@ -1074,6 +1177,10 @@ struct BoundedSseState<S, T> {
     eof: bool,
     terminated: bool,
     limits: SseLimits,
+    /// Maximum silence between two transport chunks. The reply is not bounded by
+    /// a total deadline: a slow model that keeps producing data must be allowed
+    /// to finish, while a silent connection still fails.
+    idle_timeout: Duration,
 }
 
 impl<S, T> BoundedSseState<S, T>
@@ -1081,7 +1188,7 @@ where
     S: Stream<Item = std::result::Result<T, reqwest::Error>> + Send + 'static,
     T: AsRef<[u8]> + Send + 'static,
 {
-    fn new(input: S, limits: SseLimits) -> Self {
+    fn new(input: S, limits: SseLimits, idle_timeout: Duration) -> Self {
         Self {
             input: Box::pin(input),
             chunk: None,
@@ -1094,6 +1201,7 @@ where
             eof: false,
             terminated: false,
             limits,
+            idle_timeout,
         }
     }
 
@@ -1114,8 +1222,14 @@ where
                 };
                 return self.parse_event(data).map(Some);
             }
-            match self.input.next().await {
-                Some(Ok(chunk)) => {
+            match tokio::time::timeout(self.idle_timeout, self.input.next()).await {
+                Err(_) => {
+                    return Err(anyhow::Error::new(ProviderTimeout::stream(
+                        self.idle_timeout.as_secs(),
+                    )))
+                    .context("failed to read AI chat stream");
+                }
+                Ok(Some(Ok(chunk))) => {
                     let next_total = self
                         .total_bytes
                         .checked_add(chunk.as_ref().len())
@@ -1129,8 +1243,10 @@ where
                     self.chunk = Some(chunk);
                     self.chunk_offset = 0;
                 }
-                Some(Err(error)) => return Err(error).context("failed to read AI chat stream"),
-                None => self.eof = true,
+                Ok(Some(Err(error))) => {
+                    return Err(error).context("failed to read AI chat stream");
+                }
+                Ok(None) => self.eof = true,
             }
         }
     }
@@ -1254,8 +1370,12 @@ fn append_sse_data_line(output: &mut Vec<u8>, line: &[u8], max_bytes: usize) -> 
     Ok(())
 }
 
-fn bounded_chat_sse_stream(response: Response, limits: SseLimits) -> ChatEventStream {
-    let state = BoundedSseState::new(response.bytes_stream(), limits);
+fn bounded_chat_sse_stream(
+    response: Response,
+    limits: SseLimits,
+    idle_timeout: Duration,
+) -> ChatEventStream {
+    let state = BoundedSseState::new(response.bytes_stream(), limits, idle_timeout);
     let diagnostics = SseDiagnostics::new();
     let span = tracing::Span::current();
     let stream = stream::try_unfold((state, diagnostics), move |(mut state, mut diagnostics)| {
@@ -1264,7 +1384,7 @@ fn bounded_chat_sse_stream(response: Response, limits: SseLimits) -> ChatEventSt
             let result = state.next_event().await;
             match &result {
                 Ok(Some(event)) => {
-                    diagnostics.observe(event);
+                    diagnostics.observe(event, state.total_bytes, state.event_count);
                     // Consumers can stop polling as soon as [DONE] arrives.
                     if event.done {
                         diagnostics.finish("done", state.total_bytes, state.event_count, None);
@@ -1285,7 +1405,10 @@ fn bounded_chat_sse_stream(response: Response, limits: SseLimits) -> ChatEventSt
 }
 
 /// Constant-size stream diagnostics. No event payloads or generated arguments
-/// are retained here, and there is no log entry for each token/chunk.
+/// are retained here, and there is no log entry for each token/chunk. One
+/// progress line every [`STREAM_PROGRESS_INTERVAL`] describes the *transport*
+/// (chunks, bytes, gaps) so a healthy but slow generation can be told apart
+/// from a stalled or silent one.
 struct SseDiagnostics {
     started_at: Instant,
     first_event_ms: Option<u64>,
@@ -1306,6 +1429,10 @@ struct SseDiagnostics {
     finish_reason: Option<&'static str>,
     usage: Option<Usage>,
     finished: bool,
+    last_event_at: Instant,
+    /// Largest silence between two SSE events, in milliseconds.
+    max_event_gap_ms: u64,
+    next_progress_at: Duration,
 }
 
 impl SseDiagnostics {
@@ -1322,12 +1449,20 @@ impl SseDiagnostics {
             finish_reason: None,
             usage: None,
             finished: false,
+            last_event_at: Instant::now(),
+            max_event_gap_ms: 0,
+            next_progress_at: STREAM_PROGRESS_INTERVAL,
         }
     }
 
-    fn observe(&mut self, event: &ChatStreamEvent) {
+    fn observe(&mut self, event: &ChatStreamEvent, wire_bytes: usize, event_count: usize) {
+        let now = Instant::now();
+        let since_last_event_ms = (now - self.last_event_at).as_millis() as u64;
+        self.max_event_gap_ms = self.max_event_gap_ms.max(since_last_event_ms);
+        self.last_event_at = now;
+        let elapsed = now - self.started_at;
         self.first_event_ms
-            .get_or_insert_with(|| self.started_at.elapsed().as_millis() as u64);
+            .get_or_insert(elapsed.as_millis() as u64);
         match event.content_delta.as_deref() {
             Some("") => {
                 self.empty_content_events = self.empty_content_events.saturating_add(1);
@@ -1360,6 +1495,25 @@ impl SseDiagnostics {
         if let Some(usage) = &event.usage {
             self.usage = Some(usage.clone());
         }
+        if elapsed >= self.next_progress_at {
+            self.next_progress_at = elapsed + STREAM_PROGRESS_INTERVAL;
+            tracing::debug!(
+                target: "moye_ai",
+                stage = "sse_progress",
+                wire_bytes,
+                event_count,
+                content_bytes = self.content_bytes,
+                content_events = self.content_events,
+                empty_content_events = self.empty_content_events,
+                unrecognized_events = self.unrecognized_events,
+                tool_delta_count = self.tool_delta_count,
+                since_last_event_ms,
+                max_event_gap_ms = self.max_event_gap_ms,
+                finish_reason = ?self.finish_reason,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "AI response stream progress"
+            );
+        }
     }
 
     fn finish(
@@ -1388,9 +1542,12 @@ impl SseDiagnostics {
                 json_error_column = json_error.map(serde_json::Error::column),
                 wire_bytes,
                 event_count,
+                content_bytes = self.content_bytes,
                 content_events = self.content_events,
                 empty_content_events = self.empty_content_events,
                 unrecognized_events = self.unrecognized_events,
+                max_event_gap_ms = self.max_event_gap_ms,
+                finish_reason = ?self.finish_reason,
                 elapsed_ms = self.started_at.elapsed().as_millis() as u64,
                 "AI response stream failed"
             );
@@ -1409,6 +1566,7 @@ impl SseDiagnostics {
             tool_argument_bytes = self.tool_argument_bytes,
             finish_reason = ?self.finish_reason,
             first_event_ms = self.first_event_ms,
+            max_event_gap_ms = self.max_event_gap_ms,
             elapsed_ms = self.started_at.elapsed().as_millis() as u64,
             prompt_tokens = self.usage.as_ref().map(|usage| usage.prompt_tokens),
             completion_tokens = self.usage.as_ref().map(|usage| usage.completion_tokens),
@@ -1861,6 +2019,7 @@ mod tests {
         BoundedSseState::new(
             stream::iter(vec![Ok::<Vec<u8>, reqwest::Error>(bytes)]),
             limits,
+            Duration::from_secs(30),
         )
     }
 
@@ -1931,23 +2090,35 @@ mod tests {
         // 正文」，看不出模型根本没有开始回答。
         let mut diagnostics = SseDiagnostics::new();
         for _ in 0..2 {
-            diagnostics.observe(&ChatStreamEvent {
-                content_delta: Some(String::new()),
-                ..ChatStreamEvent::default()
-            });
+            diagnostics.observe(
+                &ChatStreamEvent {
+                    content_delta: Some(String::new()),
+                    ..ChatStreamEvent::default()
+                },
+                0,
+                1,
+            );
         }
-        diagnostics.observe(&ChatStreamEvent {
-            content_delta: Some("答".to_string()),
-            ..ChatStreamEvent::default()
-        });
+        diagnostics.observe(
+            &ChatStreamEvent {
+                content_delta: Some("答".to_string()),
+                ..ChatStreamEvent::default()
+            },
+            0,
+            2,
+        );
         // 流的首块通常只带 role；provider 私有的推理字段同样落在这里：本客户端
         // 不消费的字段不会伪装成正文。
-        diagnostics.observe(&ChatStreamEvent::default());
+        diagnostics.observe(&ChatStreamEvent::default(), 0, 3);
         // `[DONE]` 本身没有载荷，不能计入「无法识别」。
-        diagnostics.observe(&ChatStreamEvent {
-            done: true,
-            ..ChatStreamEvent::default()
-        });
+        diagnostics.observe(
+            &ChatStreamEvent {
+                done: true,
+                ..ChatStreamEvent::default()
+            },
+            0,
+            4,
+        );
         assert_eq!(diagnostics.content_events, 1);
         assert_eq!(diagnostics.content_bytes, "答".len());
         assert_eq!(diagnostics.empty_content_events, 2);
@@ -2066,6 +2237,52 @@ mod tests {
                 .to_string()
                 .contains("1-event limit")
         );
+    }
+
+    /// 2026-09-11 现场：reqwest 的整体请求超时（120 秒）切断了一条仍在稳定输出的流
+    /// （1579 个正文块、7024 字节正文、没有 `[DONE]`）。流会话只能按「静默」失败，
+    /// 慢但持续有数据的回答必须被允许继续，直到输出上限或服务端结束。
+    #[tokio::test]
+    async fn streaming_reply_survives_a_total_duration_beyond_one_chunk_gap() {
+        let chunks = (0..10)
+            .map(|index| {
+                let event = format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{index}\"}},\"finish_reason\":null}}]}}\n\n"
+                );
+                (
+                    Duration::from_millis(20),
+                    Ok::<Vec<u8>, reqwest::Error>(event.into_bytes()),
+                )
+            })
+            .collect::<Vec<_>>();
+        // 累计耗时 200 毫秒，是单块静默上限（50 毫秒）的四倍。
+        let input = stream::unfold(chunks.into_iter(), |mut chunks| async move {
+            let (delay, chunk) = chunks.next()?;
+            tokio::time::sleep(delay).await;
+            Some((chunk, chunks))
+        });
+        let mut state = BoundedSseState::new(input, SseLimits::CHAT, Duration::from_millis(50));
+        for _ in 0..10 {
+            assert!(state.next_event().await.unwrap().is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_reply_reports_a_silent_gap_as_http_timeout() {
+        let event =
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":null}]}\n\n";
+        let input = stream::iter(vec![Ok::<Vec<u8>, reqwest::Error>(event.to_vec())]).chain(
+            stream::pending::<std::result::Result<Vec<u8>, reqwest::Error>>(),
+        );
+        let mut state = BoundedSseState::new(input, SseLimits::CHAT, Duration::from_secs(1));
+        assert!(state.next_event().await.unwrap().is_some());
+        let error = state.next_event().await.unwrap_err();
+        assert_eq!(error_kind(&error), "http_timeout");
+        let timeout = error
+            .downcast_ref::<ProviderTimeout>()
+            .expect("a silent stream must stay a typed provider timeout");
+        assert_eq!(timeout.scope(), "stream");
+        assert_eq!(timeout.secs(), 1);
     }
 
     #[test]

@@ -54,6 +54,9 @@ enum ReplyMode {
     FullWidthStructure,
     /// Valid answers everywhere except blocks carrying [`POISON_SENTINEL`].
     PoisonedBlock,
+    /// One complete valid answer, then a stream that never ends: the fixture
+    /// declares one byte more than it sends and keeps the socket open.
+    AnswerThenSilence,
 }
 
 /// An actual loopback HTTP/SSE provider. Every fixture opts out of automatic
@@ -202,13 +205,28 @@ impl TranslationEndpoint {
                     .0;
                 let first = json!({"choices":[{"delta":{"content":&content[..split]},"finish_reason":null}]}).to_string();
                 let last = json!({"choices":[{"delta":{"content":&content[split..]},"finish_reason":"stop"}]}).to_string();
-                let output = format!("data: {first}\n\ndata: {last}\n\ndata: [DONE]\n\n");
-                let result = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{output}", output.len())
+                let silent = matches!(mode, ReplyMode::AnswerThenSilence);
+                let output = if silent {
+                    // 完整的答案，但没有 `[DONE]`：流始终没有结束。
+                    format!("data: {first}\n\ndata: {last}\n\n")
+                } else {
+                    format!("data: {first}\n\ndata: {last}\n\ndata: [DONE]\n\n")
+                };
+                // 静默夹具声明比实际多一字节的响应体：客户端读完已有字节后会继续等待，
+                // 直到空闲超时，用来验证「答案完整、流没有结束」的可挽救路径。
+                let declared = output.len() + usize::from(silent);
+                let result = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n{output}")
                     .and_then(|_| stream.flush());
                 // A cancelled or superseded correction may close the socket
                 // before the fixture releases its deliberately late response.
                 if !gated {
                     result.unwrap();
+                }
+                if silent {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
+                        thread::sleep(Duration::from_millis(20));
+                    }
                 }
                 finished.fetch_add(1, Ordering::Release);
             }
@@ -297,13 +315,22 @@ fn read_request(stream: &mut TcpStream) -> String {
 }
 
 fn settings(endpoint: &TranslationEndpoint) -> ProviderSettings {
+    settings_with_timeout(endpoint, 10)
+}
+
+/// 请求超时是「静默」上限，不再是整段调用的总时长：夹具需要它足够短才能在不拖慢
+/// 测试的前提下触发空闲结束。
+fn settings_with_timeout(
+    endpoint: &TranslationEndpoint,
+    request_timeout_secs: u64,
+) -> ProviderSettings {
     ProviderSettings {
         base_url: endpoint.url.clone(),
         chat_model: "same-chat-model".into(),
         default_language: Some("zh-Hans".into()),
         auto_run_background_jobs: false,
         background_job_interval_ms: 0,
-        request_timeout_secs: 10,
+        request_timeout_secs,
         ..ProviderSettings::default()
     }
 }
@@ -834,6 +861,41 @@ fn exhausted_correction_fails_after_two_calls_without_storing_response_text() {
             )
             .unwrap();
         assert_eq!(persisted_error, error);
+    });
+}
+
+/// 2026-09-11 现场：本地模型的流在 120 秒请求超时里已经输出了完整译文，却一直没有
+/// 结束（1579 个正文块、7024 字节正文、没有 `[DONE]`），旧的整体请求超时把整本图书
+/// 判成失败。请求超时改为「静默」上限后，已经收到的完整答案必须被采用。
+#[test]
+fn a_complete_answer_survives_a_stream_that_never_finishes() {
+    let endpoint = TranslationEndpoint::start("译：", ReplyMode::AnswerThenSilence);
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("unfinished-stream.epub");
+    write_epub(&path, "<p>Read <strong>carefully</strong>.</p>");
+    let services = AppServices::open_with_credentials(
+        temp.path().join("library"),
+        Arc::new(MemoryCredentialStore::default()),
+    )
+    .unwrap();
+    services.runtime().block_on(async {
+        services
+            .configure_providers(settings_with_timeout(&endpoint, 1), BTreeMap::new())
+            .await
+            .unwrap();
+        let (book_id, unit_id) = import(&services, &path).await;
+        translate(&services, &book_id).await;
+        let blocks = services
+            .translation_blocks_for_unit(book_id, unit_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            endpoint.requests().len(),
+            1,
+            "a salvaged answer must not be requested a second time"
+        );
+        assert_eq!(row_count(&services), 1);
+        assert_translated_segments(&blocks, &endpoint.requests(), "译：");
     });
 }
 

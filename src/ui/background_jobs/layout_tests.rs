@@ -386,17 +386,19 @@ fn divider_drag_clamps_the_list_column_and_keeps_the_detail_readable(cx: &mut Te
     visual.update(|_, cx| {
         view.update(cx, |jobs, cx| {
             assert!(jobs.begin_list_resize());
-            assert!(jobs.resize_list_from_pointer(
-                px(500. + JOBS_RESIZE_HANDLE_WIDTH / 2.),
-                px(900.),
-            ));
+            assert!(
+                jobs.resize_list_from_pointer(px(500. + JOBS_RESIZE_HANDLE_WIDTH / 2.), px(900.),)
+            );
             assert_eq!(jobs.list_width, 500.);
             assert!(jobs.finish_list_resize());
             cx.notify();
         });
     });
     redraw(visual);
-    assert_eq!(bounds(visual, "jobs-layout-list-column").size.width, px(500.));
+    assert_eq!(
+        bounds(visual, "jobs-layout-list-column").size.width,
+        px(500.)
+    );
     assert_regions_fit(visual, 900., 640.);
 
     // The column is clamped on both sides: it never grows past what the detail
