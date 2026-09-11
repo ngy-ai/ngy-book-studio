@@ -1,7 +1,7 @@
 //! Text-only translation protocol. The original document owns every element,
 //! attribute and line break; model output can only replace identified text leaves.
 
-use std::fmt;
+use std::{borrow::Cow, fmt};
 
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,10 @@ pub struct StoredTranslation {
 pub const FORMAT_INSTRUCTIONS: &str = "用户输入是 JSON，source 是完整文本块上下文，segments 是允许翻译的文本片段。\
      结合整个文本块翻译每个片段，不要把一个片段的内容移到另一个片段。\
      仅返回 JSON 对象 {\"translations\":[{\"id\":0,\"text\":\"译文\"}]}。\
+     JSON 的结构字符（花括号、方括号、双引号、冒号、逗号）必须使用半角 ASCII：\
+     键名只能用半角双引号包裹，键名与值之间只能用半角冒号，各项之间只能用半角逗号。\
+     全角标点（：，、；「」等）只能出现在 text 的值里面，绝不能写在键名、冒号或逗号的位置。\
+     每个片段都必须写成 {\"id\":0,\"text\":\"译文\"} 这样的完整形式，不要省略键名、引号、冒号或逗号。\
      每个输入 id 必须且只能出现一次，id 使用整数；不得增加字段、解释或 Markdown 围栏。\
      text 只能是译文纯文本，不生成 HTML 或 Markdown 格式标记。\
      保留片段内部的换行以及片段首尾、相邻片段之间的空白。\
@@ -145,7 +149,38 @@ struct Response {
 /// Accept formatting around one answer, while keeping its actual JSON schema
 /// strict. A leading, explicitly closed thinking block is not an answer. Other
 /// prose and Markdown fences may surround exactly one complete JSON container.
+///
+/// A response that does not parse untouched is retried once with structural
+/// full-width punctuation normalized. That repair can only rewrite characters
+/// which must be structural in JSON, so a valid answer is never modified and a
+/// response whose missing characters would have to be invented is still
+/// rejected with the coordinates of the untouched text.
 fn decode_response(response: &str) -> std::result::Result<Response, ResponseError> {
+    match decode_untouched_response(response) {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            let (repaired, replaced) = repair_structural_punctuation(response);
+            if replaced == 0 {
+                return Err(error);
+            }
+            match decode_untouched_response(&repaired) {
+                Ok(answer) => {
+                    tracing::debug!(
+                        target: "moye_ai",
+                        stage = "translation_response_repaired",
+                        replaced_chars = replaced,
+                        response_bytes = response.len(),
+                        "Translation response repaired"
+                    );
+                    Ok(answer)
+                }
+                Err(_) => Err(error),
+            }
+        }
+    }
+}
+
+fn decode_untouched_response(response: &str) -> std::result::Result<Response, ResponseError> {
     let mut body = response.trim_matches(is_matching_whitespace);
     while let Some(thinking) = body.strip_prefix("<think>") {
         let end = thinking
@@ -266,6 +301,122 @@ fn single_json_container(response: &str) -> std::result::Result<&str, ResponseEr
         return Err(ResponseError::new("incomplete_json"));
     }
     candidate.ok_or_else(|| ResponseError::new("missing_json"))
+}
+
+/// How a string literal was opened. Full-width quotes are only treated as
+/// delimiters for a string those same characters opened, so a full-width quote
+/// inside an ASCII-quoted translation stays content.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QuoteStyle {
+    Ascii,
+    FullWidth,
+}
+
+/// Full-width punctuation a CJK-oriented model writes where JSON requires a
+/// structural character. Only the characters that can never be content outside
+/// a string literal are mapped; everything else (including every character
+/// inside a string) is left byte-identical.
+fn structural_ascii(value: char) -> Option<char> {
+    Some(match value {
+        '\u{ff1a}' => ':', // ：
+        '\u{ff0c}' => ',', // ，
+        '\u{ff5b}' => '{',
+        '\u{ff5d}' => '}',
+        '\u{ff3b}' => '[',
+        '\u{ff3d}' => ']',
+        '\u{ff02}' | '\u{201c}' | '\u{201d}' => '"', // ＂ “ ”
+        _ => return None,
+    })
+}
+
+/// Rewrites structural full-width punctuation to its ASCII form and reports how
+/// many characters changed. Positions inside string literals are copied
+/// verbatim, so this can never alter a translation. A key that already absorbed
+/// the separator (`"text："`) has no character left to rewrite and is rejected
+/// instead of guessed.
+fn repair_structural_punctuation(response: &str) -> (Cow<'_, str>, usize) {
+    let mut repaired: Option<String> = None;
+    let mut copied = 0;
+    let mut replaced = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, value) in response.char_indices() {
+        match quote {
+            Some(QuoteStyle::Ascii) => {
+                if escaped {
+                    escaped = false;
+                } else if value == '\\' {
+                    escaped = true;
+                } else if value == '"' {
+                    quote = None;
+                }
+                continue;
+            }
+            Some(QuoteStyle::FullWidth) => {
+                if matches!(value, '\u{201d}' | '\u{ff02}') {
+                    replace_with(
+                        &mut repaired,
+                        &mut copied,
+                        &mut replaced,
+                        response,
+                        index,
+                        '"',
+                    );
+                    quote = None;
+                }
+                continue;
+            }
+            None => {}
+        }
+        match value {
+            '"' => quote = Some(QuoteStyle::Ascii),
+            '\u{201c}' | '\u{ff02}' => {
+                replace_with(
+                    &mut repaired,
+                    &mut copied,
+                    &mut replaced,
+                    response,
+                    index,
+                    '"',
+                );
+                quote = Some(QuoteStyle::FullWidth);
+            }
+            value => {
+                if let Some(ascii) = structural_ascii(value) {
+                    replace_with(
+                        &mut repaired,
+                        &mut copied,
+                        &mut replaced,
+                        response,
+                        index,
+                        ascii,
+                    );
+                }
+            }
+        }
+    }
+    match repaired {
+        Some(mut text) => {
+            text.push_str(&response[copied..]);
+            (Cow::Owned(text), replaced)
+        }
+        None => (Cow::Borrowed(response), replaced),
+    }
+}
+
+fn replace_with(
+    repaired: &mut Option<String>,
+    copied: &mut usize,
+    replaced: &mut usize,
+    source: &str,
+    index: usize,
+    ascii: char,
+) {
+    let text = repaired.get_or_insert_with(|| String::with_capacity(source.len()));
+    text.push_str(&source[*copied..index]);
+    text.push(ascii);
+    *copied = index + source[index..].chars().next().map_or(0, char::len_utf8);
+    *replaced += 1;
 }
 
 /// Validates an already size-bounded provider response and restores source order.
@@ -586,6 +737,69 @@ mod tests {
             error.downcast_ref::<ResponseError>().unwrap().kind(),
             "segment_count_mismatch"
         );
+    }
+
+    #[test]
+    fn structural_full_width_punctuation_is_repaired_without_touching_content() {
+        let single = TranslationSource {
+            text: "Hello".into(),
+            segments: vec!["Hello".into()],
+        };
+        // 现场成因：中文模型把结构冒号、逗号写成了全角标点。
+        let repaired = parse_response(
+            &single,
+            "{\"translations\"：[{\"id\"：0，\"text\"：\"你好\"}]}",
+            "v2",
+        )
+        .unwrap();
+        assert_eq!(repaired.segments[0].translated, "你好");
+
+        // 结构引号写成全角引号同样可修复，值内容逐字保留。
+        let quoted = parse_response(
+            &single,
+            "{\"translations\":[{\"id\":0,\"text\":“嗯：好，”}]}",
+            "v2",
+        )
+        .unwrap();
+        assert_eq!(quoted.segments[0].translated, "嗯：好，");
+    }
+
+    #[test]
+    fn accepted_answers_are_never_rewritten_by_the_punctuation_repair() {
+        let single = TranslationSource {
+            text: "Hello".into(),
+            segments: vec!["Hello".into()],
+        };
+        let content = "他说：“好”：没问题，";
+        let json = serde_json::json!({"translations": [{"id": 0, "text": content}]}).to_string();
+        let parsed = parse_response(&single, &json, "v2").unwrap();
+        assert_eq!(parsed.segments[0].translated, content);
+
+        let (repaired, replaced) = repair_structural_punctuation(&json);
+        assert_eq!(replaced, 0, "合法响应不进入修复路径");
+        assert_eq!(repaired.as_ref(), json);
+    }
+
+    #[test]
+    fn punctuation_repair_never_invents_missing_content() {
+        // 截断的响应即使结构标点是全角也仍然被拒绝。
+        let error = parse_response(
+            &source(),
+            "{\"translations\"：[{\"id\"：0，\"text\"：\"甲\"}",
+            "v2",
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ResponseError>().unwrap().kind(),
+            "incomplete_json"
+        );
+
+        // 266 号现场：键名吞掉了分隔符（"text："），要恢复它只能猜模型意图，
+        // 因此必须继续拒绝，而不是把全角标点当成译文或补一个空值。
+        let field = r#"{"translations":[{"id":0,"text":"1 + 1"},{"id":1,"text":" = "},{"id":2,"text":"2"},{"id":3,"text：","as you'd expect."}]}"#;
+        let error = parse_response(&source(), field, "v2").unwrap_err();
+        let detail = error.downcast_ref::<ResponseError>().unwrap();
+        assert!(detail.json_line().is_some() && detail.json_column().is_some());
     }
 
     #[test]

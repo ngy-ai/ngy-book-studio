@@ -363,6 +363,25 @@ LangGraph 依赖。CLI 课程验证与桌面接入的验证分别列出。
   --lib` 446 项、`cargo test --bin moye-epub-editor` 260 项、集成测试 epub_flow 6、
   multi_format_flow 4、openai_compatible_flow 22、multi_endpoint_flow 1 全部通过
 - [ ] 真实模型翻译质量验收：本轮使用本机 mock SSE 核验应用流程，未连接真实模型评估译文质量
+- [x] 2026-09-11 现场 266 号文本块修复（本机 `ornith-1.5:9b` 把全角冒号写进 JSON
+  键名：`{"id":3,"text：","as you'd expect."}`，整段响应不是合法 JSON，温度 0 下纠正
+  请求复读同一错误，任务在 266 号块上反复失败）：格式说明显式要求结构字符使用半角
+  ASCII、全角标点只能出现在 `text` 值里；纠正提示按固定失败分类复述要修的部分；解析
+  失败时额外允许一次**字符串字面量之外**的结构标点归一（`：，｛｝［］＂“”` → 半角），
+  合法响应不进入该路径、译文逐字不变，键名吞掉分隔符的响应仍拒绝并保留原始终止行列。
+  两次请求后仍失败的文本块保留原文并继续翻译其余块，按块写 `ProtocolSkipped` 警告并像
+  缓存命中一样持久推进游标；只有连续 3 个块失败或整本图书没有任何有效译文时任务才判
+  失败，判失败前把持久游标回滚到本轮第一个未翻译块之前，使重试仍会重新尝试这些块。
+  回归：`cargo test --lib` 496 项通过/5 项忽略（含结构标点接受、合法响应不改写、截断
+  与键名吞分隔符仍拒绝）、产品二进制 266 项通过/1 项忽略、`translation_flow` 12 项
+  （新增全角结构标点无纠正接受、单块跳过继续、连续 3 块失败回滚游标三项，原有纠正预算
+  与失败用例保持通过）、`epub_flow` 6、`multi_format_flow` 4、`openai_compatible_flow` 22、
+  `multi_endpoint_flow` 1 全部通过；`cargo fmt --all --check`、`cargo check --all-targets
+  --locked` 通过，`cargo clippy --all-targets --locked` 仅剩改动前既有告警。另用本机
+  `ornith-1.5:9b` 对三个含冒号或全角引号片段的加固提示请求手工验证返回均为合法 JSON
+  （不纳入仓库测试）。未做真实 Windows GUI 复验，未连接用户书库
+- [ ] 翻译任务窗口的“文本块明细”仍按游标显示块状态，被跳过的块与已翻译块一样显示为
+  已处理；逐块结果目前只能从任务日志的 `ProtocolSkipped` 记录读取
 
 ## 明确不在当前范围
 

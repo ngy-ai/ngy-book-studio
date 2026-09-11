@@ -33,6 +33,10 @@ const FORMATTED_BODY: &str = r#"<h1>Formatting <em>matters</em></h1>
 
 const INVALID_RESPONSE_SENTINEL: &str = "PRIVATE_PROVIDER_RESPONSE_MUST_NOT_BECOME_JOB_ERROR";
 
+/// A source block carrying this marker always receives an invalid response, so
+/// the per-block skip path can be exercised without a real model.
+const POISON_SENTINEL: &str = "POISON_BLOCK";
+
 #[derive(Clone, Copy, Debug)]
 enum ReplyMode {
     ReverseIds,
@@ -45,6 +49,11 @@ enum ReplyMode {
     AlwaysInvalid,
     GatedCorrectionValid,
     GatedCorrectionInvalid,
+    /// A JSON answer whose structural punctuation is full-width, as a
+    /// CJK-oriented model writes it (`"text"："..."，"`).
+    FullWidthStructure,
+    /// Valid answers everywhere except blocks carrying [`POISON_SENTINEL`].
+    PoisonedBlock,
 }
 
 /// An actual loopback HTTP/SSE provider. Every fixture opts out of automatic
@@ -104,6 +113,9 @@ impl TranslationEndpoint {
                     .unwrap();
                 let input: Value = serde_json::from_str(user["content"].as_str().unwrap()).unwrap();
                 assert!(input["source"].is_string());
+                let poisoned = input["source"]
+                    .as_str()
+                    .is_some_and(|source| source.contains(POISON_SENTINEL));
                 let mut translations = input["segments"]
                     .as_array()
                     .unwrap()
@@ -135,6 +147,24 @@ impl TranslationEndpoint {
                         "仅供隔离测试的无效模型前缀。".repeat(256)
                     )
                 };
+                // Same answer, but every structural separator is the full-width
+                // character a Chinese model reaches for. Only the app's
+                // structural-punctuation repair can accept this response, and the
+                // translated text itself stays byte-identical.
+                let full_width_structure = || {
+                    let entries = translations
+                        .iter()
+                        .map(|segment| {
+                            format!(
+                                "{{\"id\"：{},\"text\"：{}}}",
+                                segment["id"],
+                                serde_json::to_string(&segment["text"]).unwrap()
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("，");
+                    format!("{{\"translations\"：[{entries}]}}")
+                };
                 let content = match mode {
                     ReplyMode::Fenced => format!("```json\n{valid}\n```"),
                     ReplyMode::Prefaced => format!("翻译结果如下：\n{valid}\n"),
@@ -147,6 +177,8 @@ impl TranslationEndpoint {
                         "这是没有分段信息的纯文本译文。".to_string()
                     }
                     ReplyMode::AlwaysInvalid | ReplyMode::GatedCorrectionInvalid => invalid(),
+                    ReplyMode::FullWidthStructure => full_width_structure(),
+                    ReplyMode::PoisonedBlock if poisoned => invalid(),
                     _ => valid,
                 };
                 let gated = matches!(
@@ -693,6 +725,152 @@ fn exhausted_correction_fails_after_two_calls_without_storing_response_text() {
             )
             .unwrap();
         assert_eq!(persisted_error, error);
+    });
+}
+
+#[test]
+fn full_width_structure_punctuation_is_repaired_without_a_correction() {
+    // 现场成因：模型把 JSON 的结构冒号、逗号写成全角标点。归一化只改结构位置，
+    // 因此不需要纠正请求，译文内容逐字保持模型给出的文本。
+    let endpoint = TranslationEndpoint::start("全角：", ReplyMode::FullWidthStructure);
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("full-width-structure.epub");
+    write_epub(
+        &path,
+        "<p>Read <strong>carefully</strong>.</p><p>Second <em>block</em>.</p>",
+    );
+    let services = AppServices::open_with_credentials(
+        temp.path().join("library"),
+        Arc::new(MemoryCredentialStore::default()),
+    )
+    .unwrap();
+    services.runtime().block_on(async {
+        services
+            .configure_providers(settings(&endpoint), BTreeMap::new())
+            .await
+            .unwrap();
+        let (book_id, unit_id) = import(&services, &path).await;
+        translate(&services, &book_id).await;
+        let blocks = services
+            .translation_blocks_for_unit(book_id, unit_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            endpoint.requests().len(),
+            2,
+            "结构标点归一后不需要额外纠正请求"
+        );
+        assert_eq!(row_count(&services), 2);
+        assert_translated_segments(&blocks, &endpoint.requests(), "全角：");
+    });
+}
+
+#[test]
+fn one_untranslatable_block_is_skipped_and_the_run_continues() {
+    let endpoint = TranslationEndpoint::start("跳过：", ReplyMode::PoisonedBlock);
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("skipped-block.epub");
+    write_epub(
+        &path,
+        &format!(
+            "<p>First block</p><p>{POISON_SENTINEL} never validates</p>\
+             <p>Third block</p><p>Fourth block</p>"
+        ),
+    );
+    let services = AppServices::open_with_credentials(
+        temp.path().join("library"),
+        Arc::new(MemoryCredentialStore::default()),
+    )
+    .unwrap();
+    services.runtime().block_on(async {
+        services
+            .configure_providers(settings(&endpoint), BTreeMap::new())
+            .await
+            .unwrap();
+        let (book_id, unit_id) = import(&services, &path).await;
+        let job = translate(&services, &book_id).await;
+
+        // 四个文本块：一个始终非法（两次请求），其余各一次请求。
+        assert_eq!(endpoint.requests().len(), 5);
+        let logs = services
+            .background_job_logs(job.id.clone(), vec![book_id.clone()])
+            .await
+            .unwrap();
+        let skipped: Vec<_> = logs
+            .entries
+            .iter()
+            .filter(|entry| entry.message.contains("跳过当前文本块"))
+            .collect();
+        assert_eq!(skipped.len(), 1, "跳过的文本块必须留下可读记录");
+        assert_eq!(skipped[0].metrics.ordinal, Some(1));
+        assert_eq!(
+            skipped[0].level,
+            moye_epub_editor::job_diagnostics::JobLogLevel::Warning
+        );
+        for entry in &logs.entries {
+            assert!(
+                !entry.format_line().contains(POISON_SENTINEL),
+                "任务日志不得包含正文"
+            );
+        }
+
+        // 跳过不写入译文，但游标继续前进，读者看到的是原文。
+        assert_eq!(row_count(&services), 3);
+        assert_eq!(job.progress.completed, 4);
+        let blocks = services
+            .translation_blocks_for_unit(book_id, unit_id)
+            .await
+            .unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert!(
+            blocks
+                .iter()
+                .all(|block| !block.source.contains(POISON_SENTINEL))
+        );
+    });
+}
+
+#[test]
+fn consecutive_untranslatable_blocks_fail_the_run_without_losing_progress() {
+    let endpoint = TranslationEndpoint::start("失败：", ReplyMode::PoisonedBlock);
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("consecutive-skips.epub");
+    write_epub(
+        &path,
+        &format!(
+            "<p>First block</p><p>{POISON_SENTINEL} one</p><p>{POISON_SENTINEL} two</p>\
+             <p>{POISON_SENTINEL} three</p><p>Last block</p>"
+        ),
+    );
+    let services = AppServices::open_with_credentials(
+        temp.path().join("library"),
+        Arc::new(MemoryCredentialStore::default()),
+    )
+    .unwrap();
+    services.runtime().block_on(async {
+        services
+            .configure_providers(settings(&endpoint), BTreeMap::new())
+            .await
+            .unwrap();
+        let (book_id, _unit_id) = import(&services, &path).await;
+        let job = wait_translation(&services, &book_id, BackgroundJobStatus::Paused).await;
+        assert!(
+            services
+                .control_background_job(job.id, BackgroundJobAction::Resume)
+                .await
+                .unwrap()
+        );
+        let failed = wait_translation(&services, &book_id, BackgroundJobStatus::Failed).await;
+
+        // 一个成功块加三个连续失败块：第三个失败块上停止，最后一个块不再请求。
+        assert_eq!(endpoint.requests().len(), 7);
+        let error = failed.error.unwrap();
+        assert!(error.contains("连续 3 个文本块"));
+        assert!(!error.contains(POISON_SENTINEL));
+        assert!(error.len() < 1024);
+        // 失败沿用最后一个已提交游标，重试仍会从第一个未翻译块开始。
+        assert_eq!(failed.progress.completed, 1);
+        assert_eq!(row_count(&services), 1);
     });
 }
 
