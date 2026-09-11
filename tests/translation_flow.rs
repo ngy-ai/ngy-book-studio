@@ -420,7 +420,7 @@ fn assert_one_correction(endpoint: &TranslationEndpoint) {
 }
 
 #[test]
-fn structured_translation_survives_restart_and_replaces_same_model_endpoint_cache() {
+fn structured_translation_survives_restart_and_a_changed_endpoint_keeps_its_text() {
     let first = TranslationEndpoint::start("甲：", ReplyMode::ReverseIds);
     let second = TranslationEndpoint::start("乙：", ReplyMode::ReverseIds);
     let temp = tempfile::tempdir().unwrap();
@@ -527,27 +527,30 @@ fn structured_translation_survives_restart_and_replaces_same_model_endpoint_cach
             .configure_providers(settings(&second), BTreeMap::new())
             .await
             .unwrap();
-        wait_translation(&services, &book_id, BackgroundJobStatus::Paused).await;
-        assert!(
+        let job = wait_translation(&services, &book_id, BackgroundJobStatus::Paused).await;
+        // A changed endpoint or model keeps what is already translated: the rows
+        // are restamped with the new identity instead of being discarded, so a
+        // reader never loses译文 for a book that was already translated.
+        assert_eq!(
             services
                 .translation_blocks_for_unit(book_id.clone(), unit_id.clone())
                 .await
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            initial
         );
         assert_eq!(
             row_count(&services),
-            0,
-            "old endpoint output must not remain cached under the same model name"
+            10,
+            "existing译文 must survive a changed endpoint"
         );
-        let job = translate(&services, &book_id).await;
-        let blocks = services
-            .translation_blocks_for_unit(book_id.clone(), unit_id.clone())
-            .await
-            .unwrap();
-        assert_translated_segments(&blocks, &second.requests(), "乙：");
-        assert_eq!(first.requests().len(), 10);
+        assert_eq!(
+            second.requests().len(),
+            0,
+            "already translated blocks are not requested again"
+        );
 
+        // The explicit re-translation still discards the stored text and rebuilds
+        // the book with the new endpoint.
         assert!(
             services
                 .control_background_job(job.id, BackgroundJobAction::Retranslate)
@@ -556,11 +559,117 @@ fn structured_translation_survives_restart_and_replaces_same_model_endpoint_cach
         );
         assert_eq!(row_count(&services), 0);
         translate(&services, &book_id).await;
-        assert_eq!(second.requests().len(), 20);
+        let blocks = services
+            .translation_blocks_for_unit(book_id.clone(), unit_id.clone())
+            .await
+            .unwrap();
+        assert_translated_segments(&blocks, &second.requests(), "乙：");
+        assert_eq!(second.requests().len(), 10);
+        assert_eq!(first.requests().len(), 10);
         assert_eq!(
             row_count(&services),
             10,
             "retranslation replaces rows without duplication"
+        );
+    });
+}
+
+#[test]
+fn editing_one_chapter_keeps_the_other_chapters_translation() {
+    let endpoint = TranslationEndpoint::start("译：", ReplyMode::ReverseIds);
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("two-chapters.epub");
+    write_two_chapter_epub(
+        &path,
+        "<p>first chapter words</p>",
+        "<p>second chapter words</p>",
+    );
+    let data_dir = temp.path().join("library");
+    let services =
+        AppServices::open_with_credentials(&data_dir, Arc::new(MemoryCredentialStore::default()))
+            .unwrap();
+    services.runtime().block_on(async {
+        services
+            .configure_providers(settings(&endpoint), BTreeMap::new())
+            .await
+            .unwrap();
+        let (book_id, first_unit_id) = import(&services, &path).await;
+        let second_unit_id = services
+            .spawn_library_read({
+                let book_id = book_id.clone();
+                move |library| Ok(library.document(&book_id)?.units[1].id.clone())
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        translate(&services, &book_id).await;
+        assert_eq!(endpoint.requests().len(), 2, "one block per chapter");
+        let kept = services
+            .translation_blocks_for_unit(book_id.clone(), second_unit_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(kept.len(), 1);
+
+        // Editing the first chapter publishes a new revision, but the untouched
+        // chapter keeps its译文 and is not translated again.
+        let edited_book = book_id.clone();
+        let edited_unit = first_unit_id.clone();
+        services
+            .spawn_library(move |library| {
+                library.update_content_unit_source(
+                    &edited_book,
+                    &edited_unit,
+                    "<p>edited chapter words</p>",
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            services
+                .translation_blocks_for_unit(book_id.clone(), second_unit_id.clone())
+                .await
+                .unwrap(),
+            kept,
+            "the untouched chapter keeps its译文"
+        );
+
+        let job = wait_translation(&services, &book_id, BackgroundJobStatus::Paused).await;
+        let before_edit_requests = endpoint.requests().len();
+        assert!(
+            services
+                .control_background_job(job.id, BackgroundJobAction::Resume)
+                .await
+                .unwrap()
+        );
+        wait_translation(&services, &book_id, BackgroundJobStatus::Succeeded).await;
+        let requested = endpoint
+            .requests()
+            .iter()
+            .skip(before_edit_requests)
+            .map(|request| request["source"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            requested
+                .iter()
+                .any(|source| source == "edited chapter words"),
+            "the edited chapter is translated again: {requested:?}"
+        );
+        assert!(
+            !requested
+                .iter()
+                .any(|source| source == "second chapter words"),
+            "an untouched chapter's own text is never translated again: {requested:?}"
+        );
+        let kept_after = services
+            .translation_blocks_for_unit(book_id.clone(), second_unit_id.clone())
+            .await
+            .unwrap();
+        assert!(
+            kept_after
+                .iter()
+                .any(|block| block.source == "second chapter words"),
+            "the untouched chapter still reads its译文: {kept_after:?}"
         );
     });
 }
@@ -1151,6 +1260,43 @@ fn opening_a_legacy_plain_text_cache_requires_fresh_structured_translation() {
         );
         assert_translated_segments(&blocks, &endpoint.requests()[1..], "新：");
     });
+}
+
+fn write_two_chapter_epub(path: &Path, first_body: &str, second_body: &str) {
+    let mut zip = ZipWriter::new(File::create(path).unwrap());
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    let chapter = |title: &str, body: &str| {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>{title}</title></head><body>{body}</body></html>"#
+        )
+    };
+    for (name, content) in [
+        ("mimetype", "application/epub+zip".to_string()),
+        (
+            "META-INF/container.xml",
+            r#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="EPUB/package.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#.to_string(),
+        ),
+        (
+            "EPUB/package.opf",
+            r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" unique-identifier="book-id" version="3.0"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="book-id">urn:uuid:translation-incremental-fixture</dc:identifier><dc:title>Translation Incremental Fixture</dc:title><dc:creator>Fixture</dc:creator><dc:language>en</dc:language><meta property="dcterms:modified">2026-09-11T00:00:00Z</meta></metadata><manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/><item id="chapter1" href="chapter1.xhtml" media-type="application/xhtml+xml"/><item id="chapter2" href="chapter2.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="chapter1"/><itemref idref="chapter2"/></spine></package>"#.to_string(),
+        ),
+        (
+            "EPUB/nav.xhtml",
+            r#"<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><head><title>Contents</title></head><body><nav epub:type="toc"><ol><li><a href="chapter1.xhtml">First</a></li><li><a href="chapter2.xhtml">Second</a></li></ol></nav></body></html>"#.to_string(),
+        ),
+        (
+            "EPUB/chapter1.xhtml",
+            chapter("First", first_body),
+        ),
+        (
+            "EPUB/chapter2.xhtml",
+            chapter("Second", second_body),
+        ),
+    ] {
+        zip.start_file(name, options).unwrap();
+        zip.write_all(content.as_bytes()).unwrap();
+    }
+    zip.finish().unwrap();
 }
 
 fn write_epub(path: &Path, body: &str) {

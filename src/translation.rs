@@ -28,6 +28,19 @@ pub struct StoredTranslation {
     pub segments: Vec<TranslationSegment>,
 }
 
+/// Protocol version of the persisted structured translation format. The
+/// endpoint/model digest after the colon is deliberately excluded: rows written
+/// by another engine may keep their text as long as the same protocol can read
+/// them, while a newer protocol invalidates every stored row.
+pub const EXECUTION_IDENTITY_PROTOCOL: &str = "translation-v2";
+
+/// Protocol prefix of one execution identity, i.e. everything before the
+/// endpoint/model digest. Unknown shapes are returned unchanged so two
+/// unexpected identities only match when they are literally equal.
+pub fn execution_identity_protocol(identity: &str) -> &str {
+    identity.split(':').next().unwrap_or_default()
+}
+
 pub const FORMAT_INSTRUCTIONS: &str = "用户输入是 JSON，source 是完整文本块上下文，segments 是允许翻译的文本片段。\
      结合整个文本块翻译每个片段，不要把一个片段的内容移到另一个片段。\
      仅返回 JSON 对象 {\"translations\":[{\"id\":0,\"text\":\"译文\"}]}。\

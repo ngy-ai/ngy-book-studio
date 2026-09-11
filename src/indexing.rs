@@ -6,7 +6,7 @@
 //! cursor lives in SQLite so process restarts can resume safely.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     future::Future,
     path::PathBuf,
     pin::Pin,
@@ -1829,7 +1829,7 @@ async fn run_translation_blocks(
             ..JobLogMetrics::default()
         },
     );
-    let mut current_blocks: HashSet<String> = HashSet::new();
+    let mut current_blocks: HashMap<String, StoredTranslation> = HashMap::new();
     // A block whose model response never passed the protocol is left untranslated
     // and the run continues: one pathological block must not block a whole book.
     // Every skip advances the durable cursor like a cache hit, because the
@@ -1921,7 +1921,32 @@ async fn run_translation_blocks(
             .await?;
             cached_unit = Some(block.unit_id.clone());
         }
-        if current_blocks.contains(&block.block_id) {
+        let cache_key = translation_cache_key(
+            &block.source.text,
+            block.source.segments.iter().map(String::as_str),
+        );
+        if let Some(stored) = current_blocks.get(&cache_key).cloned() {
+            // The stored text is republished under the block's current id: an
+            // edit may move a paragraph without changing it, and the row has to
+            // follow the block it belongs to instead of holding a stale position.
+            let now = unix_timestamp()?;
+            let entry = db::translations::NewTranslation {
+                book_id: cursor.book_id.clone(),
+                content_unit_id: block.unit_id.clone(),
+                block_id: block.block_id.clone(),
+                ordinal: block.ordinal as u64,
+                document_revision: cursor.revision,
+                unit_revision: block.unit_revision,
+                target_language: target_language.to_string(),
+                source_language: source_language.clone(),
+                model: translation.model.clone(),
+                source_text: block.source.text.clone(),
+                translated_text: serde_json::to_string(&stored)?,
+                created_at: now,
+                updated_at: now,
+            };
+            let db_path = inner.db_path.clone();
+            run_db(db_path, move |conn| db::translations::upsert(&conn, &entry)).await?;
             tracing::debug!(
                 target: "moye_ai",
                 stage = "translation_block_skipped",
@@ -2057,7 +2082,7 @@ async fn run_translation_blocks(
         };
         let db_path = inner.db_path.clone();
         run_db(db_path, move |conn| db::translations::upsert(&conn, &entry)).await?;
-        current_blocks.insert(block.block_id.clone());
+        current_blocks.insert(cache_key, response.clone());
 
         advance_translation_cursor(inner, job, cursor).await?;
         saved_blocks += 1;
@@ -2167,11 +2192,10 @@ async fn load_translation_blocks(
                 &conn,
                 &book_id,
                 &source_id,
-                revision,
                 Some((&opened, source.source_kind == "original")),
             )
         } else {
-            translation_blocks(&conn, &book_id, &source_id, revision)
+            translation_blocks(&conn, &book_id, &source_id)
         }
     })
     .await
@@ -2181,16 +2205,14 @@ fn translation_blocks(
     conn: &rusqlite::Connection,
     book_id: &str,
     source_id: &str,
-    revision: u64,
 ) -> Result<Vec<TranslationBlock>> {
-    translation_blocks_with_epub(conn, book_id, source_id, revision, None)
+    translation_blocks_with_epub(conn, book_id, source_id, None)
 }
 
 fn translation_blocks_with_epub(
     conn: &rusqlite::Connection,
     book_id: &str,
     source_id: &str,
-    revision: u64,
     epub: Option<(&crate::reader::OpenedBook, bool)>,
 ) -> Result<Vec<TranslationBlock>> {
     let units = db::content_units::list_for_source(conn, source_id)?;
@@ -2206,9 +2228,11 @@ fn translation_blocks_with_epub(
     let mut ordinal = 0usize;
     for (unit_index, unit) in units.into_iter().enumerate() {
         ensure!(unit.book_id == book_id, "翻译文本块与图书不匹配");
-        if unit.revision != revision {
-            continue;
-        }
+        // Every chapter of the published source stays in the list, including a
+        // chapter this revision did not change: the chapter's own revision
+        // decides whether one of its blocks may reuse a stored译文, so the task
+        // always describes the same whole book and never loses an untranslated
+        // chapter to a revision filter.
         let sources = if let Some((opened, check_original_href)) = epub {
             ensure!(unit.ordinal == unit_index, "阅读章节顺序与翻译单元不一致");
             let href = &opened.spine[unit_index].href;
@@ -2308,6 +2332,24 @@ fn translation_block_preview(text: &str) -> String {
     preview
 }
 
+/// Identity of one translatable block decision. The model sees exactly the
+/// block text and its leaf split, so a stored row may be reused for any block
+/// with the same key — even when an edit (or the normalized EPUB projection,
+/// which adds the chapter title heading) moved the block to another position.
+fn translation_cache_key<'a>(source_text: &str, segments: impl Iterator<Item = &'a str>) -> String {
+    let mut key = String::from(source_text);
+    for segment in segments {
+        key.push('\u{1f}');
+        key.push_str(segment);
+    }
+    key
+}
+
+/// Stored translations of one chapter that are still current, keyed by
+/// [`translation_cache_key`]. Keying on the text and its leaf split instead of
+/// the block position keeps every paragraph that an edit did not change
+/// reusable, while two blocks that only look alike are still translated
+/// separately.
 #[allow(clippy::too_many_arguments)]
 fn current_translation_blocks(
     conn: &rusqlite::Connection,
@@ -2318,21 +2360,33 @@ fn current_translation_blocks(
     unit_revision: u64,
     model: &str,
     execution_identity: &str,
-) -> Result<HashSet<String>> {
+) -> Result<HashMap<String, StoredTranslation>> {
     let _ = book_id;
-    Ok(
-        db::translations::list_for_unit(conn, unit_id, target_language)?
-            .into_iter()
-            .filter(|row| {
-                row.document_revision == document_revision
-                    && row.unit_revision == unit_revision
-                    && row.model == model
-                    && serde_json::from_str::<StoredTranslation>(&row.translated_text)
-                        .is_ok_and(|value| value.execution_identity == execution_identity)
-            })
-            .map(|row| row.block_id)
-            .collect(),
-    )
+    let mut stored = HashMap::new();
+    for row in db::translations::list_for_unit(conn, unit_id, target_language)? {
+        if row.document_revision != document_revision
+            || row.unit_revision != unit_revision
+            || row.model != model
+        {
+            continue;
+        }
+        let Ok(translation) = serde_json::from_str::<StoredTranslation>(&row.translated_text)
+        else {
+            continue;
+        };
+        if translation.execution_identity != execution_identity {
+            continue;
+        }
+        let key = translation_cache_key(
+            &row.source_text,
+            translation
+                .segments
+                .iter()
+                .map(|segment| segment.source.as_str()),
+        );
+        stored.insert(key, translation);
+    }
+    Ok(stored)
 }
 
 fn translation_request(
@@ -6823,6 +6877,23 @@ mod tests {
     }
 
     #[test]
+    fn translation_cache_keys_separate_a_different_leaf_split() {
+        assert_eq!(
+            translation_cache_key("ab", ["a", "b"].into_iter()),
+            translation_cache_key("ab", ["a", "b"].into_iter())
+        );
+        assert_ne!(
+            translation_cache_key("ab", ["a", "b"].into_iter()),
+            translation_cache_key("ab", ["ab"].into_iter()),
+            "identical text with another leaf split is a different model input"
+        );
+        assert_ne!(
+            translation_cache_key("ab", ["a", "b"].into_iter()),
+            translation_cache_key("ba", ["b", "a"].into_iter())
+        );
+    }
+
+    #[test]
     fn translation_blocks_flatten_text_blocks_in_document_order() {
         use crate::document::{Block, ListItem, TableCell, TableRow};
 
@@ -6874,7 +6945,7 @@ mod tests {
         )
         .unwrap();
 
-        let blocks = translation_blocks(&conn, "book", "source", 1).unwrap();
+        let blocks = translation_blocks(&conn, "book", "source").unwrap();
         assert_eq!(
             blocks
                 .iter()
@@ -6893,12 +6964,11 @@ mod tests {
         assert_eq!(blocks[0].source.text, "First paragraph");
         assert_eq!(blocks[2].unit_id, "unit");
 
-        // A unit whose revision no longer matches the job is skipped entirely.
-        assert!(
-            translation_blocks(&conn, "book", "source", 2)
-                .unwrap()
-                .is_empty()
-        );
+        // Every chapter of the source stays in the list. A chapter whose own
+        // revision is older than the document is still translated once: its
+        // revision only decides whether a stored译文 may be reused, which the
+        // per-block cache check does, not whether the chapter is listed.
+        assert!(blocks.iter().all(|block| block.unit_revision == 1));
     }
 
     #[test]
@@ -6939,7 +7009,7 @@ mod tests {
         )
         .unwrap();
 
-        let blocks = translation_blocks(&conn, "book", "source", 1).unwrap();
+        let blocks = translation_blocks(&conn, "book", "source").unwrap();
         assert_eq!(
             blocks
                 .iter()
@@ -6950,7 +7020,7 @@ mod tests {
         assert!(blocks.iter().all(|block| block.unit_id == "unit"));
 
         // Deterministic IDs keep repeated runs idempotent for the same source.
-        let again = translation_blocks(&conn, "book", "source", 1).unwrap();
+        let again = translation_blocks(&conn, "book", "source").unwrap();
         assert_eq!(
             again
                 .iter()

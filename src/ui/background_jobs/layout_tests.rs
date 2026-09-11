@@ -139,10 +139,12 @@ fn assert_regions_fit(cx: &mut VisualTestContext, width: f32, height: f32) {
     assert_eq!(root.size, size(px(width), px(height)));
     let selectors = [
         "jobs-layout-header",
+        "jobs-layout-kinds",
         "jobs-layout-filters",
         "jobs-layout-list",
         "jobs-layout-footer",
         "jobs-layout-detail",
+        "jobs-layout-resize-handle",
     ];
     let regions: Vec<_> = selectors
         .iter()
@@ -162,15 +164,53 @@ fn assert_regions_fit(cx: &mut VisualTestContext, width: f32, height: f32) {
             region
         })
         .collect();
-    for (index, adjacent) in regions.windows(2).enumerate() {
-        assert!(
-            adjacent[0].bottom() <= adjacent[1].top() + px(0.5),
-            "{} overlaps {} at {width}x{height}: {:?}",
-            selectors[index],
-            selectors[index + 1],
-            adjacent
-        );
-    }
+
+    // The kind switcher spans the top; below it the body is split into a
+    // stacked list column on the left and the detail panel as the main subject
+    // on the right.
+    let header = &regions[0];
+    let kinds = &regions[1];
+    let filters = &regions[2];
+    let list = &regions[3];
+    let footer = &regions[4];
+    let detail = &regions[5];
+    let handle = &regions[6];
+    assert!(
+        header.bottom() <= kinds.top() + px(0.5),
+        "kinds overlap header at {width}x{height}: {header:?}, {kinds:?}"
+    );
+    assert!(
+        kinds.bottom() <= filters.top() + px(0.5),
+        "filters overlap kinds at {width}x{height}: {kinds:?}, {filters:?}"
+    );
+    assert!(
+        kinds.bottom() <= detail.top() + px(0.5),
+        "detail overlaps kinds at {width}x{height}: {kinds:?}, {detail:?}"
+    );
+    assert!(
+        filters.bottom() <= list.top() + px(0.5),
+        "list overlaps filters at {width}x{height}: {filters:?}, {list:?}"
+    );
+    assert!(
+        list.bottom() <= footer.top() + px(0.5),
+        "footer overlaps list at {width}x{height}: {list:?}, {footer:?}"
+    );
+    assert!(
+        list.right() <= handle.left() + px(0.5) && handle.right() <= detail.left() + px(0.5),
+        "resize handle is not between the list and detail columns at {width}x{height}: {list:?}, {handle:?}, {detail:?}"
+    );
+    assert!(
+        handle.top() <= filters.top() + px(0.5) && handle.bottom() >= footer.bottom() - px(0.5),
+        "resize handle does not span the body at {width}x{height}: {handle:?}, {filters:?}, {footer:?}"
+    );
+    assert!(
+        detail.top() <= filters.top() + px(0.5) && filters.top() <= detail.top() + px(0.5),
+        "detail and list column do not share the body top at {width}x{height}: {detail:?}, {filters:?}"
+    );
+    assert!(
+        detail.bottom() <= root.bottom() + px(0.5) && footer.bottom() <= root.bottom() + px(0.5),
+        "body overflows root at {width}x{height}: footer={footer:?}, detail={detail:?}, root={root:?}"
+    );
 }
 
 #[gpui::test]
@@ -328,5 +368,67 @@ fn pagination_clicks_select_the_current_page_after_filter_changes(cx: &mut TestA
         });
     });
     redraw(visual);
+    assert_regions_fit(visual, 900., 640.);
+}
+
+#[gpui::test]
+fn divider_drag_clamps_the_list_column_and_keeps_the_detail_readable(cx: &mut TestAppContext) {
+    let (_directory, view, visual) = open_fixture(cx);
+    visual.simulate_resize(size(px(900.), px(640.)));
+    redraw(visual);
+    let maximum = 900. - JOBS_DETAIL_MIN_WIDTH - JOBS_RESIZE_HANDLE_WIDTH;
+    let handle = bounds(visual, "jobs-layout-resize-handle");
+    assert_eq!(handle.size.width, px(JOBS_RESIZE_HANDLE_WIDTH));
+    visual.update(|_, cx| assert_eq!(view.read(cx).list_width, JOBS_LIST_DEFAULT_WIDTH));
+
+    // The divider follows the pointer, which sits on the handle center, so half
+    // the handle belongs to the column on its left.
+    visual.update(|_, cx| {
+        view.update(cx, |jobs, cx| {
+            assert!(jobs.begin_list_resize());
+            assert!(jobs.resize_list_from_pointer(
+                px(500. + JOBS_RESIZE_HANDLE_WIDTH / 2.),
+                px(900.),
+            ));
+            assert_eq!(jobs.list_width, 500.);
+            assert!(jobs.finish_list_resize());
+            cx.notify();
+        });
+    });
+    redraw(visual);
+    assert_eq!(bounds(visual, "jobs-layout-list-column").size.width, px(500.));
+    assert_regions_fit(visual, 900., 640.);
+
+    // The column is clamped on both sides: it never grows past what the detail
+    // panel's minimum leaves, and never drops below the readable minimum.
+    visual.update(|_, cx| {
+        view.update(cx, |jobs, cx| {
+            assert!(jobs.begin_list_resize());
+            assert!(jobs.resize_list_from_pointer(px(900.), px(900.)));
+            assert_eq!(jobs.list_width, maximum);
+            assert!(jobs.resize_list_from_pointer(px(0.), px(900.)));
+            assert_eq!(jobs.list_width, JOBS_LIST_MIN_WIDTH);
+            assert!(jobs.finish_list_resize());
+            assert!(!jobs.resize_list_from_pointer(px(600.), px(900.)));
+            cx.notify();
+        });
+    });
+    redraw(visual);
+    assert_regions_fit(visual, 900., 640.);
+
+    // A stored width that no longer fits is clamped while rendering, so a
+    // shrinking window cannot squeeze the detail panel below its minimum.
+    visual.update(|_, cx| {
+        view.update(cx, |jobs, cx| {
+            jobs.list_width = JOBS_LIST_MAX_WIDTH;
+            cx.notify();
+        });
+    });
+    redraw(visual);
+    visual.update(|_, cx| {
+        let jobs = view.read(cx);
+        assert_eq!(jobs.effective_list_width(px(900.)), maximum);
+        assert_eq!(jobs.effective_list_width(px(1600.)), JOBS_LIST_MAX_WIDTH);
+    });
     assert_regions_fit(visual, 900., 640.);
 }

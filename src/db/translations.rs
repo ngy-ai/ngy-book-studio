@@ -114,6 +114,84 @@ pub(crate) fn upsert(conn: &Connection, translation: &NewTranslation) -> Result<
     Ok(())
 }
 
+/// Re-stamps every persisted row of one book and language with the active
+/// model and execution identity, so a changed chat model or endpoint keeps the
+/// text that was already translated and only has to translate what is missing.
+///
+/// Returns `false` — without writing anything — when at least one row was
+/// written by another protocol version or cannot be read back, because those
+/// rows must not be reused; the caller then discards them and translates the
+/// book again.
+pub(crate) fn adopt_execution_identity(
+    conn: &Connection,
+    book_id: &str,
+    target_language: &str,
+    model: &str,
+    execution_identity: &str,
+) -> Result<bool> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, translated_text FROM translations
+             WHERE book_id = ?1 AND target_language = ?2 ORDER BY ordinal, block_id",
+        )
+        .context("无法准备译文身份查询")?;
+    let rows = stmt
+        .query_map(params![book_id, target_language], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .context("无法读取译文身份")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("无法解析译文身份记录")?;
+    drop(stmt);
+
+    let protocol = crate::translation::execution_identity_protocol(execution_identity);
+    let mut stored = Vec::with_capacity(rows.len());
+    for (id, translated_text) in rows {
+        let Ok(mut translation) =
+            serde_json::from_str::<crate::translation::StoredTranslation>(&translated_text)
+        else {
+            return Ok(false);
+        };
+        if crate::translation::execution_identity_protocol(&translation.execution_identity)
+            != protocol
+        {
+            return Ok(false);
+        }
+        translation.execution_identity = execution_identity.to_string();
+        stored.push((id, serde_json::to_string(&translation)?));
+    }
+    for (id, translated_text) in stored {
+        conn.execute(
+            "UPDATE translations SET model = ?2, translated_text = ?3 WHERE id = ?1",
+            params![id, model, translated_text],
+        )
+        .context("无法更新译文执行身份")?;
+    }
+    Ok(true)
+}
+
+/// Marks the still-current rows of one book as belonging to the newly published
+/// document revision. Only units that kept their revision are touched: an
+/// edited chapter's rows stay behind at their old revisions and are translated
+/// again, while every other chapter keeps its译文 readable.
+pub(crate) fn refresh_document_revision(
+    conn: &Connection,
+    book_id: &str,
+    document_revision: u64,
+) -> Result<usize> {
+    conn.execute(
+        "UPDATE translations SET document_revision = ?2
+         WHERE book_id = ?1
+           AND EXISTS (
+               SELECT 1 FROM content_units
+               WHERE content_units.id = translations.content_unit_id
+                 AND content_units.revision = translations.unit_revision
+           )",
+        params![book_id, document_revision as i64],
+    )
+    .context("无法更新译文文档版本")
+}
+
 /// Removes every persisted row for one book and language. Used before a
 /// deliberate re-translation so blocks that no longer exist cannot linger.
 pub(crate) fn delete_for_book_language(
@@ -209,6 +287,82 @@ mod tests {
         assert_eq!(rows.len(), 2, "same scope must replace in place");
         assert_eq!(rows[0].translated_text, "甲二");
         assert_eq!(row_count(&conn), 2);
+    }
+
+    #[test]
+    fn adopting_a_new_engine_keeps_text_and_rejects_another_protocol() {
+        let (_temp, conn) = fixture();
+        let stored = crate::translation::StoredTranslation {
+            execution_identity: "translation-v2:old".into(),
+            segments: vec![crate::translation::TranslationSegment {
+                source: "block-a".into(),
+                translated: "甲".into(),
+            }],
+        };
+        upsert(
+            &conn,
+            &sample("block-a", 0, &serde_json::to_string(&stored).unwrap()),
+        )
+        .unwrap();
+
+        assert!(
+            adopt_execution_identity(&conn, "book", "zh-Hans", "new-model", "translation-v2:new")
+                .unwrap()
+        );
+        let rows = list_for_unit(&conn, "unit", "zh-Hans").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].model, "new-model");
+        let adopted: crate::translation::StoredTranslation =
+            serde_json::from_str(&rows[0].translated_text).unwrap();
+        assert_eq!(adopted.execution_identity, "translation-v2:new");
+        assert_eq!(adopted.segments[0].translated, "甲");
+
+        // Another protocol version cannot read the stored segments, and a
+        // refused adoption must leave every row untouched.
+        assert!(
+            !adopt_execution_identity(&conn, "book", "zh-Hans", "new-model", "translation-v3:new")
+                .unwrap()
+        );
+        let untouched: crate::translation::StoredTranslation = serde_json::from_str(
+            &list_for_unit(&conn, "unit", "zh-Hans").unwrap()[0].translated_text,
+        )
+        .unwrap();
+        assert_eq!(untouched.execution_identity, "translation-v2:new");
+
+        // A row that cannot be read back is refused as well.
+        conn.execute(
+            "UPDATE translations SET translated_text = 'legacy plain text'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            !adopt_execution_identity(&conn, "book", "zh-Hans", "new-model", "translation-v2:new")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn refreshing_the_document_revision_only_touches_current_units() {
+        let (_temp, conn) = fixture();
+        upsert(&conn, &sample("block-a", 0, "甲")).unwrap();
+        assert_eq!(refresh_document_revision(&conn, "book", 7).unwrap(), 1);
+        assert_eq!(
+            list_for_unit(&conn, "unit", "zh-Hans").unwrap()[0].document_revision,
+            7
+        );
+
+        // A unit whose content changed keeps its stale row: the row's own unit
+        // revision no longer matches, so the reader never shows it as current.
+        conn.execute(
+            "UPDATE content_units SET revision = 8 WHERE id = 'unit'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(refresh_document_revision(&conn, "book", 9).unwrap(), 0);
+        assert_eq!(
+            list_for_unit(&conn, "unit", "zh-Hans").unwrap()[0].document_revision,
+            7
+        );
     }
 
     #[test]

@@ -2254,7 +2254,8 @@ fn indexing_model_config(settings: &ProviderSettings) -> Result<IndexingModelCon
 fn translation_execution_identity(settings: &ProviderSettings) -> Result<String> {
     let endpoint = normalize_provider_base_url(&settings.endpoint_for(ModelRole::Chat)?.base_url)?;
     Ok(format!(
-        "translation-v2:{}",
+        "{}:{}",
+        crate::translation::EXECUTION_IDENTITY_PROTOCOL,
         blake3::hash(format!("{}\0{}", endpoint.as_str(), settings.chat_model).as_bytes()).to_hex()
     ))
 }

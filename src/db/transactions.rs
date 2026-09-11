@@ -266,19 +266,31 @@ pub(crate) fn install_document_revision(
         .context("当前图书来源不存在")?;
     insert_blob_metadata(&tx, graph)?;
     books::set_cover_asset(&tx, &graph.book.id, None, graph.book.updated_at)?;
+    // Derived rows belong to exactly one source revision and are rebuilt below.
+    // The canonical units are not: their rows — and with them the notes,
+    // citations and whole-book translations anchored to a unit ID — survive an
+    // edit, so only a unit that really left the document is deleted.
+    let previous_units = content_units::list_for_source(&tx, &previous_source.id)?;
     toc_entries::delete_for_source(&tx, &previous_source.id)?;
     visual_pages::delete_for_source(&tx, &previous_source.id)?;
-    content_units::delete_for_source(&tx, &previous_source.id)?;
+    search_chunks::delete_for_source(&tx, &previous_source.id)?;
     assets::delete_for_source(&tx, &previous_source.id)?;
     index_jobs::delete_for_source(&tx, &previous_source.id)?;
+    book_sources::insert(&tx, graph.source)?;
+    sync_content_units(&tx, graph, &previous_units)?;
+    // Whatever still points at the superseded source is a unit the edit removed.
+    content_units::delete_for_source(&tx, &previous_source.id)?;
     if previous_source.source_kind != "original" {
         ensure!(
             book_sources::delete(&tx, &previous_source.id)? == 1,
             "无法删除已被替代的规范化来源"
         );
     }
-    book_sources::insert(&tx, graph.source)?;
-    insert_document_children(&tx, graph)?;
+    insert_document_children_after_units(&tx, graph)?;
+    // Chapters that kept their own revision are still current, so their译文 now
+    // belongs to the newly published document revision: the reader keeps showing
+    // them and the translation task skips them instead of translating again.
+    super::translations::refresh_document_revision(&tx, &graph.book.id, graph.book.revision)?;
     enqueue_derivative_jobs(&tx, graph, auto_run_background_jobs)?;
     let catalog = books::BookCatalogUpdate {
         title: &graph.book.title,
@@ -463,19 +475,39 @@ pub(crate) fn reconfigure_translation_jobs(
     for job in &existing {
         match desired.get(&job.id) {
             Some(source) => {
-                let current = valid_translation_cursor(job, source).is_some_and(|cursor| {
+                let cursor = valid_translation_cursor(job, source);
+                let current = cursor.as_ref().is_some_and(|cursor| {
                     cursor.model.as_deref() == Some(model)
                         && cursor.execution_identity.as_deref() == Some(execution_identity)
                 });
                 if current {
                     continue;
                 }
-                let cursor_json = translation_cursor_json(source, model, execution_identity, 0)?;
-                let status = translation_initial_status(auto_run);
-                if index_jobs::reset_reconfigured(&tx, &job.id, status, &cursor_json, now)? == 1 {
-                    // A changed endpoint, model or translation protocol cannot
-                    // reuse rows from the previous execution, even if the model
-                    // name happens to be the same on both endpoints.
+                // A changed chat model or endpoint keeps the text that is already
+                // translated: the persisted rows are restamped with the active
+                // identity and only the missing blocks are queued again, so a
+                // half-read book does not lose its译文. A row written by another
+                // protocol version cannot be reused, and that case still discards
+                // the book's译文 and starts over.
+                let reusable = match target_language {
+                    Some(language) => super::translations::adopt_execution_identity(
+                        &tx,
+                        &source.book_id,
+                        language,
+                        model,
+                        execution_identity,
+                    )?,
+                    None => true,
+                };
+                let next_ordinal = if reusable {
+                    // The block list only moves when the source revision changes.
+                    // An identity change alone keeps the durable position, while
+                    // a stale cursor still restarts from the first block.
+                    cursor
+                        .as_ref()
+                        .map(|cursor| cursor.next_ordinal)
+                        .unwrap_or_default()
+                } else {
                     if let Some(language) = target_language {
                         super::translations::delete_for_book_language(
                             &tx,
@@ -483,6 +515,12 @@ pub(crate) fn reconfigure_translation_jobs(
                             language,
                         )?;
                     }
+                    0
+                };
+                let cursor_json =
+                    translation_cursor_json(source, model, execution_identity, next_ordinal)?;
+                let status = translation_initial_status(auto_run);
+                if index_jobs::reset_reconfigured(&tx, &job.id, status, &cursor_json, now)? == 1 {
                     changed += 1;
                 }
             }
@@ -2122,6 +2160,39 @@ fn insert_document_children(conn: &Connection, graph: &DocumentGraph<'_>) -> Res
     for unit in graph.content_units {
         content_units::insert(conn, unit)?;
     }
+    insert_document_children_after_units(conn, graph)
+}
+
+/// Repoints every unit that survived the edit at the new source revision and
+/// inserts the units the edit added. A unit keeps its row identity, its
+/// `created_at` and — when its content did not change — its own revision, which
+/// is what keeps notes and译文 anchored to it valid.
+fn sync_content_units(
+    conn: &Connection,
+    graph: &DocumentGraph<'_>,
+    previous_units: &[ContentUnit],
+) -> Result<()> {
+    let previous = previous_units
+        .iter()
+        .map(|unit| unit.id.as_str())
+        .collect::<HashSet<_>>();
+    for unit in graph.content_units {
+        if previous.contains(unit.id.as_str()) {
+            ensure!(
+                content_units::repoint_for_revision(conn, unit)? == 1,
+                "内容单元版本更新失败"
+            );
+        } else {
+            content_units::insert(conn, unit)?;
+        }
+    }
+    Ok(())
+}
+
+fn insert_document_children_after_units(
+    conn: &Connection,
+    graph: &DocumentGraph<'_>,
+) -> Result<()> {
     for entry in graph.toc_entries {
         toc_entries::insert(conn, entry)?;
     }
@@ -2412,6 +2483,7 @@ mod tests {
         embeddings::{self, Embedding},
         index_jobs::{self, IndexJob, IndexJobStatus},
         settings::{self, Setting},
+        translations::{self, NewTranslation},
     };
 
     #[derive(Clone)]
@@ -2774,6 +2846,134 @@ mod tests {
                 .unwrap()
                 .status,
             IndexJobStatus::Cancelled
+        );
+    }
+
+    fn stored_translation(execution_identity: &str) -> NewTranslation {
+        NewTranslation {
+            book_id: "book-1".to_string(),
+            content_unit_id: "unit-1".to_string(),
+            block_id: "block-1".to_string(),
+            ordinal: 0,
+            document_revision: 1,
+            unit_revision: 1,
+            target_language: "en".to_string(),
+            source_language: Some("zh".to_string()),
+            model: "chat-1".to_string(),
+            source_text: "searchable document body".to_string(),
+            translated_text: serde_json::to_string(&crate::translation::StoredTranslation {
+                execution_identity: execution_identity.to_string(),
+                segments: vec![crate::translation::TranslationSegment {
+                    source: "searchable document body".to_string(),
+                    translated: "译".to_string(),
+                }],
+            })
+            .unwrap(),
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    #[test]
+    fn translation_identity_change_keeps_translated_blocks_and_the_durable_cursor() {
+        let (_temp, mut conn) = open_database();
+        let fixture = Fixture::new();
+        insert_document(&mut conn, &fixture.graph(), true).unwrap();
+        translations::upsert(&conn, &stored_translation("translation-v2:old")).unwrap();
+        index_jobs::insert(
+            &conn,
+            &IndexJob {
+                id: "translation:source-1:en".to_string(),
+                book_id: "book-1".to_string(),
+                source_id: Some("source-1".to_string()),
+                kind: "translation".to_string(),
+                status: IndexJobStatus::Queued,
+                pause_requested: false,
+                cancel_requested: false,
+                attempts: 0,
+                cursor_json: serde_json::to_string(&PersistedIndexCursor {
+                    schema_version: 1,
+                    book_id: "book-1".to_string(),
+                    source_id: "source-1".to_string(),
+                    revision: 1,
+                    kind: "translation".to_string(),
+                    model: Some("chat-1".to_string()),
+                    execution_identity: Some("translation-v2:old".to_string()),
+                    input_execution_identity: None,
+                    next_ordinal: 3,
+                })
+                .unwrap(),
+                error: None,
+                created_at: 1,
+                updated_at: 1,
+                started_at: None,
+                finished_at: None,
+            },
+        )
+        .unwrap();
+
+        // A changed model keeps the text that is already translated and resumes
+        // at the same block instead of restarting the book.
+        assert_eq!(
+            reconfigure_translation_jobs(
+                &mut conn,
+                Some("en"),
+                "chat-2",
+                "translation-v2:new",
+                true,
+                20
+            )
+            .unwrap(),
+            1
+        );
+        let job = index_jobs::get(&conn, "translation:source-1:en")
+            .unwrap()
+            .unwrap();
+        let cursor = serde_json::from_str::<PersistedIndexCursor>(&job.cursor_json).unwrap();
+        assert_eq!(cursor.model.as_deref(), Some("chat-2"));
+        assert_eq!(
+            cursor.execution_identity.as_deref(),
+            Some("translation-v2:new")
+        );
+        assert_eq!(
+            cursor.next_ordinal, 3,
+            "an engine change keeps the durable position"
+        );
+        let rows = translations::list_for_unit(&conn, "unit-1", "en").unwrap();
+        assert_eq!(rows.len(), 1, "already translated blocks are kept");
+        assert_eq!(rows[0].model, "chat-2");
+        let stored: crate::translation::StoredTranslation =
+            serde_json::from_str(&rows[0].translated_text).unwrap();
+        assert_eq!(stored.execution_identity, "translation-v2:new");
+        assert_eq!(stored.segments[0].translated, "译");
+
+        // A newer protocol cannot read the stored segments, so that change still
+        // discards the rows and starts the book over.
+        assert_eq!(
+            reconfigure_translation_jobs(
+                &mut conn,
+                Some("en"),
+                "chat-3",
+                "translation-v3:new",
+                true,
+                21
+            )
+            .unwrap(),
+            1
+        );
+        assert!(
+            translations::list_for_unit(&conn, "unit-1", "en")
+                .unwrap()
+                .is_empty()
+        );
+        let job = index_jobs::get(&conn, "translation:source-1:en")
+            .unwrap()
+            .unwrap();
+        let cursor = serde_json::from_str::<PersistedIndexCursor>(&job.cursor_json).unwrap();
+        assert_eq!(cursor.next_ordinal, 0);
+        assert_eq!(
+            cursor.execution_identity.as_deref(),
+            Some("translation-v3:new")
         );
     }
 

@@ -541,14 +541,19 @@ fn spawn_editor_write(
         } = job;
         let book_id = document.id.clone();
         // Keep the authoritative UI projection from the exact validated draft.
-        // `apply_document_with_assets` only advances document/unit revisions;
-        // reconstructing that small change avoids a fallible post-commit read
-        // being misreported as a failed save.
+        // The published revisions are reported back instead of guessed: an
+        // untouched chapter keeps its own revision, so a post-commit read would
+        // be the only other way to learn them, and a transient failure of that
+        // read must not be misreported as a failed save.
         let mut saved_document = document.clone();
-        let record = library.apply_document_with_assets(document, new_asset_bytes)?;
-        saved_document.revision = Revision::new(record.revision);
-        for unit in &mut saved_document.units {
-            unit.revision = saved_document.revision;
+        let published = library.publish_document_with_assets(document, new_asset_bytes)?;
+        saved_document.revision = Revision::new(published.record.revision);
+        for (unit, revision) in saved_document
+            .units
+            .iter_mut()
+            .zip(published.unit_revisions)
+        {
+            unit.revision = revision;
         }
         let cover_bytes = library.cover_bytes_cached(&book_id);
         let export = match export_target {

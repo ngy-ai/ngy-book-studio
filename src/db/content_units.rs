@@ -91,6 +91,34 @@ pub(crate) fn update_content(conn: &Connection, unit: &ContentUnit) -> Result<us
     .context("无法更新内容单元")
 }
 
+/// Repoints one stable unit at the newly published source revision. The row
+/// identity survives an edit so everything that belongs to the unit — notes,
+/// translation rows and citations — keeps its anchor; only a unit that really
+/// left the document is deleted.
+pub(crate) fn repoint_for_revision(conn: &Connection, unit: &ContentUnit) -> Result<usize> {
+    conn.execute(
+        "UPDATE content_units SET source_id = ?2, parent_id = ?3, ordinal = ?4, kind = ?5,
+         href = ?6, source_locator_json = ?7, title = ?8, media_type = ?9,
+         source_text = ?10, block_json = ?11, revision = ?12, updated_at = ?13 WHERE id = ?1",
+        params![
+            unit.id,
+            unit.source_id,
+            unit.parent_id,
+            unit.ordinal as i64,
+            unit.kind,
+            unit.href,
+            unit.source_locator_json,
+            unit.title,
+            unit.media_type,
+            unit.source_text,
+            unit.block_json,
+            unit.revision as i64,
+            unit.updated_at as i64,
+        ],
+    )
+    .context("无法更新内容单元来源版本")
+}
+
 pub(crate) fn delete_for_source(conn: &Connection, source_id: &str) -> Result<usize> {
     conn.execute(
         "DELETE FROM content_units WHERE source_id = ?1",

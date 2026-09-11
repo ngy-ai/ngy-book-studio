@@ -1652,49 +1652,90 @@ impl AiSettingsWindow {
 
         div()
             .v_flex()
-            .gap_3()
-            .p_4()
-            .rounded(px(12.))
-            .border_1()
-            .border_color(rgb(BORDER))
-            .bg(rgb(SURFACE))
+            .gap_5()
             .child(
                 div()
-                    .text_sm()
-                    .font_semibold()
-                    .text_color(rgb(INK))
-                    .child("新任务运行方式"),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .line_height(gpui::relative(1.5))
-                    .text_color(rgb(MUTED))
+                    .v_flex()
+                    .gap_3()
+                    .p_4()
+                    .rounded(px(12.))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(SURFACE))
                     .child(
-                        "导入或编辑图书后，墨页会创建逻辑页面渲染、视觉理解和向量索引任务。",
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .text_color(rgb(INK))
+                            .child("新任务运行方式"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .line_height(gpui::relative(1.5))
+                            .text_color(rgb(MUTED))
+                            .child(
+                                "导入或编辑图书后，墨页会创建逻辑页面渲染、视觉理解和向量索引任务。",
+                            ),
+                    )
+                    .child(
+                        Checkbox::new("ai-auto-run-background-jobs")
+                            .checked(self.auto_run_background_jobs)
+                            .disabled(self.operation.busy())
+                            .label("自动运行新创建的后台任务")
+                            .debug_selector(|| "ai-auto-run-background-jobs".into())
+                            .on_click(move |checked, _, cx| {
+                                let checked = *checked;
+                                auto_run_view.update(cx, |this, cx| {
+                                    this.auto_run_background_jobs = checked;
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .line_height(gpui::relative(1.5))
+                            .text_color(rgb(MUTED))
+                            .child(
+                                "关闭后，新导入、创建或编辑图书产生的三类任务会以暂停状态创建，可在“后台任务”窗口逐项恢复。更改此设置不会暂停、恢复或取消已经排队或运行的任务。",
+                            ),
                     ),
             )
             .child(
-                Checkbox::new("ai-auto-run-background-jobs")
-                    .checked(self.auto_run_background_jobs)
-                    .disabled(self.operation.busy())
-                    .label("自动运行新创建的后台任务")
-                    .debug_selector(|| "ai-auto-run-background-jobs".into())
-                    .on_click(move |checked, _, cx| {
-                        let checked = *checked;
-                        auto_run_view.update(cx, |this, cx| {
-                            this.auto_run_background_jobs = checked;
-                            cx.notify();
-                        });
-                    }),
-            )
-            .child(
                 div()
-                    .text_xs()
-                    .line_height(gpui::relative(1.5))
-                    .text_color(rgb(MUTED))
+                    .v_flex()
+                    .gap_3()
+                    .p_4()
+                    .rounded(px(12.))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(SURFACE))
                     .child(
-                        "关闭后，新导入、创建或编辑图书产生的三类任务会以暂停状态创建，可在“后台任务”窗口逐项恢复。更改此设置不会暂停、恢复或取消已经排队或运行的任务。",
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .text_color(rgb(INK))
+                            .child("后台任务调度"),
+                    )
+                    .child(self.render_input_field(
+                        "任务并发",
+                        "同时运行的模型任务数量，1–8，默认 1。并发越高占用的内存与网络越多；配置较低的机器建议保持 1。",
+                        &self.background_job_concurrency_input,
+                    ))
+                    .child(self.render_input_field(
+                        "任务间隔（毫秒）",
+                        "一个任务完成后，休眠多久再开始下一个任务，0–60000 毫秒，默认 10。机器配置较差时增大该值可降低持续满载的风险。",
+                        &self.background_job_interval_input,
+                    ))
+                    .child(
+                        div()
+                            .text_xs()
+                            .line_height(gpui::relative(1.5))
+                            .text_color(rgb(MUTED))
+                            .child(
+                                "保存后对后续任务立即生效，不需要重启；正在运行的任务不会被打断。",
+                            ),
                     ),
             )
             .into_any_element()
@@ -1791,42 +1832,6 @@ impl AiSettingsWindow {
         div()
             .v_flex()
             .gap_5()
-            .child(
-                div()
-                    .v_flex()
-                    .gap_3()
-                    .p_4()
-                    .rounded(px(12.))
-                    .border_1()
-                    .border_color(rgb(BORDER))
-                    .bg(rgb(SURFACE))
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_semibold()
-                            .text_color(rgb(INK))
-                            .child("后台任务调度"),
-                    )
-                    .child(self.render_input_field(
-                        "任务并发",
-                        "同时运行的模型任务数量，1–8，默认 1。并发越高占用的内存与网络越多；配置较低的机器建议保持 1。",
-                        &self.background_job_concurrency_input,
-                    ))
-                    .child(self.render_input_field(
-                        "任务间隔（毫秒）",
-                        "一个任务完成后，休眠多久再开始下一个任务，0–60000 毫秒，默认 10。机器配置较差时增大该值可降低持续满载的风险。",
-                        &self.background_job_interval_input,
-                    ))
-                    .child(
-                        div()
-                            .text_xs()
-                            .line_height(gpui::relative(1.5))
-                            .text_color(rgb(MUTED))
-                            .child(
-                                "保存后对后续任务立即生效，不需要重启；正在运行的任务不会被打断。",
-                            ),
-                    ),
-            )
             .child(
                 div()
                     .v_flex()
@@ -2901,9 +2906,12 @@ mod tests {
     }
 
     #[gpui::test]
-    fn system_tab_background_job_scheduling_drafts_parse_without_saving(cx: &mut TestAppContext) {
+    fn background_jobs_tab_scheduling_drafts_parse_without_saving(cx: &mut TestAppContext) {
         let (_directory, settings, visual) = open_settings(cx);
-        click_tab(visual, SettingsTab::System);
+        click_tab(visual, SettingsTab::BackgroundJobs);
+        settings.read_with(visual, |view, _| {
+            assert_eq!(view.active_tab, SettingsTab::BackgroundJobs);
+        });
         let (concurrency, interval) = settings.read_with(visual, |view, _| {
             (
                 view.background_job_concurrency_input.clone(),

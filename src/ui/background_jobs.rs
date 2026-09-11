@@ -1,6 +1,6 @@
 use super::*;
 
-use gpui::{ClipboardItem, ScrollHandle};
+use gpui::{ClipboardItem, DragMoveEvent, EmptyView, Pixels, ScrollHandle};
 
 #[cfg(test)]
 mod layout_tests;
@@ -14,6 +14,15 @@ const JOBS_PER_PAGE: usize = 12;
 /// One page of the translation block inspector. Blocks are rendered without
 /// virtual scrolling, so the page bounds what one frame has to build.
 const BLOCKS_PER_PAGE: usize = 50;
+/// Width the task list column starts at; the divider between the list and the
+/// detail panel drags it between the hard bounds below.
+const JOBS_LIST_DEFAULT_WIDTH: f32 = 380.;
+const JOBS_LIST_MIN_WIDTH: f32 = 260.;
+const JOBS_LIST_MAX_WIDTH: f32 = 640.;
+/// The detail panel never renders narrower than this, so dragging the divider
+/// can never squeeze the main subject out of the window.
+const JOBS_DETAIL_MIN_WIDTH: f32 = 360.;
+const JOBS_RESIZE_HANDLE_WIDTH: f32 = 6.;
 const JOB_KINDS: &[(&str, &str)] = &[
     ("", "全部任务"),
     ("translation", "图书翻译"),
@@ -134,6 +143,10 @@ pub(super) struct BackgroundJobsWindow {
     search: Entity<InputState>,
     query: String,
     page: usize,
+    /// Width of the task list column, draggable through the divider that
+    /// separates the list from the detail panel.
+    list_width: f32,
+    resizing_list: bool,
     list_scroll: ScrollHandle,
     detail_scroll: ScrollHandle,
     tab: DetailTab,
@@ -156,6 +169,11 @@ pub(super) struct BackgroundJobsWindow {
     _search_subscription: Subscription,
     _poll_task: Task<()>,
 }
+
+/// Drag payload of the list/detail divider. It carries no state; the window
+/// itself tracks the live width that the handle reports.
+#[derive(Clone, Copy)]
+struct JobsListResizeDrag;
 
 impl BackgroundJobsWindow {
     fn new(
@@ -204,6 +222,8 @@ impl BackgroundJobsWindow {
             search,
             query: String::new(),
             page: 0,
+            list_width: JOBS_LIST_DEFAULT_WIDTH,
+            resizing_list: false,
             list_scroll: ScrollHandle::default(),
             detail_scroll: ScrollHandle::default(),
             tab: DetailTab::Summary,
@@ -271,6 +291,55 @@ impl BackgroundJobsWindow {
         self.blocks_error = None;
         self.blocks_state = None;
         self.blocks_page = 0;
+    }
+
+    /// Widest the list column may become while the detail panel still keeps its
+    /// minimum body width inside the given viewport.
+    fn maximum_list_width(&self, viewport_width: Pixels) -> f32 {
+        let viewport = f32::from(viewport_width);
+        if !viewport.is_finite() {
+            return JOBS_LIST_MAX_WIDTH;
+        }
+        (viewport - JOBS_DETAIL_MIN_WIDTH - JOBS_RESIZE_HANDLE_WIDTH)
+            .clamp(JOBS_LIST_MIN_WIDTH, JOBS_LIST_MAX_WIDTH)
+    }
+
+    /// Width the list column renders with. Clamping here (not only while
+    /// dragging) keeps a shrinking window from squeezing the detail panel.
+    fn effective_list_width(&self, viewport_width: Pixels) -> f32 {
+        self.list_width
+            .clamp(JOBS_LIST_MIN_WIDTH, self.maximum_list_width(viewport_width))
+    }
+
+    fn begin_list_resize(&mut self) -> bool {
+        if self.resizing_list {
+            return false;
+        }
+        self.resizing_list = true;
+        true
+    }
+
+    fn finish_list_resize(&mut self) -> bool {
+        std::mem::take(&mut self.resizing_list)
+    }
+
+    /// Follows the divider with the pointer. The pointer sits on the handle
+    /// center, so half the handle belongs to the list column on its left.
+    fn resize_list_from_pointer(&mut self, pointer_x: Pixels, viewport_width: Pixels) -> bool {
+        if !self.resizing_list {
+            return false;
+        }
+        let pointer_x = f32::from(pointer_x);
+        if !pointer_x.is_finite() {
+            return false;
+        }
+        let width = (pointer_x - JOBS_RESIZE_HANDLE_WIDTH / 2.)
+            .clamp(JOBS_LIST_MIN_WIDTH, self.maximum_list_width(viewport_width));
+        if self.list_width == width {
+            return false;
+        }
+        self.list_width = width;
+        true
     }
 
     fn filters_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -567,20 +636,25 @@ impl BackgroundJobsWindow {
             .into_any_element()
     }
 
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let mut sidebar = div()
-            .v_flex()
-            .w(px(184.))
+    /// Task-kind switcher pinned to the top of the window, above the list and
+    /// detail columns. Wraps instead of clipping so every category stays
+    /// reachable at the minimum window width.
+    fn render_kinds_bar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let mut bar = div()
+            .debug_selector(|| "jobs-layout-kinds".into())
             .flex_none()
+            .h_flex()
+            .flex_wrap()
+            .items_center()
             .gap_2()
-            .p_3()
-            .border_r_1()
+            .px_4()
+            .py_2()
+            .border_b_1()
             .border_color(rgb(BORDER))
-            .bg(rgb(SIDEBAR))
+            .bg(rgb(SURFACE))
             .child(
                 div()
-                    .px_2()
-                    .py_2()
+                    .mr_1()
                     .text_xs()
                     .text_color(rgb(MUTED))
                     .child("任务分类"),
@@ -594,24 +668,21 @@ impl BackgroundJobsWindow {
             if kind == "other" && count == 0 {
                 continue;
             }
-            sidebar = sidebar.child(
+            let selected = self.kind == kind;
+            bar = bar.child(
                 div()
                     .id(SharedString::from(format!("jobs-kind-{kind}")))
+                    .flex_none()
                     .h_flex()
                     .items_center()
-                    .justify_between()
                     .gap_2()
                     .px_3()
-                    .py_3()
-                    .rounded(px(8.))
+                    .py_1()
+                    .rounded(px(7.))
                     .cursor_pointer()
                     .text_sm()
-                    .bg(rgb(if self.kind == kind {
-                        ACCENT_SOFT
-                    } else {
-                        SIDEBAR
-                    }))
-                    .text_color(rgb(if self.kind == kind { ACCENT_DARK } else { INK }))
+                    .bg(rgb(if selected { ACCENT_SOFT } else { SIDEBAR }))
+                    .text_color(rgb(if selected { ACCENT_DARK } else { INK }))
                     .child(label)
                     .child(div().text_xs().child(count.to_string()))
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -620,30 +691,88 @@ impl BackgroundJobsWindow {
                     })),
             );
         }
-        sidebar
-            .child(div().flex_1())
+        bar.into_any_element()
+    }
+
+    /// Left column of the body: the status filters, the paged task list and its
+    /// footer. Its width is user-draggable; the divider on its right draws the
+    /// separation from the detail panel.
+    fn render_list_column(
+        &self,
+        viewport_width: Pixels,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .debug_selector(|| "jobs-layout-list-column".into())
+            .v_flex()
+            .w(px(self.effective_list_width(viewport_width)))
+            .flex_none()
+            .min_h(px(0.))
+            .overflow_hidden()
+            .child(self.render_filters(cx))
+            .child(self.render_list(cx))
+            .into_any_element()
+    }
+
+    /// Draggable divider between the list column and the detail panel. The
+    /// pointer grabs it, follows it horizontally, and releases it in place.
+    fn render_resize_handle(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let handle_view = cx.entity().clone();
+        let active = self.resizing_list;
+        div()
+            .id("jobs-list-resize-handle")
+            .debug_selector(|| "jobs-layout-resize-handle".into())
+            .h_full()
+            .w(px(JOBS_RESIZE_HANDLE_WIDTH))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_col_resize()
+            .bg(rgb(SURFACE))
+            .hover(|this| this.bg(rgb(ACCENT_SOFT)))
+            .on_drag(JobsListResizeDrag, move |_, _, _, cx| {
+                cx.stop_propagation();
+                handle_view.update(cx, |this, cx| {
+                    if this.begin_list_resize() {
+                        cx.notify();
+                    }
+                });
+                cx.new(|_| EmptyView)
+            })
+            .on_drag_move(
+                cx.listener(move |this, event: &DragMoveEvent<JobsListResizeDrag>, window, cx| {
+                    if this.resize_list_from_pointer(
+                        event.event.position.x,
+                        window.viewport_size().width,
+                    ) {
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up(gpui::MouseButton::Left, cx.listener(|this, _, _, cx| {
+                if this.finish_list_resize() {
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up_out(gpui::MouseButton::Left, cx.listener(|this, _, _, cx| {
+                if this.finish_list_resize() {
+                    cx.notify();
+                }
+            }))
             .child(
                 div()
-                    .p_2()
-                    .text_xs()
-                    .line_height(gpui::relative(1.6))
-                    .text_color(rgb(MUTED))
-                    .child("选择右侧任务查看详情与运行日志。\n关闭此窗口后，后台任务仍继续运行。"),
+                    .h_full()
+                    .w(px(if active { 2. } else { 1. }))
+                    .bg(rgb(if active { ACCENT } else { BORDER })),
             )
             .into_any_element()
     }
 
+    /// Status filters and the task search box. The kind switcher above already
+    /// names and counts the current scope, so no extra summary line is drawn
+    /// here.
     fn render_filters(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let running = self
-            .jobs
-            .iter()
-            .filter(|job| job.status == BackgroundJobStatus::Running)
-            .count();
-        let failed = self
-            .jobs
-            .iter()
-            .filter(|job| job.status == BackgroundJobStatus::Failed)
-            .count();
         let mut filters = div().h_flex().flex_wrap().gap_1();
         for &(status, label) in STATUS_FILTERS {
             filters = filters.child(
@@ -675,23 +804,8 @@ impl BackgroundJobsWindow {
             .border_color(rgb(BORDER))
             .child(
                 div()
-                    .h_flex()
-                    .items_center()
-                    .gap_4()
-                    .justify_between()
-                    .child(div().text_sm().font_semibold().child(format!(
-                            "{} · 运行 {running} · 失败 {failed}",
-                            JOB_KINDS
-                                .iter()
-                                .find(|(kind, _)| *kind == self.kind)
-                                .map(|(_, name)| *name)
-                                .unwrap_or("任务")
-                        )))
-                    .child(
-                        div()
-                            .w(px(280.))
-                            .child(Input::new(&self.search).small().prefix(IconName::Search)),
-                    ),
+                    .w_full()
+                    .child(Input::new(&self.search).small().prefix(IconName::Search)),
             )
             .child(filters)
             .into_any_element()
@@ -887,6 +1001,12 @@ impl BackgroundJobsWindow {
             .find(|job| Some(&job.id) == self.selected_job_id.as_ref())
         else {
             return div()
+                .debug_selector(|| "jobs-layout-detail".into())
+                .v_flex()
+                .flex_1()
+                .min_w(px(0.))
+                .items_center()
+                .justify_center()
                 .p_5()
                 .text_sm()
                 .text_color(rgb(MUTED))
@@ -1087,10 +1207,9 @@ impl BackgroundJobsWindow {
             .debug_selector(|| "jobs-layout-detail".into())
             .v_flex()
             .flex_1()
-            .min_h(px(150.))
+            .min_w(px(0.))
+            .min_h(px(0.))
             .overflow_hidden()
-            .border_t_1()
-            .border_color(rgb(BORDER))
             .bg(rgb(SURFACE))
             .child(header)
             .child(
@@ -1347,7 +1466,8 @@ impl BackgroundJobsWindow {
 }
 
 impl Render for BackgroundJobsWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let viewport_width = window.viewport_size().width;
         div()
             .debug_selector(|| "jobs-layout-root".into())
             .v_flex()
@@ -1378,6 +1498,7 @@ impl Render for BackgroundJobsWindow {
                         .child(notice.text.clone()),
                 )
             })
+            .child(self.render_kinds_bar(cx))
             .child(
                 div()
                     .flex()
@@ -1385,18 +1506,9 @@ impl Render for BackgroundJobsWindow {
                     .flex_1()
                     .min_h(px(0.))
                     .overflow_hidden()
-                    .child(self.render_sidebar(cx))
-                    .child(
-                        div()
-                            .v_flex()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .min_h(px(0.))
-                            .overflow_hidden()
-                            .child(self.render_filters(cx))
-                            .child(self.render_list(cx))
-                            .child(self.render_detail(cx)),
-                    ),
+                    .child(self.render_list_column(viewport_width, cx))
+                    .child(self.render_resize_handle(cx))
+                    .child(self.render_detail(cx)),
             )
     }
 }

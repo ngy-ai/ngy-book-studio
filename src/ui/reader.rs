@@ -1491,6 +1491,7 @@ impl ReaderApp {
                 }
             }
         }));
+        reader.start_translation_refresh(cx);
         reader
     }
 

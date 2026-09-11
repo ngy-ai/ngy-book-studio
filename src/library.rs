@@ -72,6 +72,17 @@ pub enum ImportOutcome {
     AlreadyExists(BookRecord),
 }
 
+/// One published canonical revision with the revision every chapter received.
+/// An edit only advances the chapters whose body changed, so a caller that keeps
+/// an in-memory projection of the saved document must take the per-chapter
+/// revisions from here instead of assuming the document revision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublishedDocument {
+    pub record: BookRecord,
+    /// One revision per content unit, in the document's own unit order.
+    pub unit_revisions: Vec<Revision>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoverDraft {
     mime: String,
@@ -1177,9 +1188,22 @@ impl LibraryStore {
     /// check; supplied bytes must exactly match their document metadata.
     pub fn apply_document_with_assets(
         &mut self,
-        mut document: BookDocument,
+        document: BookDocument,
         new_asset_bytes: HashMap<String, Arc<Vec<u8>>>,
     ) -> Result<BookRecord> {
+        self.publish_document_with_assets(document, new_asset_bytes)
+            .map(|published| published.record)
+    }
+
+    /// Publishes a canonical revision and reports the revision every chapter
+    /// received, so a caller that keeps an in-memory projection of the saved
+    /// document does not have to guess: a chapter whose body did not change
+    /// keeps its own revision and therefore its notes and whole-book译文.
+    pub fn publish_document_with_assets(
+        &mut self,
+        mut document: BookDocument,
+        new_asset_bytes: HashMap<String, Arc<Vec<u8>>>,
+    ) -> Result<PublishedDocument> {
         let position = self
             .books
             .iter()
@@ -1207,9 +1231,17 @@ impl LibraryStore {
         };
         let new_bytes =
             BuiltinDocumentExporter.export_bytes(&document, ExportFormat::Epub, &resolver)?;
+        let published = self.published_unit_content(&document.id, current.revision)?;
         document.revision = Revision::new(current.revision + 1);
         for unit in &mut document.units {
-            unit.revision = document.revision;
+            // Only a chapter whose body really changed takes the new revision.
+            // Every other chapter keeps its own revision, so its notes and its
+            // whole-book translation stay valid instead of being translated
+            // again only because another chapter was edited.
+            unit.revision = match published.get(&unit.id) {
+                Some((revision, hash)) if hash == &unit.content_hash() => Revision::new(*revision),
+                _ => document.revision,
+            };
         }
         let assets = document
             .assets
@@ -1225,6 +1257,11 @@ impl LibraryStore {
             .collect::<Result<Vec<_>>>()?;
         let book_id = document.id.clone();
         let title = document.title.clone();
+        let unit_revisions = document
+            .units
+            .iter()
+            .map(|unit| unit.revision)
+            .collect::<Vec<_>>();
         let imported = ImportedBook { document, assets };
         let updated = self.persist_document(
             imported,
@@ -1243,7 +1280,35 @@ impl LibraryStore {
                 "图书保存已提交，但封面缓存加载失败；已保留持久修订，重新加载图书时将重试封面"
             );
         }
-        Ok(updated)
+        Ok(PublishedDocument {
+            record: updated,
+            unit_revisions,
+        })
+    }
+
+    /// Content hash and own revision of every chapter of one published
+    /// revision. `apply_document_with_assets` uses this to keep a chapter's
+    /// revision — and therefore its notes and译文 — when an edit did not change
+    /// that chapter's body. A chapter whose stored structure cannot be read is
+    /// reported as changed so nothing is ever reused by accident.
+    fn published_unit_content(
+        &self,
+        book_id: &str,
+        revision: u64,
+    ) -> Result<HashMap<String, (u64, String)>> {
+        let conn = db::open_conn(&self.db_path)?;
+        let Some(source) = db::book_sources::get_revision(&conn, book_id, revision)? else {
+            return Ok(HashMap::new());
+        };
+        Ok(db::content_units::list_for_source(&conn, &source.id)?
+            .into_iter()
+            .map(|unit| {
+                let hash = serde_json::from_str::<BlockDocument>(&unit.block_json)
+                    .map(|document| document.content_hash())
+                    .unwrap_or_default();
+                (unit.id, (unit.revision, hash))
+            })
+            .collect())
     }
 
     /// Parses and cleans a source edit before atomically publishing the next
@@ -1904,7 +1969,17 @@ fn build_persisted_graph(
         .units
         .iter()
         .enumerate()
-        .map(|(ordinal, unit)| db_unit(&document.id, &source_id, ordinal, unit, revision, now))
+        .map(|(ordinal, unit)| {
+            // An update publishes the per-chapter revisions its caller assigned.
+            // A fresh import has no earlier chapter and starts every unit at the
+            // document revision.
+            let unit_revision = if previous.is_some() {
+                unit.revision.get()
+            } else {
+                revision
+            };
+            db_unit(&document.id, &source_id, ordinal, unit, unit_revision, now)
+        })
         .collect::<Result<Vec<_>>>()?;
     let href_by_unit = units
         .iter()
@@ -3362,6 +3437,101 @@ mod tests {
             .unwrap();
         let updated = library.apply_document(editor.into_document()).unwrap();
         (updated, first_unit_id, second_unit_id)
+    }
+
+    #[test]
+    fn editing_one_chapter_keeps_the_other_chapters_revision_and_translation() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut library = LibraryStore::load_from(temp.path().into()).unwrap();
+        let (book, first_id, second_id) = create_two_unit_book(&mut library);
+        let published = library.document(&book.id).unwrap();
+        assert_eq!(published.revision.get(), book.revision);
+        let second_revision = published
+            .units
+            .iter()
+            .find(|unit| unit.id == second_id)
+            .unwrap()
+            .revision
+            .get();
+
+        // One translated block per chapter, written by the running task.
+        let conn = db::open_conn(library.database_path()).unwrap();
+        for unit_id in [&first_id, &second_id] {
+            let unit = db::content_units::get(&conn, unit_id).unwrap().unwrap();
+            db::translations::upsert(
+                &conn,
+                &db::translations::NewTranslation {
+                    book_id: book.id.clone(),
+                    content_unit_id: unit_id.clone(),
+                    block_id: format!("{unit_id}::h0"),
+                    ordinal: 0,
+                    document_revision: book.revision,
+                    unit_revision: unit.revision,
+                    target_language: "zh-Hans".to_string(),
+                    source_language: Some("zh".to_string()),
+                    model: "chat-model".to_string(),
+                    source_text: "原文".to_string(),
+                    translated_text: serde_json::to_string(
+                        &crate::translation::StoredTranslation {
+                            execution_identity: "translation-v2:test".to_string(),
+                            segments: vec![crate::translation::TranslationSegment {
+                                source: "原文".to_string(),
+                                translated: "译文".to_string(),
+                            }],
+                        },
+                    )
+                    .unwrap(),
+                    created_at: 1,
+                    updated_at: 1,
+                },
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        library
+            .update_content_unit_source(&book.id, &first_id, "<h1>改写</h1><p>新的正文</p>")
+            .unwrap();
+
+        let edited = library.document(&book.id).unwrap();
+        assert_eq!(edited.revision.get(), book.revision + 1);
+        let first = edited
+            .units
+            .iter()
+            .find(|unit| unit.id == first_id)
+            .unwrap();
+        let second = edited
+            .units
+            .iter()
+            .find(|unit| unit.id == second_id)
+            .unwrap();
+        assert_eq!(
+            first.revision, edited.revision,
+            "the edited chapter must take the new revision"
+        );
+        assert_eq!(
+            second.revision.get(),
+            second_revision,
+            "an untouched chapter must keep its own revision"
+        );
+
+        let conn = db::open_conn(library.database_path()).unwrap();
+        let kept = db::translations::list_for_unit(&conn, &second_id, "zh-Hans").unwrap();
+        assert_eq!(kept.len(), 1, "an untouched chapter keeps its译文");
+        assert_eq!(
+            kept[0].document_revision,
+            edited.revision.get(),
+            "and follows the newly published document revision"
+        );
+        assert_eq!(kept[0].unit_revision, second_revision);
+        let stale = db::translations::list_for_unit(&conn, &first_id, "zh-Hans").unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_ne!(
+            stale[0].unit_revision,
+            first.revision.get(),
+            "the edited chapter's译文 must be stale"
+        );
+        assert_eq!(stale[0].document_revision, book.revision);
     }
 
     #[test]

@@ -106,8 +106,9 @@
   - [x] 持久化 embedding、视觉渲染和 vision 队列及 revision 失效处理
   - [x] 后台任务暂停、恢复、重试、取消及进程重启恢复；视觉渲染逐页持久化断点，
     恢复时跳过已提交页面，完整页面集与成功状态原子发布
-  - [x] 后台任务左右布局：左侧任务分类，右侧具体任务列表、书名/ID 搜索、状态筛选和
-    分页；选择任务查看详情与运行日志，支持复制及每 2 秒自动刷新。执行器按阶段记录
+  - [x] 后台任务布局：顶部分类，左侧任务列表、书名/ID 搜索、状态筛选和分页，右侧
+    主体展示所选任务的详情与运行日志，两栏之间的分隔条可拖动调整列表宽度（列表最窄
+    仍可读、最宽仍给详情保留最小宽度）；支持复制及每 2 秒自动刷新。执行器按阶段记录
     批次/块/页位置、尝试、耗时及安全错误分类，按任务限量保留本地日志并支持重启读取。
   - [x] 翻译任务的详情面板提供“文本块明细”：按任务游标顺序列出每个文本块的状态
     （已处理 / 处理中 / 待处理）、所属章节与原文预览，可按状态筛选、分页并跳到当前
@@ -334,10 +335,34 @@ LangGraph 依赖。CLI 课程验证与桌面接入的验证分别列出。
 - [x] 阅读器：`translations.rs` 宿主桥接与 `translations.js` 翻译展示（默认仅译文隐藏
   原文，可点击切换为双语对照；译上原下、虚线分隔）；译文节点标记 `data-moye-translation`
   并从笔记文本索引、选区与 AI 引用中排除，原文文本节点保留在 `body`
+- [x] 2026-09-11 逐章可见：译文按文本块提交，一章的文本块完成即可阅读，不必等整本任务
+  结束；阅读窗口每 2 秒查看本书未完成翻译任务的游标 `completed`，进度前进时重新读取
+  当前单元译文，并按（单元、显示方式、译文载荷）指纹去重，未变化不重写页面；任务由
+  运行转为结束再补一次读取，避免最后一次提交与末次轮询之间的竞态。章节或显示方式变化
+  仍立即强制重发，迟到的旧结果继续由 generation 丢弃。回归：`refresh_follows_task_progress`
+  与 `fingerprint_only_moves_with_the_pushed_payload`
+- [x] 2026-09-11 编辑增量失效：`publish_document_with_assets` 按章内容哈希只给真正改动的章节
+  升 revision，并通过 `PublishedDocument.unit_revisions` 把真实修订号交回编辑器（不再假定
+  整本升版）；`install_document_revision` 保留 `content_units` 行（只删除离开文档的章节），
+  显式重建 search_chunks 等派生行，并把未变章节译文行的 `document_revision` 刷到新版本。
+  因此编辑一章后其它章的译文继续有效（笔记失效判定仍按文档版本，不做增量保留），翻译任务仍
+  覆盖当前来源的全部章节；缓存命中改为按
+  「原文文本 + 叶子切分」（`translation_cache_key`）判定并在命中时把行重挂到当前块 ID，因为
+  规范化 EPUB 投影会补章节 `<h1>` 并整体移动块下标，按块位置判定会让整本白翻一遍。回归：
+  `editing_one_chapter_keeps_the_other_chapters_revision_and_translation`、
+  `editing_one_chapter_keeps_the_other_chapters_translation`、
+  `translation_cache_keys_separate_a_different_leaf_split`
+- [x] 2026-09-11 换模型保留译文：对话模型或端点变化时不再删除该书该语言的行，而是按协议前缀
+  （`translation::EXECUTION_IDENTITY_PROTOCOL`）判定可复用后重新盖上当前模型与身份，并保留
+  游标位置，只有未翻译的块交给新引擎；协议版本变化或无法解析的旧纯文本行仍整本作废重译，
+  「重新翻译」仍是干净的全量重做。回归：
+  `translation_identity_change_keeps_translated_blocks_and_the_durable_cursor`、
+  `adopting_a_new_engine_keeps_text_and_rejects_another_protocol`、
+  `structured_translation_survives_restart_and_a_changed_endpoint_keeps_its_text`
 - [x] 翻译格式保留：每次模型调用包含整段上下文和带 ID 的文字片段，严格校验片段完整性，
   由原文 DOM 还原标题、强调、换行、编号列表、引用、表格及常见排版样式；模型只提供文字，
-  代码保持原样。含媒体段落和单元格保持双语。格式协议、端点或模型改变时清理失效译文，
-  按后台自动运行偏好重新排队；超长段落明确失败，不截断后冒充完整翻译。
+  代码保持原样。含媒体段落和单元格保持双语。翻译协议版本改变时清理失效译文，端点或模型
+  改变则保留已翻译内容（见“换模型保留译文”）；超长段落明确失败，不截断后冒充完整翻译。
 - [x] 翻译响应格式兼容：识别单个完整 JSON 外的围栏、说明和完整前置思考标记；
   分段校验失败自动纠正一次，仍不符合要求则保留进度并报告失败。仍严格验证 ID 和文本，
   不将纯文本猜分段；纠正过程沿用原输入及模型配置，支持暂停/取消，旧执行失败不覆盖新任务。
