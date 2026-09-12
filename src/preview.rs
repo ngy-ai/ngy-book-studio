@@ -256,7 +256,9 @@ impl RenderPageEmitter {
             .context("视觉页面断点接收端已经关闭")
     }
 
-    #[cfg(target_os = "windows")]
+    /// Synchronous emit for renderers that rasterize on a blocking thread.
+    /// The channel is bounded, so this may park the calling worker; callers
+    /// must already be on a dedicated blocking thread.
     pub(crate) fn emit_blocking(&self, page: RenderedVisualPage) -> Result<()> {
         self.validate_emitted_page(&page)?;
         self.sender

@@ -23,6 +23,7 @@ pub use crate::job_diagnostics::{
     BACKGROUND_JOB_LOG_LIMIT, BackgroundJobLogEntry, BackgroundJobLogSnapshot, JobLogLevel,
 };
 
+use crate::djvu_renderer::{DJVU_RENDERER_NAME, DjvuPngRenderer};
 #[cfg(target_os = "windows")]
 use crate::office_visual::{OFFICE_ENHANCED_RENDERER_NAME, OfficeEnhancedRenderer};
 #[cfg(target_os = "windows")]
@@ -62,10 +63,10 @@ const PDF_READER_SETTINGS_KEY: &str = "pdf.reader.preferences.v1";
 const TRANSLATION_SETTINGS_KEY: &str = "translation.preferences.v1";
 const WEB_SEARCH_CREDENTIAL_TARGET: &str = "ai.openai_compatible.web_search.v1";
 const MAX_MODEL_NAME_CHARS: usize = 256;
-#[cfg(target_os = "windows")]
-const MAX_LOADED_OFFICE_PAGES: usize = 20_000;
-#[cfg(target_os = "windows")]
-const MAX_LOADED_OFFICE_PAGE_BYTES: u64 = 512 * 1024 * 1024;
+/// Upper bounds for one published visual page set (Office enhanced preview or
+/// DjVu scan) loaded into a reading window.
+const MAX_LOADED_VISUAL_PAGES: usize = 20_000;
+const MAX_LOADED_VISUAL_PAGE_BYTES: u64 = 512 * 1024 * 1024;
 
 pub const DEFAULT_CHAT_MODEL: &str = "qwen3.5:0.8b";
 pub const DEFAULT_EMBEDDING_MODEL: &str = "qwen3-embedding:0.6b";
@@ -658,18 +659,29 @@ pub fn language_is_target(source: Option<&str>, target: &str) -> bool {
     }
 }
 
-/// A verified Office-enhanced page loaded from the managed object store.
+/// Which persisted visual page set a reader window consumes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VisualPageSourceKind {
+    /// Microsoft Office COM enhancement pages (Windows only).
+    OfficeEnhanced,
+    /// Imported DjVu scans rasterized by the portable `moye-djvu-png` renderer.
+    Djvu,
+}
+
+/// One verified page loaded from the managed object store.
 ///
 /// Object keys and filesystem paths deliberately stay private to the service
 /// layer; callers receive only stable document coordinates and owned bytes.
-#[cfg(target_os = "windows")]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OfficeEnhancedPage {
+pub struct PublishedVisualPage {
     pub file_name: String,
     pub media_type: String,
     pub bytes: Vec<u8>,
     pub content_unit_id: Option<String>,
     pub locator: crate::document::DocumentLocator,
+    /// Pixel size of the published page image, used for reader zoom.
+    pub width: u32,
+    pub height: u32,
 }
 
 struct AiServices {
@@ -889,6 +901,9 @@ impl AppServices {
         let office: Arc<dyn OfficeEnhancer> = Arc::new(OfficeComWorker::start()?);
         let mut visual_renderers: Vec<Arc<dyn VisualRenderer>> =
             vec![Arc::new(StructuralPngRenderer)];
+        // DjVu rasterization is portable safe Rust, so it is registered on every
+        // target; the Windows-only PDF/Office renderers stay behind `cfg`.
+        visual_renderers.push(Arc::new(DjvuPngRenderer));
         #[cfg(target_os = "windows")]
         visual_renderers.push(Arc::new(WindowsPdfRenderer));
         #[cfg(target_os = "windows")]
@@ -1702,19 +1717,19 @@ impl AppServices {
         Ok(job_id)
     }
 
-    /// Loads the complete, successfully published Office-enhanced page set
-    /// for the book's current source revision.
+    /// Loads the complete, successfully published visual page set for the
+    /// book's current source revision.
     ///
     /// The database graph is validated while the object publication gate is
     /// held, then every object is rechecked against its stored length, BLAKE3
     /// digest and image media type before bytes leave the service layer.
-    #[cfg(target_os = "windows")]
-    pub async fn load_office_enhanced_pages(
+    pub async fn load_published_visual_pages(
         &self,
         book_id: String,
-    ) -> Result<Vec<OfficeEnhancedPage>> {
+        kind: VisualPageSourceKind,
+    ) -> Result<Vec<PublishedVisualPage>> {
         ensure!(!book_id.trim().is_empty(), "图书 ID 不能为空");
-        // Canonical edits and Office enable/disable operations use this same
+        // Canonical edits and source-setting operations use this same
         // turnstile. Holding the turn until object reads finish ensures the
         // result still belongs to the current source when it is returned.
         let _mutation_turn = self.library_mutations.reserve().enter().await?;
@@ -1723,51 +1738,116 @@ impl AppServices {
         let rows = self
             .runtime
             .handle()
-            .spawn_blocking(move || load_office_enhanced_page_rows(&db_path, &book_id))
+            .spawn_blocking(move || load_published_visual_page_rows(&db_path, &book_id, kind))
             .await
-            .context("Office 增强页面查询线程异常退出")??;
+            .context("视觉页面查询线程异常退出")??;
 
         let mut pages = Vec::with_capacity(rows.len());
         let mut total_bytes = 0_u64;
         for (page_index, row) in rows.into_iter().enumerate() {
-            let key = BlobKey::parse(&row.object_key).context("Office 增强页面对象键无效")?;
-            let bytes = self
-                .blobs
-                .get(&key)
-                .await
-                .context("无法读取 Office 增强页面对象")?;
+            let key = BlobKey::parse(&row.object_key).context("视觉页面对象键无效")?;
+            let bytes = self.blobs.get(&key).await.context("无法读取视觉页面对象")?;
             ensure!(
                 bytes.len() as u64 == row.byte_len,
-                "Office 增强页面对象长度与数据库元数据不一致"
+                "视觉页面对象长度与数据库元数据不一致"
             );
             total_bytes = total_bytes
                 .checked_add(row.byte_len)
-                .context("Office 增强页面总大小溢出")?;
+                .context("视觉页面总大小溢出")?;
             ensure!(
-                total_bytes <= MAX_LOADED_OFFICE_PAGE_BYTES,
-                "Office 增强页面总大小超过支持上限"
+                total_bytes <= MAX_LOADED_VISUAL_PAGE_BYTES,
+                "视觉页面总大小超过支持上限"
             );
             let digest = blake3::hash(&bytes).to_hex().to_string();
             ensure!(
                 digest == row.hash && BlobKey::from_bytes(&bytes) == key,
-                "Office 增强页面对象摘要与数据库元数据不一致"
+                "视觉页面对象摘要与数据库元数据不一致"
             );
-            let expected_format = office_enhanced_image_format(&row.media_type)?;
+            let expected_format = visual_page_image_format(&row.media_type)?;
             ensure!(
-                image::guess_format(&bytes).context("无法识别 Office 增强页面图片格式")?
-                    == expected_format,
-                "Office 增强页面图片格式与媒体类型不一致"
+                image::guess_format(&bytes).context("无法识别视觉页面图片格式")? == expected_format,
+                "视觉页面图片格式与媒体类型不一致"
             );
-            pages.push(OfficeEnhancedPage {
-                file_name: office_enhanced_page_file_name(page_index, &row.media_type)?,
+            pages.push(PublishedVisualPage {
+                file_name: visual_page_file_name(page_index, &row.media_type)?,
                 media_type: row.media_type,
                 bytes,
                 content_unit_id: row.content_unit_id,
                 locator: row.locator,
+                width: row.width,
+                height: row.height,
             });
         }
         drop(publication_guard);
         Ok(pages)
+    }
+
+    /// Loads the Office-enhanced page set for the book's current source.
+    #[cfg(target_os = "windows")]
+    pub async fn load_office_enhanced_pages(
+        &self,
+        book_id: String,
+    ) -> Result<Vec<PublishedVisualPage>> {
+        self.load_published_visual_pages(book_id, VisualPageSourceKind::OfficeEnhanced)
+            .await
+    }
+
+    /// Ensures the current source's `visual_render` job is scheduled to run and
+    /// returns its id.
+    ///
+    /// Reading a DjVu book needs its page images, and DjVu rasterization is
+    /// local, deterministic safe Rust, so the reader may start it directly
+    /// (unlike the Office COM enhancement, which stays behind an explicit
+    /// per-book opt-in). A running or already-succeeded job is left alone.
+    pub async fn ensure_visual_render_job(&self, book_id: String) -> Result<String> {
+        ensure!(!book_id.trim().is_empty(), "图书 ID 不能为空");
+        let db_path = self.db_path.clone();
+        let lookup_book_id = book_id.clone();
+        let (job_id, status) = self
+            .runtime
+            .handle()
+            .spawn_blocking(move || {
+                let conn = db::open_conn(&db_path)?;
+                let book = db::books::get(&conn, &lookup_book_id)?.context("图书不存在")?;
+                let source = db::book_sources::get_revision(&conn, &lookup_book_id, book.revision)?
+                    .context("当前图书来源不存在")?;
+                let job_id = format!("visual-render:{}", source.id);
+                let job = db::index_jobs::get(&conn, &job_id)?
+                    .with_context(|| format!("当前来源没有视觉渲染任务：{job_id}"))?;
+                ensure!(
+                    job.kind == "visual_render"
+                        && job.book_id == lookup_book_id
+                        && job.source_id.as_deref() == Some(source.id.as_str()),
+                    "视觉渲染任务不属于当前图书来源"
+                );
+                Ok((job_id, job.status))
+            })
+            .await
+            .context("视觉渲染任务查询线程异常退出")??;
+
+        use db::index_jobs::IndexJobStatus;
+        match status {
+            IndexJobStatus::Succeeded => {}
+            IndexJobStatus::Queued | IndexJobStatus::Running | IndexJobStatus::Paused => {
+                // Resume keeps the durable page prefix: a job paused from the
+                // background-task window must not restart from page 0. Calling
+                // resume on an already-running job is harmless.
+                let coordinator = self.visual_jobs().context("视觉任务协调器不可用")?;
+                coordinator
+                    .resume(&job_id)
+                    .await
+                    .context("无法恢复视觉渲染任务")?;
+            }
+            IndexJobStatus::Failed | IndexJobStatus::Cancelled => {
+                let coordinator = self.visual_jobs().context("视觉任务协调器不可用")?;
+                coordinator
+                    .retry(&job_id)
+                    .await
+                    .context("无法重试视觉渲染任务")?;
+            }
+        }
+        self.indexing.wake();
+        Ok(job_id)
     }
 
     /// Loads the complete persisted task history for the requested books on
@@ -1934,64 +2014,118 @@ impl Drop for AppServices {
     }
 }
 
-#[cfg(target_os = "windows")]
 #[derive(Debug)]
-struct OfficeEnhancedPageRow {
+struct PublishedVisualPageRow {
     object_key: String,
     media_type: String,
     byte_len: u64,
     hash: String,
     content_unit_id: Option<String>,
     locator: crate::document::DocumentLocator,
+    width: u32,
+    height: u32,
 }
 
-#[cfg(target_os = "windows")]
-fn load_office_enhanced_page_rows(
+/// Expected renderer identity and page semantics for one visual page set.
+struct PublishedPageExpectation {
+    renderer: &'static str,
+    fidelity: crate::preview::RenderFidelity,
+    /// Source formats whose originals this pipeline may render.
+    formats: &'static [&'static str],
+    /// Whether the renderer may publish pages without a content unit
+    /// (Office Word/Excel repagination previews).
+    allow_preview_only: bool,
+}
+
+fn published_page_expectation(kind: VisualPageSourceKind) -> Result<PublishedPageExpectation> {
+    match kind {
+        #[cfg(target_os = "windows")]
+        VisualPageSourceKind::OfficeEnhanced => Ok(PublishedPageExpectation {
+            renderer: OFFICE_ENHANCED_RENDERER_NAME,
+            fidelity: crate::preview::RenderFidelity::OfficeEnhanced,
+            formats: &["doc", "docx", "pptx", "xlsx"],
+            allow_preview_only: true,
+        }),
+        #[cfg(not(target_os = "windows"))]
+        VisualPageSourceKind::OfficeEnhanced => {
+            anyhow::bail!("Office 增强预览仅支持 Windows")
+        }
+        VisualPageSourceKind::Djvu => Ok(PublishedPageExpectation {
+            renderer: DJVU_RENDERER_NAME,
+            fidelity: crate::preview::RenderFidelity::Structural,
+            formats: &["djvu"],
+            allow_preview_only: false,
+        }),
+    }
+}
+
+/// The persisted `visual_pages.fidelity` string for a render fidelity.
+fn render_fidelity_key(fidelity: crate::preview::RenderFidelity) -> &'static str {
+    match fidelity {
+        crate::preview::RenderFidelity::Normalized => "normalized",
+        crate::preview::RenderFidelity::Structural => "structural",
+        crate::preview::RenderFidelity::OfficeEnhanced => "office_enhanced",
+    }
+}
+
+fn visual_page_kind_label(kind: VisualPageSourceKind) -> &'static str {
+    match kind {
+        VisualPageSourceKind::OfficeEnhanced => "Office 增强",
+        VisualPageSourceKind::Djvu => "DjVu",
+    }
+}
+
+fn load_published_visual_page_rows(
     db_path: &Path,
     book_id: &str,
-) -> Result<Vec<OfficeEnhancedPageRow>> {
+    kind: VisualPageSourceKind,
+) -> Result<Vec<PublishedVisualPageRow>> {
+    let expectation = published_page_expectation(kind)?;
+    let label = visual_page_kind_label(kind);
     let conn = db::open_conn(db_path)?;
     let book = db::books::get(&conn, book_id)?.context("图书不存在")?;
     let source = db::book_sources::get_revision(&conn, book_id, book.revision)?
         .context("当前图书来源不存在")?;
+    if kind == VisualPageSourceKind::OfficeEnhanced {
+        ensure!(
+            db::office_enhancements::is_enabled(&conn, book_id)?,
+            "当前图书尚未启用 Office 增强预览"
+        );
+    }
     ensure!(
-        db::office_enhancements::is_enabled(&conn, book_id)?,
-        "当前图书尚未启用 Office 增强预览"
-    );
-    ensure!(
-        source.source_kind == "original"
-            && matches!(source.format.as_str(), "doc" | "docx" | "pptx" | "xlsx"),
-        "当前图书来源不再是可增强的 Office 原件"
+        source.source_kind == "original" && expectation.formats.contains(&source.format.as_str()),
+        "当前图书来源不再是可渲染的 {label} 原件"
     );
 
     let job_id = format!("visual-render:{}", source.id);
-    let job = db::index_jobs::get(&conn, &job_id)?.context("Office 增强视觉任务不存在")?;
+    let job =
+        db::index_jobs::get(&conn, &job_id)?.with_context(|| format!("{label} 视觉任务不存在"))?;
     ensure!(
         job.book_id == book.id
             && job.source_id.as_deref() == Some(source.id.as_str())
             && job.kind == "visual_render",
-        "Office 增强视觉任务不属于当前图书来源"
+        "{label} 视觉任务不属于当前图书来源"
     );
     ensure!(
         job.status == db::index_jobs::IndexJobStatus::Succeeded,
-        "Office 增强视觉任务尚未成功完成"
+        "{label} 视觉任务尚未成功完成"
     );
     let (spec, completed_pages) = crate::preview::decode_persisted_visual_job(&job.cursor_json)
-        .context("Office 增强视觉任务游标无效")?;
+        .with_context(|| format!("{label} 视觉任务游标无效"))?;
     ensure!(
         spec.id == job_id
             && spec.book_id == book.id
             && spec.source_id == source.id
             && spec.document_revision.get() == book.revision
-            && spec.renderer == OFFICE_ENHANCED_RENDERER_NAME
-            && spec.fidelity == crate::preview::RenderFidelity::OfficeEnhanced,
-        "Office 增强视觉任务不是当前图书版本的增强产物"
+            && spec.renderer == expectation.renderer
+            && spec.fidelity == expectation.fidelity,
+        "{label} 视觉任务不是当前图书版本的产物"
     );
     let units = db::content_units::list_for_source(&conn, &source.id)?
         .into_iter()
         .map(|unit| (unit.id, unit.revision))
         .collect::<BTreeMap<_, _>>();
-    ensure!(!units.is_empty(), "当前 Office 来源没有内容单元");
+    ensure!(!units.is_empty(), "当前 {label} 来源没有内容单元");
     ensure!(
         spec.unit_ids.is_empty()
             || (spec.unit_ids.len() == units.len()
@@ -1999,26 +2133,23 @@ fn load_office_enhanced_page_rows(
                     .unit_ids
                     .iter()
                     .all(|unit_id| units.contains_key(unit_id))),
-        "Office 增强视觉任务只包含部分内容单元"
+        "{label} 视觉任务只包含部分内容单元"
     );
     let pages = db::visual_pages::list_for_source(&conn, &source.id)?;
     ensure!(
-        !pages.is_empty() && pages.len() <= MAX_LOADED_OFFICE_PAGES,
-        "Office 增强页面数量无效或超过支持上限"
+        !pages.is_empty() && pages.len() <= MAX_LOADED_VISUAL_PAGES,
+        "{label} 页面数量无效或超过支持上限"
     );
     ensure!(
         completed_pages == pages.len(),
-        "Office 增强视觉任务完成进度与已发布页面不一致"
+        "{label} 视觉任务完成进度与已发布页面不一致"
     );
 
     let profile_id = spec.profile.stable_id();
     let mut total_bytes = 0_u64;
     let mut rows = Vec::with_capacity(pages.len());
     for (expected_index, page) in pages.into_iter().enumerate() {
-        ensure!(
-            page.page_index == expected_index,
-            "Office 增强页面序号不连续"
-        );
+        ensure!(page.page_index == expected_index, "{label} 页面序号不连续");
         ensure!(
             page.book_id == book.id
                 && page.source_id == source.id
@@ -2027,24 +2158,45 @@ fn load_office_enhanced_page_rows(
                 && page.renderer_version == spec.renderer_version
                 && page.profile_id == profile_id
                 && page.render_scale == spec.profile.scale()
-                && page.fidelity == "office_enhanced",
-            "Office 增强页面元数据与当前视觉任务不一致"
+                && page.fidelity == render_fidelity_key(expectation.fidelity),
+            "{label} 页面元数据与当前视觉任务不一致"
         );
         ensure!(
             page.width > 0 && page.height > 0 && page.render_scale.is_finite(),
-            "Office 增强页面尺寸或缩放无效"
+            "{label} 页面尺寸或缩放无效"
         );
         let locator = serde_json::from_str::<crate::document::DocumentLocator>(&page.locator_json)
-            .context("Office 增强页面定位信息无效")?;
+            .context("视觉页面定位信息无效")?;
         locator
             .validate()
-            .context("Office 增强页面定位信息不符合统一模型约束")?;
+            .context("视觉页面定位信息不符合统一模型约束")?;
+        ensure!(locator.book_id == book.id, "视觉页面定位不属于当前图书");
         ensure!(
-            locator.book_id == book.id,
-            "Office 增强页面定位不属于当前图书"
+            locator.block_id.is_none() && locator.text_range.is_none() && locator.region.is_none(),
+            "视觉页面定位不能携带块、选区或区域坐标"
         );
         match locator.source.as_ref() {
-            Some(crate::document::SourceLocator::Slide { .. }) => {
+            Some(crate::document::SourceLocator::DjvuPage { page: source_page }) => {
+                let expected_page = u32::try_from(expected_index)
+                    .ok()
+                    .and_then(|index| index.checked_add(1));
+                ensure!(
+                    !expectation.allow_preview_only
+                        && page.content_unit_id.as_deref() == Some(locator.unit_id.as_str())
+                        && expected_page == Some(*source_page),
+                    "DjVu 页面与内容单元或源页码不一致"
+                );
+                let current_unit_revision = units.get(&locator.unit_id).with_context(|| {
+                    format!("DjVu 页面引用了不存在的内容单元：{}", locator.unit_id)
+                })?;
+                ensure!(
+                    page.unit_revision == *current_unit_revision,
+                    "DjVu 页面内容单元版本已过期"
+                );
+            }
+            Some(crate::document::SourceLocator::Slide { .. })
+                if expectation.allow_preview_only =>
+            {
                 let content_unit_id = page
                     .content_unit_id
                     .as_deref()
@@ -2058,7 +2210,9 @@ fn load_office_enhanced_page_rows(
                     "PowerPoint 增强页面内容单元映射或版本已过期"
                 );
             }
-            Some(crate::document::SourceLocator::OfficeRenderedPage { page: source_page }) => {
+            Some(crate::document::SourceLocator::OfficeRenderedPage { page: source_page })
+                if expectation.allow_preview_only =>
+            {
                 let expected_page = u32::try_from(expected_index)
                     .ok()
                     .and_then(|index| index.checked_add(1));
@@ -2067,53 +2221,49 @@ fn load_office_enhanced_page_rows(
                         && matches!(source.format.as_str(), "doc" | "docx" | "xlsx")
                         && page.unit_revision == crate::document::Revision::INITIAL.get()
                         && locator.unit_id == office_preview_unit_id(&book.id, &source.id)
-                        && locator.block_id.is_none()
-                        && locator.text_range.is_none()
-                        && locator.region.is_none()
                         && expected_page == Some(*source_page),
                     "Word/Excel 增强页面错误关联了内容单元或页面定位无效"
                 );
             }
-            _ => anyhow::bail!("Office 增强页面缺少可验证的幻灯片或预览页定位"),
+            _ => anyhow::bail!("{label} 页面缺少可验证的页面定位"),
         }
-        let blob =
-            db::blobs::get(&conn, &page.object_key)?.context("Office 增强页面对象元数据不存在")?;
-        office_enhanced_image_format(&blob.media_type)?;
-        BlobKey::parse(&blob.object_key).context("Office 增强页面对象键无效")?;
+        let blob = db::blobs::get(&conn, &page.object_key)?.context("视觉页面对象元数据不存在")?;
+        visual_page_image_format(&blob.media_type)?;
+        BlobKey::parse(&blob.object_key).context("视觉页面对象键无效")?;
         total_bytes = total_bytes
             .checked_add(blob.byte_len)
-            .context("Office 增强页面总大小溢出")?;
+            .context("视觉页面总大小溢出")?;
         ensure!(
-            total_bytes <= MAX_LOADED_OFFICE_PAGE_BYTES,
-            "Office 增强页面总大小超过支持上限"
+            total_bytes <= MAX_LOADED_VISUAL_PAGE_BYTES,
+            "视觉页面总大小超过支持上限"
         );
-        rows.push(OfficeEnhancedPageRow {
+        rows.push(PublishedVisualPageRow {
             object_key: blob.object_key,
             media_type: blob.media_type,
             byte_len: blob.byte_len,
             hash: blob.hash,
             content_unit_id: page.content_unit_id,
             locator,
+            width: page.width,
+            height: page.height,
         });
     }
     Ok(rows)
 }
 
-#[cfg(target_os = "windows")]
-fn office_enhanced_image_format(media_type: &str) -> Result<image::ImageFormat> {
+fn visual_page_image_format(media_type: &str) -> Result<image::ImageFormat> {
     match media_type {
         "image/png" => Ok(image::ImageFormat::Png),
         "image/jpeg" => Ok(image::ImageFormat::Jpeg),
-        _ => anyhow::bail!("Office 增强页面使用了不支持的图片媒体类型：{media_type}"),
+        _ => anyhow::bail!("视觉页面使用了不支持的图片媒体类型：{media_type}"),
     }
 }
 
-#[cfg(target_os = "windows")]
-fn office_enhanced_page_file_name(page_index: usize, media_type: &str) -> Result<String> {
-    let extension = match office_enhanced_image_format(media_type)? {
+fn visual_page_file_name(page_index: usize, media_type: &str) -> Result<String> {
+    let extension = match visual_page_image_format(media_type)? {
         image::ImageFormat::Png => "png",
         image::ImageFormat::Jpeg => "jpg",
-        _ => unreachable!("Office enhanced media types are exhaustively checked"),
+        _ => unreachable!("visual page media types are exhaustively checked"),
     };
     Ok(format!("Page{:05}.{extension}", page_index + 1))
 }

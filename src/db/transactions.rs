@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(target_os = "windows")]
 use crate::windows_pdf_renderer::WindowsPdfRenderer;
 use crate::{
+    djvu_renderer::{DJVU_RENDERER_NAME, DjvuPngRenderer},
     document::{BlockDocument, DocumentLocator, Revision, SourceLocator, deterministic_id},
     preview::{
         RenderProfile, RendererDescriptor, StructuralPngRenderer, VisualJobSpec,
@@ -1887,6 +1888,16 @@ fn renderer_for_source<'a>(
     {
         return Ok(renderer);
     }
+    // DjVu pages are rasterized from the retained original by the portable
+    // DjVu renderer; the canonical model never stores the page bitmaps.
+    if source.source_kind == "original"
+        && source.format == "djvu"
+        && let Some(renderer) = renderers
+            .iter()
+            .find(|renderer| renderer.renderer == DJVU_RENDERER_NAME)
+    {
+        return Ok(renderer);
+    }
     renderers
         .iter()
         .find(|renderer| renderer.renderer == "moye-structural-png")
@@ -2312,6 +2323,17 @@ fn visual_job_spec(graph: &DocumentGraph<'_>, job_id: String) -> VisualJobSpec {
             unit_ids,
             profile,
             &WindowsPdfRenderer,
+        );
+    }
+    if graph.source.source_kind == "original" && graph.source.format == "djvu" {
+        return VisualJobSpec::from_renderer(
+            job_id,
+            graph.book.id.clone(),
+            graph.source.id.clone(),
+            Revision::new(graph.book.revision),
+            unit_ids,
+            profile,
+            &DjvuPngRenderer,
         );
     }
 
@@ -3047,6 +3069,38 @@ mod tests {
                 .status,
             IndexJobStatus::Paused
         );
+    }
+
+    #[test]
+    fn djvu_sources_select_the_portable_djvu_renderer() {
+        let (_temp, mut conn) = open_database();
+        let mut fixture = Fixture::new();
+        fixture.book.format = "djvu".to_string();
+        fixture.source.format = "djvu".to_string();
+        fixture.source_blob.media_type = "image/vnd.djvu".to_string();
+        for (index, unit) in fixture.units.iter_mut().enumerate() {
+            unit.kind = "page".to_string();
+            unit.source_locator_json =
+                serde_json::to_string(&SourceLocator::djvu_page((index + 1) as u32)).unwrap();
+        }
+        insert_document(&mut conn, &fixture.graph(), true).unwrap();
+
+        // A DjVu source must be rendered from its original bytes by the
+        // portable DjVu renderer, not by the structural SVG renderer.
+        let spec = running_visual_job(&conn);
+        assert_eq!(spec.renderer, DJVU_RENDERER_NAME);
+        assert!(spec.renderer_version.contains("djvu-rs"), "{spec:?}");
+        assert_eq!(spec.fidelity, crate::preview::RenderFidelity::Structural);
+        assert_eq!(spec.unit_ids, vec!["unit-1".to_string()]);
+
+        // The same source keeps selecting the DjVu renderer when the job is
+        // reconciled against the full registered descriptor set.
+        let descriptors = vec![
+            crate::preview::VisualRenderer::descriptor(&StructuralPngRenderer),
+            crate::preview::VisualRenderer::descriptor(&DjvuPngRenderer),
+        ];
+        let selected = renderer_for_source(&conn, &fixture.source, &descriptors).unwrap();
+        assert_eq!(selected.renderer, DJVU_RENDERER_NAME);
     }
 
     fn running_visual_job(conn: &Connection) -> VisualJobSpec {

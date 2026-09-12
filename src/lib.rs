@@ -7,6 +7,7 @@ pub mod annotations;
 pub mod chat;
 pub mod credentials;
 mod db;
+pub mod djvu_renderer;
 pub mod document;
 pub mod editing;
 mod epub_limits;

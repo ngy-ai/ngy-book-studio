@@ -6,7 +6,7 @@ mod editor;
 mod learning;
 mod library;
 mod notes;
-mod office_slides;
+mod page_image;
 mod pdf_reader;
 mod reader;
 
@@ -28,7 +28,7 @@ use editor::{
 };
 use learning::open_learning_window;
 use notes::open_notes_window;
-use office_slides::open_office_slides_window;
+use page_image::open_page_image_window;
 use pdf_reader::{PdfReaderApp, PdfReaderInit, PdfReaderPage, build_pdf_reader_webview};
 use reader::{ReaderApp, ReaderWebViewBuildGate, build_reader_webview};
 
@@ -356,6 +356,20 @@ fn source_locator_matches_document(source: &CanonicalBookSource, locator: &Sourc
                     ..
                 },
                 SourceLocator::KindleSection { .. },
+            )
+            | (
+                CanonicalBookSource::Imported {
+                    format: BookFormat::Kfx,
+                    ..
+                },
+                SourceLocator::KindleSection { .. },
+            )
+            | (
+                CanonicalBookSource::Imported {
+                    format: BookFormat::Djvu,
+                    ..
+                },
+                SourceLocator::DjvuPage { .. },
             )
     )
 }

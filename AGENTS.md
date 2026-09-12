@@ -45,6 +45,12 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   在 GPUI future 里 panic，而 GPUI 回调不可 unwind，会直接终止整个进程。
   `src/services.rs` 测试里的 `block_on_without_tokio` 用非 Tokio 执行器驱动服务方法，
   用于固定这条约定（后台任务窗口的文本块明细读取曾因此崩溃）。
+  `load_published_visual_pages(book_id, kind)` 是 Office 增强预览与 DjVu 共用的页面读取
+  入口：它在 `library_mutations` 与 `blob_publication` 门闩内读 `visual_pages`、逐页校验
+  长度/BLAKE3/`BlobKey`/图片格式后才返回字节，`load_office_enhanced_pages` 只是它的
+  委托包装；新增页面来源时必须走同一入口，不要复制门闩或摘要校验。
+  `ensure_visual_render_job` 只用于本地可安全自动运行的渲染（DjVu），Office COM 增强
+  必须继续走显式信任对话框与 `set_office_enhancement_enabled`。
 - `src/learning.rs`、`src/learning_records.rs`、`src/learning_catalog.rs`、
   `src/ui/learning.rs`：学习中心异步服务、逐章目录、
   独立 JSON 学习档案和原生 GPUI 训练窗口。记录不进入图书数据库；运行前保存不可变
@@ -69,8 +75,14 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   事件与内存剪贴板回归不能替代真实 Windows 鼠标、字体和系统剪贴板验收。
 - `src/document.rs`：稳定 ID 的格式无关模型，包括 `BookDocument`、`ContentUnit`、
   `BlockDocument`、`TocNode` 和 `DocumentLocator`。
-- `src/formats/`：`DocumentImporter` 注册表及 EPUB、PDF、Office、Kindle 适配器；
-  `office_oxide`、`ebook-rs` 等第三方类型必须在本目录内转换为统一模型。
+- `src/formats/`：`DocumentImporter` 注册表及 EPUB、PDF、Office、Kindle、KFX、DjVu
+  适配器；`office_oxide`、`ebook-rs`、`djvu-rs` 等第三方类型必须在本目录内转换为统一模型。
+  `kfx.rs`：`ebook-rs::KfxBook` 是启发式文字抽取而非完整 KFX/Ion 解析（`resources` 恒空、
+  metadata 有占位默认值），因此只保留原件 + 抽取正文，导入前必须过 `validate_kfx_text`
+  三项守卫（可见字符下限、无法解码字符比例、成词比例），解析不出正文一律拒绝，
+  不得放宽为“导入成功”。`djvu.rs`：字节所有权要求下先校验上限再克隆一次源字节；
+  隐藏文字层经 `reflowable_text` 转页文字，NAVM 书签只有能解析出 `#<页号>` 时映射
+  （其余跳过但保留可解析子项）；导入阶段不产出页面图片。
 - `src/markup.rs`、`src/editing.rs`、`src/export.rs`：HTML 解析清洗、事务式
   模型编辑，以及原件/EPUB/PDF 稳定导出。
 - `src/storage.rs`、`src/media.rs`：应用自有 `BlobStore`、基于 `object_store` 的本地
@@ -183,8 +195,15 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   「重新翻译」由 `IndexingCoordinator::retranslate` 实现：先把该书该语言的译文行删掉，
   再把游标 `next_ordinal` 归零并重置为 queued/paused；只对 `translation` 生效，来源已
   被替代或其它任务类型一律拒绝（不改状态）。
-- `src/preview.rs`、`src/windows_pdf_renderer.rs`：`VisualRenderer`、结构化页面 PNG 光栅化、
-  Windows PDF 原页光栅化、可暂停/恢复/重试/取消的持久任务和本地 PDF.js 资产路由。
+- `src/preview.rs`、`src/windows_pdf_renderer.rs`、`src/djvu_renderer.rs`：`VisualRenderer`、
+  结构化页面 PNG 光栅化、Windows PDF 原页光栅化与纯 Rust DjVu 逐页光栅化、
+  可暂停/恢复/重试/取消的持久任务和本地 PDF.js 资产路由。DjVu 渲染器（`moye-djvu-png`）
+  不加 `cfg(windows)`，页与内容单元严格 1:1（`content_unit_id` + `SourceLocator::DjvuPage`），
+  必须在 `db::transactions::{renderer_for_source, visual_job_spec}` 里按 `format == "djvu"`
+  选中；新增 renderer 时这三处（注册、恢复选择、任务构造）必须同时更新，否则导入时
+  创建的 `visual-render:{source_id}` 任务会退回结构化 SVG 渲染。
+  渲染器选择失败/未注册会在恢复期报「找不到当前来源所需的 renderer」，不要用
+  `moye-structural-png` 兜底掩盖 DjVu 页面缺失。
 - `src/ai.rs`、`src/credentials.rs`：OpenAI-compatible models/chat streaming/embeddings
   接口、端点策略和 Windows Credential Manager 密钥存储。
   端点配置的“请求超时”不再作为 reqwest 的整段请求超时：`Client` 只保留 10 秒连接超时，
@@ -203,11 +222,19 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   renderer/revision/profile 发布，失败时回退结构化预览。
 - `src/reader.rs`、`src/epub_limits.rs`：EPUB 投影、资源授权、导航 URL 和归档安全上限。
 - `src/ui/`：按窗口/职责拆分的 GPUI 界面。`library.rs`、`reader.rs`、`pdf_reader.rs`、
-  `editor.rs`、`office_slides.rs` 分别管理对应窗口；`ai_sidebar.rs`、
+  `editor.rs`、`page_image.rs` 分别管理对应窗口；`ai_sidebar.rs`、
   `ai_controller.rs`、`ai_settings.rs` 管理 AI 交互；`background_jobs.rs` 管理当前图书范围
   的派生任务；后台任务窗口全应用只有一个，重复打开时激活现有窗口并按新的库范围刷新，
   不打开第二个；`mod.rs` 只保留跨窗口主题、窗口打开与安全关闭基础设施，其中包含按
-  图书登记的窗口表：删除图书后关闭该书已打开的阅读、PDF/Office 预览和编辑窗口。
+  图书登记的窗口表：删除图书后关闭该书已打开的阅读、PDF/Office 预览、DjVu 页面和编辑窗口。
+  `page_image.rs` 是 Office 增强预览与 DjVu 共用的页面图片窗口，以
+  `VisualPageSourceKind` 区分来源：它决定副标题文案、AI 引用资格（DjVu 每页 1:1 可引用，
+  Office 重排预览页不可）与是否提供“本页文字”面板。缩放是呈现层的像素尺寸变化，
+  不重新渲染；文字面板必须沿用 `scrollable_page_text` 的「外层滚动 + 自然高度
+  `selectable(true).scrollable(false)` TextView」，不得恢复内部虚拟列表滚动。
+  阅读进度复用 `reader::ReadingProgressWriter` 的有序写入与投影刷新，页变化时入队；
+  打开 DjVu 会经 `AppServices::ensure_visual_render_job` 恢复/重试本地渲染任务，
+  与 Office 的显式信任对话框不同，取消只影响本次等待。
   后台任务采用顶部分类、左任务列表、右详情/日志面板，两栏之间的分隔条可拖动调整列表
   宽度（钳制在可读最小宽度与详情面板最小宽度之间，窗口缩小也不会挤压详情）；
   每页 12 项，按创建时间与 ID 稳定

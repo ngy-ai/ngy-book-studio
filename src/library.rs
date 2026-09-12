@@ -2389,6 +2389,7 @@ fn unit_href(unit: &DocumentUnit) -> Option<String> {
         Some(SourceLocator::KindleSection { index, href }) => {
             href.clone().or_else(|| Some(format!("kindle:{index}")))
         }
+        Some(SourceLocator::DjvuPage { page }) => Some(format!("djvu:{page}")),
         Some(SourceLocator::Created) | None => Some(format!("unit:{}", unit.id)),
     }
 }
@@ -2618,6 +2619,8 @@ fn format_name(format: BookFormat) -> &'static str {
         BookFormat::Mobi => "mobi",
         BookFormat::Azw => "azw",
         BookFormat::Azw3 => "azw3",
+        BookFormat::Kfx => "kfx",
+        BookFormat::Djvu => "djvu",
     }
 }
 
@@ -2632,6 +2635,8 @@ fn parse_format(value: &str) -> Result<BookFormat> {
         "mobi" => BookFormat::Mobi,
         "azw" => BookFormat::Azw,
         "azw3" => BookFormat::Azw3,
+        "kfx" => BookFormat::Kfx,
+        "djvu" => BookFormat::Djvu,
         _ => bail!("未知图书格式：{value}"),
     })
 }

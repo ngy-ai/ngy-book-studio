@@ -2,7 +2,8 @@
 //!
 //! Set `MOYE_FORMAT_CORPUS` to a directory containing `sample.epub`,
 //! `sample.pdf`, `sample.doc`, `sample.docx`, `sample.pptx`, `sample.xlsx`,
-//! `sample.mobi`, `sample.azw`, and `sample.azw3`, then run:
+//! `sample.mobi`, `sample.azw`, `sample.azw3`, `sample.kfx` (DRM-free), and
+//! `sample.djvu`, then run:
 //!
 //! `cargo test --test format_corpus_gate --locked -- --ignored --nocapture`
 //!
@@ -35,6 +36,8 @@ fn real_documents_cross_the_canonical_import_gate() {
         ("sample.mobi", BookFormat::Mobi),
         ("sample.azw", BookFormat::Azw),
         ("sample.azw3", BookFormat::Azw3),
+        ("sample.kfx", BookFormat::Kfx),
+        ("sample.djvu", BookFormat::Djvu),
     ] {
         validate_sample(&registry, &root, file_name, expected_format);
     }

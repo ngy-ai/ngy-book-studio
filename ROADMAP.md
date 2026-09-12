@@ -25,6 +25,13 @@
   - [x] DOC/DOCX、PPTX、XLSX（`office_oxide` 转统一模型）；XLSX 导入直接以文件名
     作为书名，不采用工作簿 core properties 中可能残留的模板标题
   - [x] DRM-free MOBI/AZW/AZW3（`ebook-rs`，加密内容明确拒绝）
+  - [x] DRM-free KFX（`ebook-rs::KfxBook`，加密内容明确拒绝）：`CONT` 容器探测、
+    章节文字转统一模型、原件字节保留；导入前校验可见正文字数、无法解码字符比例与
+    成词比例，解析不出可读正文的容器明确拒绝而不是生成乱码图书；阅读/编辑/整本翻译
+    复用结构化链路
+  - [x] DjVu（`djvu-rs`）：IFF `FORM:DJVU/DJVM` 探测、逐页 `Page` 内容单元（隐藏文字层
+    `TXTz`/`TXTa` 转页文字，无文字层时留空）、NAVM 书签转目录、原件 `image/vnd.djvu`
+    字节保留；页面位图不进统一模型，由 `moye-djvu-png` 渲染任务按需产出
   - [x] 所有导入格式保留字节一致的原文件
   - [x] Office/Kindle 结构化预览与 PDF 固定版式查看
   - [x] 用户按书显式启用的 Office COM 增强预览：Word/Excel 经临时 PDF 光栅化且页面
@@ -436,6 +443,50 @@ LangGraph 依赖。CLI 课程验证与桌面接入的验证分别列出。
 - [ ] 翻译任务窗口的“文本块明细”仍按游标显示块状态，被跳过的块与已翻译块一样显示为
   已处理；逐块结果目前只能从任务日志的 `ProtocolSkipped` 记录读取
 
+## KFX 与 DjVu 导入（2026-09-12）
+
+- [x] 依赖：新增固定版本 `djvu-rs = "=0.32.1"`（MIT、纯 Rust，只启用 `std`，不含
+  OCR/ONNX/rayon）并同步 `Cargo.lock`；KFX 复用既有 `ebook-rs = "=0.16.4"`。
+  Windows/MSVC 下 `cargo check --all-targets --locked` 通过
+- [x] 格式契约：`BookFormat::{Kfx, Djvu}` 与 `SourceLocator::DjvuPage { page }`（一基、
+  与 `PdfPage` 同构、参与 `validate` 与序列化往返）；格式标签、导入对话框过滤列表、
+  原件导出扩展名、locator↔格式匹配全部同步
+- [x] KFX 导入器 `src/formats/kfx.rs`：`CONT` magic 优先探测（扩展名仅作回退）、
+  DRM 标记（`$DRM`/`DRM_V1`/`DRM_V2`/`kfx_drm`）前置拒绝、可读性守卫（可见字符下限、
+  无法解码字符比例、成词比例）、元数据占位值视为未知、`KindleSection` 定位、
+  `max_units`/单章/总文本上限；不产生封面或资源资产
+- [x] DjVu 导入器 `src/formats/djvu.rs`：`AT&TFORM`/`FORM:DJVU|DJVM` 探测、解析前的
+  文件/页数/像素/解码内存上限、逐页隐藏文字层经 `reflowable_text` 转页文字、
+  无文字层留空、NAVM 书签仅在能解析出 `#<页号>` 时映射（其余跳过但保留可解析子项）、
+  原件 `image/vnd.djvu` 字节保留
+- [x] DjVu 视觉渲染器 `src/djvu_renderer.rs`（`moye-djvu-png`，纯 Rust、无 `cfg(windows)`）：
+  来源格式/kind/MIME/IFF 校验、逐页 `claim_page` 断点、视图尺寸与像素/单页/总字节上限、
+  页与内容单元严格 1:1（`content_unit_id` + `DjvuPage` locator）、阻塞线程池内解码与 PNG 编码
+- [x] 渲染器选择：`AppServices` 注册 DjVu 渲染器；`db::transactions::renderer_for_source`
+  与 `visual_job_spec` 按 `format == "djvu"` 选择该渲染器，导入时创建的
+  `visual-render:{source_id}` 任务因此使用正确 renderer（回归
+  `djvu_sources_select_the_portable_djvu_renderer`）
+- [x] 通用页面读取：`AppServices::load_published_visual_pages(book_id, kind)` 承载原
+  Office 增强页面的全部门闩与 BLAKE3/BlobKey/图片格式校验，`load_office_enhanced_pages`
+  改为委托；新增 `ensure_visual_render_job` 在打开 DjVu 时恢复/重试本地渲染任务，
+  Office 仍保留显式信任对话框与 300 秒等待上限
+- [x] 页面图片阅读窗口 `src/ui/page_image.rs`（由 `office_slides.rs` 泛化并删除原文件）：
+  来源类别决定副标题、AI 引用资格与文字面板；新增缩放（适应窗口 / 25%–400%）、
+  按页阅读进度（复用 `ReadingProgressWriter` 有序写入与投影刷新）、
+  DjVu“本页文字”面板（可选中复制，复用外层滚动 + 自然高度 `TextView` 的既有约定）。
+  Office 行为与窗口登记/删除图书关闭路径保持不变
+- [x] 阅读分发：`src/ui/library.rs` 新增 `djvu` 分支（构造 `PageImages` 载荷、按
+  `DjvuPage` 校验引用、准备页面期间可取消、失败提示不阻断其它图书），PDF 与
+  reflowable 分支未改动
+- [x] 文档：README 支持格式、DjVu 阅读方式、KFX 解析边界与上限；AGENTS 代码地图新增
+  `djvu_renderer`、`page_image` 与渲染器选择说明；`format_corpus_gate` 语料清单增
+  `sample.kfx`/`sample.djvu`
+- [ ] 真实 Windows GUI 复验：用真实 KFX/DjVu 文件走完导入 → 页面渲染 → 翻页/缩放 →
+  文字层选中复制 → AI 引用 → 重启恢复阅读位置；当前只有单测与合成夹具（`KfxContainer::build`
+  合成容器、`encode_djvm_bundle_jb2` 双页夹具），未接入真实外部语料
+- [ ] KFX 真实语料上的可读性守卫阈值复核：当前阈值基于合成夹具，需要在多本真实
+  DRM-free KFX 上确认不会误拒
+
 ## 明确不在当前范围
 
 - [ ] Office 独立幻灯片上的选段笔记，以及笔记导出
@@ -443,8 +494,12 @@ LangGraph 依赖。CLI 课程验证与桌面接入的验证分别列出。
   流式正文渲染，不在当前翻译范围内）
 
 - [ ] S3 对象存储实现、本地/远程同步和多设备冲突处理
-- [ ] DRM Kindle 导入或 DRM 绕过
-- [ ] 修改后写回 DOC/DOCX、PPTX、XLSX、MOBI/AZW/AZW3
+- [ ] DRM Kindle 导入或 DRM 绕过（含 KFX）
+- [ ] 修改后写回 DOC/DOCX、PPTX、XLSX、MOBI/AZW/AZW3/KFX；DjVu 与 KFX 均不回写原格式
+- [ ] KFX 精确版式、封面与内嵌图片还原（当前只解析可读正文，`ebook-rs` 的 `KfxBook`
+  是启发式文字抽取，`resources` 恒为空）
+- [ ] DjVu 页面级笔记/划线/AI 解释菜单、页面段落翻译、无文字层时的 OCR，
+  以及页面图像上按像素位置的逐词文字层叠选
 - [ ] EPUB 导入时将章节内 fragment 映射为精确块目标；当前编辑器子目录打开所属章节
 - [ ] 原 Office/PDF/Kindle 复杂版式的无损规范化导出
 - [ ] Office 宏/OLE 主动调用、PDF/书内脚本或外部网络资源

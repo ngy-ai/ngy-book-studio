@@ -4,7 +4,9 @@
 //! application's [`BookDocument`](crate::document::BookDocument). They never
 //! cross this module or become database row types.
 
+mod djvu;
 mod epub;
+mod kfx;
 mod kindle;
 mod office;
 mod pdf;
@@ -28,7 +30,10 @@ use markup5ever_rcdom::{Handle, NodeData, RcDom, SerializableHandle};
 
 use crate::document::{AssetRef, AssetRole, Block, BlockDocument, BookDocument, BookFormat};
 
+pub use djvu::DjvuImporter;
+pub(crate) use djvu::{MAX_DJVU_PAGES, MAX_DJVU_SOURCE_BYTES, djvu_form_type};
 pub use epub::EpubImporter;
+pub use kfx::KfxImporter;
 pub use kindle::KindleImporter;
 pub use office::OfficeImporter;
 pub use pdf::PdfImporter;
@@ -355,6 +360,8 @@ impl FormatRegistry {
         registry.register(PdfImporter);
         registry.register(OfficeImporter);
         registry.register(KindleImporter);
+        registry.register(KfxImporter);
+        registry.register(DjvuImporter);
         registry
     }
 

@@ -448,7 +448,9 @@ fn kindle_format(bytes: &[u8], extension: Option<&str>) -> BookFormat {
     }
 }
 
-fn flatten_nav(points: &[ebook_rs::NavPoint]) -> Vec<&ebook_rs::NavPoint> {
+/// Shared with the KFX importer: `ebook-rs` exposes the same `NavPoint` tree
+/// for both PalmDB MOBI/AZW and KFX containers.
+pub(crate) fn flatten_nav(points: &[ebook_rs::NavPoint]) -> Vec<&ebook_rs::NavPoint> {
     fn visit<'a>(points: &'a [ebook_rs::NavPoint], output: &mut Vec<&'a ebook_rs::NavPoint>) {
         for point in points {
             output.push(point);
@@ -460,7 +462,7 @@ fn flatten_nav(points: &[ebook_rs::NavPoint]) -> Vec<&ebook_rs::NavPoint> {
     output
 }
 
-fn kindle_toc_node(
+pub(crate) fn kindle_toc_node(
     point: &ebook_rs::NavPoint,
     href_to_unit: &HashMap<String, String>,
     book_id: &str,
@@ -485,7 +487,7 @@ fn kindle_toc_node(
     Some(node)
 }
 
-fn href_key(href: &str) -> String {
+pub(crate) fn href_key(href: &str) -> String {
     href.split(['?', '#'])
         .next()
         .unwrap_or(href)

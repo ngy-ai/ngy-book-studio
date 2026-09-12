@@ -108,6 +108,13 @@ pub enum BookFormat {
     Mobi,
     Azw,
     Azw3,
+    /// Amazon Kindle Format 10 container (`CONT`). Structured, reflowable
+    /// content; DRM-protected files are rejected at import time.
+    Kfx,
+    /// DjVu scanned-document container. Pages are rendered as images by the
+    /// visual pipeline and the optional hidden text layer becomes the page
+    /// text.
+    Djvu,
 }
 
 /// Describes where a book came from. The original imported file is referenced
@@ -185,6 +192,12 @@ pub enum SourceLocator {
         index: u32,
         href: Option<String>,
     },
+    /// One-based page within an imported DjVu document. The page image is
+    /// produced by the visual pipeline; the locator identifies the exact
+    /// source page for citations and reading progress.
+    DjvuPage {
+        page: u32,
+    },
 }
 
 impl SourceLocator {
@@ -221,6 +234,10 @@ impl SourceLocator {
 
     pub fn kindle_section(index: u32, href: Option<String>) -> Self {
         Self::KindleSection { index, href }
+    }
+
+    pub const fn djvu_page(page: u32) -> Self {
+        Self::DjvuPage { page }
     }
 
     pub fn validate(&self) -> Result<(), ValidationError> {
@@ -279,6 +296,9 @@ impl SourceLocator {
                         "Kindle href",
                     );
                 }
+            }
+            Self::DjvuPage { page } => {
+                validate_one_based(validator, &format!("{path}.page"), *page, "DjVu page")
             }
         }
     }
@@ -2764,6 +2784,7 @@ mod tests {
             SourceLocator::slide(3),
             SourceLocator::worksheet("汇总", Some("A1:C20".to_string())),
             SourceLocator::kindle_section(4, Some("Text/part-4.html".to_string())),
+            SourceLocator::djvu_page(5),
         ];
         let json = serde_json::to_string(&locators).expect("serialize source locators");
         let decoded: Vec<SourceLocator> =
@@ -2779,6 +2800,7 @@ mod tests {
             SourceLocator::office_section(0),
             SourceLocator::slide(0),
             SourceLocator::kindle_section(0, None),
+            SourceLocator::djvu_page(0),
         ] {
             let error = locator.validate().expect_err("zero is not a source index");
             assert!(error.to_string().contains("one-based"));

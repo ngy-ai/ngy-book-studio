@@ -11,6 +11,9 @@ ammonia = "=4.1.4"
 async-channel = "2.5"
 base64 = "=0.22.1"
 blake3 = "1.8"
+# Pure-Rust DjVu decoder (MIT, no GPL code). `default` only enables `std`; the
+# OCR/ONNX/rayon and export features stay off so the build stays portable.
+djvu-rs = { version = "=0.32.1", default-features = false, features = ["std"] }
 directories = "6.0"
 futures-util = "=0.3.34"
 getrandom = "=0.4.3"

@@ -2130,6 +2130,8 @@ fn editor_book_format_label(document: &BookDocument) -> &'static str {
             BookFormat::Mobi => "MOBI",
             BookFormat::Azw => "AZW",
             BookFormat::Azw3 => "AZW3",
+            BookFormat::Kfx => "KFX",
+            BookFormat::Djvu => "DJVU",
         },
     }
 }
@@ -7064,6 +7066,8 @@ mod editor_tests {
             (BookFormat::Mobi, "MOBI"),
             (BookFormat::Azw, "AZW"),
             (BookFormat::Azw3, "AZW3"),
+            (BookFormat::Kfx, "KFX"),
+            (BookFormat::Djvu, "DJVU"),
         ];
         for (format, expected) in formats {
             let document = BookDocument::new(

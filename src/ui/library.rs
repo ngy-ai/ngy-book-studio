@@ -9,7 +9,7 @@ use moye_epub_editor::{
     office_com::OfficeCancellation,
     preview::VisualJobState,
     search::{SearchMode, SearchRequest},
-    services::OfficeEnhancedPage,
+    services::{PublishedVisualPage, VisualPageSourceKind},
 };
 
 const LIBRARY_SEARCH_LIMIT: usize = 200;
@@ -41,6 +41,9 @@ struct OfficePreviewRun {
     request_id: u64,
     book_id: String,
     title: String,
+    kind: VisualPageSourceKind,
+    /// Page to open first; `1` for a fresh Office preview.
+    initial_page: u32,
     cancellation: OfficeCancellation,
     enabling: bool,
 }
@@ -48,7 +51,9 @@ struct OfficePreviewRun {
 struct OfficePreviewLaunch {
     book_id: String,
     title: String,
-    pages: Vec<OfficeEnhancedPage>,
+    kind: VisualPageSourceKind,
+    initial_page: u32,
+    pages: Vec<PublishedVisualPage>,
 }
 
 fn is_office_format_name(format: &str) -> bool {
@@ -67,7 +72,7 @@ async fn wait_for_office_enhanced_pages(
     services: Arc<AppServices>,
     book_id: String,
     cancellation: OfficeCancellation,
-) -> Result<Vec<OfficeEnhancedPage>> {
+) -> Result<Vec<PublishedVisualPage>> {
     let job_id = services
         .set_office_enhancement_enabled(book_id.clone(), true)
         .await?;
@@ -97,7 +102,61 @@ async fn wait_for_office_enhanced_pages(
         tokio::time::sleep(OFFICE_PREVIEW_POLL_INTERVAL).await;
     }
     ensure!(!cancellation.is_cancelled(), "Office 增强预览已取消");
-    services.load_office_enhanced_pages(book_id).await
+    services
+        .load_published_visual_pages(book_id, VisualPageSourceKind::OfficeEnhanced)
+        .await
+}
+
+/// Prepares the DjVu page images for reading: schedules the local render job,
+/// waits for it to publish, then loads the verified page set.
+///
+/// DjVu rasterization is pure local Rust, so no per-book opt-in is required
+/// and a long book is bounded by the user's cancellation rather than by the
+/// Office preview timeout.
+async fn prepare_djvu_pages(
+    services: Arc<AppServices>,
+    book_id: String,
+    cancellation: OfficeCancellation,
+) -> Result<Vec<PublishedVisualPage>> {
+    let job_id = services.ensure_visual_render_job(book_id.clone()).await?;
+    wait_for_page_render_job(&services, &job_id, &cancellation, "DjVu 页面准备").await?;
+    ensure!(!cancellation.is_cancelled(), "DjVu 页面准备已取消");
+    services
+        .load_published_visual_pages(book_id, VisualPageSourceKind::Djvu)
+        .await
+}
+
+/// Waits until one visual render job publishes its page set.
+async fn wait_for_page_render_job(
+    services: &AppServices,
+    job_id: &str,
+    cancellation: &OfficeCancellation,
+    label: &str,
+) -> Result<()> {
+    let coordinator = services.visual_jobs().context("视觉任务协调器不可用")?;
+    loop {
+        ensure!(!cancellation.is_cancelled(), "{label}已取消");
+        let record = coordinator
+            .status(job_id)
+            .await?
+            .with_context(|| format!("{label}的视觉任务不存在：{job_id}"))?;
+        match record.state {
+            VisualJobState::Succeeded => return Ok(()),
+            VisualJobState::Failed => anyhow::bail!(
+                "{label}失败：{}",
+                record.error.as_deref().unwrap_or("未知错误")
+            ),
+            VisualJobState::Cancelled => anyhow::bail!("{label}已取消"),
+            VisualJobState::Paused => {
+                // A pause requested from the background-task window must not
+                // hang the reader: the job is local and deterministic, so
+                // resume it from its durable cursor instead of restarting it.
+                coordinator.resume(job_id).await?;
+            }
+            VisualJobState::Queued | VisualJobState::Running => {}
+        }
+        tokio::time::sleep(OFFICE_PREVIEW_POLL_INTERVAL).await;
+    }
 }
 
 /// Which slice of the library is on screen.
@@ -319,6 +378,12 @@ enum OpenReaderPayload {
         initial_page: u32,
         document_revision: u64,
     },
+    /// A DjVu scan: reading needs the published page images, which the reader
+    /// prepares asynchronously after the document validation succeeds here.
+    PageImages {
+        record: BookRecord,
+        initial_page: u32,
+    },
     Reflowable {
         record: BookRecord,
         book_incarnation: u64,
@@ -413,6 +478,8 @@ fn canonical_original_extension(document: &BookDocument) -> Result<&'static str>
         BookFormat::Mobi => "mobi",
         BookFormat::Azw => "azw",
         BookFormat::Azw3 => "azw3",
+        BookFormat::Kfx => "kfx",
+        BookFormat::Djvu => "djvu",
     })
 }
 
@@ -1180,7 +1247,8 @@ impl EpubReaderApp {
             .add_filter(
                 "支持的图书与文档",
                 [
-                    "epub", "pdf", "doc", "docx", "pptx", "xlsx", "mobi", "azw", "azw3",
+                    "epub", "pdf", "doc", "docx", "pptx", "xlsx", "mobi", "azw", "azw3", "kfx",
+                    "djvu",
                 ],
             )
             .open_single_file();
@@ -1514,6 +1582,8 @@ impl EpubReaderApp {
             request_id,
             book_id: book_id.clone(),
             title: book.title.clone(),
+            kind: VisualPageSourceKind::OfficeEnhanced,
+            initial_page: 1,
             cancellation: cancellation.clone(),
             enabling: true,
         });
@@ -1560,6 +1630,8 @@ impl EpubReaderApp {
             request_id,
             book_id: book_id.clone(),
             title: book.title.clone(),
+            kind: VisualPageSourceKind::OfficeEnhanced,
+            initial_page: 1,
             cancellation: cancellation.clone(),
             enabling: false,
         });
@@ -1574,9 +1646,59 @@ impl EpubReaderApp {
         let load_book_id = book_id.clone();
         let enhancement = runtime.spawn(async move {
             ensure!(!cancellation.is_cancelled(), "Office 增强预览已取消");
-            services.load_office_enhanced_pages(load_book_id).await
+            services
+                .load_published_visual_pages(load_book_id, VisualPageSourceKind::OfficeEnhanced)
+                .await
         });
         self.await_office_preview(request_id, book_id, false, enhancement, window, cx);
+    }
+
+    /// Opens (or prepares and then opens) the DjVu page reader for a book.
+    ///
+    /// Page images are published by the local `moye-djvu-png` render job, so
+    /// the first open may show a preparation notice; the render resumes from
+    /// its durable cursor and the user can cancel it from the book menu.
+    fn open_persisted_djvu_reader(
+        &mut self,
+        book_id: String,
+        initial_page: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(book) = self
+            .library
+            .books()
+            .iter()
+            .find(|book| book.id == book_id)
+            .cloned()
+        else {
+            self.set_error("图书已经不存在。".to_string(), cx);
+            return;
+        };
+        self.cancel_office_preview(None, false, cx);
+        self.office_preview_generation = self.office_preview_generation.wrapping_add(1).max(1);
+        let request_id = self.office_preview_generation;
+        let cancellation = OfficeCancellation::default();
+        self.office_preview = Some(OfficePreviewRun {
+            request_id,
+            book_id: book_id.clone(),
+            title: book.title.clone(),
+            kind: VisualPageSourceKind::Djvu,
+            initial_page: initial_page.max(1),
+            cancellation: cancellation.clone(),
+            enabling: false,
+        });
+        self.notice = Some(Notice {
+            text: format!("正在准备《{}》的 DjVu 页面…", book.title),
+            error: false,
+        });
+        cx.notify();
+
+        let services = Arc::clone(&self.services);
+        let runtime = services.runtime();
+        let load_book_id = book_id.clone();
+        let preparation = runtime.spawn(prepare_djvu_pages(services, load_book_id, cancellation));
+        self.await_office_preview(request_id, book_id, false, preparation, window, cx);
     }
 
     fn await_office_preview(
@@ -1584,7 +1706,7 @@ impl EpubReaderApp {
         request_id: u64,
         book_id: String,
         generated: bool,
-        enhancement: tokio::task::JoinHandle<Result<Vec<OfficeEnhancedPage>>>,
+        pages: tokio::task::JoinHandle<Result<Vec<PublishedVisualPage>>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1592,9 +1714,9 @@ impl EpubReaderApp {
         let services = Arc::clone(&self.services);
         let library_view = cx.entity().clone();
         cx.spawn_in(window, async move |view, cx| {
-            let outcome = match enhancement.await {
+            let outcome = match pages.await {
                 Ok(outcome) => outcome,
-                Err(error) => Err(anyhow::Error::new(error).context("Office 增强预览任务已停止")),
+                Err(error) => Err(anyhow::Error::new(error).context("视觉页面准备任务已停止")),
             };
             let launch = match view.update(cx, |this, cx| {
                 this.finish_office_preview(request_id, &book_id, generated, outcome, cx)
@@ -1605,10 +1727,14 @@ impl EpubReaderApp {
             let Some(launch) = launch else {
                 return;
             };
+            let kind = launch.kind;
+            let initial_page = launch.initial_page;
             let opened = cx.update(|_, cx| {
-                open_office_slides_window(
+                open_page_image_window(
                     launch.book_id,
                     launch.title,
+                    kind,
+                    initial_page,
                     launch.pages,
                     library,
                     services,
@@ -1619,9 +1745,14 @@ impl EpubReaderApp {
             if let Ok(Err(error)) = opened {
                 let _ = view.update(cx, |this, cx| {
                     this.set_error(
-                        format!(
-                            "无法打开 Microsoft Office 增强预览：{error:#}；结构化预览仍可使用。"
-                        ),
+                        match kind {
+                            VisualPageSourceKind::OfficeEnhanced => format!(
+                                "无法打开 Microsoft Office 增强预览：{error:#}；结构化预览仍可使用。"
+                            ),
+                            VisualPageSourceKind::Djvu => {
+                                format!("无法打开 DjVu 阅读窗口：{error:#}")
+                            }
+                        },
                         cx,
                     );
                 });
@@ -1635,7 +1766,7 @@ impl EpubReaderApp {
         request_id: u64,
         book_id: &str,
         generated: bool,
-        outcome: Result<Vec<OfficeEnhancedPage>>,
+        outcome: Result<Vec<PublishedVisualPage>>,
         cx: &mut Context<Self>,
     ) -> Option<OfficePreviewLaunch> {
         if !is_current_office_preview(self.office_preview.as_ref(), request_id, book_id) {
@@ -1644,15 +1775,20 @@ impl EpubReaderApp {
         let active = self
             .office_preview
             .take()
-            .expect("current Office preview was checked above");
+            .expect("current page preview was checked above");
         let pages = match outcome {
             Ok(pages) => pages,
             Err(error) => {
                 self.notice = Some(Notice {
-                    text: format!(
-                        "《{}》的 Microsoft Office 增强预览不可用：{error:#}；已保留结构化预览。",
-                        active.title
-                    ),
+                    text: match active.kind {
+                        VisualPageSourceKind::OfficeEnhanced => format!(
+                            "《{}》的 Microsoft Office 增强预览不可用：{error:#}；已保留结构化预览。",
+                            active.title
+                        ),
+                        VisualPageSourceKind::Djvu => {
+                            format!("《{}》的 DjVu 页面不可用：{error:#}", active.title)
+                        }
+                    },
                     error: true,
                 });
                 cx.notify();
@@ -1663,13 +1799,21 @@ impl EpubReaderApp {
             self.office_enabled_books.insert(active.book_id.clone());
         }
         self.notice = Some(Notice {
-            text: if generated {
-                format!(
+            text: match active.kind {
+                VisualPageSourceKind::OfficeEnhanced if generated => format!(
                     "《{}》的 Microsoft Office 增强页面已持久化并通过完整性校验；原件和阅读进度均未修改。",
                     active.title
-                )
-            } else {
-                format!("已读取《{}》的 Microsoft Office 增强页面。", active.title)
+                ),
+                VisualPageSourceKind::OfficeEnhanced => {
+                    format!("已读取《{}》的 Microsoft Office 增强页面。", active.title)
+                }
+                VisualPageSourceKind::Djvu => {
+                    format!(
+                        "已准备《{}》的 DjVu 页面，共 {} 页。",
+                        active.title,
+                        pages.len()
+                    )
+                }
             },
             error: false,
         });
@@ -1677,6 +1821,8 @@ impl EpubReaderApp {
         Some(OfficePreviewLaunch {
             book_id: active.book_id,
             title: active.title,
+            kind: active.kind,
+            initial_page: active.initial_page,
             pages,
         })
     }
@@ -1703,10 +1849,15 @@ impl EpubReaderApp {
             self.disable_office_enhancement(active.book_id, active.title, notify, cx);
         } else if notify {
             self.notice = Some(Notice {
-                text: format!(
-                    "已取消《{}》的 Microsoft Office 增强预览；结构化预览仍可使用。",
-                    active.title
-                ),
+                text: match active.kind {
+                    VisualPageSourceKind::OfficeEnhanced => format!(
+                        "已取消《{}》的 Microsoft Office 增强预览；结构化预览仍可使用。",
+                        active.title
+                    ),
+                    VisualPageSourceKind::Djvu => {
+                        format!("已取消《{}》的 DjVu 页面准备。", active.title)
+                    }
+                },
                 error: false,
             });
             cx.notify();
@@ -1929,6 +2080,42 @@ impl EpubReaderApp {
                     document_revision: document.revision.0,
                 });
             }
+            if record.format == "djvu" {
+                let page_count = document.units.len();
+                ensure!(page_count > 0, "该 DjVu 图书没有可阅读的页面");
+                let initial_index = source_index
+                    .or(requested_spine)
+                    .unwrap_or(record.last_spine)
+                    .min(page_count - 1);
+                let mut initial_page = match document.units[initial_index].source_locator.as_ref() {
+                    Some(SourceLocator::DjvuPage { page }) => *page,
+                    _ => u32::try_from(initial_index + 1).unwrap_or(u32::MAX),
+                };
+                if let Some(source) = source.as_ref() {
+                    match source
+                        .validated_locator()
+                        .and_then(|locator| locator.source.as_ref())
+                    {
+                        Some(SourceLocator::DjvuPage { page }) => {
+                            ensure!(
+                                document.units.get(initial_index).is_some_and(|unit| {
+                                    unit.id == source.unit_id
+                                        && unit.source_locator
+                                            == Some(SourceLocator::djvu_page(*page))
+                                }),
+                                "引用对应的 DjVu 页面已失效"
+                            );
+                            initial_page = *page;
+                        }
+                        Some(_) => anyhow::bail!("引用使用了 DjVu 阅读器不支持的来源定位"),
+                        None => {}
+                    }
+                }
+                return Ok::<_, anyhow::Error>(OpenReaderPayload::PageImages {
+                    record,
+                    initial_page,
+                });
+            }
             let opened = library
                 .reader_epub_bytes(&book_id)
                 .and_then(OpenedBook::open_bytes)?;
@@ -2018,6 +2205,28 @@ impl EpubReaderApp {
                             cx,
                         );
                     });
+                }
+                Ok(Ok(OpenReaderPayload::PageImages {
+                    record,
+                    initial_page,
+                })) => {
+                    // The page-image reader is its own window kind, so release
+                    // the reading-window reservation here. The window still
+                    // joins the per-book window registry, and the shared
+                    // preparation state (request id plus cancellation) keeps a
+                    // second open from racing the first.
+                    let key = reader_key.clone();
+                    let _ = cx.update(move |_, cx| release_singleton_window(&key, cx));
+                    let book_id = record.id.clone();
+                    if view
+                        .update_in(cx, |this, window, cx| {
+                            this.open_persisted_djvu_reader(book_id, initial_page, window, cx)
+                        })
+                        .is_err()
+                    {
+                        let key = reader_key.clone();
+                        let _ = cx.update(move |_, cx| release_singleton_window(&key, cx));
+                    }
                 }
                 Ok(Ok(OpenReaderPayload::Reflowable {
                     record,
@@ -5656,6 +5865,8 @@ mod tests {
             request_id: 8,
             book_id: "book-8".to_string(),
             title: "测试".to_string(),
+            kind: VisualPageSourceKind::OfficeEnhanced,
+            initial_page: 1,
             cancellation: cancellation.clone(),
             enabling: true,
         };
