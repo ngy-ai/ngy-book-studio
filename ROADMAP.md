@@ -470,7 +470,17 @@ LangGraph 依赖。CLI 课程验证与桌面接入的验证分别列出。
   修掉：按钮文字混进译文层、XHTML fixture 缺 `xmlns`、新用例没等行淡入）；
   `src/ui/pdf_reader/{annotations,viewer}.test.cjs` 各 4 项通过，
   `src/ui/reader/annotations.test.cjs` 19 项中 1 项既有失败（与本改动无关，待单独定位）。
-  仍未做真实 Windows GUI 手工点击复验
+  当天复核手工译文三项后补入宿主接单门的纯函数用例
+  （`a_manual_edit_must_come_from_the_chapter_the_host_pushed`），复跑：`cargo test --lib`
+  533 项通过/5 项忽略、产品二进制 276 项通过/1 项忽略、`translation_flow` 17 项通过/1 项忽略
+  （需真实模型的用例忽略）、`translations.test.cjs` 23 项通过。`translation_flow` 的偶发失败已
+  定位为宿主测试自身的预算与轮询连接抖动（并发加压下轮询会跑满应用 5 秒 `busy_timeout` 报
+  `database is locked`，20/10 秒预算在过载时不够），不是手工译文回归也不是产品侧挂起：夹具
+  改为「30 秒无进展才失败」、SQLITE_BUSY 有界重试、失败一律附桩件时间线，加固后 42 次 6 进程
+  并发运行全部通过。`cargo test --lib` 同类的 5 秒紧截止也一并修掉（`indexing` 测试的进展等待
+  统一为模块内 `TEST_PROGRESS_WAIT` = 30 秒，`wait_for_state` 失败信息带上任务 ID 与预算；
+  该模块整块并行且部分夹具故意给提供方 5 秒延迟），6 个 flow 进程并发加压下连跑 3 次 lib
+  全部通过（每次 40—47 秒）。仍未做真实 Windows GUI 手工点击复验
 - [x] 2026-09-12 「重新翻译」与换模型重排不再删除手工译文：删除改为
   `delete_for_retranslation`（只删没有手工译文、或 document/unit 版本已过期到无法再显示的
   行），`IndexingCoordinator::retranslate` 与 `reconfigure_translation_jobs` 走同一函数。

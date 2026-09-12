@@ -641,7 +641,8 @@ impl IndexingCoordinator {
             }
             ensure!(
                 Instant::now() < deadline,
-                "timed out waiting for {expected:?}; current state: {current:?}"
+                "timed out waiting for {expected:?} on {job_id} after {}s; current state: {current:?}",
+                timeout.as_secs()
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -4011,6 +4012,15 @@ mod tests {
         storage::LocalBlobStore,
     };
 
+    /// How long one test waits for the coordinator to reach a state or to make a
+    /// provider call. Every test in this module runs in parallel while other
+    /// test binaries may be loading the same machine, so a progress wait has to
+    /// outlast a busy one: a coordinator that really is stuck still fails, only
+    /// later and with the state it was stuck in. Several fixtures also hand the
+    /// provider a deliberate 5 second delay, so the old 5 second budget raced
+    /// the very work it was waiting for.
+    const TEST_PROGRESS_WAIT: Duration = Duration::from_secs(30);
+
     fn test_model_config(
         embedding_model: &str,
         embedding_execution_identity: &str,
@@ -4359,7 +4369,7 @@ mod tests {
                 .block_on(coordinator.wait_for_state(
                     &post_vision.id,
                     IndexingJobStatus::Succeeded,
-                    Duration::from_secs(5),
+                    TEST_PROGRESS_WAIT,
                 ))
                 .unwrap();
         }
@@ -4430,7 +4440,7 @@ mod tests {
                 .block_on(coordinator.wait_for_state(
                     &format!("{kind}:{}", fixture.source_id),
                     IndexingJobStatus::Succeeded,
-                    Duration::from_secs(5),
+                    TEST_PROGRESS_WAIT,
                 ))
                 .unwrap();
         }
@@ -4553,7 +4563,7 @@ mod tests {
             .block_on(coordinator.wait_for_state(
                 &job_id,
                 IndexingJobStatus::Succeeded,
-                Duration::from_secs(5),
+                TEST_PROGRESS_WAIT,
             ))
             .unwrap();
         assert!(job.attempts >= 1);
@@ -4588,7 +4598,7 @@ mod tests {
             .block_on(coordinator.wait_for_state(
                 &vision_job,
                 IndexingJobStatus::Failed,
-                Duration::from_secs(5),
+                TEST_PROGRESS_WAIT,
             ))
             .unwrap();
 
@@ -4676,7 +4686,7 @@ mod tests {
             .block_on(coordinator.wait_for_state(
                 &vision_job,
                 IndexingJobStatus::Succeeded,
-                Duration::from_secs(5),
+                TEST_PROGRESS_WAIT,
             ))
             .unwrap();
         assert_eq!(provider.vision_png_calls.load(Ordering::SeqCst), 1);
@@ -4723,7 +4733,7 @@ mod tests {
             visual[1].id,
             visual_chunk_id(&fixture.source_id, 0, locators[1].region)
         );
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + TEST_PROGRESS_WAIT;
         loop {
             let conn = db::open_conn(&fixture.db_path).unwrap();
             if visual.iter().all(|chunk| {
@@ -4793,7 +4803,7 @@ mod tests {
             .block_on(coordinator.wait_for_state(
                 &vision_job,
                 IndexingJobStatus::Failed,
-                Duration::from_secs(5),
+                TEST_PROGRESS_WAIT,
             ))
             .unwrap();
 
@@ -4863,7 +4873,7 @@ mod tests {
             .block_on(coordinator.wait_for_state(
                 &vision_job,
                 IndexingJobStatus::Failed,
-                Duration::from_secs(5),
+                TEST_PROGRESS_WAIT,
             ))
             .unwrap();
 
@@ -4940,7 +4950,7 @@ mod tests {
             .block_on(coordinator.wait_for_state(
                 &vision_job,
                 IndexingJobStatus::Failed,
-                Duration::from_secs(5),
+                TEST_PROGRESS_WAIT,
             ))
             .unwrap();
 
@@ -5005,7 +5015,7 @@ mod tests {
             .block_on(coordinator.wait_for_state(
                 &vision_job,
                 IndexingJobStatus::Succeeded,
-                Duration::from_secs(5),
+                TEST_PROGRESS_WAIT,
             ))
             .unwrap();
 
@@ -5051,7 +5061,7 @@ mod tests {
             .block_on(coordinator.wait_for_state(
                 &job_id,
                 IndexingJobStatus::Failed,
-                Duration::from_secs(5),
+                TEST_PROGRESS_WAIT,
             ))
             .unwrap();
         assert!(
@@ -5075,7 +5085,7 @@ mod tests {
             .block_on(coordinator.wait_for_state(
                 &job_id,
                 IndexingJobStatus::Succeeded,
-                Duration::from_secs(5),
+                TEST_PROGRESS_WAIT,
             ))
             .unwrap();
     }
@@ -5095,7 +5105,7 @@ mod tests {
             .block_on(coordinator.wait_for_state(
                 &embedding_job,
                 IndexingJobStatus::Paused,
-                Duration::from_secs(5),
+                TEST_PROGRESS_WAIT,
             ))
             .unwrap();
         fixture
@@ -5103,7 +5113,7 @@ mod tests {
             .block_on(coordinator.wait_for_state(
                 &vision_job,
                 IndexingJobStatus::Cancelled,
-                Duration::from_secs(5),
+                TEST_PROGRESS_WAIT,
             ))
             .unwrap();
         assert!(
@@ -5117,7 +5127,7 @@ mod tests {
             .block_on(coordinator.wait_for_state(
                 &embedding_job,
                 IndexingJobStatus::Succeeded,
-                Duration::from_secs(5),
+                TEST_PROGRESS_WAIT,
             ))
             .unwrap();
     }
@@ -5223,7 +5233,7 @@ mod tests {
             .block_on(coordinator.wait_for_state(
                 &embedding_id,
                 IndexingJobStatus::Succeeded,
-                Duration::from_secs(5),
+                TEST_PROGRESS_WAIT,
             ))
             .unwrap();
         fixture
@@ -5231,7 +5241,7 @@ mod tests {
             .block_on(coordinator.wait_for_state(
                 &vision_id,
                 IndexingJobStatus::Failed,
-                Duration::from_secs(5),
+                TEST_PROGRESS_WAIT,
             ))
             .unwrap();
     }
@@ -5336,7 +5346,7 @@ mod tests {
             .block_on(coordinator.wait_for_state(
                 &embedding_id,
                 IndexingJobStatus::Succeeded,
-                Duration::from_secs(5),
+                TEST_PROGRESS_WAIT,
             ))
             .unwrap();
         fixture
@@ -5344,7 +5354,7 @@ mod tests {
             .block_on(coordinator.wait_for_state(
                 &vision_id,
                 IndexingJobStatus::Failed,
-                Duration::from_secs(5),
+                TEST_PROGRESS_WAIT,
             ))
             .unwrap();
     }
@@ -5361,7 +5371,7 @@ mod tests {
             .block_on(coordinator.wait_for_state(
                 &job_id,
                 IndexingJobStatus::Running,
-                Duration::from_secs(5),
+                TEST_PROGRESS_WAIT,
             ))
             .unwrap();
         assert!(
@@ -5375,7 +5385,7 @@ mod tests {
             .block_on(coordinator.wait_for_state(
                 &job_id,
                 IndexingJobStatus::Paused,
-                Duration::from_secs(5),
+                TEST_PROGRESS_WAIT,
             ))
             .unwrap();
         let cursor = paused.cursor_json.clone();
@@ -5392,7 +5402,7 @@ mod tests {
             .block_on(coordinator.wait_for_state(
                 &job_id,
                 IndexingJobStatus::Succeeded,
-                Duration::from_secs(5),
+                TEST_PROGRESS_WAIT,
             ))
             .unwrap();
         assert_ne!(completed.cursor_json, cursor);
@@ -5423,7 +5433,7 @@ mod tests {
             .block_on(coordinator.wait_for_state(
                 &job_id,
                 IndexingJobStatus::Succeeded,
-                Duration::from_secs(5),
+                TEST_PROGRESS_WAIT,
             ))
             .unwrap();
         assert!(completed.attempts >= 2);
@@ -5476,7 +5486,7 @@ mod tests {
             .block_on(coordinator.wait_for_state(
                 &canonical_id,
                 IndexingJobStatus::Failed,
-                Duration::from_secs(5),
+                TEST_PROGRESS_WAIT,
             ))
             .unwrap();
         assert_eq!(canonical.status, IndexingJobStatus::Failed);
@@ -5501,7 +5511,7 @@ mod tests {
             .block_on(coordinator.wait_for_state(
                 &canonical_id,
                 IndexingJobStatus::Failed,
-                Duration::from_secs(5),
+                TEST_PROGRESS_WAIT,
             ))
             .unwrap();
 
@@ -5847,10 +5857,10 @@ mod tests {
             .block_on(coordinator.wait_for_state(
                 &job_id,
                 IndexingJobStatus::Running,
-                Duration::from_secs(5),
+                TEST_PROGRESS_WAIT,
             ))
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + TEST_PROGRESS_WAIT;
         while old_provider.embedding_calls.load(Ordering::SeqCst) == 0 {
             assert!(
                 Instant::now() < deadline,
@@ -5881,7 +5891,7 @@ mod tests {
             .block_on(coordinator.wait_for_state(
                 &job_id,
                 IndexingJobStatus::Succeeded,
-                Duration::from_secs(5),
+                TEST_PROGRESS_WAIT,
             ))
             .unwrap();
         assert!(new_provider.embedding_calls.load(Ordering::SeqCst) > 0);
@@ -5890,7 +5900,7 @@ mod tests {
             .block_on(coordinator.wait_for_state(
                 &format!("vision:{}", fixture.source_id),
                 IndexingJobStatus::Succeeded,
-                Duration::from_secs(5),
+                TEST_PROGRESS_WAIT,
             ))
             .unwrap();
         assert_eq!(new_provider.vision_png_calls.load(Ordering::SeqCst), 0);
@@ -5902,7 +5912,7 @@ mod tests {
             .block_on(coordinator.wait_for_state(
                 &job_id,
                 IndexingJobStatus::Succeeded,
-                Duration::from_secs(5),
+                TEST_PROGRESS_WAIT,
             ))
             .unwrap();
         let cursor: JobCursor = serde_json::from_str(&completed.cursor_json).unwrap();
@@ -5939,7 +5949,7 @@ mod tests {
             .store(60_000, Ordering::SeqCst);
         let coordinator = fixture
             .coordinator_with_providers(embedding_provider.clone(), old_vision_provider.clone());
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + TEST_PROGRESS_WAIT;
         while old_vision_provider.vision_png_calls.load(Ordering::SeqCst) == 0 {
             assert!(
                 Instant::now() < deadline,
@@ -5968,7 +5978,7 @@ mod tests {
             .block_on(coordinator.wait_for_state(
                 &vision_job_id,
                 IndexingJobStatus::Succeeded,
-                Duration::from_secs(5),
+                TEST_PROGRESS_WAIT,
             ))
             .unwrap();
         fixture
@@ -5976,7 +5986,7 @@ mod tests {
             .block_on(coordinator.wait_for_state(
                 &format!("embedding:{}", fixture.source_id),
                 IndexingJobStatus::Succeeded,
-                Duration::from_secs(5),
+                TEST_PROGRESS_WAIT,
             ))
             .unwrap();
         fixture.wait_for_post_vision_embedding(
@@ -6640,10 +6650,10 @@ mod tests {
             .block_on(coordinator.wait_for_state(
                 &canonical_id,
                 IndexingJobStatus::Running,
-                Duration::from_secs(5),
+                TEST_PROGRESS_WAIT,
             ))
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + TEST_PROGRESS_WAIT;
         while provider.vision_png_calls.load(Ordering::SeqCst) == 0 {
             assert!(
                 Instant::now() < deadline,
@@ -6672,7 +6682,7 @@ mod tests {
             .block_on(coordinator.wait_for_state(
                 &canonical_id,
                 IndexingJobStatus::Succeeded,
-                Duration::from_secs(5),
+                TEST_PROGRESS_WAIT,
             ))
             .unwrap();
         let cursor: JobCursor = serde_json::from_str(&completed.cursor_json).unwrap();

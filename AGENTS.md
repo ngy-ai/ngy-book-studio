@@ -363,6 +363,29 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   （`manual_edit_belongs_to_current_chapter`：URL 必须解析为当前章、`revision` 必须等于本窗口
   推送过的值）由独立纯函数用例固定，没有版本记录的章推送 0 也必须接受回传的 0，否则该章
   永远不能手工改，所以不得改成「必须有版本记录」的严格比较。
+  2026-09-12 `translation_flow` 偶发失败已定位，不是手工译文的回归、也不是产品侧挂起：用 6 个
+  测试进程并发加压可稳定复现，桩件时间线显示 mock 在 1—2 ms 内应答，真正的成因是宿主测试
+  自己的预算与轮询方式——(1) 轮询 `background_jobs_for_books` 每 20 ms 新开一个连接，和本次
+  运行的写事务相撞后会跑满应用 5 秒 `busy_timeout`，报 `database is locked`（SQLITE_BUSY）；
+  (2) 单个用例的 20 秒总截止与 10 秒 `wait_for_requests`/`wait_for_responses` 预算在机器过载
+  时不够（同一次运行从 8 秒涨到 33 秒）。夹具已按「失败必须可归因」重构：`wait_translation`
+  改为「30 秒无进展才失败」（另有 240 秒上限），两个 mock 等待预算 10 → 30 秒，mock 读超时
+  5 → 30 秒且 `read_request` 返回 `io::Result`（掉线连接只记录、不再杀死桩件），轮询对
+  SQLITE_BUSY 有界重试（`is_database_busy`，`open_fixture_conn` 给直接连接同样的 busy
+  timeout），失败信息一律附上进程级桩件时间线（连接/请求/应答与时间戳）。用例
+  `a_second_writer_reports_the_lock_conflict_the_poller_retries` 钉住重试依赖的错误形状。
+  加固后 42 次 6 进程并发运行全部通过（加固前同一实验 6 个进程里 2 个失败）。该套件当前为
+  17 项运行 + 1 项需真实模型的忽略用例。同一轮加压后另观察到 `cargo test --lib` 的
+  `indexing::tests::vision_endpoint_switch_uses_new_provider_and_preserves_embedding_route`
+  等同类紧截止失败（`src/indexing.rs` 里 5 秒的「旧 vision 请求未开始」与 `wait_for_state`
+  截止，3 次重跑里 1 次）：这是该模块测试自己的预算问题——整块测试并行，有些夹具还故意给
+  提供方 5 秒延迟，5 秒预算等于和它要等的工作赛跑。已把这些进展等待统一为模块内的
+  `TEST_PROGRESS_WAIT`（30 秒），`wait_for_state` 的失败信息补上任务 ID 与预算；6 个 flow
+  进程并发加压下连跑 3 次 lib 全部通过（每次 40—47 秒）。真正的挂起仍会失败，只是多等一会儿
+  并打印卡在哪个状态。诊断同时留下一条产品侧观察：`db::connection::open_conn` 只给 5 秒
+  `busy_timeout`，而 UI 的后台任务窗口与阅读窗口译文进度都是「每 2 秒新开连接」的查询，极端
+  过载下这类查询可能报 `database is locked`；本次未改产品代码，需要时再评估提高耐心或减少
+  连接抖动。
   2026-09-12 DOM 门禁：本机 Node 26.8.1（fnm，`E:\ai\fnm\node-versions\v26.8.1\installation`）
   加已安装的 Playwright 1.61.1（借用其它项目的包，`NODE_PATH` 指向其 `node_modules`，
   浏览器用 `%LOCALAPPDATA%\ms-playwright\chromium-1228`，不安装也不改动本仓库依赖）运行
@@ -375,6 +398,16 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   1 项失败（`clicking a mark lists its thoughts…`：`result()` 之后直接取 `.mark.highlight`，
   而同一文件第一个用例是靠 `waitForFunction` 等划线渲染的），该文件与 `annotations.js`、
   初始化桥都与 HEAD 一致，待单独定位，不要当成手工译文引入的回归。
+  2026-09-12 真实模型门禁：`tests/translation_flow.rs` 的
+  `a_local_model_replays_the_previously_rejected_blocks` 默认 `#[ignore]`，把现场日志里的三个
+  文本块（含 inline 边界，片段切分逐字一致）交给本机模型复跑真实翻译任务，需要
+  127.0.0.1:11434 上的 Ollama（`MOYE_REPLAY_ENDPOINT` / `MOYE_REPLAY_MODEL` / `MOYE_REPLAY_LOG`
+  可覆盖）。它断言持久化任务日志里不出现 `JobLogErrorKind::InvalidSchema`，并断言两个 2 段块
+  必须落库；3 段的段落会被小模型合并成一段而按数量检查跳过，那是协议该做的拒绝、不得判成
+  任务失败。对 `qwen3.5:0.8b` 的实测：全部拒绝都是 `segment_count_mismatch`
+  （`expected_segments=2/3 actual_segments=1`），2 块落库、1 块跳过，
+  `translation_run_untranslated` 而非 `run_failed`；修复前同一批块是 3/3 `invalid_schema`、
+  连续 3 块未译后整本任务失败。换模型后重跑该门禁即可复验，不要把它并入默认测试。
 - `src/ui/pdf_reader/annotations.rs`、`annotations.js`：PDF 页面笔记宿主与页面桥接，
   复用同一张 `annotations` 表、互斥标记规则、人工/AI 想法流程与展示清洗。锚点作用域
   是单页的 PDF.js 文字层：宿主无法复刻该投影，因此

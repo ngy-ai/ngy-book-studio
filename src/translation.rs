@@ -273,7 +273,10 @@ fn require_segment_objects(candidate: &str) -> std::result::Result<(), ResponseE
 /// (`[0,"译文"]`) is left for the caller to reject rather than searched for a
 /// nested result.
 fn decode_bare_segment_list(payload: &str) -> Option<Response> {
-    if payload.trim_matches(is_matching_whitespace).starts_with('[') {
+    if payload
+        .trim_matches(is_matching_whitespace)
+        .starts_with('[')
+    {
         return decode_segment_array(payload);
     }
     serde_json::from_str::<ResponseSegment>(payload)

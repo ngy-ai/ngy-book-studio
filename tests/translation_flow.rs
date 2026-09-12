@@ -5,7 +5,7 @@ use std::{
     net::{TcpListener, TcpStream},
     path::Path,
     sync::{
-        Arc, Mutex,
+        Arc, LazyLock, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
@@ -14,6 +14,7 @@ use std::{
 
 use moye_epub_editor::{
     credentials::MemoryCredentialStore,
+    job_diagnostics::JobLogErrorKind,
     library::ImportOutcome,
     services::{
         AppServices, BackgroundJobAction, BackgroundJobSnapshot, BackgroundJobStatus,
@@ -63,6 +64,86 @@ enum ReplyMode {
     AnswerThenSilence,
 }
 
+/// Process-wide start marker so every fixture event carries a comparable
+/// timestamp without pulling in another dependency.
+static PROCESS_START: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// How long the fixture waits for one request before it treats the connection
+/// as stray. It has to stay clearly above the clients' own timeouts: a fixture
+/// that gives up first turns a slow machine into what looks like a product
+/// hang, and the real failure then has to be inferred with no evidence.
+const FIXTURE_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long one fixture may take to see a request or to finish writing an
+/// answer. Every case in this file runs in parallel, so a loaded machine can
+/// need several times the idle time for the same run; the budget only has to
+/// outlast that, while a request that truly never arrives still fails and now
+/// prints the fixture's own timeline as evidence.
+const FIXTURE_WAIT: Duration = Duration::from_secs(30);
+
+fn elapsed_ms() -> u128 {
+    PROCESS_START.elapsed().as_millis()
+}
+
+/// Observable state of one mock endpoint, registered process-wide so a failure
+/// can tell "the fixture never received that request" apart from "the fixture
+/// answered and the client never used the answer" without threading the fixture
+/// through every helper that only takes the services handle.
+struct EndpointStats {
+    label: &'static str,
+    accepted: AtomicUsize,
+    requests: AtomicUsize,
+    responses: AtomicUsize,
+    events: Mutex<Vec<String>>,
+}
+
+impl EndpointStats {
+    fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            accepted: AtomicUsize::new(0),
+            requests: AtomicUsize::new(0),
+            responses: AtomicUsize::new(0),
+            events: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Timestamped one-liner. The list is bounded: the point is the shape of a
+    /// failure, not an unbounded log, and a fixture that ran away must not grow
+    /// the process while it does.
+    fn note(&self, event: impl Into<String>) {
+        let mut events = self.events.lock().unwrap();
+        if events.len() < 512 {
+            events.push(format!("+{}ms {}", elapsed_ms(), event.into()));
+        }
+    }
+}
+
+static ENDPOINTS: LazyLock<Mutex<Vec<Arc<EndpointStats>>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Every fixture's timeline in this test process, appended to job failures so a
+/// dead or starved fixture is never mistaken for a hung product. Other cases in
+/// the same binary are included on purpose: they show the machine-wide picture
+/// at the moment of the failure.
+fn fixture_timeline() -> String {
+    let endpoints = ENDPOINTS.lock().unwrap();
+    let mut report = String::from("\n  --- fixture timeline ---");
+    for endpoint in endpoints.iter() {
+        report.push_str(&format!(
+            "\n  fixture {:?}: accepted={} requests={} responses={}",
+            endpoint.label,
+            endpoint.accepted.load(Ordering::Acquire),
+            endpoint.requests.load(Ordering::Acquire),
+            endpoint.responses.load(Ordering::Acquire),
+        ));
+        for event in endpoint.events.lock().unwrap().iter() {
+            report.push_str(&format!("\n    {event}"));
+        }
+    }
+    report
+}
+
 /// An actual loopback HTTP/SSE provider. Every fixture opts out of automatic
 /// jobs, then resumes only translation so no PDF rendering or other AI role is
 /// involved in this contract test.
@@ -91,6 +172,9 @@ impl TranslationEndpoint {
         let finished = Arc::clone(&responses_finished);
         let stopped = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&stopped);
+        let stats = Arc::new(EndpointStats::new(label));
+        ENDPOINTS.lock().unwrap().push(Arc::clone(&stats));
+        let fixture = Arc::clone(&stats);
         let worker = thread::spawn(move || {
             while !stop.load(Ordering::Acquire) {
                 let (mut stream, _) = match listener.accept() {
@@ -104,11 +188,27 @@ impl TranslationEndpoint {
                 // Windows accepted sockets inherit the listener's nonblocking
                 // flag, while this bounded reader requires blocking reads.
                 stream.set_nonblocking(false).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                let request = read_request(&mut stream);
-                assert!(request.starts_with("POST /v1/chat/completions "));
+                stream.set_read_timeout(Some(FIXTURE_READ_TIMEOUT)).unwrap();
+                let connection = fixture.accepted.fetch_add(1, Ordering::AcqRel) + 1;
+                fixture.note(format!("connection {connection} accepted"));
+                // A connection a client opened and then abandoned, or one the
+                // machine is too loaded to deliver in time, must not kill the
+                // fixture: the request still has to arrive, and the job's own
+                // timeouts turn a bad one into a visible failure instead of a
+                // stall nobody can attribute.
+                let request = match read_request(&mut stream) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        fixture.note(format!("connection {connection} dropped: {error}"));
+                        continue;
+                    }
+                };
+                fixture.note(format!("connection {connection}: {} bytes", request.len()));
+                assert!(
+                    request.starts_with("POST /v1/chat/completions "),
+                    "unexpected fixture request: {:?}",
+                    request.lines().next().unwrap_or_default()
+                );
                 let body: Value =
                     serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
                 assert_eq!(body["model"], "same-chat-model");
@@ -147,6 +247,12 @@ impl TranslationEndpoint {
                     captured.len()
                 };
                 captured_full.lock().unwrap().push(body);
+                fixture.requests.fetch_add(1, Ordering::AcqRel);
+                fixture.note(format!(
+                    "request #{request_number}: {} segments{}",
+                    translations.len(),
+                    if poisoned { " (poisoned block)" } else { "" }
+                ));
                 let valid = json!({"translations":translations}).to_string();
                 let invalid = || {
                     format!(
@@ -194,6 +300,7 @@ impl TranslationEndpoint {
                     ReplyMode::GatedCorrectionValid | ReplyMode::GatedCorrectionInvalid
                 );
                 if gated && request_number == 2 {
+                    fixture.note("correction gated until the test releases it");
                     while !released.load(Ordering::Acquire) && !stop.load(Ordering::Acquire) {
                         thread::sleep(Duration::from_millis(5));
                     }
@@ -227,14 +334,21 @@ impl TranslationEndpoint {
                 if !gated {
                     result.unwrap();
                 }
+                fixture.note(format!(
+                    "response #{request_number}: {declared} bytes declared{}",
+                    if silent { ", stream left open" } else { "" }
+                ));
                 if silent {
+                    fixture.note("holding the answer open for the silence fixture");
                     let deadline = Instant::now() + Duration::from_secs(5);
                     while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
                         thread::sleep(Duration::from_millis(20));
                     }
                 }
+                fixture.responses.fetch_add(1, Ordering::AcqRel);
                 finished.fetch_add(1, Ordering::Release);
             }
+            fixture.note("fixture stopped");
         });
         Self {
             url,
@@ -260,24 +374,26 @@ impl TranslationEndpoint {
     }
 
     async fn wait_for_requests(&self, count: usize) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + FIXTURE_WAIT;
         // Full capture happens after the extracted input capture, so reaching
         // this count also guarantees assertions can inspect both snapshots.
         while self.full_requests.lock().unwrap().len() < count {
             assert!(
                 Instant::now() < deadline,
-                "mock did not receive request {count}"
+                "mock did not receive request {count}{}",
+                fixture_timeline()
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
     async fn wait_for_responses(&self, count: usize) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + FIXTURE_WAIT;
         while self.responses_finished.load(Ordering::Acquire) < count {
             assert!(
                 Instant::now() < deadline,
-                "mock did not finish response {count}"
+                "mock did not finish response {count}{}",
+                fixture_timeline()
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -295,28 +411,51 @@ impl Drop for TranslationEndpoint {
     }
 }
 
-fn read_request(stream: &mut TcpStream) -> String {
+/// Reads one complete request. Everything a stray, abandoned or malformed
+/// connection can cause comes back as an error so the fixture drops that one
+/// connection and keeps serving instead of dying on the first hiccup.
+fn read_request(stream: &mut TcpStream) -> std::io::Result<String> {
     let mut bytes = Vec::new();
     let mut buffer = [0; 8192];
     loop {
-        let count = stream.read(&mut buffer).unwrap();
-        assert!(count > 0, "translation mock request ended early");
+        let count = stream.read(&mut buffer)?;
+        if count == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "request ended early",
+            ));
+        }
         bytes.extend_from_slice(&buffer[..count]);
-        assert!(bytes.len() < 1024 * 1024, "oversized fixture request");
+        if bytes.len() >= 1024 * 1024 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "oversized fixture request",
+            ));
+        }
         if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
             let headers = String::from_utf8_lossy(&bytes[..end]);
             let length = headers
                 .lines()
                 .filter_map(|line| line.split_once(':'))
                 .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
-                .map(|(_, value)| value.trim().parse::<usize>().unwrap())
-                .unwrap();
+                .map(|(_, value)| value.trim().parse::<usize>())
+                .transpose()
+                .map_err(|error| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+                })?;
+            let Some(length) = length else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "request without a content length",
+                ));
+            };
             if bytes.len() >= end + 4 + length {
                 break;
             }
         }
     }
-    String::from_utf8(bytes).unwrap()
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 fn settings(endpoint: &TranslationEndpoint) -> ProviderSettings {
@@ -359,32 +498,106 @@ async fn import(services: &AppServices, path: &Path) -> (String, String) {
     (book.id, unit_id)
 }
 
+/// How long a run may stop making progress before the fixture gives up on it.
+/// Every case in this file runs in parallel, so a loaded machine can make an
+/// honest run take several times longer than an idle one; what must never be
+/// tolerated is a job that stops advancing, which is exactly what this budget
+/// watches. A real hang therefore fails in 30 s while a slow but progressing
+/// run is allowed to finish.
+const TRANSLATION_STALL: Duration = Duration::from_secs(30);
+/// Absolute ceiling for one run, so a job that keeps advancing forever still
+/// ends the test instead of blocking the suite.
+const TRANSLATION_WAIT: Duration = Duration::from_secs(240);
+
 async fn wait_translation(
     services: &AppServices,
     book_id: &str,
     expected: BackgroundJobStatus,
 ) -> BackgroundJobSnapshot {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let started = Instant::now();
+    let mut observed: Option<(BackgroundJobStatus, usize)> = None;
+    let mut progressed_at = Instant::now();
     loop {
-        let jobs = services
-            .background_jobs_for_books(vec![book_id.to_owned()])
-            .await
-            .unwrap();
+        let jobs = background_job_snapshots(services, book_id).await;
         if let Some(job) = jobs.iter().find(|job| job.kind == "translation") {
             if job.status == expected {
                 return job.clone();
             }
             assert!(
                 job.status != BackgroundJobStatus::Failed,
-                "translation failed: {job:?}"
+                "translation failed: {job:?}{}",
+                fixture_timeline()
             );
+            if observed != Some((job.status, job.progress.completed)) {
+                observed = Some((job.status, job.progress.completed));
+                progressed_at = Instant::now();
+            }
         }
+        let silent = progressed_at.elapsed();
         assert!(
-            Instant::now() < deadline,
-            "translation did not reach {expected:?}: {jobs:?}"
+            silent < TRANSLATION_STALL && started.elapsed() < TRANSLATION_WAIT,
+            "translation did not reach {expected:?}: no progress for {}s (last {:?}, waited {}s): {jobs:?}{}",
+            silent.as_secs(),
+            observed,
+            started.elapsed().as_secs(),
+            fixture_timeline()
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// Reads the task list with the fixture timeline attached, so a database error
+/// on a loaded machine keeps its own message instead of looking like a hang.
+///
+/// A poll can meet a write transaction another connection is holding. The
+/// database is healthy: it is this harness's own 20 ms polling, each tick
+/// opening a fresh connection through the application's API, that collides with
+/// the writes of the run it is watching. A bounded retry therefore keeps a
+/// transient lock from failing an untouched run, while a database that stays
+/// unavailable still fails the case with the error and the timeline.
+async fn background_job_snapshots(
+    services: &AppServices,
+    book_id: &str,
+) -> Vec<BackgroundJobSnapshot> {
+    let deadline = Instant::now() + TRANSLATION_STALL;
+    loop {
+        match services
+            .background_jobs_for_books(vec![book_id.to_owned()])
+            .await
+        {
+            Ok(jobs) => return jobs,
+            Err(error) if is_database_busy(&error) && Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => panic!(
+                "background job query failed: {error:#}{}",
+                fixture_timeline()
+            ),
+        }
+    }
+}
+
+/// Whether a failure is the transient "another connection holds the lock" case
+/// that a busy machine can provoke, rather than a real database problem.
+fn is_database_busy(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(inner, _))
+                if inner.code == rusqlite::ErrorCode::DatabaseBusy
+                    || inner.code == rusqlite::ErrorCode::DatabaseLocked
+        )
+    })
+}
+
+/// Opens the fixture's own database for a direct assertion or for a deliberate
+/// change to one row. It gets the same lock patience the application's own
+/// connections use: every case in this file runs in parallel, and the
+/// application may be in the middle of a write transaction when it looks.
+fn open_fixture_conn(path: &Path) -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.busy_timeout(Duration::from_secs(5)).unwrap();
+    conn
 }
 
 async fn translate(services: &AppServices, book_id: &str) -> BackgroundJobSnapshot {
@@ -418,8 +631,7 @@ fn assert_translated_segments(blocks: &[TranslatedBlock], requests: &[Value], la
 }
 
 fn row_count(services: &AppServices) -> usize {
-    rusqlite::Connection::open(services.database_path())
-        .unwrap()
+    open_fixture_conn(services.database_path())
         .query_row("SELECT count(*) FROM translations", [], |row| row.get(0))
         .unwrap()
 }
@@ -1038,6 +1250,130 @@ fn a_bare_segment_array_answer_is_accepted_without_a_correction() {
     });
 }
 
+/// 手工门禁（默认 ignored）：把现场日志里的三个文本块原样交给真实本地模型，复跑一次
+/// 真实的整本翻译。现场（2026-09-12 13:19，`qwen3.5:0.8b`）：模型丢掉了 `translations`
+/// 外壳、逐块返回被围栏包裹的顶层数组，整本书的块全部判 `invalid_schema`，连续 3 块未译
+/// 后 `translation_run_finish result="failed"`。
+///
+/// ```text
+/// cargo test --test translation_flow -- --ignored --nocapture a_local_model
+/// ```
+///
+/// 需要 127.0.0.1:11434 上的 Ollama（`MOYE_REPLAY_ENDPOINT` / `MOYE_REPLAY_MODEL`
+/// 可覆盖）；`MOYE_REPLAY_LOG` 调诊断级别。默认测试不运行它，也不触碰用户图书库。
+#[test]
+#[ignore = "manual gate: needs a local OpenAI-compatible model endpoint"]
+fn a_local_model_replays_the_previously_rejected_blocks() {
+    // 诊断行必须能直接在输出里看到，才能和现场日志逐条比对。
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            std::env::var("MOYE_REPLAY_LOG")
+                .map(tracing_subscriber::EnvFilter::new)
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,moye_ai=debug")),
+        )
+        .try_init();
+    let base_url = std::env::var("MOYE_REPLAY_ENDPOINT")
+        .unwrap_or_else(|_| "http://127.0.0.1:11434/v1/".to_string());
+    let model = std::env::var("MOYE_REPLAY_MODEL").unwrap_or_else(|_| "qwen3.5:0.8b".to_string());
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("local-model-replay.epub");
+    // 与现场日志逐字一致：连片段切分方式（inline 元素边界）都照抄。
+    write_epub(
+        &path,
+        "<h1>Praise for <em>Head First Agile</em></h1>\
+         <p>Praise for other <em>Head First books</em></p>\
+         <p>Your name could be here! We’re looking for early praise from project managers, \
+         developers, business anaylsts, and anyone else who’s read the early release of our book. \
+         Contact us at <a href=\"mailto:info@stellman-greene.com\">info@stellman-greene.com</a>.</p>",
+    );
+    let services = AppServices::open_with_credentials(
+        temp.path().join("library"),
+        Arc::new(MemoryCredentialStore::default()),
+    )
+    .unwrap();
+    services.runtime().block_on(async {
+        let listing: Value = reqwest::get(format!("{base_url}models"))
+            .await
+            .unwrap_or_else(|error| {
+                panic!("本机没有可用的 OpenAI 兼容端点 {base_url}（先启动模型服务）：{error}")
+            })
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            listing["data"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item["id"] == model)),
+            "端点没有 {model}：{listing}"
+        );
+        services
+            .configure_providers(
+                ProviderSettings {
+                    base_url: base_url.clone(),
+                    chat_model: model.clone(),
+                    default_language: Some("zh-Hans".into()),
+                    auto_run_background_jobs: false,
+                    background_job_interval_ms: 0,
+                    // 与现场一致：120 秒只是静默上限，不是整段请求的总时长。
+                    request_timeout_secs: 120,
+                    ..ProviderSettings::default()
+                },
+                BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+        let (book_id, unit_id) = import(&services, &path).await;
+        let job = translate(&services, &book_id).await;
+        let blocks = services
+            .translation_blocks_for_unit(book_id.clone(), unit_id)
+            .await
+            .unwrap();
+        for block in &blocks {
+            println!(
+                "{} => {:?}",
+                block.source,
+                block
+                    .segments
+                    .iter()
+                    .map(|segment| segment.translated.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
+        // 关键回归：现场那批块被拒的原因只有外壳。持久化任务日志里不允许再出现
+        // `invalid_schema`；剩下的不足只能是「模型把多段合并成一段」的数量检查失败，
+        // 那是协议该做的正当拒绝。
+        let logs = services
+            .background_job_logs(job.id.clone(), vec![book_id.clone()])
+            .await
+            .unwrap();
+        let rejected = logs
+            .entries
+            .iter()
+            .filter(|entry| entry.metrics.error_kind == Some(JobLogErrorKind::InvalidSchema))
+            .map(|entry| entry.format_line())
+            .collect::<Vec<_>>();
+        assert!(
+            rejected.is_empty(),
+            "顶层数组外壳仍被判 invalid_schema：{rejected:?}"
+        );
+        // 两个 2 段块在旧协议下只会回 invalid_schema，而模型的 id 是齐的，必须落库。
+        for source in [
+            "Praise for Head First Agile",
+            "Praise for other Head First books",
+        ] {
+            assert!(
+                blocks.iter().any(|block| block.source == source),
+                "{source:?} 必须有译文行，实际拿到：{:?}",
+                blocks
+                    .iter()
+                    .map(|block| block.source.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert!(row_count(&services) >= 2);
+    });
+}
+
 #[test]
 fn malformed_or_plain_first_response_gets_one_immutable_structured_correction() {
     for mode in [ReplyMode::MalformedThenValid, ReplyMode::PlainThenValid] {
@@ -1110,8 +1446,7 @@ fn exhausted_correction_fails_after_two_calls_without_storing_response_text() {
                 .unwrap()
                 .is_empty()
         );
-        let persisted_error: String = rusqlite::Connection::open(services.database_path())
-            .unwrap()
+        let persisted_error: String = open_fixture_conn(services.database_path())
             .query_row(
                 "SELECT error FROM index_jobs WHERE book_id = ?1 AND kind = 'translation'",
                 [&book_id],
@@ -1439,7 +1774,7 @@ fn failed_cursor_publication_settles_the_owned_execution_and_retry_reuses_saved_
         {
             // Fail only cursor advancement in this isolated database. Saving
             // the translated block and settling its old cursor remain legal.
-            let conn = rusqlite::Connection::open(services.database_path()).unwrap();
+            let conn = open_fixture_conn(services.database_path());
             conn.execute_batch(
                 "CREATE TRIGGER fixture_reject_translation_progress
                  BEFORE UPDATE OF cursor_json ON index_jobs
@@ -1471,7 +1806,7 @@ fn failed_cursor_publication_settles_the_owned_execution_and_retry_reuses_saved_
             "the block was committed before progress publication failed"
         );
         {
-            let conn = rusqlite::Connection::open(services.database_path()).unwrap();
+            let conn = open_fixture_conn(services.database_path());
             let (status, cursor): (String, String) = conn
                 .query_row(
                     "SELECT status, cursor_json FROM index_jobs WHERE id = ?1",
@@ -1536,7 +1871,7 @@ fn opening_a_legacy_plain_text_cache_requires_fresh_structured_translation() {
     {
         // Only this isolated fixture is changed; its completed old-version
         // cursor and plaintext row reproduce a pre-format-preservation cache.
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let conn = open_fixture_conn(&db_path);
         let cursor: String = conn
             .query_row(
                 "SELECT cursor_json FROM index_jobs WHERE id = ?1",
@@ -1580,6 +1915,28 @@ fn opening_a_legacy_plain_text_cache_requires_fresh_structured_translation() {
         );
         assert_translated_segments(&blocks, &endpoint.requests()[1..], "新：");
     });
+}
+
+/// The retry in [`background_job_snapshots`] is only worth having if a real
+/// lock conflict is recognised, so this pins the error shape SQLite produces
+/// for a second writer: a rusqlite change must not silently turn the retry into
+/// dead code that lets the poller fail again.
+#[test]
+fn a_second_writer_reports_the_lock_conflict_the_poller_retries() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("locked.db");
+    let first = rusqlite::Connection::open(&path).unwrap();
+    first.pragma_update(None, "journal_mode", "WAL").unwrap();
+    first
+        .execute_batch("CREATE TABLE probe (id TEXT); BEGIN IMMEDIATE;")
+        .unwrap();
+
+    let second = rusqlite::Connection::open(&path).unwrap();
+    second.busy_timeout(Duration::from_millis(0)).unwrap();
+    let error = anyhow::Error::new(second.execute_batch("BEGIN IMMEDIATE;").unwrap_err());
+    assert!(is_database_busy(&error), "unexpected lock error: {error:#}");
+
+    first.execute_batch("ROLLBACK;").unwrap();
 }
 
 fn write_two_chapter_epub(path: &Path, first_body: &str, second_body: &str) {
