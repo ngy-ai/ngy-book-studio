@@ -12,11 +12,70 @@
 //! without switching away and back.
 use super::*;
 use moye_epub_editor::services::{BackgroundJobStatus, TranslatedBlock, TranslationDisplayMode};
+use moye_epub_editor::translation::TranslationSegment;
 
 /// Task kind of a whole-book translation job, as persisted in `index_jobs`.
 const TRANSLATION_JOB_KIND: &str = "translation";
 /// How often the reader asks whether the book's translation task advanced.
 const TRANSLATION_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+/// Upper bounds for one manual translation request. The host re-reads the stored
+/// row and revalidates the edit, so these only reject nonsense before the work
+/// starts; the same limits are enforced again by the service.
+const MAX_MANUAL_TRANSLATION_KEY_BYTES: usize = 256;
+const MAX_MANUAL_TRANSLATION_SEGMENTS: usize = 512;
+const MAX_MANUAL_TRANSLATION_SEGMENT_BYTES: usize = 8 * 1024;
+const MAX_MANUAL_TRANSLATION_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(in crate::ui) enum ManualTranslationAction {
+    /// Replace the model output of one block with the reader's own text.
+    Update,
+    /// Drop the reader's own text and show the model output again.
+    Restore,
+}
+
+/// One manual translation edit submitted by the reading window.
+///
+/// The reader may only describe the edit. Which block it belongs to, what its
+/// original text is and whether it is still current are decided by the host from
+/// the stored row, never from this payload.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub(in crate::ui) struct ManualTranslationRequest {
+    action: ManualTranslationAction,
+    revision: u64,
+    request_id: u64,
+    key: String,
+    #[serde(default)]
+    segments: Vec<TranslationSegment>,
+}
+
+impl ManualTranslationRequest {
+    pub(super) fn valid(&self) -> bool {
+        let mut total = 0;
+        let segments_ok = self.segments.iter().all(|segment| {
+            // Count both halves: the host stores the sources beside the text, and
+            // this bound stands in for that serialized row.
+            total += segment.source.len() + segment.translated.len();
+            // A translation that is only whitespace cannot have come from a leaf
+            // that had visible text, and the service rejects it anyway.
+            !segment.source.trim().is_empty()
+                && !segment.translated.trim().is_empty()
+                && segment.source.len() <= MAX_MANUAL_TRANSLATION_SEGMENT_BYTES
+                && segment.translated.len() <= MAX_MANUAL_TRANSLATION_SEGMENT_BYTES
+        });
+        !self.key.is_empty()
+            && self.key.len() <= MAX_MANUAL_TRANSLATION_KEY_BYTES
+            && (1..=(1_u64 << 53) - 1).contains(&self.request_id)
+            && self.segments.len() <= MAX_MANUAL_TRANSLATION_SEGMENTS
+            && segments_ok
+            && total <= MAX_MANUAL_TRANSLATION_BYTES
+            && match self.action {
+                ManualTranslationAction::Update => !self.segments.is_empty(),
+                ManualTranslationAction::Restore => self.segments.is_empty(),
+            }
+    }
+}
 
 pub(super) struct ReaderTranslations {
     session: String,
@@ -215,6 +274,85 @@ impl ReaderApp {
         .detach();
     }
 
+    /// Saves or clears one block's manual translation.
+    ///
+    /// The request is only accepted from the chapter document the window is
+    /// actually showing, at the revision it was pushed with; the service then
+    /// revalidates the whole edit against the stored row, so a stale or forged
+    /// payload can never write another block's text.
+    pub(super) fn handle_manual_translation(
+        &mut self,
+        url: &str,
+        request: ManualTranslationRequest,
+        cx: &mut Context<Self>,
+    ) {
+        // The page can only answer with the revision it was pushed with.
+        let pushed_revision = self
+            .annotations
+            .revisions
+            .1
+            .get(self.current_spine)
+            .copied();
+        if self.closing
+            || self.webview_build_gate.close_requested
+            || !manual_edit_belongs_to_current_chapter(
+                self.book.spine_index_for_url(url),
+                self.current_spine,
+                pushed_revision,
+                request.revision,
+            )
+        {
+            return;
+        }
+        let Some(locator) = self.progress_locators.get(self.current_spine) else {
+            return;
+        };
+        let unit_id = locator.unit_id.clone();
+        let segments =
+            (request.action == ManualTranslationAction::Update).then(|| request.segments.clone());
+        let book_id = self.book_id.clone();
+        let key = request.key.clone();
+        let request_id = request.request_id;
+        let url = url.to_string();
+        let services = Arc::clone(&self.services);
+        cx.spawn(async move |view, cx| {
+            let result = services
+                .set_manual_translation(book_id, unit_id, key, segments)
+                .await;
+            let _ = view.update(cx, |this, cx| {
+                this.finish_manual_translation(&url, request_id, result, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn finish_manual_translation(
+        &mut self,
+        url: &str,
+        request_id: u64,
+        result: anyhow::Result<()>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.closing || self.current_reader_url.as_deref() != Some(url) {
+            return;
+        }
+        let payload = match &result {
+            Ok(()) => serde_json::json!({ "request_id": request_id, "ok": true }),
+            Err(error) => {
+                let message = format!("{error:#}");
+                self.set_error(format!("无法保存手工译文：{message}"), cx);
+                serde_json::json!({ "request_id": request_id, "ok": false, "error": message })
+            }
+        };
+        self.translation_script("result", payload, cx);
+        // Only a stored edit changes what the chapter should show. A failed
+        // request leaves the editor in place with the reader's own text, so
+        // nothing is republished and nothing typed is thrown away.
+        if result.is_ok() {
+            self.load_translations(url, true, cx);
+        }
+    }
+
     /// Loads the book's stored display choice once per window. Until it arrives
     /// the window shows the global preference, so an unreadable row keeps that
     /// default rather than blocking the chapter.
@@ -378,6 +516,23 @@ fn translation_refresh_due(observed: &mut Option<usize>, current: Option<usize>)
     changed && (current.is_some() || was_active)
 }
 
+/// Whether a manual edit may be applied to the chapter the window is showing.
+///
+/// The page can only answer for the chapter the host pushed into it and with
+/// the revision that push carried, so an edit naming another chapter, or an
+/// older payload than the one on screen, is dropped here before any database
+/// work starts. A chapter without a revision entry is pushed as 0 and therefore
+/// has to accept an echoed 0: rejecting that would forbid editing the
+/// translations of such a chapter outright.
+fn manual_edit_belongs_to_current_chapter(
+    edited_chapter: Option<usize>,
+    current_chapter: usize,
+    pushed_revision: Option<u64>,
+    requested_revision: u64,
+) -> bool {
+    edited_chapter == Some(current_chapter) && pushed_revision.unwrap_or(0) == requested_revision
+}
+
 fn translation_display_mode_label(mode: TranslationDisplayMode) -> &'static str {
     match mode {
         TranslationDisplayMode::Bilingual => "bilingual",
@@ -408,6 +563,7 @@ fn translated_block_json(block: &TranslatedBlock) -> serde_json::Value {
         "key": block.key,
         "source": block.source,
         "segments": block.segments,
+        "manual": block.manual,
     })
 }
 
@@ -433,6 +589,50 @@ mod tests {
         assert!(translation_refresh_due(&mut observed, None));
         assert_eq!(observed, None);
         assert!(!translation_refresh_due(&mut observed, None));
+    }
+
+    #[test]
+    fn a_manual_edit_must_come_from_the_chapter_the_host_pushed() {
+        // 正常路径：窗口推的是第 3 章、版本 7，页面就带着这两个值回来。
+        assert!(manual_edit_belongs_to_current_chapter(
+            Some(3),
+            3,
+            Some(7),
+            7
+        ));
+        // 另一章的 URL：即使版本号凑巧相同也不能写进当前章。
+        assert!(!manual_edit_belongs_to_current_chapter(
+            Some(2),
+            3,
+            Some(7),
+            7
+        ));
+        assert!(!manual_edit_belongs_to_current_chapter(
+            Some(4),
+            3,
+            Some(7),
+            7
+        ));
+        // 不属于本书的 URL 解析不出章号。
+        assert!(!manual_edit_belongs_to_current_chapter(None, 3, Some(7), 7));
+        // 上一版载荷的陈旧请求：页面还没换成当前的译文。
+        assert!(!manual_edit_belongs_to_current_chapter(
+            Some(3),
+            3,
+            Some(7),
+            6
+        ));
+        // 没有版本记录时宿主推送 0，页面回传 0 必须被接受，
+        // 否则该章的手工译文永远写不进去。
+        assert!(manual_edit_belongs_to_current_chapter(Some(3), 3, None, 0));
+        assert!(!manual_edit_belongs_to_current_chapter(Some(3), 3, None, 1));
+        // 有版本记录时伪造成 0 同样被拒。
+        assert!(!manual_edit_belongs_to_current_chapter(
+            Some(3),
+            3,
+            Some(7),
+            0
+        ));
     }
 
     #[test]
@@ -483,5 +683,69 @@ mod tests {
             base,
             translation_fingerprint("unit-1", "bilingual", std::slice::from_ref(&translated))
         );
+    }
+
+    #[test]
+    fn manual_translation_ipc_bounds_the_edit_before_the_host_reads_the_database() {
+        let own_uri = "epubreader://book/Text/one.xhtml".parse().unwrap();
+        let accepted = reader_ipc_event(
+            &own_uri,
+            r#"{"type":"manual_translation","action":"update","revision":3,"request_id":9,"key":"block-1","segments":[{"source":"One","translated":"一个"}]}"#,
+        );
+        let Some(ReaderWebEvent::ManualTranslation { url, request }) = accepted else {
+            panic!("a bounded manual translation edit must be accepted");
+        };
+        assert_eq!(url, "epubreader://book/Text/one.xhtml");
+        assert_eq!(request.action, ManualTranslationAction::Update);
+        assert_eq!(request.revision, 3);
+        assert_eq!(request.request_id, 9);
+        assert_eq!(request.key, "block-1");
+        assert_eq!(request.segments.len(), 1);
+        assert_eq!(request.segments[0].source, "One");
+        assert_eq!(request.segments[0].translated, "一个");
+
+        // 恢复只表达“删掉手工译文”，所以它不携带任何文本。
+        assert!(matches!(
+            reader_ipc_event(
+                &own_uri,
+                r#"{"type":"manual_translation","action":"restore","revision":3,"request_id":10,"key":"block-1","segments":[]}"#,
+            ),
+            Some(ReaderWebEvent::ManualTranslation { .. })
+        ));
+
+        for forged in [
+            // 没有文本块标识，宿主无法定位已存的机器译文行
+            r#"{"type":"manual_translation","action":"update","revision":3,"request_id":1,"key":"","segments":[{"source":"One","translated":"一个"}]}"#,
+            // 改译文必须带文本，恢复必须不带
+            r#"{"type":"manual_translation","action":"update","revision":3,"request_id":1,"key":"block-1","segments":[]}"#,
+            r#"{"type":"manual_translation","action":"restore","revision":3,"request_id":1,"key":"block-1","segments":[{"source":"One","translated":"一个"}]}"#,
+            // 空译文与空原文都不是阅读窗口能产生的编辑
+            r#"{"type":"manual_translation","action":"update","revision":3,"request_id":1,"key":"block-1","segments":[{"source":"One","translated":"   "}]}"#,
+            r#"{"type":"manual_translation","action":"update","revision":3,"request_id":1,"key":"block-1","segments":[{"source":"","translated":"一个"}]}"#,
+            // 请求序号 0 永远不是一个真实的请求
+            r#"{"type":"manual_translation","action":"restore","revision":3,"request_id":0,"key":"block-1","segments":[]}"#,
+            // 未定义的动作
+            r#"{"type":"manual_translation","action":"delete","revision":3,"request_id":1,"key":"block-1","segments":[]}"#,
+        ] {
+            assert!(reader_ipc_event(&own_uri, forged).is_none(), "{forged}");
+        }
+
+        // 超长译文与超长标识在同一条流水线上被拒绝，而不是写进数据库。
+        let oversized_segment = format!(
+            r#"{{"type":"manual_translation","action":"update","revision":1,"request_id":1,"key":"block-1","segments":[{{"source":"One","translated":"{}"}}]}}"#,
+            "字".repeat(MAX_MANUAL_TRANSLATION_SEGMENT_BYTES)
+        );
+        assert!(reader_ipc_event(&own_uri, &oversized_segment).is_none());
+        let oversized_key = format!(
+            r#"{{"type":"manual_translation","action":"restore","revision":1,"request_id":1,"key":"{}","segments":[]}}"#,
+            "k".repeat(MAX_MANUAL_TRANSLATION_KEY_BYTES + 1)
+        );
+        assert!(reader_ipc_event(&own_uri, &oversized_key).is_none());
+        let too_many_segments = format!(
+            r#"{{"type":"manual_translation","action":"update","revision":1,"request_id":1,"key":"block-1","segments":[{}]}}"#,
+            vec![r#"{"source":"One","translated":"一"}"#; MAX_MANUAL_TRANSLATION_SEGMENTS + 1]
+                .join(",")
+        );
+        assert!(reader_ipc_event(&own_uri, &too_many_segments).is_none());
     }
 }

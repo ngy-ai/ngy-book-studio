@@ -515,10 +515,11 @@ pub(crate) fn reconfigure_translation_jobs(
                         .unwrap_or_default()
                 } else {
                     if let Some(language) = target_language {
-                        super::translations::delete_for_book_language(
+                        super::translations::delete_for_retranslation(
                             &tx,
                             &source.book_id,
                             language,
+                            source.revision,
                         )?;
                     }
                     0

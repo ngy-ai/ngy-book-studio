@@ -13,7 +13,10 @@ const selectionBridgeMatch = readerSource.match(/const READER_INITIALIZATION_SCR
 assert.ok(selectionBridgeMatch, "The DOM gate must load the product's actual reader selection bridge");
 const selectionBridge = selectionBridgeMatch[1];
 
-const fixture = `<!DOCTYPE html><html><head><style>
+// Real chapters are XHTML with the namespace declared, and the gate loads this
+// same fixture as `application/xhtml+xml`: without it the elements would belong
+// to no namespace and stop being HTML elements at all.
+const fixture = `<!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><style>
   body{font:22px/1.8 Arial;margin:50px;max-width:760px}p{margin:15px 0}
 </style></head><body>
 <h1 id="title">无译文标题</h1>
@@ -676,6 +679,232 @@ for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; c
         indent: "\u200b\u200b", codeTranslated: undefined,
         proseIndent: "\u200b\u200b", proseTranslated: "\u200b\u200b甲组 乙组",
       }, "the invisible indentation keeps its node, code is skipped whole and only visible prose leaves are replaced");
+    } finally { await page.close(); }
+  });
+}
+
+// The reader may replace the model output of one block by hand. These gates drive
+// the shipped layer and assert the two halves of that contract: the page only
+// describes an edit (the host revalidates it against the stored row), and nothing
+// typed is lost to a background republish, a failure or a cancel.
+const manualMessages = (page) => page.evaluate(() =>
+  window.__messages.filter((item) => item.type === "manual_translation"));
+
+// The control row is chrome inside the layer's shadow root: its labels must not
+// join the block's text, so every lookup goes through that boundary.
+const clickControl = (page, id, label) => page.evaluate(({ id, label }) => {
+  const layer = document.getElementById(id).previousElementSibling;
+  const button = [...layer.querySelector("[data-moye-translation-controls]").shadowRoot
+    .querySelectorAll("button")].find((element) => element.textContent === label);
+  if (!button) throw new Error(`missing control: ${label}`);
+  button.click();
+}, { id, label });
+
+const manualState = (page, id) => page.evaluate((id) => {
+  const book = document.getElementById(id);
+  const layer = book.previousElementSibling;
+  const row = layer.querySelector("[data-moye-translation-controls]").shadowRoot;
+  const editable = layer.querySelector("[contenteditable='true']");
+  return {
+    translated: layer.querySelector(".moye-translation-text").textContent,
+    editing: !!editable,
+    editableText: editable?.textContent ?? null,
+    focused: editable ? document.activeElement === editable : false,
+    manual: !!row.querySelector(".moye-translation-manual"),
+    error: row.querySelector(".moye-translation-error")?.textContent ?? null,
+    buttons: [...row.querySelectorAll("button")].map((element) => element.textContent),
+    bookText: book.textContent,
+    bookHidden: book.style.display,
+  };
+}, id);
+
+test("a manual edit is posted for the displayed block and survives the host's answer", async () => {
+  const page = await pageWithFixture();
+  try {
+    await configure(page);
+    assert.deepEqual(await page.evaluate(() => {
+      const layer = document.getElementById("c").previousElementSibling;
+      const controls = layer.querySelector("[data-moye-translation-controls]");
+      const style = getComputedStyle(controls);
+      return {
+        buttons: [...controls.shadowRoot.querySelectorAll("button")]
+          .map((element) => element.textContent),
+        faded: style.opacity,
+        clickable: style.pointerEvents,
+        tabbable: [...document.querySelectorAll("[data-moye-translation-controls]")]
+          .flatMap((element) => [...element.shadowRoot.querySelectorAll("button")]).length,
+        // Chrome must never join the block's text: a copied translation would
+        // carry the button labels.
+        layerText: layer.textContent,
+      };
+    }), { buttons: ["编辑译文"], faded: "0", clickable: "none", tabbable: 7, layerText: "乙" },
+    "every applied block offers an edit affordance that stays out of the way until it is used");
+
+    // Revealing happens on hover or on keyboard focus, and settling the row back
+    // happens without rebuilding the layer. The row fades in, so the revealed
+    // state is waited for instead of read in the same frame as the focus.
+    await page.evaluate(() => {
+      const layer = document.getElementById("c").previousElementSibling;
+      layer.querySelector("[data-moye-translation-controls]").shadowRoot
+        .querySelector("button").focus();
+    });
+    await page.waitForFunction(() => getComputedStyle(
+      document.getElementById("c").previousElementSibling
+        .querySelector("[data-moye-translation-controls]")).opacity === "1");
+    assert.equal(await page.evaluate(() => getComputedStyle(
+      document.getElementById("c").previousElementSibling
+        .querySelector("[data-moye-translation-controls]")).opacity), "1",
+    "tabbing into the row reveals it");
+
+    await clickControl(page, "c", "编辑译文");
+    assert.deepEqual(await manualState(page, "c"), {
+      translated: "乙", editing: true, editableText: "乙", focused: true,
+      manual: false, error: null, buttons: ["保存", "取消"], bookText: "Beta", bookHidden: "",
+    }, "editing replaces only the translated leaf and focuses it");
+
+    // A leaf is one line, so Enter cannot split it into a shape the host could
+    // not store; real keystrokes must still reach the editable.
+    await page.keyboard.press("Enter");
+    await page.keyboard.type("！");
+    assert.equal((await manualState(page, "c")).editableText, "乙！");
+
+    await clickControl(page, "c", "保存");
+    const sent = (await manualMessages(page)).at(-1);
+    assert.deepEqual(sent, {
+      type: "manual_translation", action: "update", revision: 1, request_id: sent.request_id, key: "c",
+      segments: [{ source: "Beta", translated: "乙！" }],
+    }, "the page submits the original leaf as the source, never a rewritten one");
+    assert.equal((await manualState(page, "c")).buttons.length, 0, "the editor is busy until the host answers");
+
+    await page.evaluate((request_id) => window.moyeTranslations.result({ request_id, ok: true }),
+      sent.request_id);
+    assert.deepEqual(await manualState(page, "c"), {
+      translated: "乙！", editing: false, editableText: null, focused: false,
+      manual: true, error: null, buttons: ["编辑译文", "恢复机器译文"], bookText: "Beta", bookHidden: "",
+    }, "a saved edit keeps the reader's text, is marked as manual and can be restored");
+
+    await clickControl(page, "c", "恢复机器译文");
+    const restore = (await manualMessages(page)).at(-1);
+    assert.deepEqual(restore, {
+      type: "manual_translation", action: "restore", revision: 1, request_id: restore.request_id,
+      key: "c", segments: [],
+    });
+    await page.evaluate((request_id) => window.moyeTranslations.result({ request_id, ok: true }),
+      restore.request_id);
+    assert.deepEqual((await manualState(page, "c")).buttons, ["编辑译文"],
+      "restoring drops the manual marker until the host republishes the model text");
+  } finally { await page.close(); }
+});
+
+test("a failed manual edit keeps the typed text, a republish waits and cancel restores it", async () => {
+  const page = await pageWithFixture();
+  try {
+    await configure(page);
+    await page.evaluate(() => {
+      window.__editedLayer = document.getElementById("c").previousElementSibling;
+    });
+    await clickControl(page, "c", "编辑译文");
+    await page.keyboard.type("组");
+    await clickControl(page, "c", "保存");
+    const sent = (await manualMessages(page)).at(-1);
+    await page.evaluate((request_id) => window.moyeTranslations.result({
+      request_id, ok: false, error: "该文本块的译文已过期，请重新打开本章后再修改",
+    }), sent.request_id);
+    const failed = await manualState(page, "c");
+    assert.equal(failed.editableText, "乙组", "a rejected edit is not thrown away");
+    assert.equal(failed.error, "该文本块的译文已过期，请重新打开本章后再修改");
+    assert.deepEqual(failed.buttons, ["保存", "取消"]);
+
+    // The background poll republishes the same chapter while a translation job
+    // advances; it must not delete text the reader is still typing.
+    await page.evaluate((value) => window.moyeTranslations.configure(value), {
+      session: "translation-session", revision: 1,
+      blocks: [{ key: "c", source: "Beta", segments: [{ source: "Beta", translated: "新乙" }] }],
+    });
+    assert.equal((await manualState(page, "c")).editableText, "乙组");
+    assert.equal(await page.evaluate(() =>
+      document.getElementById("c").previousElementSibling === window.__editedLayer), true,
+      "the layer being edited is not rebuilt underneath the reader");
+
+    // Cancelling restores the pre-edit model text and then applies what waited.
+    await clickControl(page, "c", "取消");
+    assert.deepEqual(await manualState(page, "c"), {
+      translated: "新乙", editing: false, editableText: null, focused: false,
+      manual: false, error: null, buttons: ["编辑译文"], bookText: "Beta", bookHidden: "",
+    }, "cancel restores the model text and the deferred payload is applied");
+    assert.equal(await page.evaluate(() => window.moyeTranslations.applied()), 1,
+      "the waiting payload is the one that took effect");
+  } finally { await page.close(); }
+});
+
+test("an empty manual translation is refused before it leaves the page", async () => {
+  const page = await pageWithFixture();
+  try {
+    await configure(page);
+    const before = (await manualMessages(page)).length;
+    await clickControl(page, "c", "编辑译文");
+    await page.keyboard.press("Control+A");
+    await page.keyboard.press("Backspace");
+    await clickControl(page, "c", "保存");
+    const state = await manualState(page, "c");
+    assert.equal(state.editableText, "");
+    assert.equal(state.error, "译文不能为空；如需还原请使用「恢复机器译文」");
+    assert.deepEqual(state.buttons, ["保存", "取消"]);
+    assert.equal((await manualMessages(page)).length, before, "nothing was sent for an empty edit");
+    await clickControl(page, "c", "取消");
+    assert.equal((await manualState(page, "c")).translated, "乙");
+  } finally { await page.close(); }
+});
+
+for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; charset=utf-8"]) {
+  const mode = contentType.startsWith("application") ? "XHTML" : "HTML";
+  test(`${mode}: editing a translation keeps the book text and resolves selections to it`, async () => {
+    const page = await pageWithFixture(undefined, contentType);
+    try {
+      await configure(page);
+      await clickControl(page, "c", "编辑译文");
+      const edited = await page.evaluate(() => {
+        const book = document.getElementById("c");
+        const editable = book.previousElementSibling.querySelector("[contenteditable='true']");
+        const range = document.createRange();
+        range.selectNodeContents(editable);
+        window.getSelection().removeAllRanges();
+        window.getSelection().addRange(range);
+        return {
+          bookText: book.textContent,
+          translatedTo: window.moyeTranslations.originalRange(range)?.toString(),
+        };
+      });
+      assert.deepEqual(edited, { bookText: "Beta", translatedTo: "Beta" },
+        "the editable holds presentation only; notes still anchor to the book text");
+      await clickControl(page, "c", "取消");
+    } finally { await page.close(); }
+  });
+}
+
+for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; charset=utf-8"]) {
+  const mode = contentType.startsWith("application") ? "XHTML" : "HTML";
+  test(`${mode}: a block already marked manual offers restore and skips the editor`, async () => {
+    const page = await pageWithFixture(undefined, contentType);
+    try {
+      await page.evaluate((value) => window.moyeTranslations.configure(value), {
+        session: "manual-session", revision: 2,
+        blocks: [
+          { key: "a", source: "Alpha", segments: [{ source: "Alpha", translated: "人工甲" }], manual: true },
+          segmentBlock("c", "Beta", [["Beta", "乙"]]),
+        ],
+      });
+      const state = await manualState(page, "a");
+      assert.equal(state.translated, "人工甲");
+      assert.equal(state.manual, true);
+      assert.deepEqual(state.buttons, ["编辑译文", "恢复机器译文"]);
+      assert.equal((await manualState(page, "c")).manual, false, "the marker is per block");
+      await clickControl(page, "a", "编辑译文");
+      await page.keyboard.type("改");
+      await clickControl(page, "a", "保存");
+      const sent = (await manualMessages(page)).at(-1);
+      assert.deepEqual(sent.segments, [{ source: "Alpha", translated: "人工甲改" }],
+        "editing a manual block sends its stored source, not the displayed text");
     } finally { await page.close(); }
   });
 }

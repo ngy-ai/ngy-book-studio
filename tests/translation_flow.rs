@@ -19,6 +19,7 @@ use moye_epub_editor::{
         AppServices, BackgroundJobAction, BackgroundJobSnapshot, BackgroundJobStatus,
         ProviderSettings, TranslatedBlock,
     },
+    translation::TranslationSegment,
 };
 use serde_json::{Value, json};
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
@@ -52,6 +53,9 @@ enum ReplyMode {
     /// A JSON answer whose structural punctuation is full-width, as a
     /// CJK-oriented model writes it (`"text"："..."，"`).
     FullWidthStructure,
+    /// 现场（2026-09-12，`qwen3.5:0.8b`）：答案完全正确，但丢掉了 `translations`
+    /// 外壳，被围栏包裹的顶层数组就是整个响应。
+    BareSegmentArray,
     /// Valid answers everywhere except blocks carrying [`POISON_SENTINEL`].
     PoisonedBlock,
     /// One complete valid answer, then a stream that never ends: the fixture
@@ -181,6 +185,7 @@ impl TranslationEndpoint {
                     }
                     ReplyMode::AlwaysInvalid | ReplyMode::GatedCorrectionInvalid => invalid(),
                     ReplyMode::FullWidthStructure => full_width_structure(),
+                    ReplyMode::BareSegmentArray => format!("```json\n{}\n```", json!(translations)),
                     ReplyMode::PoisonedBlock if poisoned => invalid(),
                     _ => valid,
                 };
@@ -601,6 +606,224 @@ fn structured_translation_survives_restart_and_a_changed_endpoint_keeps_its_text
     });
 }
 
+/// 阅读窗口可以手工改写某一段的机器译文。手工译文必须是读者看到的正文，不能被后续
+/// 机器运行覆盖，重启与换端点后仍然有效，并且机器原文行始终保留在它背后，所以
+/// 「恢复机器译文」不需要重新调用模型。
+#[test]
+fn a_manual_translation_overrides_the_model_text_and_survives_a_changed_endpoint() {
+    let first = TranslationEndpoint::start("译：", ReplyMode::ReverseIds);
+    let second = TranslationEndpoint::start("再：", ReplyMode::ReverseIds);
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("manual.epub");
+    write_epub(
+        &path,
+        "<p>Manual <strong>edit</strong> target</p><p>Second paragraph</p>",
+    );
+    let data_dir = temp.path().join("library");
+    let credentials = Arc::new(MemoryCredentialStore::default());
+    let services = AppServices::open_with_credentials(&data_dir, credentials.clone()).unwrap();
+    let (book_id, unit_id, key, machine, manual) = services.runtime().block_on(async {
+        services
+            .configure_providers(settings(&first), BTreeMap::new())
+            .await
+            .unwrap();
+        let (book_id, unit_id) = import(&services, &path).await;
+        translate(&services, &book_id).await;
+        let blocks = services
+            .translation_blocks_for_unit(book_id.clone(), unit_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks.iter().all(|block| !block.manual));
+        let target = blocks
+            .iter()
+            .find(|block| block.source.starts_with("Manual"))
+            .unwrap();
+        assert_eq!(
+            target.segments.len(),
+            3,
+            "formatting leaves become separate segments"
+        );
+        let machine = target.segments.clone();
+        let untouched = blocks
+            .iter()
+            .filter(|block| block.key != target.key)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        // 页面只能描述改动：与已存片段对不上的请求一律拒绝，且必须一个字节都不写。
+        let mut rewritten = machine.clone();
+        rewritten[0].source = "Rewritten".into();
+        let mut short = machine.clone();
+        short.pop();
+        assert!(
+            services
+                .set_manual_translation(
+                    book_id.clone(),
+                    unit_id.clone(),
+                    target.key.clone(),
+                    Some(rewritten),
+                )
+                .await
+                .is_err(),
+            "a rewritten source must be refused"
+        );
+        assert!(
+            services
+                .set_manual_translation(
+                    book_id.clone(),
+                    unit_id.clone(),
+                    target.key.clone(),
+                    Some(short),
+                )
+                .await
+                .is_err(),
+            "a truncated segment list must be refused"
+        );
+        assert!(
+            services
+                .set_manual_translation(
+                    book_id.clone(),
+                    unit_id.clone(),
+                    target.key.clone(),
+                    Some(vec![machine[0].clone(); 513]),
+                )
+                .await
+                .is_err(),
+            "an oversized payload must be refused before any database work"
+        );
+        assert!(
+            services
+                .set_manual_translation(
+                    book_id.clone(),
+                    unit_id.clone(),
+                    "missing-block".into(),
+                    Some(machine.clone()),
+                )
+                .await
+                .is_err(),
+            "a block without a stored row must be refused"
+        );
+        assert!(
+            services
+                .set_manual_translation(
+                    book_id.clone(),
+                    unit_id.clone(),
+                    target.key.clone(),
+                    Some(Vec::new())
+                )
+                .await
+                .is_err(),
+            "an empty edit must be refused"
+        );
+        assert_eq!(
+            services
+                .translation_blocks_for_unit(book_id.clone(), unit_id.clone())
+                .await
+                .unwrap(),
+            blocks,
+            "a refused edit leaves the stored translation untouched"
+        );
+
+        let manual = machine
+            .iter()
+            .map(|segment| TranslationSegment {
+                source: segment.source.clone(),
+                translated: format!("手工：{}", segment.translated.trim()),
+            })
+            .collect::<Vec<_>>();
+        services
+            .set_manual_translation(
+                book_id.clone(),
+                unit_id.clone(),
+                target.key.clone(),
+                Some(manual.clone()),
+            )
+            .await
+            .unwrap();
+        let blocks = services
+            .translation_blocks_for_unit(book_id.clone(), unit_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            blocks.iter().filter(|block| block.manual).count(),
+            1,
+            "only the edited block is manual"
+        );
+        let edited = blocks.iter().find(|block| block.key == target.key).unwrap();
+        assert!(edited.manual);
+        assert_eq!(edited.segments, manual);
+        assert_eq!(
+            blocks
+                .iter()
+                .filter(|block| block.key != target.key)
+                .cloned()
+                .collect::<Vec<_>>(),
+            untouched,
+            "the other block keeps its machine text"
+        );
+        assert_eq!(row_count(&services), 2, "a manual edit adds no row");
+        (book_id, unit_id, target.key.clone(), machine, manual)
+    });
+    drop(services);
+
+    let services = AppServices::open_with_credentials(&data_dir, credentials).unwrap();
+    services.runtime().block_on(async {
+        let blocks = services
+            .translation_blocks_for_unit(book_id.clone(), unit_id.clone())
+            .await
+            .unwrap();
+        let edited = blocks.iter().find(|block| block.key == key).unwrap();
+        assert!(edited.manual, "a manual edit survives a restart");
+        assert_eq!(edited.segments, manual);
+
+        services
+            .configure_providers(settings(&second), BTreeMap::new())
+            .await
+            .unwrap();
+        wait_translation(&services, &book_id, BackgroundJobStatus::Paused).await;
+        assert_eq!(
+            second.requests().len(),
+            0,
+            "a manually edited block is still a cache hit for the model"
+        );
+        let blocks = services
+            .translation_blocks_for_unit(book_id.clone(), unit_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            blocks
+                .iter()
+                .find(|block| block.key == key)
+                .unwrap()
+                .segments,
+            manual,
+            "a changed endpoint does not hide the reader's own text"
+        );
+
+        services
+            .set_manual_translation(book_id.clone(), unit_id.clone(), key.clone(), None)
+            .await
+            .unwrap();
+        let blocks = services
+            .translation_blocks_for_unit(book_id.clone(), unit_id.clone())
+            .await
+            .unwrap();
+        let restored = blocks.iter().find(|block| block.key == key).unwrap();
+        assert!(!restored.manual, "restoring drops the manual marker");
+        assert_eq!(
+            restored.segments, machine,
+            "the machine text was kept behind the manual edit"
+        );
+        assert_eq!(
+            second.requests().len(),
+            0,
+            "restoring does not spend a model call"
+        );
+        assert_eq!(row_count(&services), 2);
+    });
+}
+
 #[test]
 fn editing_one_chapter_keeps_the_other_chapters_translation() {
     let endpoint = TranslationEndpoint::start("译：", ReplyMode::ReverseIds);
@@ -778,6 +1001,41 @@ fn fenced_and_prefaced_structured_responses_succeed_without_correction() {
             assert_translated_segments(&blocks, &endpoint.requests(), "译：");
         });
     }
+}
+
+#[test]
+fn a_bare_segment_array_answer_is_accepted_without_a_correction() {
+    // 现场（2026-09-12，qwen3.5:0.8b）：小模型丢掉了 `translations` 外壳，逐块返回被
+    // 围栏包裹的顶层数组。旧协议把每个块都判成 invalid_schema，连续跳过 3 块后整本书
+    // 的翻译任务直接失败（translation_run_finish result="failed"）。
+    let endpoint = TranslationEndpoint::start("译：", ReplyMode::BareSegmentArray);
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("bare-array-response.epub");
+    write_epub(&path, "<p>Read <strong>carefully</strong>.</p>");
+    let services = AppServices::open_with_credentials(
+        temp.path().join("library"),
+        Arc::new(MemoryCredentialStore::default()),
+    )
+    .unwrap();
+    services.runtime().block_on(async {
+        services
+            .configure_providers(settings(&endpoint), BTreeMap::new())
+            .await
+            .unwrap();
+        let (book_id, unit_id) = import(&services, &path).await;
+        translate(&services, &book_id).await;
+        let blocks = services
+            .translation_blocks_for_unit(book_id, unit_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            endpoint.requests().len(),
+            1,
+            "a bare segment array is a complete answer and must not need a correction"
+        );
+        assert_eq!(row_count(&services), 1);
+        assert_translated_segments(&blocks, &endpoint.requests(), "译：");
+    });
 }
 
 #[test]

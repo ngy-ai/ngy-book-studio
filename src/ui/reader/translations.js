@@ -1,5 +1,9 @@
 // Trusted reading-time translation layer. The model returns text leaves only;
 // formatting always comes from the current book DOM, never from model markup.
+//
+// The reader may rewrite the model output of a single block by hand: the layer
+// turns its translated leaves into plain-text editables, and the host persists
+// the edit beside the machine text (see `translations.rs` / `db::translations`).
 (() => {
   "use strict";
 
@@ -30,12 +34,38 @@
     ...["top", "right", "bottom", "left"].flatMap((side) =>
       ["width", "style", "color"].map((part) => `border-${side}-${part}`)),
   ];
+  // The manual editor is presentation only. It never becomes book text, a note
+  // anchor or a translation payload: those still read the original leaves.
+  // Faded instead of `visibility:hidden`: opacity keeps the row in the tab order
+  // so a keyboard-only reader can still reach 「编辑译文」, while
+  // `pointer-events:none` keeps the invisible row unclickable. Its labels live in
+  // a shadow root below `CONTROLS_STYLE`: chrome inside the layer would join the
+  // block's text, so a copied translation would carry 「编辑译文」.
+  const CONTROLS_STYLE = "display:block!important;margin:0 0 0.3em!important;padding:0!important;" +
+    "font:0.78em/1.7 system-ui,\"Microsoft YaHei\",sans-serif!important;color:#8a8a8a!important;" +
+    "letter-spacing:normal!important;text-align:right!important;" +
+    "opacity:0!important;pointer-events:none!important;transition:opacity 0.12s ease-out;";
+  const CONTROLS_ROW_STYLE = "display:block!important;margin:0!important;padding:0!important;" +
+    "letter-spacing:normal!important;";
+  const CONTROL_BUTTON_STYLE = "margin:0 0 0 0.5em!important;padding:0.1em 0.5em!important;" +
+    "border:1px solid currentColor!important;border-radius:0.25em!important;background:transparent!important;" +
+    "color:inherit!important;font:inherit!important;cursor:pointer!important;";
+  const EDITABLE_STYLE = "outline:1px dashed rgba(90,130,200,0.75)!important;border-radius:2px!important;";
 
   let session = "";
+  let revision = 0;
+  let requestId = 0;
+  // A payload that arrived while the reader was editing the same chapter. The
+  // background poll must not delete text being typed; it is applied as soon as
+  // the editor closes.
+  let deferred = null;
   const applied = [];
   // Applied layer element -> its state, so a selection made on a translation can
   // be resolved back to the original text it was built from.
   const layerStates = new Map();
+  // In-flight manual translation requests, so a reply for a chapter that is gone
+  // is simply dropped.
+  const pending = new Map();
   const normalize = (value) => (typeof value === "string" ? value : "").replace(/\s+/gu, " ").trim();
   // Unicode `Cf` format characters that ECMAScript `\s` does not cover. A leaf
   // made only of these (or of whitespace) has nothing to translate: the model
@@ -86,6 +116,7 @@
     }
     applied.length = 0;
     layerStates.clear();
+    pending.clear();
   };
 
   // Only innermost blocks participate. Skipped subtrees do not contribute text
@@ -149,7 +180,7 @@
       const copy = document.createTextNode(leading + value.trim() + trailing);
       // A translated leaf was built from exactly this original leaf; nothing can
       // map translated characters back one by one, so this is the finest anchor.
-      pairs.push({ copy, origin: node });
+      pairs.push({ copy, origin: node, value: value.trim(), leading, trailing, node: null });
       return copy;
     }
     if (node.nodeType !== Node.ELEMENT_NODE || SKIPPED.has(tag(node)) || node.matches(MEDIA)) return null;
@@ -179,7 +210,204 @@
     state.layer.setAttribute("data-moye-collapsed", collapsed ? "1" : "0");
   };
 
-  const insert = (element, translated, translateOnly) => {
+  const button = (label, handler) => {
+    const element = create("button");
+    element.type = "button";
+    element.textContent = label;
+    element.style.cssText = CONTROL_BUTTON_STYLE;
+    element.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      handler();
+    });
+    return element;
+  };
+
+  /// What the editor offers for one applied block: nothing while a save is in
+  /// flight, save/cancel while editing, and edit plus the manual state otherwise.
+  const renderControls = (state) => {
+    const controls = state.controls;
+    if (!controls) return;
+    controls.textContent = "";
+    if (state.error) {
+      const error = create("span");
+      error.className = "moye-translation-error";
+      error.textContent = state.error;
+      error.style.setProperty("color", "#c0392b", "important");
+      error.style.setProperty("margin-right", "0.5em", "important");
+      controls.append(error);
+    } else if (state.manual) {
+      const marker = create("span");
+      marker.className = "moye-translation-manual";
+      marker.textContent = "已手工修改";
+      marker.style.setProperty("margin-right", "0.5em", "important");
+      controls.append(marker);
+    }
+    if (state.request) {
+      const busy = create("span");
+      busy.textContent = "保存中…";
+      controls.append(busy);
+    } else if (state.editing) {
+      controls.append(
+        button("保存", () => saveEdit(state)),
+        button("取消", () => endEdit(state, true)),
+      );
+    } else {
+      controls.append(button("编辑译文", () => beginEdit(state)));
+      if (state.manual) {
+        controls.append(button("恢复机器译文", () => {
+          state.error = "";
+          submit(state, "restore", []);
+        }));
+      }
+    }
+    // Editing, saving and failures pin the row open; otherwise the pointer decides.
+    state.showControls?.(state.hovering);
+  };
+
+  /// Turns the translated leaves of one block into plain-text editables. The
+  /// original book text must not change: failure or cancel puts the exact text
+  /// node back, and a save is revalidated by the host against the stored row.
+  const beginEdit = (state) => {
+    if (state.editing || state.request || !state.key) return;
+    state.editing = true;
+    state.error = "";
+    for (const pair of state.pairs) {
+      const editable = create("span");
+      editable.className = "moye-translation-editable";
+      editable.setAttribute("contenteditable", "true");
+      editable.style.cssText = EDITABLE_STYLE;
+      editable.textContent = pair.value;
+      editable.onkeydown = (event) => {
+        // A leaf is one line: a paragraph break inside one could not be stored
+        // or rendered. Escape abandons the edit.
+        if (event.key === "Enter") event.preventDefault();
+        else if (event.key === "Escape") { event.preventDefault(); endEdit(state, true); }
+      };
+      editable.onpaste = (event) => {
+        event.preventDefault();
+        insertPlainText(event.clipboardData?.getData("text/plain") ?? "");
+      };
+      pair.node = pair.copy;
+      pair.copy = editable;
+      pair.node.replaceWith(editable);
+    }
+    renderControls(state);
+    const first = state.pairs[0]?.copy;
+    if (first) focusEnd(first);
+  };
+
+  const insertPlainText = (text) => {
+    const selection = window.getSelection();
+    if (!selection || selection.rangeCount !== 1 || !text) return;
+    const range = selection.getRangeAt(0);
+    range.deleteContents();
+    const node = document.createTextNode(text);
+    range.insertNode(node);
+    range.setStartAfter(node);
+    range.collapse(true);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  };
+
+  const focusEnd = (element) => {
+    element.focus({ preventScroll: true });
+    const range = document.createRange();
+    range.selectNodeContents(element);
+    range.collapse(false);
+    const selection = window.getSelection();
+    if (!selection) return;
+    selection.removeAllRanges();
+    selection.addRange(range);
+  };
+
+  /// Leaves edit mode. `revert` restores the pre-edit text; otherwise the typed
+  /// text stays until the host republishes the chapter from the stored row.
+  const endEdit = (state, revert) => {
+    for (const pair of state.pairs) {
+      if (!pair.node) continue;
+      if (revert) {
+        pair.copy.replaceWith(pair.node);
+        pair.copy = pair.node;
+      } else {
+        const settled = document.createTextNode(
+          pair.leading + pair.copy.textContent.trim() + pair.trailing,
+        );
+        pair.copy.replaceWith(settled);
+        pair.copy = settled;
+      }
+      pair.node = null;
+    }
+    state.editing = false;
+    renderControls(state);
+    flushDeferred();
+  };
+
+  const saveEdit = (state) => {
+    const segments = state.pairs.map((pair, index) => ({
+      // The host must find this string in the stored row, so prefer the source it
+      // pushed: a leaf's own text can differ in whitespace alone.
+      source: state.sources?.[index] ?? pair.origin.data,
+      translated: pair.copy.textContent.trim(),
+    }));
+    if (segments.some((segment) => !segment.translated)) {
+      state.error = "译文不能为空；如需还原请使用「恢复机器译文」";
+      renderControls(state);
+      return;
+    }
+    state.error = "";
+    submit(state, "update", segments);
+  };
+
+  const submit = (state, action, segments) => {
+    if (state.request || !state.key) return;
+    if (!window.ipc?.postMessage) {
+      state.error = "无法连接阅读窗口，译文未能保存";
+      renderControls(state);
+      return;
+    }
+    requestId += 1;
+    state.request = requestId;
+    state.requestManual = action === "update";
+    pending.set(requestId, state);
+    try {
+      window.ipc.postMessage(JSON.stringify({
+        type: "manual_translation",
+        action,
+        revision,
+        request_id: state.request,
+        key: state.key,
+        segments,
+      }));
+    } catch {
+      pending.delete(state.request);
+      state.request = 0;
+      state.error = "无法发送译文修改请求";
+    }
+    renderControls(state);
+  };
+
+  /// The host's answer to one manual translation request. A request id this page
+  /// never sent (an answer for a chapter that is already gone) is ignored.
+  const applyResult = (payload) => {
+    if (!payload || typeof payload !== "object") return;
+    const state = pending.get(payload.request_id);
+    if (!state || state.request !== payload.request_id) return;
+    pending.delete(payload.request_id);
+    state.request = 0;
+    if (payload.ok) {
+      state.manual = state.requestManual === true;
+      state.error = "";
+      endEdit(state, false);
+      return;
+    }
+    state.error = typeof payload.error === "string" && payload.error
+      ? payload.error
+      : "译文未能保存";
+    renderControls(state);
+  };
+
+  const insert = (element, entry, translated, translateOnly) => {
     const inPlace = isCell(element) || tag(element) === "li";
     const layer = create("div");
     layer.setAttribute(MARK, "1");
@@ -217,15 +445,26 @@
     }
     const state = {
       original, wrapper, layer, divider, pairs, hidden: false,
+      // The stored source of each leaf, in the same order as `pairs`. The host
+      // revalidates a manual edit against these exact strings.
+      sources: Array.isArray(entry.segments)
+        ? entry.segments.map((segment) => segment.source)
+        : [],
+      key: typeof entry.key === "string" ? entry.key : "",
+      manual: entry.manual === true,
+      editing: false, request: 0, requestManual: false, error: "", hovering: false,
+      controls: null, showControls: null,
       display: original.style.getPropertyValue("display"),
       priority: original.style.getPropertyPriority("display"),
       hadStyle: original.hasAttribute("style"),
     };
     layerStates.set(layer, state);
+    // Computed before any chrome is added: a control button inside an LI must not
+    // disable that item's click-to-collapse behaviour.
     const toggleable = !isCell(element) && !element.querySelector(MEDIA);
     const onToggle = (event) => {
-      // Dragging to copy a translation must not collapse the paragraph.
-      if (window.getSelection()?.toString()) return;
+      // Dragging to copy a translation, or editing one, must not collapse it.
+      if (state.editing || state.request || window.getSelection()?.toString()) return;
       event.preventDefault();
       event.stopPropagation();
       setCollapsed(state, !state.hidden);
@@ -239,13 +478,55 @@
     }
     if (inPlace) element.insertBefore(layer, element.firstChild);
     else element.parentNode.insertBefore(layer, element);
+    appendControls(state);
     setCollapsed(state, translateOnly && toggleable);
     applied.push(state);
   };
 
-  const configure = (payload) => {
-    if (!payload || typeof payload !== "object") return;
+  /// Adds the manual-edit row to one applied block. It sits between the
+  /// translation and the divider, appears on hover, and is inert for a block the
+  /// page cannot address (no key means the host cannot find the stored row).
+  ///
+  /// The row's contents live in a shadow root: labels are chrome, and light DOM
+  /// text inside the layer would be copied with a selection and would make the
+  /// layer report more text than the translation it displays. The host element
+  /// (the shadow boundary) carries the visibility state instead.
+  const appendControls = (state) => {
+    if (!state.key) return;
+    const host = create("span");
+    host.className = "moye-translation-controls";
+    host.setAttribute("data-moye-translation-controls", "1");
+    host.style.cssText = CONTROLS_STYLE;
+    const row = create("span");
+    row.className = "moye-translation-row";
+    row.style.cssText = CONTROLS_ROW_STYLE;
+    host.attachShadow({ mode: "open" }).append(row);
+    state.controls = row;
+    state.showControls = (visible) => {
+      const pinned = state.editing || state.request > 0 || !!state.error;
+      const shown = visible || pinned;
+      host.style.setProperty("opacity", shown ? "1" : "0", "important");
+      host.style.setProperty("pointer-events", shown ? "auto" : "none", "important");
+    };
+    state.layer.addEventListener("mouseenter", () => {
+      state.hovering = true;
+      state.showControls(true);
+    });
+    state.layer.addEventListener("mouseleave", () => {
+      state.hovering = false;
+      state.showControls(false);
+    });
+    // Tabbing into the hidden row reveals it, so keyboard users can see where
+    // focus is before pressing Enter. Focus events cross the shadow boundary.
+    host.addEventListener("focusin", () => state.showControls(true));
+    host.addEventListener("focusout", () => state.showControls(state.hovering));
+    state.layer.insertBefore(host, state.divider);
+    renderControls(state);
+  };
+
+  const applyPayload = (payload) => {
     session = typeof payload.session === "string" ? payload.session : "";
+    revision = Number.isSafeInteger(payload.revision) ? payload.revision : 0;
     clear();
     const queues = new Map();
     for (const entry of Array.isArray(payload.blocks) ? payload.blocks : []) {
@@ -266,12 +547,37 @@
       if (looksLikeSourceCode(source.lines)) continue;
       const queue = queues.get(source.source);
       if (!queue?.length) continue;
-      const translated = validatedLeaves(queue.shift(), source);
+      const entry = queue.shift();
+      const translated = validatedLeaves(entry, source);
       // A stale/invalid result never hides book text. Consume its position so
       // repeated source blocks cannot silently borrow a later block's result.
       if (!translated || getComputedStyle(element).display === "none") continue;
-      insert(element, translated, payload.displayMode === "translation-only");
+      insert(element, entry, translated, payload.displayMode === "translation-only");
     }
+  };
+
+  const editing = () => applied.some((state) => state.editing || state.request > 0);
+
+  const flushDeferred = () => {
+    if (!deferred || editing()) return;
+    const payload = deferred;
+    deferred = null;
+    applyPayload(payload);
+  };
+
+  const configure = (payload) => {
+    if (!payload || typeof payload !== "object") return;
+    // The background poll republishes the chapter while its translations advance.
+    // That must never delete an edit in progress: the newest payload for the same
+    // chapter waits until the editor closes. A payload for another chapter is a
+    // navigation and applies immediately.
+    const next = Number.isSafeInteger(payload.revision) ? payload.revision : 0;
+    if (editing() && next === revision) {
+      deferred = payload;
+      return;
+    }
+    deferred = null;
+    applyPayload(payload);
   };
 
   /// The original book-text range one selection on the applied translation layer
@@ -311,7 +617,8 @@
 
   window.moyeTranslations = Object.freeze({
     configure,
-    clear: () => { session = ""; clear(); },
+    result: applyResult,
+    clear: () => { session = ""; deferred = null; clear(); },
     applied: () => applied.length,
     session: () => session,
     originalRange,

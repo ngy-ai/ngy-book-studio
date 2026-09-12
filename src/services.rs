@@ -71,6 +71,13 @@ const MAX_LOADED_VISUAL_PAGE_BYTES: u64 = 512 * 1024 * 1024;
 pub const DEFAULT_CHAT_MODEL: &str = "qwen3.5:0.8b";
 pub const DEFAULT_EMBEDDING_MODEL: &str = "qwen3-embedding:0.6b";
 pub const DEFAULT_VISION_MODEL: &str = "qwen3.5:0.8b";
+/// Upper bounds for one manually edited translation block. The reading window
+/// submits the reader's own text for a single block, so these stay far above
+/// any real edit while still bounding the WebView message and the stored row.
+const MAX_MANUAL_TRANSLATION_SEGMENTS: usize = 512;
+const MAX_MANUAL_TRANSLATION_SEGMENT_BYTES: usize = 8 * 1024;
+const MAX_MANUAL_TRANSLATION_BYTES: usize = 64 * 1024;
+
 /// Default embedding vector dimension. When the configured value differs from
 /// the previously saved one, all existing vector indices are invalidated and
 /// must be regenerated.
@@ -633,11 +640,16 @@ pub struct BackgroundJobSnapshot {
 /// One current translation of a text block, keyed for the reader's DOM
 /// matching. `source` is the canonical source text used as a matching hint when
 /// the chapter HTML carries no block identifiers.
+///
+/// `manual` marks a block whose segments are the reader's own edit rather than
+/// the model output; the reading window renders the same payload either way and
+/// only uses the flag for the "已手工修改 / 恢复机器译文" affordances.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TranslatedBlock {
     pub key: String,
     pub source: String,
     pub segments: Vec<crate::translation::TranslationSegment>,
+    pub manual: bool,
 }
 
 /// Whether a book's declared language already satisfies a target tag. Compares
@@ -1095,11 +1107,27 @@ impl AppServices {
                 Ok(rows
                     .into_iter()
                     .filter(|row| {
-                        row.document_revision == book.revision
-                            && row.unit_revision == unit.revision
-                            && row.model == chat_model
+                        row.document_revision == book.revision && row.unit_revision == unit.revision
                     })
                     .filter_map(|row| {
+                        // A manual edit is displayed regardless of which model or
+                        // endpoint produced the machine text behind it: the reader
+                        // wrote it, and a model change must not hide it.
+                        let manual = row.manual_text.as_deref().and_then(|manual| {
+                            serde_json::from_str::<crate::translation::StoredTranslation>(manual)
+                                .ok()
+                        });
+                        if let Some(translation) = manual {
+                            return Some(TranslatedBlock {
+                                key: row.block_id,
+                                source: row.source_text,
+                                segments: translation.segments,
+                                manual: true,
+                            });
+                        }
+                        if row.model != chat_model {
+                            return None;
+                        }
                         let translation = serde_json::from_str::<
                             crate::translation::StoredTranslation,
                         >(&row.translated_text)
@@ -1111,12 +1139,101 @@ impl AppServices {
                             key: row.block_id,
                             source: row.source_text,
                             segments: translation.segments,
+                            manual: false,
                         })
                     })
                     .collect())
             })
             .await
             .context("译文查询线程异常退出")?
+    }
+
+    /// Saves the reader's own translation of one block, or clears it with `None`
+    /// so the block falls back to the machine text.
+    ///
+    /// The reading window is untrusted input: the host reloads the row itself and
+    /// requires the submitted segments to line up with the stored machine
+    /// segments, so a request can only replace the translated text of a block
+    /// that is genuinely current. Sources are always taken from the stored row,
+    /// never from the request.
+    pub async fn set_manual_translation(
+        &self,
+        book_id: String,
+        content_unit_id: String,
+        block_id: String,
+        segments: Option<Vec<crate::translation::TranslationSegment>>,
+    ) -> Result<()> {
+        ensure!(!book_id.trim().is_empty(), "图书 ID 不能为空");
+        ensure!(!content_unit_id.trim().is_empty(), "内容单元 ID 不能为空");
+        ensure!(!block_id.trim().is_empty(), "文本块 ID 不能为空");
+        if let Some(segments) = &segments {
+            validate_manual_translation_segments(segments)?;
+        }
+        let settings = self.provider_settings()?;
+        let Some(target_language) = settings.default_language.clone() else {
+            anyhow::bail!("尚未配置默认译文语言，无法保存手工译文");
+        };
+        let db_path = self.db_path.clone();
+        self.runtime
+            .handle()
+            .spawn_blocking(move || {
+                let conn = db::open_conn(&db_path)?;
+                let Some(book) = db::books::get(&conn, &book_id)? else {
+                    anyhow::bail!("图书不存在，无法保存手工译文");
+                };
+                let Some(unit) = db::content_units::get(&conn, &content_unit_id)? else {
+                    anyhow::bail!("章节不存在，无法保存手工译文");
+                };
+                ensure!(unit.book_id == book_id, "该章节不属于当前图书");
+                let rows =
+                    db::translations::list_for_unit(&conn, &content_unit_id, &target_language)?;
+                let Some(row) = rows.into_iter().find(|row| row.block_id == block_id) else {
+                    anyhow::bail!("该文本块没有可修改的译文");
+                };
+                ensure!(
+                    row.document_revision == book.revision && row.unit_revision == unit.revision,
+                    "该文本块的译文已过期，请重新打开本章后再修改"
+                );
+                let manual_text = match segments {
+                    None => None,
+                    Some(segments) => {
+                        let machine =
+                            serde_json::from_str::<crate::translation::StoredTranslation>(
+                                &row.translated_text,
+                            )
+                            .context("该文本块的机器译文不可用，无法保存手工译文")?;
+                        let segments = manual_translation_segments(&machine, &segments)?;
+                        Some(
+                            serde_json::to_string(&crate::translation::StoredTranslation {
+                                execution_identity: machine.execution_identity,
+                                segments,
+                            })
+                            .context("无法序列化手工译文")?,
+                        )
+                    }
+                };
+                ensure!(
+                    manual_text
+                        .as_ref()
+                        .is_none_or(|text| text.len() <= MAX_MANUAL_TRANSLATION_BYTES),
+                    "手工译文过长"
+                );
+                let updated = db::translations::set_manual_text(
+                    &conn,
+                    &book_id,
+                    &content_unit_id,
+                    &block_id,
+                    &target_language,
+                    book.revision,
+                    unit.revision,
+                    manual_text.as_deref(),
+                    unix_timestamp()?,
+                )?;
+                ensure!(updated, "该文本块的译文已过期，请重新打开本章后再修改");
+                Ok(())
+            })
+            .await
+            .context("手工译文保存线程异常退出")?
     }
 
     /// One book's own translation display choice, written by the reading window.
@@ -2479,6 +2596,68 @@ fn indexing_model_config(settings: &ProviderSettings) -> Result<IndexingModelCon
     )
 }
 
+/// Shape check for one manual edit request, applied before any database work so
+/// an oversized or empty payload never reaches a translation row.
+fn validate_manual_translation_segments(
+    segments: &[crate::translation::TranslationSegment],
+) -> Result<()> {
+    ensure!(!segments.is_empty(), "手工译文不能为空");
+    ensure!(
+        segments.len() <= MAX_MANUAL_TRANSLATION_SEGMENTS,
+        "手工译文的片段数量超出上限"
+    );
+    for segment in segments {
+        ensure!(!segment.source.trim().is_empty(), "手工译文缺少原文片段");
+        ensure!(
+            !segment.translated.trim().is_empty(),
+            "译文不能为空；如需还原请使用「恢复机器译文」"
+        );
+        ensure!(
+            segment.source.len() <= MAX_MANUAL_TRANSLATION_SEGMENT_BYTES,
+            "原文片段过长"
+        );
+        ensure!(
+            segment.translated.len() <= MAX_MANUAL_TRANSLATION_SEGMENT_BYTES,
+            "译文片段过长"
+        );
+        ensure!(
+            !segment.source.contains('\0') && !segment.translated.contains('\0'),
+            "译文不能包含空字符"
+        );
+    }
+    Ok(())
+}
+
+/// Pairs the request's translated text with the **stored** segment sources: the
+/// reading window may replace the translation, never the segment shape or the
+/// original text a translation is attached to.
+fn manual_translation_segments(
+    machine: &crate::translation::StoredTranslation,
+    submitted: &[crate::translation::TranslationSegment],
+) -> Result<Vec<crate::translation::TranslationSegment>> {
+    ensure!(
+        machine.segments.len() == submitted.len(),
+        "该文本块的原文结构已改变，无法保存手工译文"
+    );
+    machine
+        .segments
+        .iter()
+        .zip(submitted)
+        .enumerate()
+        .map(|(index, (stored, submitted))| {
+            ensure!(
+                stored.source.trim() == submitted.source.trim(),
+                "第 {} 段译文的原文已改变，无法保存手工译文",
+                index + 1
+            );
+            Ok(crate::translation::TranslationSegment {
+                source: stored.source.clone(),
+                translated: submitted.translated.trim().to_string(),
+            })
+        })
+        .collect()
+}
+
 /// Non-secret identity for deciding whether persisted whole-book translations
 /// are stale. A changed chat endpoint or model restarts every translation job
 /// from the first block; the target language is part of each job's identity.
@@ -3202,6 +3381,251 @@ mod tests {
             })
             .unwrap();
         assert_eq!(title, "Service book");
+    }
+
+    /// 手工译文优先于机器译文，并且不受机器行的模型 / 端点身份影响：读者自己写下的
+    /// 文字不能因为换模型或换端点而消失，机器行仍然留在它背后作为「恢复机器译文」
+    /// 的来源。身份不匹配的机器行照旧不显示。
+    #[test]
+    fn a_manual_translation_is_shown_independently_of_the_machine_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let services = AppServices::open_with_credentials(
+            temp.path(),
+            Arc::new(MemoryCredentialStore::default()),
+        )
+        .unwrap();
+        let settings = ProviderSettings {
+            base_url: "https://models.example.test/v1".to_string(),
+            chat_model: "chat-test".to_string(),
+            default_language: Some("zh-Hans".to_string()),
+            remote_content_confirmed: true,
+            confirmed_remote_endpoint: "https://models.example.test/v1/".to_string(),
+            auto_run_background_jobs: false,
+            ..Default::default()
+        };
+        let identity = translation_execution_identity(&settings).unwrap();
+        let (book_id, unit_id, document_revision, unit_revision) = services
+            .runtime()
+            .block_on(async {
+                services
+                    .configure_providers(settings.clone(), BTreeMap::new())
+                    .await?;
+                let outcome = services
+                    .spawn_library(|library| Ok(library.create_book("Manual book", "Author")?.id))
+                    .await
+                    .context("library test worker stopped")?;
+                let book_id = outcome?;
+                let conn = db::open_conn(services.database_path())?;
+                let book =
+                    db::books::get(&conn, &book_id)?.context("the created book disappeared")?;
+                let source = db::book_sources::list_for_book(&conn, &book_id)?
+                    .into_iter()
+                    .next()
+                    .context("the created book has no source")?;
+                let unit = db::content_units::list_for_source(&conn, &source.id)?
+                    .into_iter()
+                    .next()
+                    .context("the created book has no chapter")?;
+                Ok::<_, anyhow::Error>((book_id, unit.id.clone(), book.revision, unit.revision))
+            })
+            .unwrap();
+
+        let stored = |identity: &str, block_id: &str, translated: String| {
+            serde_json::to_string(&crate::translation::StoredTranslation {
+                execution_identity: identity.to_string(),
+                segments: vec![crate::translation::TranslationSegment {
+                    source: format!("source-{block_id}"),
+                    translated,
+                }],
+            })
+            .unwrap()
+        };
+        let write = |block_id: &str,
+                     ordinal: u64,
+                     model: &str,
+                     row_identity: &str,
+                     manual: Option<String>| {
+            let conn = db::open_conn(&services.db_path).unwrap();
+            db::translations::upsert(
+                &conn,
+                &db::translations::NewTranslation {
+                    book_id: book_id.clone(),
+                    content_unit_id: unit_id.clone(),
+                    block_id: block_id.to_string(),
+                    ordinal,
+                    document_revision,
+                    unit_revision,
+                    target_language: "zh-Hans".to_string(),
+                    source_language: None,
+                    model: model.to_string(),
+                    source_text: format!("source-{block_id}"),
+                    translated_text: stored(row_identity, block_id, format!("machine-{block_id}")),
+                    created_at: 10,
+                    updated_at: 10,
+                },
+            )
+            .unwrap();
+            if let Some(manual) = manual {
+                db::translations::set_manual_text(
+                    &conn,
+                    &book_id,
+                    &unit_id,
+                    block_id,
+                    "zh-Hans",
+                    document_revision,
+                    unit_revision,
+                    Some(&manual),
+                    11,
+                )
+                .unwrap();
+            }
+        };
+        let stale = format!("{}:stale", crate::translation::EXECUTION_IDENTITY_PROTOCOL);
+
+        // 同一模型同一身份：手工与机器各行其是。
+        write(
+            "block-a",
+            0,
+            "chat-test",
+            &identity,
+            Some(stored(&identity, "block-a", "manual-a".into())),
+        );
+        write("block-b", 1, "chat-test", &identity, None);
+        // 换了模型：手工译文照旧显示，机器译文按既有规则不显示。
+        write(
+            "block-c",
+            2,
+            "other-model",
+            &identity,
+            Some(stored(&identity, "block-c", "manual-c".into())),
+        );
+        write("block-d", 3, "other-model", &identity, None);
+        // 同名模型换了端点（身份不同）：同上。
+        write(
+            "block-e",
+            4,
+            "chat-test",
+            &stale,
+            Some(stored(&stale, "block-e", "manual-e".into())),
+        );
+        write("block-f", 5, "chat-test", &stale, None);
+        // 手工译文不可解析时退回机器译文，不丢整章。
+        write(
+            "block-g",
+            6,
+            "chat-test",
+            &identity,
+            Some("not json".to_string()),
+        );
+        // 章节版本已经变化的手工译文同样不显示。
+        {
+            let conn = db::open_conn(&services.db_path).unwrap();
+            db::translations::upsert(
+                &conn,
+                &db::translations::NewTranslation {
+                    book_id: book_id.clone(),
+                    content_unit_id: unit_id.clone(),
+                    block_id: "block-h".to_string(),
+                    ordinal: 7,
+                    document_revision,
+                    unit_revision: unit_revision + 1,
+                    target_language: "zh-Hans".to_string(),
+                    source_language: None,
+                    model: "chat-test".to_string(),
+                    source_text: "source-block-h".to_string(),
+                    translated_text: stored(&identity, "block-h", "machine-block-h".into()),
+                    created_at: 10,
+                    updated_at: 10,
+                },
+            )
+            .unwrap();
+        }
+
+        let blocks = block_on_without_tokio(
+            services.translation_blocks_for_unit(book_id.clone(), unit_id.clone()),
+        )
+        .unwrap();
+        let shape = blocks
+            .iter()
+            .map(|block| {
+                (
+                    block.key.clone(),
+                    block.manual,
+                    block
+                        .segments
+                        .first()
+                        .map(|segment| segment.translated.clone()),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shape,
+            vec![
+                ("block-a".to_string(), true, Some("manual-a".to_string())),
+                (
+                    "block-b".to_string(),
+                    false,
+                    Some("machine-block-b".to_string())
+                ),
+                ("block-c".to_string(), true, Some("manual-c".to_string())),
+                ("block-e".to_string(), true, Some("manual-e".to_string())),
+                (
+                    "block-g".to_string(),
+                    false,
+                    Some("machine-block-g".to_string())
+                ),
+            ],
+            "a manual edit outlives the model identity; a stale machine row still does not"
+        );
+        assert_eq!(
+            db::translations::list_for_unit(
+                &db::open_conn(&services.db_path).unwrap(),
+                &unit_id,
+                "zh-Hans",
+            )
+            .unwrap()
+            .iter()
+            .filter(|row| row.manual_text.is_some())
+            .count(),
+            4,
+            "displaying a manual edit never rewrites the rows behind it"
+        );
+
+        // 恢复机器译文只清掉手工列，机器文本原样返回。
+        block_on_without_tokio(services.set_manual_translation(
+            book_id.clone(),
+            unit_id.clone(),
+            "block-e".to_string(),
+            None,
+        ))
+        .unwrap();
+        let blocks = block_on_without_tokio(
+            services.translation_blocks_for_unit(book_id.clone(), unit_id.clone()),
+        )
+        .unwrap();
+        assert!(
+            blocks.iter().all(|block| block.key != "block-e"),
+            "the machine text of the wrong identity is not resurrected by a restore"
+        );
+        block_on_without_tokio(services.set_manual_translation(
+            book_id.clone(),
+            unit_id.clone(),
+            "block-a".to_string(),
+            None,
+        ))
+        .unwrap();
+        let blocks = block_on_without_tokio(
+            services.translation_blocks_for_unit(book_id.clone(), unit_id.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            blocks
+                .iter()
+                .find(|block| block.key == "block-a")
+                .map(|block| block.manual),
+            Some(false),
+            "restoring falls back to the machine text of the current identity"
+        );
     }
 
     #[test]

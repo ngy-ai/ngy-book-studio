@@ -95,7 +95,7 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   修订或删除章节保留失效笔记，不按 quote 搜索重定位；删除图书级联清除笔记。
   同书/单元/双版本/精确起止范围的三种标记由部分唯一索引约束，改样式在事务中替换，
   不创建多条标记。删除划线只删除该范围的标记，人工与 AI 想法保持不变。
-  当前开发结构版本为 13，遵循重建策略，不编写迁移。
+  当前开发结构版本为 14，遵循重建策略，不编写迁移。
 - `src/db/`：SQLite 连接、当前结构、单表 CRUD/查询映射和跨表事务。每张表对应一个
   文件：`books.rs`、`book_sources.rs`、`content_units.rs`、`toc_entries.rs`、
   `blobs.rs`、`assets.rs`、`asset_refs.rs`、`progress.rs`、`search_chunks.rs`、
@@ -132,8 +132,12 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   链接、span 或列表文字叶节点。其它格式使用规范化 HTML；解析在后台执行。
   `src/translation.rs` 定义只含文字的分段协议：每次提供整段上下文与整数 ID，模型必须
   返回完整、唯一的 ID 集合；按原文顺序回排并恢复片段边界空白，不能用模型 HTML 替换正文。
-  响应允许完整的前置 `<think>`、Markdown 围栏和说明文字包裹一个完整 JSON 对象；
-  不深入数组、字符串或其它对象查找答案，多个答案、截断 JSON、缺失/重复/未知 ID 均拒绝。
+  响应允许完整的前置 `<think>`、Markdown 围栏和说明文字包裹一个完整答案；规范外壳是
+  `{"translations":[{"id":0,"text":"译文"}]}`。只有小模型丢掉该外壳时才把顶层片段对象本身或
+  片段对象数组折进同一外壳（现场：`qwen3.5:0.8b` 逐块返回 `[{"id":0,"text":"…"}]`，整本书
+  的块都判 `invalid_schema` 而任务失败），元素仍必须是严格片段对象——位置化片段、带额外字段
+  的元素和 `[{"translations":[…]}]` 这类包裹别的答案的容器一律拒绝，绝不搜索嵌套结果。多个
+  答案、截断 JSON、缺失/重复/未知 ID 均拒绝。
   解析失败时只允许一次**结构标点归一**：把字符串字面量之外的全角结构字符（`：，｛｝［］＂“”`）
   换成半角 ASCII 后再走同一条严格流水线。它只改写 JSON 里只可能是结构的位置，因此合法
   响应永不进入该路径、译文内容逐字不变；键名吞掉分隔符（现场 266 块 `"text："`）要恢复
@@ -176,8 +180,16 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   （现场 96 号代码行）。`markup` 与 `translations.js` 必须共用同一份字符表，两边叶节点
   数量不一致会让回填整体对齐失败而保留原文。该规则只会减少槽位，命中旧缓存的块最多回退
   原文，因此不提升 `translation-v2` 身份、不重译整库。源文本超过既有上限明确失败，不能
-  截断后存成完整块。`translated_text` 保存校验后的 `StoredTranslation` JSON 和执行身份，
-  不增加表结构或旧字段回退。对话模型或端点变化不清除旧译文：重排事务按协议前缀
+  截断后存成完整块。`translated_text` 保存校验后的 `StoredTranslation` JSON 和执行身份。
+  阅读窗口可以手工改写单个文本块的译文，它存在同一行的可空 `translations.manual_text`（同形状
+  JSON），与机器文本**并排**：`upsert`、缓存命中重挂与重排事务只替换机器列，必须保留手工列
+  （重排确实要作废时走 `delete_for_retranslation`，它同样保留仍可显示的手工行），因此后续模型
+  运行、重译、重启或换端点都不会覆盖读者写下的文字，「恢复机器译文」只是把该列写回 `NULL`。写入只走 `AppServices::set_manual_translation`：来源永远取自表内片段
+  （`manual_translation_segments`，请求只能替换译文文本），并按
+  book/unit/block/language/document_revision/unit_revision 精确匹配，匹配不到或校验失败即报错
+  且不落库。读取时手工译文**不校验模型与执行身份**（读者自己的文字不能因换模型而消失），但
+  文档/单元版本仍必须匹配，手工列无法解析时退回机器译文。结构版本 13 → 14 只为这一列。
+  对话模型或端点变化不清除旧译文：重排事务按协议前缀
   （`translation::EXECUTION_IDENTITY_PROTOCOL`，即身份中冒号前的 `translation-v2`）判定
   可复用后，把该书该语言的行重新盖上当前模型与身份并保留游标位置，只有未翻译的块才由
   新引擎补翻；协议版本变化（如 `translation-v2` → `translation-v3`）仍整本作废重译，
@@ -192,9 +204,13 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   版本 + 文档版本 + 模型身份」共同决定（`translation_cache_key`），不能按块位置判定：规范化
   EPUB 投影会给没有同名标题的章节补 `<h1>` 并整体移动块下标，按位置判定会让整本图书白翻一遍。
   命中时把已存译文重挂到当前块 ID（不调用模型），使行始终跟随它所属的块。
-  「重新翻译」由 `IndexingCoordinator::retranslate` 实现：先把该书该语言的译文行删掉，
-  再把游标 `next_ordinal` 归零并重置为 queued/paused；只对 `translation` 生效，来源已
-  被替代或其它任务类型一律拒绝（不改状态）。
+  「重新翻译」由 `IndexingCoordinator::retranslate` 实现：先把该书该语言的译文行删掉
+  （`db::translations::delete_for_retranslation`），再把游标 `next_ordinal` 归零并重置为
+  queued/paused；只对 `translation` 生效，来源已被替代或其它任务类型一律拒绝（不改状态）。
+  这次删除**保留仍可显示的手工译文行**（`manual_text` 非空且 document/unit 版本都是当前的），
+  换模型/协议重排走的是同一个函数：后台动作不得删除读者写下的文字。被保留的行仍是有效的
+  缓存项，所以重新翻译只重跑其余文本块，手工改写过的块保留原机器译文与身份；版本已经过期
+  的手工行和没有手工译文的行一样被删掉，不会留下再也显示不出来的孤儿行。
 - `src/preview.rs`、`src/windows_pdf_renderer.rs`、`src/djvu_renderer.rs`：`VisualRenderer`、
   结构化页面 PNG 光栅化、Windows PDF 原页光栅化与纯 Rust DjVu 逐页光栅化、
   可暂停/恢复/重试/取消的持久任务和本地 PDF.js 资产路由。DjVu 渲染器（`moye-djvu-png`）
@@ -315,12 +331,50 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   译文格式只从当前原文 DOM 的白名单元素与排版 computed style 重建，禁止复制 ID、事件和
   URL 属性；逐项核验源文字叶节点，匹配失败保留原文。直接列表项保留 li 和编号，内部
   原文包装必须可在 clear 时恢复；含媒体段落保持双语，不能隐藏图片。HTML/XHTML 均须支持。
+  手工修改单块译文（`TranslatedBlock::manual` + 每块 `key`）：页面在每个译文叶子旁提供
+  「编辑译文 / 保存 / 取消 / 恢复机器译文」（`data-moye-translation-controls`，默认 `opacity:0`
+  且 `pointer-events:none`，悬停或 `focusin` 时显现——用 `visibility:hidden` 会把按钮移出 Tab
+  序列，键盘用户将无法进入编辑）。控制行自身放在该 host 的 shadow root
+  （`attachShadow({mode:"open"})`）里：按钮文字是 chrome，留在译文层的 light DOM 里会跟着
+  选区被复制，也会让译文层报出比它显示的译文更多的文字（`focusin` 会穿过边界，悬停由
+  layer 的 `mouseenter` 决定）。编辑器只在译文叶子位置替换成单行 `contenteditable` 纯文本
+  节点（`Enter` 禁止、`Escape` 取消、粘贴只取 `text/plain`、空译文在页面先拒绝），原文节点、
+  笔记 UTF-16 锚点与 `originalRange()` 叶子映射都不受影响（`pair.copy` 在编辑期间就是该
+  可编辑节点）。保存把 `source`（取自**原文**叶子，不是页面显示的文字）与当前文本经
+  `manual_translation` IPC 交给宿主，宿主重新读取该章并强制推送；页面只有在
+  `result({ok:true})` 之后才把内容落成普通文本节点，失败时保留输入并显示原因，且必须能看到
+  「取消」。**后台逐块推送与编辑互斥**：同一章节（revision 相同）的载荷在编辑或保存进行中先
+  缓存，编辑器关闭后再应用，绝不能用重推丢掉正在输入的文字；revision 变化（切章）立即应用。
+  IPC 侧 `ManualTranslationRequest::valid()` 只做粗筛（动作、非空、片段/字节上限），权威校验在
+  `set_manual_translation`：两处上限必须一致，页面与宿主都必须拒绝空译文，只有「恢复」允许
+  空片段列表。
   `src/ui/reader/translations.test.cjs` 是可选 DOM 门禁（Node + 已安装 Playwright），
-  覆盖双语顺序、重复文本消歧、嵌套块、单元格插入、点击切换与笔记/选区排除。
+  覆盖双语顺序、重复文本消歧、嵌套块、单元格插入、点击切换与笔记/选区排除，
+  以及手工译文用例：编辑→保存的请求形状、失败后保留输入、重推延后到取消之后、空译文不发请求、
+  编辑时选区仍解析回原文（HTML/XHTML）。
   2026-09-11 格式回归：11 项 HTML/XHTML DOM 用例通过；`tests/translation_flow.rs`
   通过本机 mock SSE 验证请求、严格回填、重启、缓存失效、切端点与重译。真实 Windows
   独立 EPUB 的 14 块中文译文验证标题/强调/颜色/换行/列表/表格/上下标/代码和点击切换，
   重启仍保留译文，取消/确认退出正常，两次错误日志为空；未连接真实模型或用户书库。
+  2026-09-12 手工译文：`tests/translation_flow.rs` 新用例覆盖手工译文覆盖机器文本、重启与换
+  端点后仍显示、恢复后回到机器文本且不新增模型请求，并拒绝改写原文/截断/超大/未知块/空译文；
+  `services` 单元用例覆盖手工译文不校验模型与执行身份、版本失效与不可解析的手工列退回机器
+  文本；阅读窗口 IPC 用例覆盖动作/空值与上限拒绝，宿主的接单门
+  （`manual_edit_belongs_to_current_chapter`：URL 必须解析为当前章、`revision` 必须等于本窗口
+  推送过的值）由独立纯函数用例固定，没有版本记录的章推送 0 也必须接受回传的 0，否则该章
+  永远不能手工改，所以不得改成「必须有版本记录」的严格比较。
+  2026-09-12 DOM 门禁：本机 Node 26.8.1（fnm，`E:\ai\fnm\node-versions\v26.8.1\installation`）
+  加已安装的 Playwright 1.61.1（借用其它项目的包，`NODE_PATH` 指向其 `node_modules`，
+  浏览器用 `%LOCALAPPDATA%\ms-playwright\chromium-1228`，不安装也不改动本仓库依赖）运行
+  `node --test src/ui/reader/translations.test.cjs`：23 项全部通过。首轮 5 项失败暴露了两个
+  真实问题与一个测试缺陷并已修掉——控制行按钮文字混进译文层的 `textContent`（改 shadow root）、
+  XHTML fixture 没有 `xmlns` 因而元素不再具备 HTML 接口（fixture 补齐命名空间，真实章节都带它）、
+  以及新用例在 `focus` 同一帧读 `opacity` 而没等淡入（改为 `waitForFunction`）。
+  同一轮 `node --test src/ui/pdf_reader/annotations.test.cjs` 4 项、
+  `src/ui/pdf_reader/viewer.test.cjs` 4 项通过；`src/ui/reader/annotations.test.cjs` 19 项中
+  1 项失败（`clicking a mark lists its thoughts…`：`result()` 之后直接取 `.mark.highlight`，
+  而同一文件第一个用例是靠 `waitForFunction` 等划线渲染的），该文件与 `annotations.js`、
+  初始化桥都与 HEAD 一致，待单独定位，不要当成手工译文引入的回归。
 - `src/ui/pdf_reader/annotations.rs`、`annotations.js`：PDF 页面笔记宿主与页面桥接，
   复用同一张 `annotations` 表、互斥标记规则、人工/AI 想法流程与展示清洗。锚点作用域
   是单页的 PDF.js 文字层：宿主无法复刻该投影，因此
@@ -473,6 +527,29 @@ cargo test --test openai_compatible_flow --locked
 
 `src/ui/` 的单元测试属于产品二进制目标，不包含在 `cargo test --lib` 中。完成 Rust
 改动前仍应执行全目标检查和测试；不要只用快速命令作最终验收。
+
+### 可选 DOM 门禁（Node + 已安装 Playwright）
+
+`src/ui/reader/translations.test.cjs`、`src/ui/reader/annotations.test.cjs`、
+`src/ui/pdf_reader/annotations.test.cjs`、`src/ui/pdf_reader/viewer.test.cjs` 用
+`node --test <file>` 运行。它们只使用本机已安装的 Playwright，不为测试安装依赖、
+不触碰用户数据，`MOYE_TEST_CHROMIUM` 可指定浏览器。改动 `src/ui/**/*.js` 的交互代码
+或 `web/pdf` 产物时建议跑对应门禁，并在 `ROADMAP.md` 或本文件记下结果。
+
+本机（2026-09-12）可用组合：Node 26.8.1 由 fnm 安装在
+`E:\ai\fnm\node-versions\v26.8.1\installation`（`fnm list` 可查，非交互 shell 默认
+不在 `PATH` 上），Playwright 1.61.1 借自本机已有安装（`NODE_PATH` 指向其
+`node_modules`，本次为另一个项目的 pnpm 目录），浏览器复用
+`%LOCALAPPDATA%\ms-playwright\chromium-1228`：
+
+```powershell
+$env:PATH = "E:\ai\fnm\node-versions\v26.8.1\installation;" + $env:PATH
+$env:NODE_PATH = "E:\projects\deepseek-harness\node_modules\.pnpm\node_modules"
+node --test src/ui/reader/translations.test.cjs
+```
+
+门禁失败先分清产品缺陷与用例缺陷：XHTML 夹具必须带 `xmlns`（否则元素不再具备 HTML
+接口），异步重绘要用 `waitForFunction` 等，而不是在同一个任务里直接读结果。
 
 ### AI 问答诊断日志
 

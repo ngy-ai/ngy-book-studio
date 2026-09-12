@@ -5,6 +5,11 @@ use rusqlite::{Connection, params};
 /// by `(book_id, content_unit_id, block_id, target_language)` so the reader can
 /// look up a whole chapter in one query, and the background job can replace a
 /// block in place when the document revision or model changes.
+///
+/// `manual_text` carries the reader's own edit of the same block in the same
+/// [`StoredTranslation`](crate::translation::StoredTranslation) shape. It lives
+/// beside the machine text instead of replacing it, so the job never has to
+/// know about it and "恢复机器译文" is a plain `NULL` write.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Translation {
     pub block_id: String,
@@ -14,6 +19,7 @@ pub(crate) struct Translation {
     pub model: String,
     pub source_text: String,
     pub translated_text: String,
+    pub manual_text: Option<String>,
 }
 
 /// Insert/update payload. The primary key is derived deterministically from the
@@ -37,7 +43,7 @@ pub(crate) struct NewTranslation {
 }
 
 const SELECT: &str = "SELECT block_id, ordinal, document_revision, unit_revision,
-    model, source_text, translated_text FROM translations";
+    model, source_text, translated_text, manual_text FROM translations";
 
 /// Stable surrogate key for one translation scope. Derived so an upsert can
 /// reuse the canonical row without churning the primary key.
@@ -72,6 +78,9 @@ pub(crate) fn list_for_unit(
         .context("无法解析章节译文记录")
 }
 
+/// Machine path of the translation job. A conflicting row is replaced in place
+/// and deliberately keeps `manual_text`: the reader's own edit of that block is
+/// never a casualty of a later model run (or of a cache-hit republish).
 pub(crate) fn upsert(conn: &Connection, translation: &NewTranslation) -> Result<()> {
     let id = translation_id(
         &translation.book_id,
@@ -112,6 +121,45 @@ pub(crate) fn upsert(conn: &Connection, translation: &NewTranslation) -> Result<
     )
     .context("无法保存译文")?;
     Ok(())
+}
+
+/// Stores the reader's own translation of one block, or clears it with `None`
+/// so the block falls back to the machine text.
+///
+/// The row must still describe the block being read: the update matches the
+/// document and unit revisions the caller validated, and returns `false`
+/// without writing when no row matches exactly (the chapter changed, the block
+/// left the document, or the row was deleted by a re-translation).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn set_manual_text(
+    conn: &Connection,
+    book_id: &str,
+    content_unit_id: &str,
+    block_id: &str,
+    target_language: &str,
+    document_revision: u64,
+    unit_revision: u64,
+    manual_text: Option<&str>,
+    updated_at: u64,
+) -> Result<bool> {
+    let updated = conn
+        .execute(
+            "UPDATE translations SET manual_text = ?7, updated_at = MAX(?8, created_at)
+             WHERE book_id = ?1 AND content_unit_id = ?2 AND block_id = ?3
+               AND target_language = ?4 AND document_revision = ?5 AND unit_revision = ?6",
+            params![
+                book_id,
+                content_unit_id,
+                block_id,
+                target_language,
+                document_revision as i64,
+                unit_revision as i64,
+                manual_text,
+                updated_at as i64,
+            ],
+        )
+        .context("无法保存手工译文")?;
+    Ok(updated == 1)
 }
 
 /// Re-stamps every persisted row of one book and language with the active
@@ -192,16 +240,28 @@ pub(crate) fn refresh_document_revision(
     .context("无法更新译文文档版本")
 }
 
-/// Removes every persisted row for one book and language. Used before a
-/// deliberate re-translation so blocks that no longer exist cannot linger.
-pub(crate) fn delete_for_book_language(
+/// Removes the machine text of one book and language before it is translated
+/// again, so blocks that no longer exist cannot linger.
+///
+/// A row whose manual translation can still be displayed — the reader's own text,
+/// for a block of the current document and chapter revision — is kept, because a
+/// background re-translation may never delete text the reader typed. Such a row
+/// is still a cache entry for the run that follows, so only the blocks that lost
+/// their row are translated again.
+pub(crate) fn delete_for_retranslation(
     conn: &Connection,
     book_id: &str,
     target_language: &str,
+    document_revision: u64,
 ) -> Result<usize> {
     conn.execute(
-        "DELETE FROM translations WHERE book_id = ?1 AND target_language = ?2",
-        params![book_id, target_language],
+        "DELETE FROM translations
+         WHERE book_id = ?1 AND target_language = ?2
+           AND (manual_text IS NULL
+                OR document_revision <> ?3
+                OR unit_revision IS NOT
+                   (SELECT revision FROM content_units WHERE id = translations.content_unit_id))",
+        params![book_id, target_language, document_revision as i64],
     )
     .context("无法删除指定语言的译文")
 }
@@ -215,6 +275,7 @@ fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Translation> {
         model: row.get(4)?,
         source_text: row.get(5)?,
         translated_text: row.get(6)?,
+        manual_text: row.get(7)?,
     })
 }
 
@@ -287,6 +348,144 @@ mod tests {
         assert_eq!(rows.len(), 2, "same scope must replace in place");
         assert_eq!(rows[0].translated_text, "甲二");
         assert_eq!(row_count(&conn), 2);
+    }
+
+    #[test]
+    fn a_manual_edit_survives_the_job_and_can_be_restored() {
+        let (_temp, conn) = fixture();
+        upsert(&conn, &sample("block-a", 0, "机器译文")).unwrap();
+        assert!(
+            set_manual_text(
+                &conn,
+                "book",
+                "unit",
+                "block-a",
+                "zh-Hans",
+                1,
+                1,
+                Some("人工译文"),
+                20
+            )
+            .unwrap()
+        );
+        let row = &list_for_unit(&conn, "unit", "zh-Hans").unwrap()[0];
+        assert_eq!(row.manual_text.as_deref(), Some("人工译文"));
+        assert_eq!(
+            row.translated_text, "机器译文",
+            "the model text stays behind"
+        );
+        assert_eq!(updated_at(&conn), 20);
+
+        // The background job replaces the machine text in place but must never
+        // drop the reader's own edit of the same block.
+        upsert(&conn, &sample("block-a", 0, "机器译文二")).unwrap();
+        let row = &list_for_unit(&conn, "unit", "zh-Hans").unwrap()[0];
+        assert_eq!(row.translated_text, "机器译文二");
+        assert_eq!(row.manual_text.as_deref(), Some("人工译文"));
+
+        assert!(
+            // A clock that reports an earlier instant must not violate the row's
+            // `updated_at >= created_at` contract.
+            set_manual_text(&conn, "book", "unit", "block-a", "zh-Hans", 1, 1, None, 1).unwrap()
+        );
+        assert_eq!(
+            list_for_unit(&conn, "unit", "zh-Hans").unwrap()[0].manual_text,
+            None
+        );
+        assert_eq!(updated_at(&conn), 10);
+    }
+
+    fn updated_at(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT updated_at FROM translations WHERE block_id = 'block-a'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_manual_edit_only_matches_the_current_block() {
+        let (_temp, conn) = fixture();
+        upsert(&conn, &sample("block-a", 0, "机器译文")).unwrap();
+        for (book, unit, block, language, document, revision) in [
+            ("other-book", "unit", "block-a", "zh-Hans", 1, 1),
+            ("book", "other-unit", "block-a", "zh-Hans", 1, 1),
+            ("book", "unit", "block-b", "zh-Hans", 1, 1),
+            ("book", "unit", "block-a", "ja", 1, 1),
+            ("book", "unit", "block-a", "zh-Hans", 2, 1),
+            ("book", "unit", "block-a", "zh-Hans", 1, 2),
+        ] {
+            assert!(
+                !set_manual_text(
+                    &conn,
+                    book,
+                    unit,
+                    block,
+                    language,
+                    document,
+                    revision,
+                    Some("人工译文"),
+                    20
+                )
+                .unwrap(),
+                "a stale or foreign scope must not be written"
+            );
+        }
+        assert_eq!(
+            list_for_unit(&conn, "unit", "zh-Hans").unwrap()[0].manual_text,
+            None
+        );
+    }
+
+    #[test]
+    fn a_re_translation_drops_machine_rows_but_keeps_manual_edits_that_still_show() {
+        let (_temp, conn) = fixture();
+        upsert(&conn, &sample("block-a", 0, "机器译文")).unwrap();
+        set_manual_text(
+            &conn,
+            "book",
+            "unit",
+            "block-a",
+            "zh-Hans",
+            1,
+            1,
+            Some("人工译文"),
+            20,
+        )
+        .unwrap();
+        upsert(&conn, &sample("block-b", 1, "机器译文")).unwrap();
+        upsert(&conn, &sample("block-c", 2, "机器译文")).unwrap();
+        set_manual_text(
+            &conn,
+            "book",
+            "unit",
+            "block-c",
+            "zh-Hans",
+            1,
+            1,
+            Some("人工译文"),
+            20,
+        )
+        .unwrap();
+        // A manual edit of a chapter version that is already gone cannot be shown
+        // again, so it leaves with the machine rows.
+        conn.execute(
+            "UPDATE translations SET unit_revision = 2 WHERE block_id = 'block-c'",
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(
+            delete_for_retranslation(&conn, "book", "zh-Hans", 1).unwrap(),
+            2,
+            "the machine row and the undisplayable manual row go"
+        );
+        let rows = list_for_unit(&conn, "unit", "zh-Hans").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].block_id, "block-a");
+        assert_eq!(rows[0].manual_text.as_deref(), Some("人工译文"));
+        assert_eq!(row_count(&conn), 1);
     }
 
     #[test]

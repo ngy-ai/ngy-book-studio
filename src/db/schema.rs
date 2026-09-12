@@ -6,7 +6,7 @@ use crate::document::{DocumentLocator, SourceLocator};
 /// Identifies SQLite files owned by this application (ASCII "MOYE").
 pub(super) const APPLICATION_ID: i64 = 0x4D4F_5945;
 /// Development schemas are deliberately rebuilt instead of migrated.
-pub(super) const SCHEMA_VERSION: i64 = 13;
+pub(super) const SCHEMA_VERSION: i64 = 14;
 
 #[derive(Clone, Copy)]
 struct ColumnSpec {
@@ -286,6 +286,7 @@ const TRANSLATION_COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("model", "TEXT", true, 0),
     ColumnSpec::new("source_text", "TEXT", true, 0),
     ColumnSpec::new("translated_text", "TEXT", true, 0),
+    ColumnSpec::new("manual_text", "TEXT", false, 0),
     ColumnSpec::new("created_at", "INTEGER", true, 0),
     ColumnSpec::new("updated_at", "INTEGER", true, 0),
 ];
@@ -1007,6 +1008,7 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
              model TEXT NOT NULL CHECK(length(model) > 0),
              source_text TEXT NOT NULL CHECK(length(source_text) > 0),
              translated_text TEXT NOT NULL CHECK(length(translated_text) > 0),
+             manual_text TEXT CHECK(manual_text IS NULL OR length(manual_text) > 0),
              created_at INTEGER NOT NULL CHECK(created_at >= 0),
              updated_at INTEGER NOT NULL CHECK(updated_at >= created_at)
          );

@@ -24,7 +24,7 @@ mod annotations;
 use annotations::{AnnotationAction, ReaderAnnotations};
 
 mod translations;
-use translations::ReaderTranslations;
+use translations::{ManualTranslationRequest, ReaderTranslations};
 
 #[cfg(target_os = "windows")]
 pub(super) mod selection_menu;
@@ -151,6 +151,10 @@ enum ReaderIpcMessage {
         #[serde(flatten)]
         action: AnnotationAction,
     },
+    ManualTranslation {
+        #[serde(flatten)]
+        request: ManualTranslationRequest,
+    },
     SelectionChanged {
         selected_text: String,
     },
@@ -168,6 +172,10 @@ pub(super) enum ReaderWebEvent {
     AnnotationAction {
         url: String,
         action: AnnotationAction,
+    },
+    ManualTranslation {
+        url: String,
+        request: ManualTranslationRequest,
     },
     PageLoaded(String),
     ExplainSelection {
@@ -899,6 +907,12 @@ fn reader_ipc_event(uri: &gpui_component::wry::http::Uri, body: &str) -> Option<
             action.valid().then(|| ReaderWebEvent::AnnotationAction {
                 url: uri.to_string(),
                 action,
+            })
+        }
+        ReaderIpcMessage::ManualTranslation { request } => {
+            request.valid().then(|| ReaderWebEvent::ManualTranslation {
+                url: uri.to_string(),
+                request,
             })
         }
         ReaderIpcMessage::SelectionChanged { selected_text } => {
@@ -1865,6 +1879,9 @@ impl ReaderApp {
             }
             ReaderWebEvent::AnnotationAction { url, action } => {
                 self.handle_annotation_action(&url, action, cx)
+            }
+            ReaderWebEvent::ManualTranslation { url, request } => {
+                self.handle_manual_translation(&url, request, cx)
             }
             ReaderWebEvent::PageLoaded(url) => self.sync_loaded_page(&url, cx),
             ReaderWebEvent::ExplainSelection { url, selected_text } => {

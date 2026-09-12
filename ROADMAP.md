@@ -90,6 +90,19 @@
     隐藏，标记需切到双语或原文才可见。解释译文时页面把所选译文作为 `displayed_text`
     回传（仅 `ai_explain`），提问按“请按译文解释”附上该译文，模型因此解释你读到的文字，
     而引用、来源与保存的 AI 想法仍是原文
+  - [x] 手工修改单块译文：段落译文旁的「编辑译文」把该块的译文就地变成可编辑文本，保存
+    后作为手工译文显示并标记「已手工修改」，另有「恢复机器译文」回到模型文本。手工译文
+    与机器译文并排存放在同一行（`translations.manual_text`），因此后续模型运行、重译、
+    重启或换端点都不会覆盖读者写下的文字，机器文本始终留在背后，恢复也不需要重新调用
+    模型。请求只携带原文叶子的 source 与改写后的文本，宿主按
+    book/unit/block/language/文档版本/单元版本精确匹配表内片段后才写入，空译文、片段
+    数量或顺序不符、未知块与超长载荷一律拒绝且不落库。编辑器替换的是译文叶子
+    （`contenteditable` 纯文本，Enter 禁止、Escape 取消、粘贴只取纯文本），原文节点、
+    笔记锚点与译文→原文映射不受影响；后台逐块推送在编辑或保存进行中先延后，绝不覆盖
+    正在输入的文字；译文只在 `result({ok:true})` 之后才落成普通文本节点，宿主失败时保留
+    输入并显示原因
+  - [x] 结构版本 13 → 14：`translations` 新增可空 `manual_text`（`upsert` 只替换机器列），
+    仍遵循重建策略、不编写迁移
   - [x] 结构版本 12 → 13：新增 `translations` 表（部分唯一索引按
     book/unit/block/language 约束）、`db/translations.rs` DAO 与完整性关系校验，遵循
     重建策略、不编写迁移
@@ -350,9 +363,11 @@ LangGraph 依赖。CLI 课程验证与桌面接入的验证分别列出。
   `markup::block_texts_from_html()` 提取最内层块级元素（`p`/`h1–h6`/`li`/`blockquote`/
   `td`/`th`）归一化后的文本，与前端匹配的候选集一致（跳过 script/style，图片章节返回空）。
   修复了“任务立刻成功但译文 0 行”的问题；回归覆盖嵌套列表、内联标签、纯图片章节与 ID 确定性
-- [x] 后台任务窗口对翻译类任务提供“重新翻译”：先删除该书该语言的译文行，再把游标
+- [x] 后台任务窗口对翻译类任务提供“重新翻译”：先删除该书该语言的译文行（`manual_text`
+  非空且版本仍当前的行的机器译文会保留，见手工译文条目），再把游标
   `next_ordinal` 归零并重置为排队/已暂停；只对 translation 生效，来源已被替代或其它
-  任务类型拒绝修改
+  任务类型拒绝修改。回归：`retranslating_a_translation_job_resets_it_and_clears_its_rows`、
+  `retranslating_a_translation_job_keeps_a_manual_edit_and_clears_the_rest`
 - [x] 阅读器：`translations.rs` 宿主桥接与 `translations.js` 翻译展示（默认仅译文隐藏
   原文，可点击切换为双语对照；译上原下、虚线分隔）；译文节点标记 `data-moye-translation`
   并从笔记文本索引、选区与 AI 引用中排除，原文文本节点保留在 `body`
@@ -376,7 +391,7 @@ LangGraph 依赖。CLI 课程验证与桌面接入的验证分别列出。
 - [x] 2026-09-11 换模型保留译文：对话模型或端点变化时不再删除该书该语言的行，而是按协议前缀
   （`translation::EXECUTION_IDENTITY_PROTOCOL`）判定可复用后重新盖上当前模型与身份，并保留
   游标位置，只有未翻译的块交给新引擎；协议版本变化或无法解析的旧纯文本行仍整本作废重译，
-  「重新翻译」仍是干净的全量重做。回归：
+  「重新翻译」仍是全量重做（仅保留读者手工改写的行，其机器译文不变）。回归：
   `translation_identity_change_keeps_translated_blocks_and_the_durable_cursor`、
   `adopting_a_new_engine_keeps_text_and_rejects_another_protocol`、
   `structured_translation_survives_restart_and_a_changed_endpoint_keeps_its_text`
@@ -440,6 +455,27 @@ LangGraph 依赖。CLI 课程验证与桌面接入的验证分别列出。
   `multi_format_flow` 4、`multi_endpoint_flow` 1、`format_corpus_gate` 0/1 忽略全部通过。
   未连接 `ornith-1.5:9b` 复现该块的实际输出，也未做真实 Windows GUI 复验；下次运行可按
   `translation_stream_progress` 判断是「没写出答案 / 思考没关 / 答案重复 / 持续变慢」
+- [x] 2026-09-12 手工修改单块译文：`translations.manual_text`（结构版本 13 → 14，
+  `upsert` 与缓存命中重挂只替换机器列）、`db::translations::set_manual_text` 按
+  book/unit/block/language/文档版本/单元版本精确匹配写入、读取时手工列优先且不校验
+  模型与执行身份（文档/单元版本仍须匹配）、`AppServices::set_manual_translation` 校验
+  片段来源与形状、阅读窗口 `manual_translation` IPC 与 `translations.js` 的就地编辑/
+  保存/取消/恢复（编辑或保存期间先延后后台推送）。控制行放在 host 的 shadow root 里，
+  按钮文字不进入译文层文本，复制译文不会带上「编辑译文」。回归：`cargo test --lib`
+  531 项通过/5 项忽略、产品二进制 275 项通过/1 项忽略、`translation_flow` 15、
+  `epub_flow` 6、`openai_compatible_flow` 22、`multi_format_flow` 4、`multi_endpoint_flow` 1
+  全部通过；`cargo fmt --all --check` 通过，`cargo clippy --all-targets --locked` 仅剩改动前
+  既有告警。2026-09-12 补跑 Node 26.8.1 + Playwright 1.61.1 的
+  `node --test src/ui/reader/translations.test.cjs`：23 项全部通过（首轮 5 项失败已定位并
+  修掉：按钮文字混进译文层、XHTML fixture 缺 `xmlns`、新用例没等行淡入）；
+  `src/ui/pdf_reader/{annotations,viewer}.test.cjs` 各 4 项通过，
+  `src/ui/reader/annotations.test.cjs` 19 项中 1 项既有失败（与本改动无关，待单独定位）。
+  仍未做真实 Windows GUI 手工点击复验
+- [x] 2026-09-12 「重新翻译」与换模型重排不再删除手工译文：删除改为
+  `delete_for_retranslation`（只删没有手工译文、或 document/unit 版本已过期到无法再显示的
+  行），`IndexingCoordinator::retranslate` 与 `reconfigure_translation_jobs` 走同一函数。
+  回归：`retranslating_a_translation_job_keeps_a_manual_edit_and_clears_the_rest`、
+  `a_re_translation_drops_machine_rows_but_keeps_manual_edits_that_still_show`
 - [ ] 翻译任务窗口的“文本块明细”仍按游标显示块状态，被跳过的块与已翻译块一样显示为
   已处理；逐块结果目前只能从任务日志的 `ProtocolSkipped` 记录读取
 

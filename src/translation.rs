@@ -207,15 +207,21 @@ fn decode_untouched_response(response: &str) -> std::result::Result<Response, Re
             return Ok(response);
         }
         // Serde structs can accept positional sequences. The protocol requires
-        // an object, so a valid array/string envelope is never unwrapped.
+        // one answer envelope, so a valid object/array inside another container
+        // is never unwrapped.
         Ok(_) => return Err(ResponseError::new("invalid_schema")),
         Err(error) if error.is_data() => {
-            // Some small models drop the `translations` wrapper and return a
-            // single segment object directly. Treat one bare segment object as
-            // `{"translations":[that]}` so one-segment blocks still translate;
-            // multi-segment requests then fail at the segment-count check.
-            if let Some(response) = decode_single_segment_object(body) {
+            // Small models may drop the `translations` wrapper; the segment list
+            // itself is still accepted at the element level below.
+            if let Some(response) = decode_bare_segment_list(body) {
                 return Ok(response);
+            }
+            // 容器扫描的结论优先于笼统的 invalid_schema，使重复的数组答案与重复的
+            // 对象答案一样报 ambiguous_json。
+            if body.starts_with('[')
+                && let Err(container) = single_json_container(body)
+            {
+                return Err(container);
             }
             return Err(ResponseError::json(&error));
         }
@@ -223,7 +229,9 @@ fn decode_untouched_response(response: &str) -> std::result::Result<Response, Re
     }
     let candidate = single_json_container(body)?;
     if !candidate.starts_with('{') {
-        return Err(ResponseError::new("invalid_schema"));
+        // 顶层数组只可能是被丢掉的片段列表；包裹别的答案的数组仍在这里被拒绝。
+        return decode_bare_segment_list(candidate)
+            .ok_or_else(|| ResponseError::new("invalid_schema"));
     }
     match serde_json::from_str::<Response>(candidate) {
         Ok(response) => {
@@ -231,7 +239,7 @@ fn decode_untouched_response(response: &str) -> std::result::Result<Response, Re
             return Ok(response);
         }
         Err(error) => {
-            if let Some(response) = decode_single_segment_object(candidate) {
+            if let Some(response) = decode_bare_segment_list(candidate) {
                 return Ok(response);
             }
             return Err(ResponseError::json(&error));
@@ -255,16 +263,89 @@ fn require_segment_objects(candidate: &str) -> std::result::Result<(), ResponseE
     Ok(())
 }
 
-/// Some providers/models return a single segment object without the
-/// `translations` wrapper. Fold exactly one such object into the expected
-/// envelope; anything that is not a clean segment object is left for the
-/// caller to reject (so multi-segment requests still fail at the count check).
-fn decode_single_segment_object(payload: &str) -> Option<Response> {
+/// Some providers/models drop the `translations` wrapper and return the segment
+/// list itself: either one bare segment object, or the array of segment objects
+/// that should have been the value of `translations` (`qwen3.5:0.8b`, 2026-09-12:
+/// one library run was rejected as `invalid_schema` on every block for exactly
+/// that array). Fold only that shape into the expected envelope; every element
+/// must still be a strict segment object, so a container that wraps a different
+/// answer (for example `[{"translations":[…]}]`) or a positional segment
+/// (`[0,"译文"]`) is left for the caller to reject rather than searched for a
+/// nested result.
+fn decode_bare_segment_list(payload: &str) -> Option<Response> {
+    if payload.trim_matches(is_matching_whitespace).starts_with('[') {
+        return decode_segment_array(payload);
+    }
     serde_json::from_str::<ResponseSegment>(payload)
         .ok()
         .map(|segment| Response {
             translations: vec![segment],
         })
+}
+
+fn decode_segment_array(payload: &str) -> Option<Response> {
+    let translations = object_array_elements(payload)?
+        .iter()
+        .map(|element| serde_json::from_str::<ResponseSegment>(element).ok())
+        .collect::<Option<Vec<_>>>()?;
+    Some(Response { translations })
+}
+
+/// Splits one complete top-level array into its element slices, requiring every
+/// element to be an object. Separators are validated here as well, so a missing,
+/// doubled or trailing comma and a positional `[0,"译文"]` all stay rejected.
+fn object_array_elements(payload: &str) -> Option<Vec<&str>> {
+    let payload = payload.trim_matches(is_matching_whitespace);
+    let inner = payload.strip_prefix('[')?.strip_suffix(']')?;
+    let mut elements = Vec::new();
+    let mut stack = Vec::new();
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut start = 0;
+    // 下一个非空白字节必须是元素起点：缺分隔符、多余逗号或尾随逗号都在这里失败。
+    let mut expecting_element = true;
+    for (offset, byte) in inner.bytes().enumerate() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+            }
+            continue;
+        }
+        if stack.is_empty() {
+            match byte {
+                b' ' | b'\t' | b'\r' | b'\n' => {}
+                b',' if !expecting_element => expecting_element = true,
+                b'{' if expecting_element => {
+                    expecting_element = false;
+                    start = offset;
+                    stack.push(byte);
+                }
+                _ => return None,
+            }
+            continue;
+        }
+        match byte {
+            b'"' => quoted = true,
+            b'{' | b'[' => stack.push(byte),
+            b'}' | b']' => {
+                if stack.pop() != Some(if byte == b'}' { b'{' } else { b'[' }) {
+                    return None;
+                }
+                if stack.is_empty() {
+                    elements.push(&inner[start..=offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+    if !stack.is_empty() || quoted || expecting_element {
+        return None;
+    }
+    Some(elements)
 }
 
 /// Find only top-level containers. Braces inside strings and nested containers
@@ -749,6 +830,79 @@ mod tests {
         assert_eq!(
             error.downcast_ref::<ResponseError>().unwrap().kind(),
             "segment_count_mismatch"
+        );
+    }
+
+    #[test]
+    fn bare_segment_array_is_accepted_as_the_translation_list() {
+        // 现场（2026-09-12，qwen3.5:0.8b）：小模型丢掉了 translations 外壳，逐块返回
+        // 顶层数组 [{"id":0,"text":"…"}]，同一本书的文本块全部被判 invalid_schema。
+        let answer = r#"[{"id":0,"text":"阅读"},{"id":1,"text":"重要"},{"id":2,"text":"文本"}]"#;
+        let expected = parse_response(&source(), valid_response(), "v2").unwrap();
+        for response in [
+            answer.to_string(),
+            format!("```json\n{answer}\n```"),
+            format!("结果：\n```json\n{answer}\n```\n完成。"),
+            format!("<think>先确认术语，再逐片段翻译。</think>\n{answer}"),
+        ] {
+            assert_eq!(
+                parse_response(&source(), &response, "v2").unwrap(),
+                expected,
+                "{response}"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_segment_array_keeps_every_element_level_rule() {
+        let single = TranslationSource {
+            text: "Hello".into(),
+            segments: vec!["Hello".into()],
+        };
+        let rejected = [
+            // 位置化片段、非对象元素和包裹另一个答案的数组都不是片段列表。
+            r#"[[0,"你好"]]"#,
+            r#"["你好"]"#,
+            r#"[{"translations":[{"id":0,"text":"你好"}]}]"#,
+            // 元素本身仍受 deny_unknown_fields / 重复字段 / JSON 语法约束。
+            r#"[{"id":0,"text":"你好","html":"<b>"}]"#,
+            r#"[{"id":0,"id":0,"text":"你好"}]"#,
+            r#"[{"id":0,"text":"你好"},]"#,
+            r#"[{"id":0,"text":"你好"}{"id":0,"text":"你好"}]"#,
+            r#"[]"#,
+        ];
+        for json in rejected {
+            for response in [json.to_string(), format!("结果：\n```json\n{json}\n```")] {
+                let error = parse_response(&single, &response, "v2").unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<ResponseError>().unwrap().kind(),
+                    "invalid_schema",
+                    "{response}"
+                );
+            }
+        }
+
+        // 结构可接受、片段数量不符时必须落到数量检查，而不是格式错误。
+        let two = TranslationSource {
+            text: "A B".into(),
+            segments: vec!["A".into(), "B".into()],
+        };
+        let error = parse_response(&two, r#"[{"id":0,"text":"甲"}]"#, "v2").unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ResponseError>().unwrap().kind(),
+            "segment_count_mismatch"
+        );
+
+        // 两个完整的顶层容器仍然无法确认唯一答案。
+        let error = parse_response(
+            &single,
+            r#"[{"id":0,"text":"甲"}] [{"id":0,"text":"乙"}]"#,
+            "v2",
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ResponseError>().unwrap().kind(),
+            "ambiguous_json"
         );
     }
 

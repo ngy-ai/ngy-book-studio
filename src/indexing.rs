@@ -723,7 +723,12 @@ impl IndexingCoordinator {
                 next_ordinal: 0,
             };
             let now = unix_timestamp()?;
-            db::translations::delete_for_book_language(&conn, &job.book_id, &language)?;
+            db::translations::delete_for_retranslation(
+                &conn,
+                &job.book_id,
+                &language,
+                book.revision,
+            )?;
             db::index_jobs::reset_reconfigured(
                 &conn,
                 &job_id,
@@ -7461,6 +7466,87 @@ mod tests {
                 .block_on(coordinator.retranslate(&other))
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn retranslating_a_translation_job_keeps_a_manual_edit_and_clears_the_rest() {
+        let fixture = Fixture::new();
+        let coordinator = IndexingCoordinator {
+            inner: fixture.indexing_inner(),
+            workers: Mutex::new(Vec::new()),
+        };
+        let provider: Arc<dyn OpenAiCompatibleProvider> = Arc::new(MockProvider::default());
+        let job_id = format!("translation:{}:zh-Hans", fixture.source_id);
+        fixture
+            .runtime
+            .block_on(coordinator.configure_translation(
+                provider,
+                "chat-test".to_string(),
+                "translation-v1:chat-test".to_string(),
+                Some("zh-Hans".to_string()),
+                false,
+            ))
+            .unwrap();
+        let manual_text = serde_json::to_string(&crate::translation::StoredTranslation {
+            execution_identity: "translation-v1:chat-test".to_string(),
+            segments: vec![crate::translation::TranslationSegment {
+                source: "Alpha".to_string(),
+                translated: "人工甲".to_string(),
+            }],
+        })
+        .unwrap();
+        {
+            let conn = db::open_conn(&fixture.db_path).unwrap();
+            for (block_id, ordinal) in [("edited", 0), ("plain", 1)] {
+                db::translations::upsert(
+                    &conn,
+                    &db::translations::NewTranslation {
+                        book_id: fixture.book_id.clone(),
+                        content_unit_id: fixture.unit_id.clone(),
+                        block_id: block_id.to_string(),
+                        ordinal,
+                        document_revision: fixture.revision,
+                        unit_revision: fixture.revision,
+                        target_language: "zh-Hans".to_string(),
+                        source_language: Some("en".to_string()),
+                        model: "chat-test".to_string(),
+                        source_text: "Alpha".to_string(),
+                        translated_text: "甲".to_string(),
+                        created_at: 10,
+                        updated_at: 10,
+                    },
+                )
+                .unwrap();
+            }
+            db::translations::set_manual_text(
+                &conn,
+                &fixture.book_id,
+                &fixture.unit_id,
+                "edited",
+                "zh-Hans",
+                fixture.revision,
+                fixture.revision,
+                Some(&manual_text),
+                20,
+            )
+            .unwrap();
+        }
+
+        assert!(
+            fixture
+                .runtime
+                .block_on(coordinator.retranslate(&job_id))
+                .unwrap()
+        );
+        let conn = db::open_conn(&fixture.db_path).unwrap();
+        let rows = db::translations::list_for_unit(&conn, &fixture.unit_id, "zh-Hans").unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "re-translating clears the machine rows and keeps the reader's own text"
+        );
+        assert_eq!(rows[0].block_id, "edited");
+        assert_eq!(rows[0].manual_text.as_deref(), Some(manual_text.as_str()));
     }
 
     #[test]
