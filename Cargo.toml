@@ -57,7 +57,7 @@ zip = { version = "8.6", default-features = false }
 # Deliberately pinned pre-v1 Kindle parser. Keep changes behind the Windows
 # corpus and hostile-file gates documented in AGENTS.md.
 ebook-rs = { version = "=0.16.4", default-features = false }
-ngy-utils-tracing = "0.2.0"
+ngy-utils-tracing = "0.5.1"
 
 [dev-dependencies]
 gpui = { version = "0.2.2", features = ["test-support"] }

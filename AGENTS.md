@@ -77,14 +77,19 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   显示在同一个窗口里让用户改路径重试（`report_failure`），启动期间不接受第二次提交也不
   响应关窗；确认成功才交回 `src/main.rs` 打开主窗口，然后关掉自己。它不写真实
   `bootstrap.json` 的路径由调用方注入，因此可测。
-- `src/logging.rs`：日志目录、默认过滤串与保留策略。全局 subscriber 由
-  `main.rs::install_logging` 调用 `ngy_utils_tracing::init` 安装，安装点必须晚于数据目录
-  确定（`LOG_DIR` 由它推出，此前的启动阶段没有日志）。文件层只在 Production/Test 模式
-  落到 `<数据目录>/logs/ngy-book-studio.<YYYY-MM-DD>.log`，按 UTC 日期滚动，启动时清理
-  超过 7 天的同类文件（只认自己的前缀 + 合法日期，其它文件不动）；Development（默认）
-  只写控制台，模式可用第一个命令行参数覆盖。日志目录不是独立选项：它固定是
-  `<数据目录>/logs/`。`main.rs` 持有 init 返回的 guard 并在进程退出前 drop，以免丢掉
-  非阻塞写入的尾日志；init 失败退回 `console_tracing`，两条路都装不上只报 stderr，
+- `src/logging.rs`：日志目录与默认过滤串（`logs/` 子目录名、文件前缀与默认 `RUST_LOG`
+  串）。全局 subscriber 由 `main.rs::install_logging` 调用 `ngy_utils_tracing::init` 安装，
+  安装点必须晚于数据目录确定（日志目录由它推出，此前的启动阶段没有日志）。`ngy_utils_tracing`
+  默认 Production 模式：文件层落到 `<数据目录>/logs/ngy-book-studio.<YYYY-MM-DD>`，JSON
+  格式、按 UTC 日期滚动；目录创建与过期清理（保留最近 7 个日滚动文件，含当天）都由该库在
+  `init` 时完成，并在后台定期执行，本项目不再自行实现。Development 只写控制台（pretty
+  格式），Test 为控制台 + 文件。模式由 `MOYE_APP_MODE` 环境变量决定（首个命令行参数可覆盖），
+  未设置时默认 Production。该库先加载 `.env` 再读取模式，所以 `.env` 里的
+  `MOYE_APP_MODE` 也生效，并且因用 `dotenv_override`，其值会覆盖进程环境变量；命令行
+  参数的覆盖优先级最高。
+  日志目录不是独立选项：它固定是 `<数据目录>/logs/`。`main.rs` 持有 init 返回的
+  `InitResult`（含文件 guard 与后台清理句柄）并在进程退出前 drop，以免丢掉非阻塞写入的
+  尾日志、或让清理线程悬空；init 失败退回 `console_tracing`，两条路都装不上只报 stderr，
   不 panic（GPUI 回调不可 unwind），也不拦住启动。
 - `src/services.rs`、`src/runtime.rs`：进程级服务组合与独立 Tokio runtime；统一持有
   图书库、对象存储、格式注册表、搜索、AI、Office 和后台任务。GPUI 回调跑在自己的
@@ -790,9 +795,15 @@ cargo build --release --locked --bin ngy-book-studio
 设置界面是应用自己的窗口（`src/ui/data_dir_setup.rs`）：输入框里预填推荐路径或上次的
 选择，可以直接改、可以点「浏览…」调系统目录选择器，点「确认并启动」（或回车）后才校验
 并记录；校验在后台执行器上做，失败原因显示在同一个窗口里。关闭设置窗口即放弃启动。
-日志固定在 `<数据目录>/logs/`，按 UTC 日期分文件、保留 7 天。目录写入配置之前必须
-通过“建目录 + 写删探针”校验；记下的目录之后不可用时会重新询问并说明原因，不会静默
+日志固定在 `<数据目录>/logs/`，按 UTC 日期分文件、保留最近 7 个文件。目录写入配置之前
+必须通过“建目录 + 写删探针”校验；记下的目录之后不可用时会重新询问并说明原因，不会静默
 回落默认目录。系统配置页显示两个目录位置，并提供更改数据目录与打开目录的入口。
+
+日志落点由运行模式决定：`production`（默认）只写 `<数据目录>/logs/` 下的 JSON 文件，
+终端没有任何 tracing 输出；`development` 只写终端（pretty，带源码文件和行号）；
+`test` 两者都写。因此下文几段从终端抓日志的排障处方，都必须先把 `MOYE_APP_MODE` 设成
+`development`（或 `test`）才有内容可抓；保持默认 `production` 时应改去读日志文件。
+模式由 `MOYE_APP_MODE`、`.env` 或第一个命令行参数设置（优先级见 `main.rs::install_logging`）。
 
 更改数据目录等于**搬迁**：设置界面选新位置后写配置并记下待搬迁的旧目录，随后自动重启
 墨页；新进程在打开图书库之前把旧目录整体搬过去（同卷重命名，跨卷复制后才删源），旧目录
@@ -862,15 +873,19 @@ Node 认不出来，`require("playwright")` 会 `MODULE_NOT_FOUND`）。
 
 AI 日志统一使用 `ngy_ai` target。未设置 `RUST_LOG` 时，默认
 `warn,ngy_ai=info`，记录问答开始、完成、取消及失败；详细排障使用
-`warn,ngy_ai=debug`。日志同时写终端和数据目录下的
-`logs/ngy-book-studio.<YYYY-MM-DD>.log`（见 `src/logging.rs`），终端输出带源码文件
-和行号。数据目录确定之前的启动阶段没有日志，需要整段启动过程时，在 PowerShell 中运行：
+`warn,ngy_ai=debug`。默认 Production 模式只写数据目录下的
+`logs/ngy-book-studio.<YYYY-MM-DD>`（见 `src/logging.rs`）；Development 模式只写终端，
+输出带源码文件和行号。数据目录确定之前的启动阶段没有日志，需要整段启动过程时，
+在 PowerShell 中运行：
 
 ```powershell
 $env:RUST_LOG = "warn,ngy_ai=debug"
 $aiLog = Join-Path ([System.IO.Path]::GetTempPath()) ("ngy-ai-" + [guid]::NewGuid() + ".log")
 cargo run --locked --bin ngy-book-studio 2>&1 | Tee-Object -FilePath $aiLog
 ```
+
+> `Tee-Object` 只截获终端输出；默认 `production` 模式终端没有 tracing 输出，需先
+> `$env:MOYE_APP_MODE = "development"`（或 `test`），详见「数据目录与日志位置」。
 
 开发验证还须按下文 GUI 冒烟要求设置唯一 `NGY_DATA_DIR`。环境变量只作用于从该
 终端新启动的进程；复现结束后恢复原来的 `RUST_LOG`，或原来未设置时用
@@ -904,6 +919,9 @@ $env:RUST_LOG = "warn,ngy_ai=info,ngy_import=debug,ngy_reader=debug"
 $importLog = Join-Path ([System.IO.Path]::GetTempPath()) ("ngy-import-" + [guid]::NewGuid() + ".log")
 cargo run --locked --bin ngy-book-studio 2>&1 | Tee-Object -FilePath $importLog
 ```
+
+> 同样地，默认 `production` 模式终端没有 tracing 输出，需先
+> `$env:MOYE_APP_MODE = "development"`（或 `test`），详见「数据目录与日志位置」。
 
 导入路径上的日志只记录字节数、记录序号、格式、置信度、媒体类型、稳定 ID 与受控错误
 分类；不记录正文、译文、选区、密钥或完整文件内容。用户可见的失败仍以界面提示为准，
@@ -1342,6 +1360,10 @@ $env:NGY_DATA_DIR = Join-Path ([System.IO.Path]::GetTempPath()) ("ngy-agent-" + 
 $env:RUST_LOG = "error"
 cargo run --locked --bin ngy-book-studio
 ```
+
+> 默认 `production` 模式终端没有 tracing 输出，这条命令抓不到日志；要按 `RUST_LOG=error`
+> 检查 HWND/WebView 错误，需先设 `$env:MOYE_APP_MODE = "development"`，或改去读
+> `<NGY_DATA_DIR>\logs\` 下的日志文件（详见「数据目录与日志位置」）。
 
 涉及 UI、WebView、导航、编辑器、Office 或窗口生命周期时，除自动验证外还要实际
 走完受影响路径。按范围覆盖：启动；导入 EPUB/PDF/Office/DRM-free Kindle；结构化和

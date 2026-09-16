@@ -253,39 +253,43 @@ fn report_startup_failure(cx: &mut App, setup: Option<SetupHandles>, failure: St
 }
 
 /// 安装日志：由 `ngy_utils_tracing` 安装全局 subscriber，文件日志落到
-/// `<数据目录>/logs/`（Production/Test 模式）。
+/// `<数据目录>/logs/`（默认 Production 模式，Development/Test 模式行为见 `ngy_utils_tracing`）。
 ///
 /// 数据目录在启动早期才能确定，所以这里才装 subscriber；在此之前（含设置窗口阶段）
 /// 的 tracing 事件会丢弃。subscriber 只能装一次：`LOGGING_INSTALLED` 保证本函数只跑一次。
+///
+/// 模式由 `MOYE_APP_MODE` 环境变量（或第一个命令行参数覆盖）决定；`ngy_utils_tracing`
+/// 未设置时默认 `production`，文件日志始终写到数据目录。该库先加载 `.env` 再读取模式，
+/// 因此 `.env` 里的 `MOYE_APP_MODE` 也生效，且因用 `dotenv_override`，`.env` 的值会覆盖
+/// 进程环境变量；命令行参数的覆盖优先级最高。目录创建、按日滚动、保留最近
+/// [`logging::LOG_MAX_FILES`] 个文件与过期清理也由该库在 `init` 时完成（并在后台定期执行），
+/// 本项目不再自行实现。
 fn install_logging(selection: &DataDirSelection) {
     if LOGGING_INSTALLED.swap(true, Ordering::AcqRel) {
         return;
     }
 
-    // 让 `ngy_utils_tracing` 把文件日志写到 `<数据目录>/logs/`，文件名前缀 `ngy-book-studio`。
-    // 只有 Production/Test 模式才会真正写文件；Development（默认）只写控制台。
-    let log_dir = logging::log_directory(&selection.data_dir);
-    unsafe {
-        std::env::set_var("LOG_DIR", &log_dir);
-    }
+    // `RUST_LOG` 未设置时给一个项目默认过滤；`ngy_utils_tracing` 的控制台层与文件层都读取它。
     if std::env::var_os("RUST_LOG").is_none() {
+        // SAFETY: 启动早期、全局 subscriber 安装之前调用，此时还没有其它线程读该环境变量。
         unsafe {
             std::env::set_var("RUST_LOG", logging::DEFAULT_LOG_FILTER);
         }
     }
 
-    // 先建目录、清理过期日志，再安装 subscriber。
-    logging::prepare(&selection.data_dir);
-
+    // 文件日志落到 `<数据目录>/logs/`（`log_dir` 直接传入，优先级高于 `LOG_DIR`），
+    // 前缀 `ngy-book-studio`，保留最近 `LOG_MAX_FILES` 个日滚动文件。
+    let log_dir = logging::log_directory(&selection.data_dir);
     let crates = vec!["ngy-book-studio".to_string()];
-    // 第一个命令行参数作为模式覆盖（development/test/production）。
-    let mode_override = std::env::args().nth(1);
-    match ngy_utils_tracing::init(
-        mode_override.as_deref(),
-        crates.clone(),
-        Some(logging::LOG_PREFIX.to_string()),
-        None,
-    ) {
+    let options = ngy_utils_tracing::InitOptions::default()
+        // 第一个命令行参数作为模式覆盖（development/test/production），优先级高于 `MOYE_APP_MODE`。
+        .mode_override(std::env::args().nth(1))
+        .crates(crates.clone())
+        .log_dir(Some(log_dir.to_string_lossy().into_owned()))
+        .log_prefix(Some(logging::LOG_PREFIX.to_string()))
+        .max_log_files(Some(logging::LOG_MAX_FILES))
+        .mode_env_var(Some("MOYE_APP_MODE".to_string()));
+    match ngy_utils_tracing::init(options) {
         Ok(result) => {
             *LOG_GUARD.lock().expect("log guard lock poisoned") = Some(result);
             tracing::info!(
