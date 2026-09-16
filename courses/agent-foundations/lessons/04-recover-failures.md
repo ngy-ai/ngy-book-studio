@@ -158,8 +158,8 @@ messages.append(message)
 ```python
 import json
 
-from moye_lab.contracts import AgentOutcome, BudgetExceeded
-from moye_lab.implementations.common import initial_messages, parse_final
+from ngy_lab.contracts import AgentOutcome, BudgetExceeded
+from ngy_lab.implementations.common import initial_messages, parse_final
 
 
 def execute_with_retry(tools, call):

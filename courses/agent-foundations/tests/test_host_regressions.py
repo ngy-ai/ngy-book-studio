@@ -4,8 +4,8 @@ import sys
 
 import pytest
 
-from moye_lab import runner
-from moye_lab.implementations import manual
+from ngy_lab import runner
+from ngy_lab.implementations import manual
 
 
 @pytest.mark.parametrize("scenario", ["model_budget", "tool_budget"])
@@ -44,7 +44,7 @@ def test_invalid_instrumentation_returns_an_actionable_error_report(monkeypatch,
     assert report["error"]["type"] == "ProtocolError"
     assert "emit" in report["error"]["message"]
     assert any(
-        frame["file"] == "moye_lab/runner.py" and frame["function"] == "emit"
+        frame["file"] == "ngy_lab/runner.py" and frame["function"] == "emit"
         for frame in report["error"]["frames"]
     )
     assert report["metrics"]["model_decisions"] == 0

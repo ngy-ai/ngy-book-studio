@@ -75,9 +75,9 @@ interface EditorHostApi {
 declare global {
   interface Window {
     ipc?: { postMessage(message: string): void };
-    __moyeEditorInstalled?: boolean;
-    __moyeEditorSend?: (requestId?: number) => void;
-    __moyeProseMirror?: EditorHostApi;
+    __ngyEditorInstalled?: boolean;
+    __ngyEditorSend?: (requestId?: number) => void;
+    __ngyProseMirror?: EditorHostApi;
   }
 }
 
@@ -143,7 +143,7 @@ function safeResourceUrl(value: unknown, kind: ResourceKind): string | null {
       !parsed.password &&
       !parsed.search &&
       !parsed.hash &&
-      /^\/\.moye\/assets\/[A-Za-z0-9._~-]+$/u.test(parsed.pathname)
+      /^\/\.ngy\/assets\/[A-Za-z0-9._~-]+$/u.test(parsed.pathname)
     ) {
       return parsed.href;
     }
@@ -260,9 +260,9 @@ const restrictedHtmlSpec: NodeSpec = {
   code: true,
   defining: true,
   marks: "",
-  parseDOM: [{ tag: "pre[data-moye-raw-html]", preserveWhitespace: "full" }],
+  parseDOM: [{ tag: "pre[data-ngy-raw-html]", preserveWhitespace: "full" }],
   toDOM() {
-    return ["pre", { "data-moye-raw-html": "restricted" }, ["code", 0]];
+    return ["pre", { "data-ngy-raw-html": "restricted" }, ["code", 0]];
   },
 };
 
@@ -328,11 +328,21 @@ function decodeEditorHref(pathname: string): string | null {
   }
 }
 
-function postIpc(payload: Record<string, unknown>): void {
+/**
+ * Reports whether the payload actually reached the host bridge. A missing
+ * `window.ipc` and a throwing `postMessage` both mean "not delivered", so a
+ * caller holding unsendable state can keep it instead of assuming success.
+ * Callers that only announce offline state may ignore the result: the Rust-side
+ * readiness timeout still covers a host that never becomes available.
+ */
+function postIpc(payload: Record<string, unknown>): boolean {
+  const bridge = window.ipc;
+  if (!bridge) return false;
   try {
-    window.ipc?.postMessage(JSON.stringify(payload));
+    bridge.postMessage(JSON.stringify(payload));
+    return true;
   } catch {
-    // The Rust-side readiness timeout safely handles a missing/closed host.
+    return false;
   }
 }
 
@@ -340,7 +350,7 @@ function parseInitialDocument(body: Element): ProseMirrorNode {
   const source = body.cloneNode(true) as HTMLElement;
   source
     .querySelectorAll(
-      "script,style,iframe,frame,object,embed,form,input,button,textarea,select,link,meta,base,[data-moye-editor-ui]",
+      "script,style,iframe,frame,object,embed,form,input,button,textarea,select,link,meta,base,[data-ngy-editor-ui]",
     )
     .forEach((node) => node.remove());
   return ProseMirrorDOMParser.fromSchema(schema).parse(source, {
@@ -418,7 +428,7 @@ function button(label: string, title: string, command: () => boolean): HTMLButto
 }
 
 async function installEditor(): Promise<void> {
-  if (window.__moyeEditorInstalled || !document.body) return;
+  if (window.__ngyEditorInstalled || !document.body) return;
 
   const url = new URL(window.location.href);
   const revisionSource = uniqueQueryValue(url, "rev");
@@ -441,50 +451,50 @@ async function installEditor(): Promise<void> {
     return;
   }
 
-  window.__moyeEditorInstalled = true;
+  window.__ngyEditorInstalled = true;
   const initialDocument = await fetchInitialDocument(url);
   document.body.replaceChildren();
-  document.body.setAttribute("data-moye-rich-editor", "true");
+  document.body.setAttribute("data-ngy-rich-editor", "true");
 
   const style = document.createElementNS(XHTML_NAMESPACE, "style") as HTMLStyleElement;
-  style.dataset.moyeEditorUi = "style";
+  style.dataset.ngyEditorUi = "style";
   style.textContent = `
-    body[data-moye-rich-editor="true"] { min-height: 100vh; caret-color: #b95f42; }
-    [data-moye-editor-ui="toolbar"] {
+    body[data-ngy-rich-editor="true"] { min-height: 100vh; caret-color: #b95f42; }
+    [data-ngy-editor-ui="toolbar"] {
       box-sizing: border-box; position: sticky; top: 0; z-index: 2147483647;
       display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0 0 14px;
       padding: 8px; border: 1px solid #ded8cf; border-radius: 9px;
       background: rgba(255, 254, 250, 0.97); box-shadow: 0 4px 14px rgba(41,38,33,.10);
       font: 13px/1.2 "Microsoft YaHei", sans-serif; color: #292621;
     }
-    [data-moye-editor-ui="toolbar"] button {
+    [data-ngy-editor-ui="toolbar"] button {
       box-sizing: border-box; cursor: pointer; padding: 5px 9px;
       border: 1px solid #ded8cf; border-radius: 6px; background: #fffefa;
       font: 13px/1.2 "Microsoft YaHei", sans-serif; color: #292621;
     }
-    [data-moye-editor-ui="toolbar"] button:hover { background: #f1ddd5; border-color: #b95f42; }
-    [data-moye-editor-ui="surface"] .ProseMirror { min-height: 70vh; outline: none; }
-    [data-moye-editor-ui="surface"] .ProseMirror-selectednode { outline: 2px solid #b95f42; }
-    [data-moye-editor-ui="surface"] table { border-collapse: collapse; margin: 1em 0; }
-    [data-moye-editor-ui="surface"] th,
-    [data-moye-editor-ui="surface"] td { border: 1px solid #aaa; min-width: 3em; padding: .35em; }
-    [data-moye-editor-ui="surface"] .column-resize-handle { background: #b95f42; width: 4px; }
-    [data-moye-editor-ui="surface"] pre[data-moye-raw-html] {
+    [data-ngy-editor-ui="toolbar"] button:hover { background: #f1ddd5; border-color: #b95f42; }
+    [data-ngy-editor-ui="surface"] .ProseMirror { min-height: 70vh; outline: none; }
+    [data-ngy-editor-ui="surface"] .ProseMirror-selectednode { outline: 2px solid #b95f42; }
+    [data-ngy-editor-ui="surface"] table { border-collapse: collapse; margin: 1em 0; }
+    [data-ngy-editor-ui="surface"] th,
+    [data-ngy-editor-ui="surface"] td { border: 1px solid #aaa; min-width: 3em; padding: .35em; }
+    [data-ngy-editor-ui="surface"] .column-resize-handle { background: #b95f42; width: 4px; }
+    [data-ngy-editor-ui="surface"] pre[data-ngy-raw-html] {
       white-space: pre-wrap; border-left: 3px solid #b95f42; padding: .75em; background: #f7f4ee;
     }
-    [data-moye-editor-ui="surface"] img,
-    [data-moye-editor-ui="surface"] video { max-width: 100%; height: auto; }
-    [data-moye-editor-ui="surface"] audio { width: min(100%, 36em); }
+    [data-ngy-editor-ui="surface"] img,
+    [data-ngy-editor-ui="surface"] video { max-width: 100%; height: auto; }
+    [data-ngy-editor-ui="surface"] audio { width: min(100%, 36em); }
   `;
   (document.head || document.documentElement).appendChild(style);
 
   const toolbar = document.createElementNS(XHTML_NAMESPACE, "div") as HTMLDivElement;
-  toolbar.dataset.moyeEditorUi = "toolbar";
+  toolbar.dataset.ngyEditorUi = "toolbar";
   toolbar.setAttribute("contenteditable", "false");
   toolbar.setAttribute("role", "toolbar");
 
   const surface = document.createElementNS(XHTML_NAMESPACE, "div") as HTMLDivElement;
-  surface.dataset.moyeEditorUi = "surface";
+  surface.dataset.ngyEditorUi = "surface";
   document.body.append(toolbar, surface);
 
   let dirty = false;
@@ -558,7 +568,7 @@ async function installEditor(): Promise<void> {
       });
       return;
     }
-    postIpc({
+    const delivered = postIpc({
       session_id,
       chapter_id,
       href,
@@ -568,7 +578,14 @@ async function installEditor(): Promise<void> {
       selected_text,
       too_large: false,
     });
-    dirty = false;
+    // Only a send the bridge accepted clears `dirty`. A dropped body keeps the
+    // page dirty, so the next debounced edit, blur, or host `__ngyEditorSend`
+    // retries this same body under the existing throttle instead of echoing an
+    // empty snapshot that would freeze stale Rust state. No timer is re-armed
+    // here, so a permanently dead bridge cannot spin.
+    if (delivered) {
+      dirty = false;
+    }
   };
 
   const queueSnapshot = (): void => {
@@ -721,8 +738,8 @@ async function installEditor(): Promise<void> {
     }),
   );
 
-  window.__moyeEditorSend = (requestId?: number) => sendSnapshot(requestId);
-  window.__moyeProseMirror = Object.freeze({
+  window.__ngyEditorSend = (requestId?: number) => sendSnapshot(requestId);
+  window.__ngyProseMirror = Object.freeze({
     version: 1 as const,
     focus: () => view.focus(),
     insertResource(resource: ResourceBlock) {

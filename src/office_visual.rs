@@ -22,7 +22,7 @@ use crate::{
     windows_pdf_renderer::{PdfRasterTarget, rasterize_pdf_bytes},
 };
 
-pub(crate) const OFFICE_ENHANCED_RENDERER_NAME: &str = "moye-office-com-enhanced";
+pub(crate) const OFFICE_ENHANCED_RENDERER_NAME: &str = "ngy-office-com-enhanced";
 const MAX_ENHANCED_PAGES: usize = 20_000;
 const MAX_ENHANCED_PDF_PAGES: usize = 4_096;
 const MAX_ENHANCED_SLIDE_BYTES: usize = 12 * 1024 * 1024;

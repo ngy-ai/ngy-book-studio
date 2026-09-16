@@ -979,7 +979,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(units.len(), 1);
-        assert!(units[0].source.contains("moye-asset:office-image-id"));
+        assert!(units[0].source.contains("ngy-asset:office-image-id"));
         assert!(
             units[0]
                 .document

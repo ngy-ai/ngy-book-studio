@@ -15,16 +15,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from moye_lab import COURSE_ID, COURSE_VERSION, REPORT_VERSION, RULES_VERSION
-from moye_lab.contracts import AgentOutcome, BudgetExceeded, LabError, ProtocolError, RunLimits
-from moye_lab.runtime import ObservedModel, ScriptedModel, ToolBroker, json_text
-from moye_lab.scenarios import Scenario, get_scenario
+from ngy_lab import COURSE_ID, COURSE_VERSION, REPORT_VERSION, RULES_VERSION
+from ngy_lab.contracts import AgentOutcome, BudgetExceeded, LabError, ProtocolError, RunLimits
+from ngy_lab.runtime import ObservedModel, ScriptedModel, ToolBroker, json_text
+from ngy_lab.scenarios import Scenario, get_scenario
 
 COURSE_ROOT = Path(__file__).resolve().parents[1]
 
 
 def source_snapshot(implementation: str) -> dict[str, str]:
-    paths = list((COURSE_ROOT / "moye_lab").rglob("*.py"))
+    paths = list((COURSE_ROOT / "ngy_lab").rglob("*.py"))
     paths += [COURSE_ROOT / "pyproject.toml", COURSE_ROOT / "uv.lock"]
     if (COURSE_ROOT / ".python-version").exists():
         paths.append(COURSE_ROOT / ".python-version")
@@ -49,7 +49,7 @@ def source_snapshot(implementation: str) -> dict[str, str]:
 def load_run(implementation: str) -> Callable[..., AgentOutcome]:
     if implementation in {"manual", "langgraph"}:
         name = "manual" if implementation == "manual" else "langgraph_agent"
-        return importlib.import_module(f"moye_lab.implementations.{name}").run
+        return importlib.import_module(f"ngy_lab.implementations.{name}").run
     path = (COURSE_ROOT / implementation).resolve()
     if not path.is_relative_to(COURSE_ROOT / "workspaces") or path.suffix != ".py":
         raise ValueError("学习者实现必须位于本课程 workspaces/ 下")
@@ -240,7 +240,7 @@ def execute_run(
     if mode == "scripted":
         raw_model = ScriptedModel(scenario)
     else:
-        from moye_lab.live import OpenAICompatibleModel
+        from ngy_lab.live import OpenAICompatibleModel
 
         if live_config is None:
             raise ValueError("live 模式必须显式配置端点与模型")

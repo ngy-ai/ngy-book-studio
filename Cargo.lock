@@ -4699,54 +4699,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "moye-epub-editor"
-version = "0.1.0"
-dependencies = [
- "ammonia",
- "anyhow",
- "async-channel 2.5.0",
- "base64 0.22.1",
- "blake3",
- "directories",
- "djvu-rs",
- "ebook-rs",
- "futures-util",
- "getrandom 0.4.3",
- "gpui",
- "gpui-component",
- "gpui-component-assets",
- "html5ever 0.27.0",
- "image",
- "keyring",
- "lopdf",
- "markdown",
- "markup5ever_rcdom",
- "mime_guess",
- "native-dialog",
- "object_store",
- "office_oxide",
- "open",
- "percent-encoding",
- "pulldown-cmark",
- "rbook",
- "reqwest",
- "resvg",
- "rusqlite",
- "serde",
- "serde_json",
- "sqlite-vec",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "tree-sitter-python",
- "urlencoding",
- "webview2-com",
- "windows 0.61.3",
- "zip",
-]
-
-[[package]]
 name = "naga"
 version = "25.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4832,6 +4784,54 @@ name = "new_debug_unreachable"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
+
+[[package]]
+name = "ngy-book-studio"
+version = "0.1.0"
+dependencies = [
+ "ammonia",
+ "anyhow",
+ "async-channel 2.5.0",
+ "base64 0.22.1",
+ "blake3",
+ "directories",
+ "djvu-rs",
+ "ebook-rs",
+ "futures-util",
+ "getrandom 0.4.3",
+ "gpui",
+ "gpui-component",
+ "gpui-component-assets",
+ "html5ever 0.27.0",
+ "image",
+ "keyring",
+ "lopdf",
+ "markdown",
+ "markup5ever_rcdom",
+ "mime_guess",
+ "native-dialog",
+ "object_store",
+ "office_oxide",
+ "open",
+ "percent-encoding",
+ "pulldown-cmark",
+ "rbook",
+ "reqwest",
+ "resvg",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sqlite-vec",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "tree-sitter-python",
+ "urlencoding",
+ "webview2-com",
+ "windows 0.61.3",
+ "zip",
+]
 
 [[package]]
 name = "nix"

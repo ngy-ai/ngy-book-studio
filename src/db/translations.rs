@@ -62,6 +62,31 @@ fn translation_id(
     )
 }
 
+/// Every译文 row of one book and language at the given document revision.
+/// Used by a per-block retry to tell which of the requested ordinals still have
+/// no usable translation: those are the only ones worth re-sending, while an
+/// already translated (or hand-edited) block must keep its row.
+pub(crate) fn list_for_source(
+    conn: &Connection,
+    book_id: &str,
+    target_language: &str,
+    document_revision: u64,
+) -> Result<Vec<Translation>> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "{SELECT} WHERE book_id = ?1 AND target_language = ?2 AND document_revision = ?3
+             ORDER BY ordinal, block_id"
+        ))
+        .context("无法准备整本译文查询")?;
+    stmt.query_map(
+        params![book_id, target_language, document_revision as i64],
+        from_row,
+    )
+    .context("无法读取整本译文")?
+    .collect::<rusqlite::Result<Vec<_>>>()
+    .context("无法解析整本译文记录")
+}
+
 pub(crate) fn list_for_unit(
     conn: &Connection,
     content_unit_id: &str,

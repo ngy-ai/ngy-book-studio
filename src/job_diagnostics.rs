@@ -53,6 +53,10 @@ pub enum JobLogEvent {
     ProtocolRejected,
     ProtocolCorrection,
     ProtocolSkipped,
+    /// 多片段文本块在两次严格尝试后改用逐片段请求重新翻译。
+    SegmentFallback,
+    /// 整个文本块在协议纠正后仍不合格，按冻结输入重发一轮（最后一轮才带逐片段回退）。
+    BlockRetry,
     ItemSaved,
     PublicationStarted,
     RunSucceeded,
@@ -90,6 +94,16 @@ impl JobLogEvent {
                 Warning,
                 "protocol",
                 "模型响应在自动纠正后仍不符合分段协议，已跳过当前文本块并保留原文",
+            ),
+            Self::SegmentFallback => (
+                Info,
+                "protocol",
+                "多片段响应仍不完整，改用逐片段请求重新翻译当前文本块",
+            ),
+            Self::BlockRetry => (
+                Info,
+                "protocol",
+                "整个文本块的响应仍不合格，已按冻结输入重发该块",
             ),
             Self::ItemSaved => (Info, "persist", "当前单元结果已持久化"),
             Self::PublicationStarted => (Info, "publish", "开始发布完整任务结果"),
@@ -137,7 +151,43 @@ pub enum JobLogErrorKind {
     MissingSegmentId,
     EmptySegmentText,
     InvalidSegmentText,
+    /// 模型响应在输出上限处被截断，没有写出完整答案。
+    ResponseTruncated,
     Unknown,
+}
+
+impl JobLogErrorKind {
+    /// Fixed explanation of one category, for the task window. The table is
+    /// closed, so a label can never echo provider text, a book body or a URL.
+    /// It also describes a failure without depending on the error's `Display`.
+    pub fn label(self) -> &'static str {
+        use JobLogErrorKind::*;
+        match self {
+            Provider => "模型服务返回错误",
+            Database => "本地数据库错误",
+            Io => "本地读写错误",
+            InvalidData => "任务数据无效",
+            Timeout => "模型请求超时或长时间无数据",
+            Translation => "译文内容不符合分段协议",
+            ContextWindowExceeded => "超出模型上下文长度",
+            StreamProtocol => "流式响应协议错误",
+            Cancelled => "请求被取消",
+            InvalidJson => "响应不是合法 JSON",
+            IncompleteJson => "响应 JSON 不完整",
+            InvalidSchema => "响应结构不符合分段协议",
+            IncompleteReasoning => "模型思考未结束",
+            AmbiguousJson => "响应包含多个候选答案",
+            MissingJson => "响应中没有找到答案",
+            SegmentCountMismatch => "片段数量与原文不一致",
+            UnknownSegmentId => "响应包含未知片段编号",
+            DuplicateSegmentId => "响应重复了同一片段编号",
+            MissingSegmentId => "响应缺少片段编号",
+            EmptySegmentText => "响应包含空译文片段",
+            InvalidSegmentText => "译文片段格式无效",
+            ResponseTruncated => "模型响应在输出上限处被截断",
+            Unknown => "未归类的错误",
+        }
+    }
 }
 
 /// Inspect typed errors through the existing safe classifier; never inspect or
@@ -156,7 +206,10 @@ pub fn classify_error(error: &anyhow::Error) -> JobLogErrorKind {
         "cancelled" => Cancelled,
         "invalid_json" | "json_syntax" => InvalidJson,
         "incomplete_json" | "json_eof" => IncompleteJson,
-        "invalid_schema" | "json_data" => InvalidSchema,
+        // 位置数组是「结构无效」的一个更具体的子类：模型按段答了，只是把
+        // `{"id","text"}` 写成了 serde 的位置序列。任务日志沿用同一分类，
+        // 逐片段回退的判定在读 `ResponseError::kind()` 时已经能把两者分开。
+        "invalid_schema" | "json_data" | "positional_segments" => InvalidSchema,
         "incomplete_reasoning" => IncompleteReasoning,
         "ambiguous_json" => AmbiguousJson,
         "missing_json" => MissingJson,
@@ -166,6 +219,7 @@ pub fn classify_error(error: &anyhow::Error) -> JobLogErrorKind {
         "missing_segment_id" => MissingSegmentId,
         "empty_segment_text" => EmptySegmentText,
         "invalid_segment_text" => InvalidSegmentText,
+        "response_truncated" => ResponseTruncated,
         "agent_configuration" | "tool_arguments" | "agent_limit" | "scope_violation" => InvalidData,
         _ => Unknown,
     }
@@ -223,6 +277,9 @@ impl JobLogMetrics {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackgroundJobLogEntry {
+    /// The closed event that produced this line. Callers that need to tell one
+    /// kind of failure from another must match on this, never on `message`.
+    pub event: JobLogEvent,
     pub timestamp_ms: u64,
     pub level: JobLogLevel,
     pub stage: String,
@@ -261,7 +318,12 @@ impl BackgroundJobLogEntry {
         if let Some(error_kind) = self.metrics.error_kind {
             // Serialization of a closed enum cannot expose an error body.
             if let Ok(label) = serde_json::to_string(&error_kind) {
-                let _ = write!(line, " error_kind={}", label.trim_matches('"'));
+                let _ = write!(
+                    line,
+                    " error_kind={}({})",
+                    label.trim_matches('"'),
+                    error_kind.label()
+                );
             }
         }
         line
@@ -314,7 +376,7 @@ pub fn record_for_database(
         .and_then(|store| store.record(job_id, event, metrics))
     {
         tracing::warn!(
-            target: "moye_ai",
+            target: "ngy_ai",
             error_kind = crate::ai_diagnostics::error_kind(&error),
             "background job diagnostic could not be persisted"
         );
@@ -472,6 +534,7 @@ impl JobDiagnosticStore {
                 .map_err(|_| anyhow::anyhow!("任务日志字段无效"))?;
             let (level, stage, message) = event.presentation();
             snapshot.entries.push(BackgroundJobLogEntry {
+                event,
                 timestamp_ms,
                 level,
                 stage: stage.into(),
@@ -517,11 +580,60 @@ mod tests {
         let reopened = JobDiagnosticStore::for_database(&database).unwrap();
         let log = reopened.read(secret).unwrap();
         assert_eq!(log.entries.len(), 1);
+        assert_eq!(log.entries[0].event, JobLogEvent::RunFailed);
         let line = log.entries[0].format_line();
         assert!(line.contains("run_id=17 ordinal=8"));
-        assert!(line.contains("error_kind=unknown"));
+        assert!(line.contains("error_kind=unknown(未归类的错误)"));
         assert!(!line.contains(secret));
         assert!(!String::from_utf8_lossy(&fs::read(reopened.path).unwrap()).contains(secret));
+    }
+
+    /// A failure category without a readable explanation is the exact gap this
+    /// table closes: the window can only show fixed text, never the error body.
+    #[test]
+    fn every_failure_category_has_a_distinct_readable_label() {
+        let categories = [
+            JobLogErrorKind::Provider,
+            JobLogErrorKind::Database,
+            JobLogErrorKind::Io,
+            JobLogErrorKind::InvalidData,
+            JobLogErrorKind::Timeout,
+            JobLogErrorKind::Translation,
+            JobLogErrorKind::ContextWindowExceeded,
+            JobLogErrorKind::StreamProtocol,
+            JobLogErrorKind::Cancelled,
+            JobLogErrorKind::InvalidJson,
+            JobLogErrorKind::IncompleteJson,
+            JobLogErrorKind::InvalidSchema,
+            JobLogErrorKind::IncompleteReasoning,
+            JobLogErrorKind::AmbiguousJson,
+            JobLogErrorKind::MissingJson,
+            JobLogErrorKind::SegmentCountMismatch,
+            JobLogErrorKind::UnknownSegmentId,
+            JobLogErrorKind::DuplicateSegmentId,
+            JobLogErrorKind::MissingSegmentId,
+            JobLogErrorKind::EmptySegmentText,
+            JobLogErrorKind::InvalidSegmentText,
+            JobLogErrorKind::ResponseTruncated,
+            JobLogErrorKind::Unknown,
+        ];
+        let mut labels = std::collections::BTreeSet::new();
+        for category in categories {
+            let label = category.label();
+            assert!(!label.trim().is_empty(), "{category:?} 缺少说明");
+            assert!(
+                label
+                    .chars()
+                    .any(|character| ('\u{4e00}'..='\u{9fff}').contains(&character)),
+                "{category:?} 的说明必须包含可读中文：{label}"
+            );
+            assert!(labels.insert(label), "{category:?} 的说明与其它分类重复");
+        }
+        // The classifier must only ever return a category covered by the table.
+        assert_eq!(
+            classify_error(&anyhow::anyhow!("boom")),
+            JobLogErrorKind::Unknown
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@
 use super::*;
 use crate::ui::ai_sidebar::{AiAnswerCompleted, AiExplanationFailed, AiExplanationSubmitted};
 use anyhow::ensure;
-use moye_epub_editor::annotations::{Annotation, AnnotationDraft, AnnotationKind, TextAnchor};
+use ngy_book_studio::annotations::{Annotation, AnnotationDraft, AnnotationKind, TextAnchor};
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -265,7 +265,7 @@ impl PdfReaderApp {
         let Some(webview) = self.webview.as_ref() else {
             return;
         };
-        let script = format!("window.moyeAnnotations?.{method}({value});");
+        let script = format!("window.ngyAnnotations?.{method}({value});");
         if let Err(error) = webview.read(cx).raw().evaluate_script(&script) {
             self.set_error(format!("无法更新 PDF 笔记界面：{error}"), cx);
         }
@@ -723,7 +723,7 @@ impl PdfReaderApp {
         }
         if let Some(webview) = self.webview.as_ref() {
             let script = format!(
-                "window.moyeAnnotations?.explainSelection({});",
+                "window.ngyAnnotations?.explainSelection({});",
                 serde_json::json!(selected_text)
             );
             if let Err(error) = webview.read(cx).raw().evaluate_script(&script) {
@@ -941,8 +941,8 @@ mod tests {
         let bridge = include_str!("annotations.js");
         for contract in [
             "window.top === window",
-            "moyepdf.viewer",
-            "\"moyepdf:\"",
+            "ngypdf.viewer",
+            "\"ngypdf:\"",
             "document.querySelector(`.pdf-page[data-page=\"${page}\"]`)",
             "querySelector(\".textLayer\")",
             "attachShadow({ mode: \"closed\" })",

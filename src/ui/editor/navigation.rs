@@ -74,7 +74,7 @@ pub(super) fn toc_outdent_destination(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use moye_epub_editor::document::{BlockDocument, ContentUnit, TocTarget};
+    use ngy_book_studio::document::{BlockDocument, ContentUnit, TocTarget};
 
     fn document_with_fifteen_units() -> BookDocument {
         let mut document = BookDocument::created("book-navigation", "目录与线性正文");

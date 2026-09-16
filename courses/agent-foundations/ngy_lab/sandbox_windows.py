@@ -24,9 +24,9 @@ BOOL = c.c_int32
 HANDLE = c.c_void_p
 SIZE_T = c.c_size_t
 PTR = c.c_void_p
-PROFILE_PREFIX = "moye-lab-"
+PROFILE_PREFIX = "ngy-lab-"
 PROFILE_MARKER = "sandbox-profile.json"
-_PROFILE_PATTERN = re.compile(r"moye-lab-[0-9a-f]{32}\Z")
+_PROFILE_PATTERN = re.compile(r"ngy-lab-[0-9a-f]{32}\Z")
 _LPAC_POLICY = 1  # PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT
 _BASE_CAPABILITIES = ("registryRead",)
 
@@ -804,7 +804,7 @@ class AppContainerProfile:
         all_packages, acl = PTR(), PTR()
         probe = self.stage_root.parent / f"lpac-access-probe-{uuid.uuid4().hex}.dat"
         with probe.open("xb") as stream:
-            stream.write(b"moye LPAC access probe")
+            stream.write(b"ngy LPAC access probe")
         try:
             api.check(
                 api.advapi.ConvertStringSidToSidW("S-1-15-2-1", c.byref(all_packages)),

@@ -12,8 +12,16 @@ const MAX_TEXT_LAYER_ITEMS = 100_000;
 const MAX_SELECTION_BYTES = 32 * 1024;
 const MAX_SELECTION_SCAN_CODE_UNITS = 128 * 1024;
 const SELECTION_SEPARATOR = /[\u0000-\u001f\u007f-\u009f\s]/u;
-// The reading shell has no zoom control, so every page uses one fixed scale.
-const PAGE_SCALE = 1.5;
+// Ctrl + wheel changes the page scale. The host owns the scale of a book, so it
+// pushes one here; this shell only steps it, keeps the page being read in place
+// while the column re-lays out, and reports back the scale it stopped at. The
+// bounds are the host's (`src/ui/pdf_reader.rs`), which rejects anything else.
+const PAGE_ZOOM_DEFAULT_MILLI = 1500;
+const PAGE_ZOOM_MIN_MILLI = 500;
+const PAGE_ZOOM_MAX_MILLI = 4000;
+const PAGE_ZOOM_STEP_MILLI = 250;
+// Wheel notches arrive in bursts; report the scale once the reader stops.
+const PAGE_ZOOM_REPORT_MS = 250;
 // Pages are laid out immediately but only drawn close to the viewport, then
 // released again so a very long document never keeps the whole book in memory.
 const RENDER_ROOT_MARGIN = "200% 0px";
@@ -29,7 +37,7 @@ const utf8Encoder = new TextEncoder();
 let activeLoadingTask = null;
 let openedPdf = null;
 let documentGeneration = 0;
-// Last `moye-pdf-go-to` request id. Every page change and selection reuses it
+// Last `ngy-pdf-go-to` request id. Every page change and selection reuses it
 // so the host can still reject messages from a superseded navigation.
 let requestId = 0;
 let currentPage = 0;
@@ -43,6 +51,8 @@ let pageObserver = null;
 let viewportEstimate = null;
 let frameHandle = 0;
 let settleTimer = 0;
+let zoomReportTimer = 0;
+let pageZoomMilli = PAGE_ZOOM_DEFAULT_MILLI;
 let lastSelectionPayload = null;
 let lastStatusPage = 0;
 
@@ -166,7 +176,7 @@ function notify(message) {
 // The notes bridge is injected before this module and installs on
 // DOMContentLoaded, so every call tolerates it not being ready yet.
 function bridge() {
-  return globalThis.moyeAnnotations;
+  return globalThis.ngyAnnotations;
 }
 
 function bridgeLockedPage() {
@@ -236,7 +246,7 @@ function notifySelectionChanged(force = false) {
   if (!force && payload === lastSelectionPayload) return;
   lastSelectionPayload = payload;
   notify({
-    type: "moye-pdf-selection-changed",
+    type: "ngy-pdf-selection-changed",
     requestId,
     pageNumber: page,
     selectedText,
@@ -262,7 +272,7 @@ function bytesFromHost(value) {
 function reportError(error) {
   status.textContent = "PDF 预览失败";
   notify({
-    type: "moye-pdf-error",
+    type: "ngy-pdf-error",
     requestId,
     message: String(error?.message || error).slice(0, 1000),
   });
@@ -280,6 +290,97 @@ function applySize(container, viewport) {
   container.style.setProperty("--total-scale-factor", String(viewport.scale));
 }
 
+function clampPageZoom(zoomMilli) {
+  const value = Number(zoomMilli);
+  if (!Number.isFinite(value)) return PAGE_ZOOM_DEFAULT_MILLI;
+  return Math.min(PAGE_ZOOM_MAX_MILLI, Math.max(PAGE_ZOOM_MIN_MILLI, Math.round(value)));
+}
+
+function pageScale() {
+  return pageZoomMilli / 1_000;
+}
+
+/// One page's own box, in the units a viewport at scale 1 would measure. A
+/// rotated page keeps its rotation: only the ratio to the viewport it came from
+/// is kept, so the box can be re-scaled without asking PDF.js again.
+function pageBoxOf(viewport) {
+  const scale = viewport.scale || 1;
+  return { width: viewport.width / scale, height: viewport.height / scale };
+}
+
+function sizedViewport(box) {
+  return {
+    width: box.width * pageScale(),
+    height: box.height * pageScale(),
+    scale: pageScale(),
+  };
+}
+
+/// Sizes one page slot from its own box. A page whose size is not resolved yet
+/// has no box and keeps whatever the estimate gave it.
+function applySlotSize(slot) {
+  if (slot.pageBox) applySize(slot.container, sizedViewport(slot.pageBox));
+}
+
+/// Where the reader is looking: the page at the top of the reading area and how
+/// far into that page the top of the window sits. A scale change puts this point
+/// back where it was instead of scrolling to a different page.
+function readingAnchor() {
+  const slot = anchorSlot();
+  if (!slot) return null;
+  const rect = slot.container.getBoundingClientRect();
+  const height = rect.height || 1;
+  return {
+    page: slot.page,
+    fraction: Math.min(1, Math.max(0, -rect.top / height)),
+  };
+}
+
+function restoreReadingAnchor(anchor) {
+  if (!anchor) return;
+  const slot = slotsByPage.get(anchor.page);
+  if (!slot) return;
+  const rect = slot.container.getBoundingClientRect();
+  const top = rect.top + window.scrollY + rect.height * anchor.fraction;
+  window.scrollTo({ top: Math.max(0, top), behavior: "auto" });
+}
+
+/// Drops everything a slot currently holds so it can be laid out and drawn
+/// again: a cancelled render, a released canvas and the placeholder it falls
+/// back to. Re-observing re-reports the intersection state, so a page that is
+/// still on screen is drawn again instead of staying blank.
+function resetSlot(slot) {
+  slot.task?.cancel();
+  slot.textTask?.cancel();
+  slot.task = null;
+  slot.textTask = null;
+  slot.container.replaceChildren();
+  slot.placeholder = placeholderFor(slot.page);
+  slot.container.append(slot.placeholder);
+  slot.container.dataset.rendered = "false";
+  slot.state = "idle";
+  renderedPages.delete(slot.page);
+  bridge()?.pageReleased?.(slot.page);
+  if (pageObserver) {
+    pageObserver.unobserve(slot.container);
+    pageObserver.observe(slot.container);
+  }
+}
+
+/// Re-lays out every page at the current scale.
+///
+/// Sizing is one style write per page, which is what keeps the whole column —
+/// and therefore the scrollbar and the reading position — correct without
+/// asking PDF.js for every viewport again. Only a page that actually holds
+/// something has to be reset; a placeholder only needs its new size.
+function applyScaleToSlots() {
+  for (const slot of slots) {
+    if (slot.state !== "idle") resetSlot(slot);
+  }
+  for (const slot of slots) applySlotSize(slot);
+  publishRenderedPages();
+}
+
 function placeholderFor(pageNumber) {
   const placeholder = document.createElement("div");
   placeholder.className = "page-placeholder";
@@ -289,7 +390,7 @@ function placeholderFor(pageNumber) {
 
 async function seedViewportEstimate() {
   const first = await openedPdf.getPage(1);
-  viewportEstimate = first.getViewport({ scale: PAGE_SCALE });
+  viewportEstimate = first.getViewport({ scale: pageScale() });
   first.cleanup();
 }
 
@@ -305,12 +406,15 @@ function createSlots(count) {
     container.dataset.rendered = "false";
     const placeholder = placeholderFor(page);
     container.append(placeholder);
-    if (viewportEstimate) applySize(container, viewportEstimate);
+    const pageBox = viewportEstimate ? pageBoxOf(viewportEstimate) : null;
+    if (pageBox) applySize(container, sizedViewport(pageBox));
     fragment.append(container);
     const slot = {
       page,
       container,
       placeholder,
+      /// This page's own box, resolved once its viewport is known.
+      pageBox,
       state: "idle",
       sizeKnown: false,
       // Whether the page is inside the (expanded) render window. Only a page
@@ -330,8 +434,9 @@ function createSlots(count) {
 async function resolveSize(slot) {
   if (slot.sizeKnown || !openedPdf) return;
   const page = await openedPdf.getPage(slot.page);
-  applySize(slot.container, page.getViewport({ scale: PAGE_SCALE }));
+  slot.pageBox = pageBoxOf(page.getViewport({ scale: pageScale() }));
   slot.sizeKnown = true;
+  applySlotSize(slot);
 }
 
 function requestRender(pageNumber, urgent = false) {
@@ -376,7 +481,8 @@ async function renderSlot(slot, generation) {
   slot.state = "rendering";
   const page = await openedPdf.getPage(slot.page);
   if (generation !== documentGeneration) return;
-  const viewport = page.getViewport({ scale: PAGE_SCALE });
+  const viewport = page.getViewport({ scale: pageScale() });
+  slot.pageBox = pageBoxOf(viewport);
   applySize(slot.container, viewport);
   slot.sizeKnown = true;
   const canvas = document.createElement("canvas");
@@ -446,21 +552,7 @@ async function renderSlot(slot, generation) {
 
 function releaseSlot(slot) {
   if (slot.state !== "rendered") return;
-  slot.task?.cancel();
-  slot.textTask?.cancel();
-  slot.task = null;
-  slot.textTask = null;
-  slot.container.replaceChildren();
-  slot.placeholder = placeholderFor(slot.page);
-  slot.container.append(slot.placeholder);
-  slot.container.dataset.rendered = "false";
-  slot.state = "idle";
-  renderedPages.delete(slot.page);
-  bridge()?.pageReleased?.(slot.page);
-  // Re-observing re-reports the current intersection state, so a page released
-  // while still visible is rendered again instead of staying blank.
-  pageObserver.unobserve(slot.container);
-  pageObserver.observe(slot.container);
+  resetSlot(slot);
   publishRenderedPages();
 }
 
@@ -544,7 +636,7 @@ function reportCurrentPage() {
   }
   reportedPage = page;
   notify({
-    type: "moye-pdf-page-changed",
+    type: "ngy-pdf-page-changed",
     requestId,
     pageNumber: page,
     pageCount: openedPdf.numPages,
@@ -567,10 +659,36 @@ async function scrollToPage(pageNumber, smooth = true) {
   schedulePageSync();
 }
 
+function reportPageZoom() {
+  zoomReportTimer = 0;
+  if (!openedPdf) return;
+  notify({ type: "ngy-pdf-zoom-changed", requestId, zoomMilli: pageZoomMilli });
+}
+
+/// Re-lays the reading column out at one scale.
+///
+/// The page the reader is looking at stays where it is, so a scale change never
+/// moves the reading position; the host is only told about a scale the reader
+/// chose, never about one it pushed here itself.
+function applyPageZoom(zoomMilli, { report = true } = {}) {
+  const next = clampPageZoom(zoomMilli);
+  if (next === pageZoomMilli) return;
+  const anchor = readingAnchor();
+  pageZoomMilli = next;
+  applyScaleToSlots();
+  restoreReadingAnchor(anchor);
+  schedulePageSync();
+  if (!report) return;
+  clearTimeout(zoomReportTimer);
+  zoomReportTimer = setTimeout(reportPageZoom, PAGE_ZOOM_REPORT_MS);
+}
+
 async function cancelActive() {
   documentGeneration += 1;
   clearTimeout(settleTimer);
   settleTimer = 0;
+  clearTimeout(zoomReportTimer);
+  zoomReportTimer = 0;
   if (frameHandle) {
     cancelAnimationFrame(frameHandle);
     frameHandle = 0;
@@ -625,12 +743,19 @@ async function openPdf(request) {
   });
   const opened = await activeLoadingTask.promise;
   if (generation !== documentGeneration) return;
-  openedPdf = opened;
-  if (openedPdf.numPages > MAX_RENDER_PAGES) {
+  // The page-count guard runs before any of the document's state is adopted, so
+  // a rejected document leaves nothing behind for the zoom and page-step paths
+  // to act on: no open document, and no worker still holding its pages. The
+  // loading task is the only thing this rejection has created yet, so it is the
+  // only thing to release here.
+  if (opened.numPages > MAX_RENDER_PAGES) {
+    await activeLoadingTask.destroy();
+    activeLoadingTask = null;
     throw new RangeError("PDF page count exceeds the safety limit");
   }
+  openedPdf = opened;
   notify({
-    type: "moye-pdf-ready",
+    type: "ngy-pdf-ready",
     requestId,
     pageCount: openedPdf.numPages,
   });
@@ -646,12 +771,33 @@ async function openPdf(request) {
 window.addEventListener("message", (event) => {
   if (event.source !== window || event.origin !== location.origin) return;
   const request = event.data;
-  if (!request || request.type !== "moye-pdf-go-to") return;
+  if (!request) return;
+  if (request.type === "ngy-pdf-zoom") {
+    // The host owns the stored scale; a scale it pushed is not news back to it.
+    applyPageZoom(request.zoomMilli, { report: false });
+    return;
+  }
+  if (request.type !== "ngy-pdf-go-to") return;
   if (Number.isSafeInteger(request.requestId) && request.requestId >= 0) {
     requestId = request.requestId;
   }
   scrollToPage(request.pageNumber).catch(reportError);
 });
+
+// Ctrl + wheel changes the page scale. The page being read stays where it is
+// and the column re-lays out under it, so the notch must not also scroll the
+// document. Plain wheel, and every other modifier, keep scrolling.
+window.addEventListener(
+  "wheel",
+  (event) => {
+    if (!event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
+    if (event.deltaY === 0 || !openedPdf) return;
+    event.preventDefault();
+    const step = event.deltaY < 0 ? PAGE_ZOOM_STEP_MILLI : -PAGE_ZOOM_STEP_MILLI;
+    applyPageZoom(pageZoomMilli + step);
+  },
+  { passive: false },
+);
 
 // Ctrl + Left/Up steps to the previous page and Ctrl + Right/Down to the next.
 // The host owns page state, reading progress and note re-binding, so the shell
@@ -677,7 +823,7 @@ window.addEventListener(
     event.preventDefault();
     const target = delta < 0 ? currentPage - 1 : currentPage + 1;
     if (target < 1 || target > (openedPdf?.numPages ?? 0)) return;
-    notify({ type: "moye-pdf-request-page", delta });
+    notify({ type: "ngy-pdf-request-page", delta });
   },
   true,
 );
@@ -702,7 +848,7 @@ pageObserver = new IntersectionObserver(
 );
 
 async function openLocalDocument() {
-  notify({ type: "moye-pdf-viewer-ready" });
+  notify({ type: "ngy-pdf-viewer-ready" });
   const response = await fetch(new URL("./document.pdf", location.href), {
     cache: "no-store",
     credentials: "omit",
@@ -725,6 +871,7 @@ window.addEventListener(
   "pagehide",
   () => {
     clearTimeout(settleTimer);
+    clearTimeout(zoomReportTimer);
     if (frameHandle) cancelAnimationFrame(frameHandle);
     frameHandle = 0;
     renderQueue.length = 0;

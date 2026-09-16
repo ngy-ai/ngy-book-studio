@@ -2,7 +2,7 @@
 
 import json
 
-from moye_lab.contracts import AgentOutcome
+from ngy_lab.contracts import AgentOutcome
 
 
 def load_case(task, model, tools):

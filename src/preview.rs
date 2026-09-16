@@ -409,7 +409,7 @@ pub struct StructuralPngRenderer;
 impl VisualRenderer for StructuralPngRenderer {
     fn descriptor(&self) -> RendererDescriptor {
         RendererDescriptor {
-            renderer: "moye-structural-png".to_string(),
+            renderer: "ngy-structural-png".to_string(),
             version: concat!(env!("CARGO_PKG_VERSION"), "+resvg-0.45.1").to_string(),
             fidelity: RenderFidelity::Structural,
         }
@@ -3204,7 +3204,7 @@ mod tests {
             "unit-image",
             ContentUnitKind::Chapter,
             "图片章节",
-            "<img src=\"moye-asset:asset-image\" alt=\"说明\">",
+            "<img src=\"ngy-asset:asset-image\" alt=\"说明\">",
             BlockDocument::new(vec![Block::Image {
                 id: "block-image".to_string(),
                 asset_id: "asset-image".to_string(),
@@ -3504,7 +3504,7 @@ mod tests {
             "unit-image",
             ContentUnitKind::Chapter,
             "SVG 图片章节",
-            "<img src=\"moye-asset:asset-image\" alt=\"说明\">",
+            "<img src=\"ngy-asset:asset-image\" alt=\"说明\">",
             BlockDocument::new(vec![Block::Image {
                 id: "block-image".to_string(),
                 asset_id: "asset-image".to_string(),
@@ -4417,9 +4417,9 @@ mod tests {
         // The reader lays the whole document out in one scrollable column, so
         // every page is drawn on demand and released again once it is far away.
         assert!(PDFJS_VIEWER_SCRIPT.contains("IntersectionObserver("));
-        assert!(PDFJS_VIEWER_SCRIPT.contains("moye-pdf-page-changed"));
-        assert!(PDFJS_VIEWER_SCRIPT.contains("moye-pdf-selection-changed"));
-        assert!(PDFJS_VIEWER_SCRIPT.contains("moye-pdf-request-page"));
+        assert!(PDFJS_VIEWER_SCRIPT.contains("ngy-pdf-page-changed"));
+        assert!(PDFJS_VIEWER_SCRIPT.contains("ngy-pdf-selection-changed"));
+        assert!(PDFJS_VIEWER_SCRIPT.contains("ngy-pdf-request-page"));
         // The compact reading preference reaches the viewer through one URL
         // parameter and one document attribute, and stale bundle assets would
         // silently ignore it.

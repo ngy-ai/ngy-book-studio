@@ -12,7 +12,7 @@ from ctypes import wintypes
 
 from .contracts import LabError
 
-NAMESPACE = "dev.moye.agent-foundations.endpoint-"
+NAMESPACE = "dev.ngy.agent-foundations.endpoint-"
 MAX_KEY_BYTES = 2560
 _TARGET_PATTERN = re.compile(re.escape(NAMESPACE) + r"[0-9a-f]{64}\Z")
 
@@ -120,7 +120,7 @@ def write_api_key(target: str, api_key: str) -> None:
         CredentialBlobSize=len(encoded),
         CredentialBlob=ctypes.cast(blob, ctypes.POINTER(ctypes.c_ubyte)),
         Persist=2,  # CRED_PERSIST_LOCAL_MACHINE: persist for this Windows user.
-        UserName="moye-agent-foundations",
+        UserName="ngy-agent-foundations",
     )
     try:
         if not api.CredWriteW(ctypes.byref(entry), 0):

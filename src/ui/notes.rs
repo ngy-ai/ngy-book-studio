@@ -3,7 +3,7 @@ use super::*;
 
 use gpui::{ClipboardItem, Pixels, ScrollHandle};
 use gpui_component::text::{TextView, TextViewStyle};
-use moye_epub_editor::annotations::{AnnotationKind, AnnotationOverview};
+use ngy_book_studio::annotations::{AnnotationKind, AnnotationOverview};
 use std::collections::HashMap;
 
 const NOTES_PER_PAGE: usize = 30;
@@ -1102,7 +1102,7 @@ pub(super) fn open_notes_window(
                 title: Some(title.into()),
                 ..Default::default()
             }),
-            app_id: Some("dev.moye.epub-editor.notes".into()),
+            app_id: Some("dev.ngy.book-studio.notes".into()),
             ..Default::default()
         },
         move |window, cx| {
@@ -1139,7 +1139,7 @@ mod tests {
         Modifiers, MouseButton, ScrollDelta, ScrollWheelEvent, TestAppContext, VisualTestContext,
         point,
     };
-    use moye_epub_editor::annotations::{Annotation, TextAnchor};
+    use ngy_book_studio::annotations::{Annotation, TextAnchor};
 
     fn note(id: usize, book: &str, kind: AnnotationKind) -> AnnotationOverview {
         AnnotationOverview {

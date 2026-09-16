@@ -14,8 +14,8 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
-from moye_lab.contracts import BudgetExceeded, ProtocolError
-from moye_lab.implementations.common import (
+from ngy_lab.contracts import BudgetExceeded, ProtocolError
+from ngy_lab.implementations.common import (
     _finite_json_float,
     _reject_non_finite,
     _unique_json_object,
@@ -543,7 +543,7 @@ def make_case(chapter, scenario="normal", *, seed=None):
                 "params": {
                     "protocolVersion": inp["protocol_version"],
                     "capabilities": {},
-                    "clientInfo": {"name": "moye-practice", "version": "1.0.0"},
+                    "clientInfo": {"name": "ngy-practice", "version": "1.0.0"},
                 },
             }
         )
@@ -892,7 +892,7 @@ class ChapterTools:
             if self.phase != "new" or params != {
                 "protocolVersion": self.case.input["protocol_version"],
                 "capabilities": {},
-                "clientInfo": {"name": "moye-practice", "version": "1.0.0"},
+                "clientInfo": {"name": "ngy-practice", "version": "1.0.0"},
             }:
                 self.deny("初始化消息或会话状态无效")
             self.phase = "initializing"

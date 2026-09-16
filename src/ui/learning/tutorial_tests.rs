@@ -39,7 +39,7 @@ fn open_learning(
     let directory = tempfile::tempdir().unwrap();
     let service = Arc::new(LearningService::new(
         directory.path().join("learning"),
-        moye_epub_editor::runtime::IoRuntime::new(1).unwrap(),
+        ngy_book_studio::runtime::IoRuntime::new(1).unwrap(),
     ));
     cx.update(gpui_component::init);
     let mut learning = None;
@@ -48,7 +48,7 @@ fn open_learning(
             let mut view = LearningWindow::new(service, window, cx);
             view.apply_snapshot(
                 LearningSnapshot {
-                    lessons: moye_epub_editor::learning_records::lessons(),
+                    lessons: ngy_book_studio::learning_records::lessons(),
                     workspace,
                     history: vec![],
                     environment: LearningEnvironment {
@@ -267,7 +267,7 @@ fn save_preserves_undo_but_new_round_and_restore_reset_each_editors_history(
         );
     }
     let backup = directory.path().join("undo-restore-backup.json");
-    moye_epub_editor::learning_records::LearningStore::new(directory.path().join("learning"))
+    ngy_book_studio::learning_records::LearningStore::new(directory.path().join("learning"))
         .export(&backup)
         .unwrap();
     for index in 0..4 {
@@ -411,7 +411,7 @@ fn failed_chapter_load_opens_its_recovery_and_preserves_previous_inputs(cx: &mut
         assert!(!view.chapter_entry_disabled());
     });
     assert_eq!(
-        moye_epub_editor::learning_records::LearningStore::new(data.clone())
+        ngy_book_studio::learning_records::LearningStore::new(data.clone())
             .workspace()
             .unwrap()
             .notes,
@@ -460,7 +460,7 @@ fn failed_chapter_load_opens_its_recovery_and_preserves_previous_inputs(cx: &mut
 fn previous_chapter_save_failure_keeps_its_unsaved_inputs(cx: &mut TestAppContext) {
     let (directory, learning, visual) = open_learning(cx, LearningWorkspace::default());
     let store =
-        moye_epub_editor::learning_records::LearningStore::new(directory.path().join("learning"));
+        ngy_book_studio::learning_records::LearningStore::new(directory.path().join("learning"));
     // Simulate an independently advanced revision; switching must not conceal
     // the original editor or bind it to the target chapter after save fails.
     store.save(LearningWorkspace::default()).unwrap();
@@ -491,7 +491,7 @@ fn unloaded_corrupt_chapters_allow_leaving_and_restoring_their_own_backup(cx: &m
     let (directory, learning, visual) = open_learning(cx, LearningWorkspace::default());
     let data = directory.path().join("learning");
     let second =
-        moye_epub_editor::learning_records::LearningStore::for_chapter(data.clone(), 2).unwrap();
+        ngy_book_studio::learning_records::LearningStore::for_chapter(data.clone(), 2).unwrap();
     second
         .save(LearningWorkspace {
             notes: "第二章备份里的作答".into(),

@@ -47,7 +47,7 @@ let browser;
 before(async () => {
   browser = await chromium.launch({
     headless: true,
-    ...(process.env.MOYE_TEST_CHROMIUM ? { executablePath: process.env.MOYE_TEST_CHROMIUM } : {}),
+    ...(process.env.NGY_TEST_CHROMIUM ? { executablePath: process.env.NGY_TEST_CHROMIUM } : {}),
   });
 });
 after(async () => { await browser?.close(); });
@@ -64,7 +64,7 @@ async function pageWithFixture(html = fixture, contentType = "text/html; charset
     const originalAttach = Element.prototype.attachShadow;
     Element.prototype.attachShadow = function(options) {
       const result = originalAttach.call(this, options);
-      if (this.localName === 'moye-reader-notes') window.__notesRoot = result;
+      if (this.localName === 'ngy-reader-notes') window.__notesRoot = result;
       return result;
     };
     ${selectionBridge}
@@ -72,20 +72,20 @@ async function pageWithFixture(html = fixture, contentType = "text/html; charset
     ${translationsSource}
   ` });
   await page.goto("http://epubreader.book/chapter.html");
-  await page.evaluate(() => window.moyeAnnotations.configure({ session: "chapter-session", revision: 1, notes: [] }));
+  await page.evaluate(() => window.ngyAnnotations.configure({ session: "chapter-session", revision: 1, notes: [] }));
   await page.waitForFunction(() => !!window.__notesRoot);
   return page;
 }
 
 async function configure(page) {
-  await page.evaluate((value) => window.moyeTranslations.configure(value), payload);
+  await page.evaluate((value) => window.ngyTranslations.configure(value), payload);
 }
 
 function translationText(page, id) {
   return page.evaluate((id) => {
     const node = document.getElementById(id).previousElementSibling;
-    return node && node.hasAttribute("data-moye-translation")
-      ? node.querySelector(".moye-translation-text").textContent
+    return node && node.hasAttribute("data-ngy-translation")
+      ? node.querySelector(".ngy-translation-text").textContent
       : null;
   }, id);
 }
@@ -97,11 +97,11 @@ test("translated blocks render bilingual above each matched paragraph", async ()
     const state = await page.evaluate(() => {
       const titleSibling = document.getElementById("title").previousElementSibling;
       return {
-        count: document.querySelectorAll("[data-moye-translation]").length,
-        titleHasMark: !!(titleSibling && titleSibling.hasAttribute("data-moye-translation")),
-        listItemTranslations: document.getElementById("li").querySelectorAll("[data-moye-translation]").length,
+        count: document.querySelectorAll("[data-ngy-translation]").length,
+        titleHasMark: !!(titleSibling && titleSibling.hasAttribute("data-ngy-translation")),
+        listItemTranslations: document.getElementById("li").querySelectorAll("[data-ngy-translation]").length,
         cellFirstIsMark: !!document.getElementById("cell").firstElementChild
-          && document.getElementById("cell").firstElementChild.hasAttribute("data-moye-translation"),
+          && document.getElementById("cell").firstElementChild.hasAttribute("data-ngy-translation"),
       };
     });
     assert.equal(state.count, 7, "one translation layer per matched block");
@@ -117,38 +117,65 @@ test("translated blocks render bilingual above each matched paragraph", async ()
   } finally { await page.close(); }
 });
 
-test("clicking a translation toggles only that paragraph between bilingual and translation-only", async () => {
+test("the trailing icon is the only toggle between translation-only and bilingual", async () => {
   const page = await pageWithFixture();
   try {
-    await configure(page);
+    // The shipped default reading mode is 「译文」: the original is hidden and
+    // every collapsible block carries its own reveal icon after the last
+    // translated character.
+    await page.evaluate((value) => window.ngyTranslations.configure(value), {
+      ...payload, displayMode: "translation-only",
+    });
+    const initial = await page.evaluate(() => {
+      const layer = document.getElementById("a").previousElementSibling;
+      return {
+        display: document.getElementById("a").style.display,
+        icons: document.querySelectorAll("[data-ngy-translation-reveal]").length,
+        label: layer.querySelector("[data-ngy-translation-reveal]").getAttribute("aria-label"),
+        text: layer.querySelector(".ngy-translation-text").textContent,
+        layerText: layer.textContent,
+      };
+    });
+    assert.equal(initial.display, "none", "translation-only mode hides the original");
+    assert.equal(initial.icons, 6, "one reveal icon per collapsible translated block: the table cell stays bilingual");
+    assert.equal(initial.label, "显示原文", "the icon names the action it offers");
+    assert.equal(initial.text, "甲一");
+    assert.equal(initial.layerText, "甲一", "the icon adds no text to the layer it trails");
+
+    // Clicking the translated text itself no longer toggles: that is where a
+    // reader selects and copies, and a drag used to flip the paragraph.
     const point = await page.evaluate(() => {
       const text = document.getElementById("a").previousElementSibling
-        .querySelector(".moye-translation-text");
+        .querySelector(".ngy-translation-text");
       const rect = text.getBoundingClientRect();
       return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
     });
     await page.mouse.click(point.x, point.y);
-    const collapsed = await page.evaluate(() => ({
-      display: document.getElementById("a").style.display,
-      divider: document.getElementById("a").previousElementSibling
-        .querySelector(".moye-translation-divider").style.display,
-      collapsed: document.getElementById("a").previousElementSibling
-        .getAttribute("data-moye-collapsed"),
-    }));
-    assert.equal(collapsed.display, "none", "translation-only mode hides the original");
-    assert.equal(collapsed.divider, "none");
-    assert.equal(collapsed.collapsed, "1");
+    assert.equal(await page.evaluate(() => document.getElementById("a").style.display), "none",
+      "clicking the translation leaves the mode alone");
 
-    await page.mouse.click(point.x, point.y);
-    const restored = await page.evaluate(() => ({
-      display: document.getElementById("a").style.display,
-      divider: document.getElementById("a").previousElementSibling
-        .querySelector(".moye-translation-divider").style.display,
-      neighbour: document.getElementById("b").style.display,
-    }));
-    assert.equal(restored.display, "", "bilingual mode restores the original");
-    assert.notEqual(restored.divider, "none");
-    assert.equal(restored.neighbour, "", "the neighbouring paragraph is unaffected");
+    const clickReveal = (id) => page.evaluate((id) => document.getElementById(id)
+      .previousElementSibling.querySelector("[data-ngy-translation-reveal]").click(), id);
+    await clickReveal("a");
+    const revealed = await page.evaluate(() => {
+      const layer = document.getElementById("a").previousElementSibling;
+      return {
+        display: document.getElementById("a").style.display,
+        divider: layer.querySelector(".ngy-translation-divider").style.display,
+        collapsed: layer.getAttribute("data-ngy-collapsed"),
+        label: layer.querySelector("[data-ngy-translation-reveal]").getAttribute("aria-label"),
+        neighbour: document.getElementById("b").style.display,
+      };
+    });
+    assert.equal(revealed.display, "", "the icon brings the original back");
+    assert.notEqual(revealed.divider, "none");
+    assert.equal(revealed.collapsed, "0");
+    assert.equal(revealed.label, "收起原文", "the same icon now offers the way back");
+    assert.equal(revealed.neighbour, "none", "the neighbouring paragraph is unaffected");
+
+    await clickReveal("a");
+    assert.equal(await page.evaluate(() => document.getElementById("a").style.display), "none",
+      "the same icon collapses the paragraph again");
   } finally { await page.close(); }
 });
 
@@ -157,11 +184,11 @@ test("the original-only mode clears the layer and brings the hidden text back", 
   try {
     // The reading window pushes an empty payload for "原文": it must remove the
     // layer of the previous mode and restore every hidden original.
-    await page.evaluate((value) => window.moyeTranslations.configure(value), {
+    await page.evaluate((value) => window.ngyTranslations.configure(value), {
       ...payload, session: "translation-only-session", revision: 1, displayMode: "translation-only",
     });
     const collapsed = await page.evaluate(() => ({
-      applied: window.moyeTranslations.applied(),
+      applied: window.ngyTranslations.applied(),
       paragraph: document.getElementById("a").style.display,
       // The real list marker must stay visible; the list original is wrapped.
       listItem: getComputedStyle(document.getElementById("li")).display,
@@ -172,12 +199,12 @@ test("the original-only mode clears the layer and brings the hidden text back", 
     assert.equal(collapsed.listItem, "list-item", "the list marker itself stays visible");
     assert.equal(collapsed.listContent, "none");
 
-    await page.evaluate(() => window.moyeTranslations.configure({
+    await page.evaluate(() => window.ngyTranslations.configure({
       session: "original-only-session", revision: 1, displayMode: "original-only", blocks: [],
     }));
     const state = await page.evaluate(() => ({
-      applied: window.moyeTranslations.applied(),
-      blocks: document.querySelectorAll("[data-moye-translation]").length,
+      applied: window.ngyTranslations.applied(),
+      blocks: document.querySelectorAll("[data-ngy-translation]").length,
       hidden: [...document.querySelectorAll("body *")]
         .filter((node) => node.style.display === "none").length,
       paragraphDisplay: document.getElementById("a").style.display,
@@ -252,7 +279,7 @@ test("translation nodes never become book text and selections on them resolve to
     // bridge debounces its report, so wait for the message this selection sends.
     const translated = await page.evaluate(async () => {
       const text = document.getElementById("a").previousElementSibling
-        .querySelector(".moye-translation-text");
+        .querySelector(".ngy-translation-text");
       const before = window.__messages
         .filter((item) => item.type === "selection_changed").length;
       window.getSelection().removeAllRanges();
@@ -278,9 +305,9 @@ test("translation nodes never become book text and selections on them resolve to
     // Two translated paragraphs resolve to both originals in document order.
     const spanning = await page.evaluate(async () => {
       const first = document.getElementById("a").previousElementSibling
-        .querySelector(".moye-translation-text");
+        .querySelector(".ngy-translation-text");
       const last = document.getElementById("b").previousElementSibling
-        .querySelector(".moye-translation-text");
+        .querySelector(".ngy-translation-text");
       const before = window.__messages
         .filter((item) => item.type === "selection_changed").length;
       const range = document.createRange();
@@ -304,13 +331,13 @@ test("translation nodes never become book text and selections on them resolve to
     // the frozen anchor is still the original range it was translated from.
     const explained = await page.evaluate(() => {
       const layer = document.getElementById("a").previousElementSibling;
-      const text = layer.querySelector(".moye-translation-text");
+      const text = layer.querySelector(".ngy-translation-text");
       window.getSelection().removeAllRanges();
       const range = document.createRange();
       range.selectNodeContents(text);
       window.getSelection().addRange(range);
       layer.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true }));
-      const accepted = window.moyeAnnotations.explainSelection(text.textContent);
+      const accepted = window.ngyAnnotations.explainSelection(text.textContent);
       const message = window.__messages.filter((item) => item.action === "ai_explain").at(-1);
       return {
         accepted,
@@ -329,7 +356,7 @@ test("translation nodes never become book text and selections on them resolve to
     // The floating selection menu takes the same path.
     const viaToolbar = await page.evaluate(async () => {
       const layer = document.getElementById("b").previousElementSibling;
-      const text = layer.querySelector(".moye-translation-text");
+      const text = layer.querySelector(".ngy-translation-text");
       window.getSelection().removeAllRanges();
       const range = document.createRange();
       range.selectNodeContents(text);
@@ -354,7 +381,7 @@ test("translation nodes never become book text and selections on them resolve to
       window.getSelection().removeAllRanges();
       window.getSelection().addRange(range);
       paragraph.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true }));
-      const accepted = window.moyeAnnotations.explainSelection("Alpha");
+      const accepted = window.ngyAnnotations.explainSelection("Alpha");
       const message = window.__messages.filter((item) => item.action === "ai_explain").at(-1);
       return { accepted, hasDisplayed: Object.hasOwn(message, "displayed_text") };
     });
@@ -436,20 +463,24 @@ for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; c
         }
         return result;
       });
-      await page.evaluate((payload) => window.moyeTranslations.configure(payload), formattedPayload);
+      await page.evaluate((payload) => window.ngyTranslations.configure(payload), formattedPayload);
       const state = await page.evaluate((expected) => {
         const translation = (id) => {
           const original = document.getElementById(id);
           const layer = ["li", "td", "th"].includes(original.localName)
             ? original.firstElementChild : original.previousElementSibling;
-          return layer.querySelector(".moye-translation-text");
+          return layer.querySelector(".ngy-translation-text");
         };
         const nodes = {
           heading: translation("heading"), headingEm: translation("heading").querySelector("em"),
           rich: translation("rich"), strong: translation("rich").querySelector("strong"),
           em: translation("rich").querySelector("em"), del: translation("rich").querySelector("del"),
           sub: translation("rich").querySelector("sub"), sup: translation("rich").querySelector("sup"),
-          code: translation("rich").querySelector("code"), tone: translation("rich").lastElementChild,
+          code: translation("rich").querySelector("code"),
+          // The source class is not copied, and the reveal icon now trails the
+          // translated text, so the trailing span is addressed by its text.
+          tone: [...translation("rich").querySelectorAll("span")]
+            .find((element) => element.textContent === "彩色"),
           quote: translation("quote"), cellStrong: translation("table-cell").querySelector("strong"),
         };
         const styles = Object.fromEntries(Object.entries(nodes).map(([name, element]) => {
@@ -458,7 +489,7 @@ for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; c
         }));
         const rich = translation("rich");
         return {
-          styles, applied: window.moyeTranslations.applied(), headingTag: nodes.heading.localName,
+          styles, applied: window.ngyTranslations.applied(), headingTag: nodes.heading.localName,
           headingNamespace: nodes.heading.namespaceURI,
           headingText: nodes.heading.textContent, boldText: nodes.strong.textContent,
           brCount: rich.querySelectorAll("br").length, code: nodes.code.textContent,
@@ -475,7 +506,7 @@ for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; c
           headerColumns: document.getElementById("header").colSpan,
           cellDisplay: getComputedStyle(document.getElementById("table-cell")).display,
           cellText: translation("table-cell").textContent,
-          cellCollapsed: translation("table-cell").parentElement.getAttribute("data-moye-collapsed"),
+          cellCollapsed: translation("table-cell").parentElement.getAttribute("data-ngy-collapsed"),
           mediaVisible: getComputedStyle(document.getElementById("media")).display !== "none",
           imageIdentity: document.getElementById("original-image") === window.__originalImage,
           mediaCopies: document.querySelectorAll("img").length,
@@ -509,9 +540,9 @@ for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; c
       assert.equal(state.mediaCopies, 1);
 
       const restored = await page.evaluate(() => {
-        window.moyeTranslations.clear();
+        window.ngyTranslations.clear();
         return {
-          count: document.querySelectorAll("[data-moye-translation]").length,
+          count: document.querySelectorAll("[data-ngy-translation]").length,
           nodesRestored: window.__originalLiNodes.every((node, index) => document.getElementById("one").childNodes[index] === node),
           paragraphStyle: document.getElementById("rich").getAttribute("style"),
           liText: document.getElementById("one").textContent,
@@ -523,15 +554,15 @@ for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; c
         count: 0, nodesRestored: true, paragraphStyle: null, liText: "First item",
         imageSame: true, sourceLink: "https://invalid.example/link",
       }, "clear restores the original DOM nodes and display state");
-      await page.evaluate((payload) => window.moyeTranslations.configure(payload), formattedPayload);
-      assert.equal(await page.evaluate(() => window.moyeTranslations.applied()), 10, "clear/reapply does not accumulate wrappers");
+      await page.evaluate((payload) => window.ngyTranslations.configure(payload), formattedPayload);
+      assert.equal(await page.evaluate(() => window.ngyTranslations.applied()), 10, "clear/reapply does not accumulate wrappers");
     } finally { await page.close(); }
   });
 
   test(`${mode}: stale, reordered, missing and legacy leaves keep their original paragraphs visible`, async () => {
     const page = await pageWithFixture(`<!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><title>Validation</title></head><body><p id="wrong">One <b>two</b></p><p id="missing">Three <i>four</i></p><p id="legacy">Legacy</p><p id="empty">Empty</p><p id="skipped">Visible<script>ignored()</script><style>.ignored{color:red}</style><span> text</span></p><p id="code">Run <code>print("ok")</code> now</p></body></html>`, contentType);
     try {
-      await page.evaluate((payload) => window.moyeTranslations.configure(payload), {
+      await page.evaluate((payload) => window.ngyTranslations.configure(payload), {
         session: "invalid-session", displayMode: "translation-only", blocks: [
           segmentBlock("wrong", "One two", [["two", "二"], ["One", "一"]]),
           segmentBlock("missing", "Three four", [["Three", "三"]]),
@@ -542,7 +573,7 @@ for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; c
         ],
       });
       const result = await page.evaluate(() => ({
-        applied: window.moyeTranslations.applied(),
+        applied: window.ngyTranslations.applied(),
         unchanged: ["wrong", "missing", "legacy", "empty"].every((id) => document.getElementById(id).style.display !== "none"),
         skipped: document.getElementById("skipped").previousElementSibling.textContent,
         code: document.getElementById("code").previousElementSibling.querySelector("code").textContent,
@@ -575,7 +606,7 @@ for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; c
         return page.evaluate(() => {
           window.__notesRoot.querySelector('[data-action="highlight"]').click();
           const message = window.__messages.filter((item) => item.action === "highlight").at(-1);
-          window.moyeAnnotations.result({
+          window.ngyAnnotations.result({
             session: message.session, revision: message.revision, request_id: message.request_id, ok: true, notes: [],
           });
           return message.anchor;
@@ -585,7 +616,7 @@ for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; c
       assert.deepEqual(baseline, { quote: "End", start: 8, end: 11 });
       await page.evaluate((payload) => {
         window.getSelection().removeAllRanges();
-        window.moyeTranslations.configure(payload);
+        window.ngyTranslations.configure(payload);
       }, {
         session: "list-session", displayMode: "translation-only",
         blocks: [segmentBlock("list", "A B", [["A ", "甲"], ["B", "乙"]])],
@@ -593,7 +624,7 @@ for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; c
       assert.deepEqual(await readAnchor(), baseline, "the original hidden list leaves retain their UTF-16 offsets");
       await page.evaluate(() => {
         window.getSelection().removeAllRanges();
-        const text = document.getElementById("list").querySelector(".moye-translation-text");
+        const text = document.getElementById("list").querySelector(".ngy-translation-text");
         const range = document.createRange();
         range.selectNodeContents(text);
         window.getSelection().addRange(range);
@@ -608,10 +639,10 @@ for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; c
         "a selection on the translated list item resolves to the original list text");
       await page.evaluate(() => {
         window.getSelection().removeAllRanges();
-        document.getElementById("list").querySelector(".moye-translation-text").click();
+        document.getElementById("list").querySelector("[data-ngy-translation-reveal]").click();
       });
-      assert.equal(await page.evaluate(() => document.getElementById("list").lastElementChild.style.display), "contents", "click reveals original list text without hiding its marker");
-      await page.evaluate(() => window.moyeTranslations.clear());
+      assert.equal(await page.evaluate(() => document.getElementById("list").lastElementChild.style.display), "contents", "the reveal icon brings the list original back without hiding its marker");
+      await page.evaluate(() => window.ngyTranslations.clear());
       assert.deepEqual(await readAnchor(), baseline, "clear restores list originals without shifting later notes");
     } finally { await page.close(); }
   });
@@ -622,7 +653,7 @@ for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; c
   test(`${mode}: code descendants and code-only blocks do not consume repeated prose translations`, async () => {
     const page = await pageWithFixture('<!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><title>Code boundaries</title></head><body><pre><code><p id="inside-code">Same</p></code></pre><p id="only-code"><code>Same</code></p><p id="prose-first">Same</p><p id="prose-second">Same</p><ul><li id="code-container">Lead <pre><p id="nested-code">code()</p></pre> tail</li></ul></body></html>', contentType);
     try {
-      await page.evaluate((payload) => window.moyeTranslations.configure(payload), {
+      await page.evaluate((payload) => window.ngyTranslations.configure(payload), {
         session: "code-boundary-session", displayMode: "translation-only", blocks: [
           segmentBlock("first", "Same", [["Same", "第一处正文"]]),
           segmentBlock("second", "Same", [["Same", "第二处正文"]]),
@@ -630,13 +661,13 @@ for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; c
         ],
       });
       const state = await page.evaluate(() => ({
-        count: window.moyeTranslations.applied(),
+        count: window.ngyTranslations.applied(),
         insideCode: document.getElementById("inside-code").style.display,
         codeOnly: document.getElementById("only-code").style.display,
-        codeLayerCount: document.querySelectorAll("pre [data-moye-translation],code [data-moye-translation]").length,
-        first: document.getElementById("prose-first").previousElementSibling.querySelector(".moye-translation-text")?.textContent,
-        second: document.getElementById("prose-second").previousElementSibling.querySelector(".moye-translation-text")?.textContent,
-        container: document.getElementById("code-container").firstElementChild.querySelector(".moye-translation-text")?.textContent,
+        codeLayerCount: document.querySelectorAll("pre [data-ngy-translation],code [data-ngy-translation]").length,
+        first: document.getElementById("prose-first").previousElementSibling.querySelector(".ngy-translation-text")?.textContent,
+        second: document.getElementById("prose-second").previousElementSibling.querySelector(".ngy-translation-text")?.textContent,
+        container: document.getElementById("code-container").firstElementChild.querySelector(".ngy-translation-text")?.textContent,
         preservedCode: document.getElementById("code-container").firstElementChild.querySelector("pre")?.textContent,
       }));
       assert.deepEqual(state, {
@@ -655,7 +686,7 @@ for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; c
     // 不再进入翻译，正文块仍保留同一份叶子过滤。
     const page = await pageWithFixture('<!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><title>Invisible leaves</title></head><body><p id="code-line"><span id="indent">\u200b\u200b</span><span>const</span> THREE_AND_A_BIT : f32 = 3.4028236;</p><p id="prose"><span id="prose-indent">\u200b\u200b</span><span>甲</span> 乙</p><p id="blank">\u200b\u00ad</p></body></html>', contentType);
     try {
-      await page.evaluate((payload) => window.moyeTranslations.configure(payload), {
+      await page.evaluate((payload) => window.ngyTranslations.configure(payload), {
         session: "invisible-leaf-session", displayMode: "translation-only", blocks: [
           segmentBlock("code-line", "\u200b\u200bconst THREE_AND_A_BIT : f32 = 3.4028236;", [
             ["const", "常量"],
@@ -665,14 +696,14 @@ for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; c
         ],
       });
       const state = await page.evaluate(() => ({
-        applied: window.moyeTranslations.applied(),
-        layers: document.querySelectorAll("[data-moye-translation]").length,
+        applied: window.ngyTranslations.applied(),
+        layers: document.querySelectorAll("[data-ngy-translation]").length,
         indent: document.getElementById("indent").textContent,
         codeTranslated: document.getElementById("code-line").previousElementSibling
-          ?.querySelector(".moye-translation-text")?.textContent,
+          ?.querySelector(".ngy-translation-text")?.textContent,
         proseIndent: document.getElementById("prose-indent").textContent,
         proseTranslated: document.getElementById("prose").previousElementSibling
-          ?.querySelector(".moye-translation-text")?.textContent,
+          ?.querySelector(".ngy-translation-text")?.textContent,
       }));
       assert.deepEqual(state, {
         applied: 1, layers: 1,
@@ -694,7 +725,7 @@ const manualMessages = (page) => page.evaluate(() =>
 // join the block's text, so every lookup goes through that boundary.
 const clickControl = (page, id, label) => page.evaluate(({ id, label }) => {
   const layer = document.getElementById(id).previousElementSibling;
-  const button = [...layer.querySelector("[data-moye-translation-controls]").shadowRoot
+  const button = [...layer.querySelector("[data-ngy-translation-controls]").shadowRoot
     .querySelectorAll("button")].find((element) => element.textContent === label);
   if (!button) throw new Error(`missing control: ${label}`);
   button.click();
@@ -703,15 +734,15 @@ const clickControl = (page, id, label) => page.evaluate(({ id, label }) => {
 const manualState = (page, id) => page.evaluate((id) => {
   const book = document.getElementById(id);
   const layer = book.previousElementSibling;
-  const row = layer.querySelector("[data-moye-translation-controls]").shadowRoot;
+  const row = layer.querySelector("[data-ngy-translation-controls]").shadowRoot;
   const editable = layer.querySelector("[contenteditable='true']");
   return {
-    translated: layer.querySelector(".moye-translation-text").textContent,
+    translated: layer.querySelector(".ngy-translation-text").textContent,
     editing: !!editable,
     editableText: editable?.textContent ?? null,
     focused: editable ? document.activeElement === editable : false,
-    manual: !!row.querySelector(".moye-translation-manual"),
-    error: row.querySelector(".moye-translation-error")?.textContent ?? null,
+    manual: !!row.querySelector(".ngy-translation-manual"),
+    error: row.querySelector(".ngy-translation-error")?.textContent ?? null,
     buttons: [...row.querySelectorAll("button")].map((element) => element.textContent),
     bookText: book.textContent,
     bookHidden: book.style.display,
@@ -724,14 +755,14 @@ test("a manual edit is posted for the displayed block and survives the host's an
     await configure(page);
     assert.deepEqual(await page.evaluate(() => {
       const layer = document.getElementById("c").previousElementSibling;
-      const controls = layer.querySelector("[data-moye-translation-controls]");
+      const controls = layer.querySelector("[data-ngy-translation-controls]");
       const style = getComputedStyle(controls);
       return {
         buttons: [...controls.shadowRoot.querySelectorAll("button")]
           .map((element) => element.textContent),
         faded: style.opacity,
         clickable: style.pointerEvents,
-        tabbable: [...document.querySelectorAll("[data-moye-translation-controls]")]
+        tabbable: [...document.querySelectorAll("[data-ngy-translation-controls]")]
           .flatMap((element) => [...element.shadowRoot.querySelectorAll("button")]).length,
         // Chrome must never join the block's text: a copied translation would
         // carry the button labels.
@@ -745,15 +776,15 @@ test("a manual edit is posted for the displayed block and survives the host's an
     // state is waited for instead of read in the same frame as the focus.
     await page.evaluate(() => {
       const layer = document.getElementById("c").previousElementSibling;
-      layer.querySelector("[data-moye-translation-controls]").shadowRoot
+      layer.querySelector("[data-ngy-translation-controls]").shadowRoot
         .querySelector("button").focus();
     });
     await page.waitForFunction(() => getComputedStyle(
       document.getElementById("c").previousElementSibling
-        .querySelector("[data-moye-translation-controls]")).opacity === "1");
+        .querySelector("[data-ngy-translation-controls]")).opacity === "1");
     assert.equal(await page.evaluate(() => getComputedStyle(
       document.getElementById("c").previousElementSibling
-        .querySelector("[data-moye-translation-controls]")).opacity), "1",
+        .querySelector("[data-ngy-translation-controls]")).opacity), "1",
     "tabbing into the row reveals it");
 
     await clickControl(page, "c", "编辑译文");
@@ -776,7 +807,7 @@ test("a manual edit is posted for the displayed block and survives the host's an
     }, "the page submits the original leaf as the source, never a rewritten one");
     assert.equal((await manualState(page, "c")).buttons.length, 0, "the editor is busy until the host answers");
 
-    await page.evaluate((request_id) => window.moyeTranslations.result({ request_id, ok: true }),
+    await page.evaluate((request_id) => window.ngyTranslations.result({ request_id, ok: true }),
       sent.request_id);
     assert.deepEqual(await manualState(page, "c"), {
       translated: "乙！", editing: false, editableText: null, focused: false,
@@ -789,7 +820,7 @@ test("a manual edit is posted for the displayed block and survives the host's an
       type: "manual_translation", action: "restore", revision: 1, request_id: restore.request_id,
       key: "c", segments: [],
     });
-    await page.evaluate((request_id) => window.moyeTranslations.result({ request_id, ok: true }),
+    await page.evaluate((request_id) => window.ngyTranslations.result({ request_id, ok: true }),
       restore.request_id);
     assert.deepEqual((await manualState(page, "c")).buttons, ["编辑译文"],
       "restoring drops the manual marker until the host republishes the model text");
@@ -807,7 +838,7 @@ test("a failed manual edit keeps the typed text, a republish waits and cancel re
     await page.keyboard.type("组");
     await clickControl(page, "c", "保存");
     const sent = (await manualMessages(page)).at(-1);
-    await page.evaluate((request_id) => window.moyeTranslations.result({
+    await page.evaluate((request_id) => window.ngyTranslations.result({
       request_id, ok: false, error: "该文本块的译文已过期，请重新打开本章后再修改",
     }), sent.request_id);
     const failed = await manualState(page, "c");
@@ -817,7 +848,7 @@ test("a failed manual edit keeps the typed text, a republish waits and cancel re
 
     // The background poll republishes the same chapter while a translation job
     // advances; it must not delete text the reader is still typing.
-    await page.evaluate((value) => window.moyeTranslations.configure(value), {
+    await page.evaluate((value) => window.ngyTranslations.configure(value), {
       session: "translation-session", revision: 1,
       blocks: [{ key: "c", source: "Beta", segments: [{ source: "Beta", translated: "新乙" }] }],
     });
@@ -832,7 +863,7 @@ test("a failed manual edit keeps the typed text, a republish waits and cancel re
       translated: "新乙", editing: false, editableText: null, focused: false,
       manual: false, error: null, buttons: ["编辑译文"], bookText: "Beta", bookHidden: "",
     }, "cancel restores the model text and the deferred payload is applied");
-    assert.equal(await page.evaluate(() => window.moyeTranslations.applied()), 1,
+    assert.equal(await page.evaluate(() => window.ngyTranslations.applied()), 1,
       "the waiting payload is the one that took effect");
   } finally { await page.close(); }
 });
@@ -872,7 +903,7 @@ for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; c
         window.getSelection().addRange(range);
         return {
           bookText: book.textContent,
-          translatedTo: window.moyeTranslations.originalRange(range)?.toString(),
+          translatedTo: window.ngyTranslations.originalRange(range)?.toString(),
         };
       });
       assert.deepEqual(edited, { bookText: "Beta", translatedTo: "Beta" },
@@ -887,7 +918,7 @@ for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; c
   test(`${mode}: a block already marked manual offers restore and skips the editor`, async () => {
     const page = await pageWithFixture(undefined, contentType);
     try {
-      await page.evaluate((value) => window.moyeTranslations.configure(value), {
+      await page.evaluate((value) => window.ngyTranslations.configure(value), {
         session: "manual-session", revision: 2,
         blocks: [
           { key: "a", source: "Alpha", segments: [{ source: "Alpha", translated: "人工甲" }], manual: true },
@@ -916,7 +947,7 @@ for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; c
     // 不翻译；正文句子即使带括号、URL 或全角标点仍然翻译。
     const page = await pageWithFixture('<!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><title>Code shape</title></head><body><p id="statement">const TOTAL : f32 = 3.5;</p><p id="braces">fn main() {</p><p id="comment">// 注释</p><p id="operator">count =&gt; count + 1</p><p id="prose">Read the note (see above).</p><p id="url">https://example.test/a/b</p></body></html>', contentType);
     try {
-      await page.evaluate((payload) => window.moyeTranslations.configure(payload), {
+      await page.evaluate((payload) => window.ngyTranslations.configure(payload), {
         session: "code-shape-session", displayMode: "translation-only", blocks: [
           segmentBlock("statement", "const TOTAL : f32 = 3.5;", [["const TOTAL : f32 = 3.5;", "常量"]]),
           segmentBlock("braces", "fn main() {", [["fn main() {", "主函数 {"]]),
@@ -928,11 +959,11 @@ for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; c
       });
       const state = await page.evaluate(() => {
         const layered = (id) => !!document.getElementById(id).previousElementSibling
-          ?.hasAttribute("data-moye-translation");
+          ?.hasAttribute("data-ngy-translation");
         const text = (id) => document.getElementById(id).previousElementSibling
-          ?.querySelector(".moye-translation-text")?.textContent;
+          ?.querySelector(".ngy-translation-text")?.textContent;
         return {
-          applied: window.moyeTranslations.applied(),
+          applied: window.ngyTranslations.applied(),
           statement: layered("statement"), braces: layered("braces"),
           comment: layered("comment"), operator: layered("operator"),
           prose: layered("prose"), url: layered("url"),

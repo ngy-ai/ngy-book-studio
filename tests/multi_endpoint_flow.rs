@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use moye_epub_editor::{
+use ngy_book_studio::{
     agent::{AgentAnswerSourceStatus, SearchMode, SearchRequest},
     agent_chat::{AgentConversation, ConversationQuestion},
     chat::ChatWindowKind,
@@ -166,6 +166,9 @@ fn independent_endpoints_route_chat_search_and_background_jobs_after_restart() {
         embedding_model: "embedding-model".into(),
         vision_model: "vision-model".into(),
         auto_run_background_jobs: true,
+        // The mock endpoints only answer the indexing pipeline; whole-book
+        // translation is off so no extra job enters the completion wait below.
+        default_language: None,
         ..ProviderSettings::default()
     };
     settings.endpoint_routing.additional_endpoints =

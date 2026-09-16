@@ -24,14 +24,21 @@ for (const contract of [
   "AnnotationMode.DISABLE",
   "page.getTextContent(",
   "new TextLayer(",
-  "moye-pdf-selection-changed",
-  "moye-pdf-page-changed",
-  "moye-pdf-request-page",
+  "ngy-pdf-selection-changed",
+  "ngy-pdf-page-changed",
+  "ngy-pdf-request-page",
+  // Ctrl + wheel re-lays the column out at a new page scale while the page
+  // being read stays where it is; the host owns the stored scale.
+  "ngy-pdf-zoom",
+  "ngy-pdf-zoom-changed",
+  "PAGE_ZOOM_MIN_MILLI = 500",
+  "PAGE_ZOOM_MAX_MILLI = 4000",
+  "readingAnchor()",
   "MAX_SELECTION_BYTES = 32 * 1024",
   // The reading column is laid out in one pass and drawn page by page.
   "IntersectionObserver(",
   "releaseSlot(",
-  "globalThis.moyeAnnotations",
+  "globalThis.ngyAnnotations",
   // Page spacing is a host preference applied through one html attribute, and a
   // live change must keep the reading position instead of scrolling the reader.
   'get("compact")',

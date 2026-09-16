@@ -264,7 +264,7 @@ impl std::fmt::Debug for PreparedAgentRequest {
 impl Drop for PreparedAgentRequest {
     fn drop(&mut self) {
         tracing::debug!(
-            target: "moye_ai",
+            target: "ngy_ai",
             trace_id = self.cancellation.trace_id(),
             request_id = self.request_id,
             cancelled = self.cancellation.is_cancelled(),
@@ -312,7 +312,7 @@ fn finalize_committed_delete(
     *selection = ConversationSelection::Fresh;
     if let Err(error) = release_claim() {
         tracing::error!(
-            target: "moye_ai",
+            target: "ngy_ai",
             stage = "release_deleted_session",
             error_kind = error_kind(&error),
             "conversation was deleted but its process-local claim could not be released"
@@ -664,7 +664,7 @@ impl AgentConversation {
         active.insert(request_id, cancellation.clone());
         drop(active);
         tracing::debug!(
-            target: "moye_ai",
+            target: "ngy_ai",
             trace_id = cancellation.trace_id(),
             request_id,
             window_kind = ?self.window_kind,
@@ -689,7 +689,7 @@ impl AgentConversation {
         prepared: PreparedAgentRequest,
     ) -> Result<ConversationAnswer> {
         let span = tracing::info_span!(
-            target: "moye_ai",
+            target: "ngy_ai",
             "ai_conversation",
             trace_id = prepared.cancellation.trace_id(),
             request_id = request.request_id,
@@ -785,7 +785,7 @@ impl AgentConversation {
             self.thread_and_history(&repository, &request.question, scope.clone()),
         )
         .await?;
-        tracing::debug!(target: "moye_ai", history_messages = previous.len(), "AI conversation history loaded");
+        tracing::debug!(target: "ngy_ai", history_messages = previous.len(), "AI conversation history loaded");
         ensure_request_not_cancelled(&cancellation)?;
         let mut user_draft = NewChatMessage::text(ChatRole::User, request.question.clone());
         user_draft.parent_id = previous.last().map(|message| message.id.clone());
@@ -854,7 +854,7 @@ impl AgentConversation {
                 source_title: citation.source_title.clone(),
             })
             .collect();
-        tracing::debug!(target: "moye_ai", answer_bytes = answer.markdown.len(), citations = answer.citations.len(), "AI answer ready for persistence");
+        tracing::debug!(target: "ngy_ai", answer_bytes = answer.markdown.len(), citations = answer.citations.len(), "AI answer ready for persistence");
         let stored_message = conversation_stage("persist_answer_citations", async {
             repository
                 .append_message(
@@ -980,10 +980,10 @@ impl AgentConversation {
             return false;
         };
         let Some(token) = active.get(&request_id) else {
-            tracing::debug!(target: "moye_ai", request_id, window_kind = ?self.window_kind, "AI cancellation ignored for inactive request");
+            tracing::debug!(target: "ngy_ai", request_id, window_kind = ?self.window_kind, "AI cancellation ignored for inactive request");
             return false;
         };
-        tracing::info!(target: "moye_ai", trace_id = token.trace_id(), request_id, window_kind = ?self.window_kind, "AI conversation cancellation requested");
+        tracing::info!(target: "ngy_ai", trace_id = token.trace_id(), request_id, window_kind = ?self.window_kind, "AI conversation cancellation requested");
         token.cancel();
         true
     }
@@ -991,7 +991,7 @@ impl AgentConversation {
     pub fn cancel_all(&self) {
         if let Ok(active) = self.active.lock() {
             for (request_id, token) in active.iter() {
-                tracing::info!(target: "moye_ai", trace_id = token.trace_id(), request_id, window_kind = ?self.window_kind, "AI conversation closing; cancelling request");
+                tracing::info!(target: "ngy_ai", trace_id = token.trace_id(), request_id, window_kind = ?self.window_kind, "AI conversation closing; cancelling request");
                 token.cancel();
             }
         }
@@ -1003,18 +1003,18 @@ async fn conversation_stage<T>(
     future: impl Future<Output = Result<T>>,
 ) -> Result<T> {
     let started = Instant::now();
-    tracing::debug!(target: "moye_ai", stage, "AI conversation stage started");
+    tracing::debug!(target: "ngy_ai", stage, "AI conversation stage started");
     let result = future.await;
     let elapsed_ms = started.elapsed().as_millis() as u64;
     match &result {
         Ok(_) => {
-            tracing::debug!(target: "moye_ai", stage, elapsed_ms, "AI conversation stage completed")
+            tracing::debug!(target: "ngy_ai", stage, elapsed_ms, "AI conversation stage completed")
         }
         Err(error) if error.is::<AgentRequestCancelled>() => {
-            tracing::debug!(target: "moye_ai", stage, elapsed_ms, error_kind = "cancelled", "AI conversation stage cancelled")
+            tracing::debug!(target: "ngy_ai", stage, elapsed_ms, error_kind = "cancelled", "AI conversation stage cancelled")
         }
         Err(error) => {
-            tracing::warn!(target: "moye_ai", stage, elapsed_ms, error_kind = error_kind(error), "AI conversation stage failed")
+            tracing::warn!(target: "ngy_ai", stage, elapsed_ms, error_kind = error_kind(error), "AI conversation stage failed")
         }
     }
     result

@@ -8,16 +8,16 @@ from pathlib import Path
 
 import pytest
 
-from moye_lab.chapter_runtime import (
+from ngy_lab.chapter_runtime import (
     ChapterModel,
     ChapterTools,
     _score,
     evaluate_chapter,
     make_case,
 )
-from moye_lab.chapter_support import call_tool, finish, load_case
-from moye_lab.contracts import BudgetExceeded, ProtocolError, RunLimits
-from moye_lab.sandbox import execute_desktop_run
+from ngy_lab.chapter_support import call_tool, finish, load_case
+from ngy_lab.contracts import BudgetExceeded, ProtocolError, RunLimits
+from ngy_lab.sandbox import execute_desktop_run
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -560,7 +560,7 @@ def test_multi_agent_faults_do_not_always_change_the_schedule_claim():
 
 
 def test_multi_agent_reading_then_guessing_rejections_from_roles_fails():
-    from moye_lab.chapter_runtime import _aggregate
+    from ngy_lab.chapter_runtime import _aggregate
 
     failures = 0
     for seed in range(20):

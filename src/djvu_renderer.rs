@@ -27,7 +27,7 @@ use crate::{
 };
 
 /// Stable renderer identity; `db::transactions` selects it for DjVu sources.
-pub const DJVU_RENDERER_NAME: &str = "moye-djvu-png";
+pub const DJVU_RENDERER_NAME: &str = "ngy-djvu-png";
 
 const MAX_RASTER_DIMENSION: u32 = 4_096;
 const MAX_RASTER_PIXELS: u64 = 16 * 1024 * 1024;

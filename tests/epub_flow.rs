@@ -6,7 +6,7 @@ use std::{
 };
 
 use image::ImageEncoder as _;
-use moye_epub_editor::{
+use ngy_book_studio::{
     document::{AssetRef, AssetRole},
     library::{CoverDraft, ImportOutcome, LibraryStore},
     media::MediaService,
@@ -54,7 +54,7 @@ fn imports_reads_and_restores_a_real_epub() {
     assert_eq!(chapter.mime, "application/xhtml+xml; charset=utf-8");
     let chapter = String::from_utf8(chapter.bytes).unwrap();
     assert!(chapter.contains("山海之间"));
-    assert!(chapter.contains("moye-reader-style"));
+    assert!(chapter.contains("ngy-reader-style"));
     assert!(load_resource(&opened.epub, "/META-INF/container.xml").is_err());
     assert_eq!(
         opened.spine_index_for_url("http://epubreader.book/EPUB/chapter-2.xhtml#end"),
@@ -155,7 +155,7 @@ fn imported_media_survives_canonical_edit_epub_export_and_reopen() {
     referenced.sort_unstable();
     referenced.dedup();
     assert_eq!(referenced.len(), 4, "image, audio, video, and poster refs");
-    assert!(unit.source.contains("moye-asset:"));
+    assert!(unit.source.contains("ngy-asset:"));
     assert!(!unit.source.contains("../media/"));
     assert!(!unit.source.contains("example.invalid"));
     for expected in &media {
@@ -195,7 +195,7 @@ fn imported_media_survives_canonical_edit_epub_export_and_reopen() {
         .unwrap();
     assert!(chapter.contains("EditedMediaRoundTrip"));
     assert_eq!(chapter.matches("../assets/").count(), 4);
-    assert!(!chapter.contains("moye-asset:"));
+    assert!(!chapter.contains("ngy-asset:"));
 
     let mut archive = ZipArchive::new(Cursor::new(normalized_bytes)).unwrap();
     let mut exported_media = Vec::new();
@@ -425,8 +425,8 @@ fn png_with_pixel(pixel: [u8; 4]) -> Vec<u8> {
 fn write_media_epub(path: &Path) -> Vec<Vec<u8>> {
     let picture = png_with_pixel([31, 97, 191, 255]);
     let poster = png_with_pixel([197, 81, 43, 255]);
-    let audio = b"ID3\x04\0\0moye-audio-fixture".to_vec();
-    let video = b"\0\0\0\x18ftypmp42moye-video-fixture".to_vec();
+    let audio = b"ID3\x04\0\0ngy-audio-fixture".to_vec();
+    let video = b"\0\0\0\x18ftypmp42ngy-video-fixture".to_vec();
 
     let file = File::create(path).unwrap();
     let mut zip = ZipWriter::new(file);
@@ -447,7 +447,7 @@ fn write_media_epub(path: &Path) -> Vec<Vec<u8>> {
         br#"<?xml version="1.0" encoding="UTF-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" unique-identifier="book-id" version="3.0">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
-    <dc:identifier id="book-id">urn:uuid:moye-media-test</dc:identifier>
+    <dc:identifier id="book-id">urn:uuid:ngy-media-test</dc:identifier>
     <dc:title>Media Round Trip</dc:title><dc:language>en</dc:language>
     <meta property="dcterms:modified">2026-09-02T00:00:00Z</meta>
   </metadata>
@@ -507,7 +507,7 @@ fn write_sample_epub(path: &Path) {
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" unique-identifier="book-id" version="3.0">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
-    <dc:identifier id="book-id">urn:uuid:moye-test-book</dc:identifier>
+    <dc:identifier id="book-id">urn:uuid:ngy-test-book</dc:identifier>
     <dc:title>山海小记</dc:title>
     <dc:creator>测试作者</dc:creator>
     <dc:language>zh-CN</dc:language>
@@ -598,7 +598,7 @@ fn write_sample_epub2(path: &Path) {
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" unique-identifier="book-id" version="2.0">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
-    <dc:identifier id="book-id">urn:uuid:moye-test-epub2</dc:identifier>
+    <dc:identifier id="book-id">urn:uuid:ngy-test-epub2</dc:identifier>
     <dc:title>旧版小书</dc:title><dc:creator>测试作者</dc:creator><dc:language>zh-CN</dc:language>
   </metadata>
   <manifest>
@@ -616,7 +616,7 @@ fn write_sample_epub2(path: &Path) {
         "OEBPS/toc.ncx",
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
-  <head><meta name="dtb:uid" content="urn:uuid:moye-test-epub2"/></head>
+  <head><meta name="dtb:uid" content="urn:uuid:ngy-test-epub2"/></head>
   <docTitle><text>旧版小书</text></docTitle>
   <navMap>
     <navPoint id="nav-1" playOrder="1"><navLabel><text>开篇</text></navLabel><content src="chapter-1.xhtml"/></navPoint>

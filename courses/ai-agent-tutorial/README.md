@@ -107,7 +107,7 @@ def run(task, model, tools, limits, emit):
 才是待处理的数据。这里不会提供应交回的整份作业结果，也没有让模型代写作业的后续对话。
 第六章的 `gold` 是评分任务本身的输入，你仍需根据它计算各项检查，不能把标签当作评分结果。
 
-起始代码中的 `moye_lab.chapter_support` 只封装公共协议：`load_case` 取得输入，
+起始代码中的 `ngy_lab.chapter_support` 只封装公共协议：`load_case` 取得输入，
 `call_tool` 组装调用并解析结果，`finish` 封装交卷。它们不实现本章算法。
 多数起始代码把作业再分成两个小函数：`prepare(data)` 接收本章 `input`，返回你设计的
 判定或计划；`perform(data, plan, state, tools)` 接收这份中间结果，执行允许的动作，

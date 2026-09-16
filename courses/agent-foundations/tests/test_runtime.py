@@ -6,11 +6,11 @@ import time
 
 import pytest
 
-from moye_lab import runner
-from moye_lab.contracts import AgentOutcome, ProtocolError, RunLimits
-from moye_lab.implementations.common import initial_messages
-from moye_lab.runtime import ObservedModel, ScriptedModel, ToolBroker, json_text
-from moye_lab.scenarios import get_scenario
+from ngy_lab import runner
+from ngy_lab.contracts import AgentOutcome, ProtocolError, RunLimits
+from ngy_lab.implementations.common import initial_messages
+from ngy_lab.runtime import ObservedModel, ScriptedModel, ToolBroker, json_text
+from ngy_lab.scenarios import get_scenario
 
 EXPECTED_COUNTS = {
     "normal": (3, 3),

@@ -6,7 +6,7 @@
 // column, pages far from the reading position are released and drawn again on
 // return, the shell reports the page it settled on and which page owns a
 // selection, and the compact reading preference never moves the reading
-// position. Drive it with MOYE_TEST_CHROMIUM when no bundled browser exists.
+// position. Drive it with NGY_TEST_CHROMIUM when no bundled browser exists.
 const { test, before, after } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -68,7 +68,7 @@ let browser;
 before(async () => {
   browser = await chromium.launch({
     headless: true,
-    ...(process.env.MOYE_TEST_CHROMIUM ? { executablePath: process.env.MOYE_TEST_CHROMIUM } : {}),
+    ...(process.env.NGY_TEST_CHROMIUM ? { executablePath: process.env.NGY_TEST_CHROMIUM } : {}),
   });
 });
 after(async () => { await browser?.close(); });
@@ -94,7 +94,7 @@ async function openViewer(query = "") {
       return scrollTo(...args);
     };
   });
-  await page.route("http://moyepdf.viewer/**", (route) => {
+  await page.route("http://ngypdf.viewer/**", (route) => {
     const name = new URL(route.request().url()).pathname.replace(/^\//, "");
     if (name === "document.pdf") {
       return route.fulfill({ status: 200, contentType: "application/pdf", body: pdf });
@@ -109,8 +109,8 @@ async function openViewer(query = "") {
       body: fs.readFileSync(file),
     });
   });
-  await page.goto(`http://moyepdf.viewer/viewer.html${query}`);
-  await waitForMessage(page, "moye-pdf-ready");
+  await page.goto(`http://ngypdf.viewer/viewer.html${query}`);
+  await waitForMessage(page, "ngy-pdf-ready");
   return page;
 }
 
@@ -195,7 +195,7 @@ async function selectPageText(page, pageNumber) {
 test("the whole document is one scrollable column that reports the page it settled on", async () => {
   const page = await openViewer();
   try {
-    const ready = await lastMessage(page, "moye-pdf-ready");
+    const ready = await lastMessage(page, "ngy-pdf-ready");
     assert.equal(ready.pageCount, PAGES);
 
     const column = await page.evaluate(() => {
@@ -217,19 +217,19 @@ test("the whole document is one scrollable column that reports the page it settl
 
     // Plain scrolling reports the page the reader settled on, plus the total.
     await page.evaluate(() => window.scrollTo(0, 2400));
-    await waitForMessage(page, "moye-pdf-page-changed", { pageNumber: 4, pageCount: PAGES });
-    const changed = await lastMessage(page, "moye-pdf-page-changed");
+    await waitForMessage(page, "ngy-pdf-page-changed", { pageNumber: 4, pageCount: PAGES });
+    const changed = await lastMessage(page, "ngy-pdf-page-changed");
     assert.equal(changed.requestId, 0, "plain scrolling is not a host navigation");
 
     // Ctrl + Arrow asks the host for a relative step instead of moving alone.
     await page.keyboard.press("Control+ArrowDown");
-    await waitForMessage(page, "moye-pdf-request-page", { delta: 1 });
+    await waitForMessage(page, "ngy-pdf-request-page", { delta: 1 });
     assert.equal(await page.evaluate(() => window.scrollY), 2400, "the shell only asks");
 
     // A host navigation scrolls to the page and reuses its request id.
     await page.evaluate(() =>
-      window.postMessage({ type: "moye-pdf-go-to", requestId: 9, pageNumber: 12 }, location.origin));
-    await waitForMessage(page, "moye-pdf-page-changed", { requestId: 9, pageNumber: 12 });
+      window.postMessage({ type: "ngy-pdf-go-to", requestId: 9, pageNumber: 12 }, location.origin));
+    await waitForMessage(page, "ngy-pdf-page-changed", { requestId: 9, pageNumber: 12 });
     const top = await page.evaluate(() =>
       document.querySelector('.pdf-page[data-page="12"]').getBoundingClientRect().top);
     assert.ok(
@@ -249,7 +249,7 @@ test("pages far from the reading position are released and drawn again on return
     );
     const height = await page.evaluate(() => document.documentElement.scrollHeight);
     await page.evaluate((height) => window.scrollTo(0, height), height);
-    await waitForMessage(page, "moye-pdf-page-changed", { pageNumber: PAGES });
+    await waitForMessage(page, "ngy-pdf-page-changed", { pageNumber: PAGES });
     await page.waitForFunction(
       () => document.querySelector('.pdf-page[data-page="1"]').dataset.rendered === "false",
       null,
@@ -275,7 +275,7 @@ test("pages far from the reading position are released and drawn again on return
     const anchor = await settle(page);
     assert.equal(anchor.anchor.rendered, "true", "the page being read stays drawn");
     await page.evaluate(() => window.scrollTo(0, 0));
-    await waitForMessage(page, "moye-pdf-page-changed", { pageNumber: 1 });
+    await waitForMessage(page, "ngy-pdf-page-changed", { pageNumber: 1 });
     await page.waitForFunction(
       () => document.querySelector('.pdf-page[data-page="1"]').dataset.rendered === "true",
       null,
@@ -294,12 +294,12 @@ test("a text selection is reported with the page that owns it", async () => {
   const page = await openViewer();
   try {
     await page.evaluate(() => window.scrollTo(0, 2400));
-    await waitForMessage(page, "moye-pdf-page-changed", { pageNumber: 4 });
+    await waitForMessage(page, "ngy-pdf-page-changed", { pageNumber: 4 });
     const selected = await selectPageText(page, 4);
     assert.ok(selected.includes("Page 4"), `the page text layer is selectable (${selected})`);
     await page.waitForFunction(
       () => window.__messages.some((message) =>
-        message.type === "moye-pdf-selection-changed" && message.pageNumber === 4 &&
+        message.type === "ngy-pdf-selection-changed" && message.pageNumber === 4 &&
         message.selectedText.includes("Page 4")),
       null,
       { timeout: 20000 },
@@ -312,7 +312,7 @@ test("a text selection is reported with the page that owns it", async () => {
     });
     await page.waitForFunction(
       () => window.__messages.some((message) =>
-        message.type === "moye-pdf-selection-changed" && message.pageNumber === 4 &&
+        message.type === "ngy-pdf-selection-changed" && message.pageNumber === 4 &&
         message.selectedText === ""),
       null,
       { timeout: 20000 },
@@ -328,7 +328,7 @@ test("compact reading applies from the URL and toggling it keeps the reading pos
     assert.equal(first.compact, "1", "compact=1 names the attribute");
     assert.equal(first.gap, 0, "compact=1 removes the gap before the first slot is drawn");
     assert.equal(first.slotCount, PAGES);
-    await waitForMessage(compact, "moye-pdf-page-changed", { pageNumber: 3 });
+    await waitForMessage(compact, "ngy-pdf-page-changed", { pageNumber: 3 });
   } finally { await compact.close(); }
 
   // Toggling it on a scrolled document is a pure page-spacing change: only the
@@ -369,4 +369,60 @@ test("compact reading applies from the URL and toggling it keeps the reading pos
       `restoring the gap keeps the reading position (before=${JSON.stringify(beforeRestore)} after=${JSON.stringify(afterRestore)})`,
     );
   } finally { await page.close(); }
+});
+
+/// Ctrl + wheel re-lays the reading column out at a new page scale: the page
+/// being read keeps its place inside that page, only the scale the reader chose
+/// is reported back, and a scale the host pushed is not news back to the host.
+test("ctrl + wheel changes the page scale without moving the reading position", async () => {
+  const page = await openViewer();
+  try {
+    const pageWidth = () => page.evaluate(() =>
+      document.querySelector(".pdf-page").getBoundingClientRect().width);
+    // The viewport starts 200px into page 12, so the anchor page's top sits well
+    // above the window and a scale change has to move it by a measurable amount.
+    await page.evaluate(() => {
+      const slot = document.querySelector('.pdf-page[data-page="12"]');
+      window.scrollTo(0, slot.getBoundingClientRect().top + window.scrollY + 200);
+    });
+    const before = await settle(page);
+    const widthBefore = await pageWidth();
+    assert.equal(before.anchor?.page, 12, "the fixture must be read on page 12");
+    assert.ok(before.anchor.top < -50, `page 12 must start above the window: ${before.anchor.top}`);
+
+    await page.mouse.move(VIEWPORT.width / 2, VIEWPORT.height / 2);
+    await page.keyboard.down("Control");
+    await page.mouse.wheel(0, -120);
+    await page.keyboard.up("Control");
+
+    await waitForMessage(page, "ngy-pdf-zoom-changed", { zoomMilli: 1750 });
+    const after = await settle(page);
+    assert.ok(await pageWidth() > widthBefore, `page width must grow: ${widthBefore}`);
+
+    // The anchor keeps its place inside its own page, which is what a reader
+    // looking at a point in the text expects a scale change to preserve.
+    assert.equal(after.anchor?.page, 12, "the page being read must not change");
+    const expected = before.anchor.top * (1750 / 1500);
+    assert.ok(
+      Math.abs(after.anchor.top - expected) < 12,
+      `page 12 top ${before.anchor.top} -> ${after.anchor.top}, expected about ${expected}`,
+    );
+
+    // A scale the host pushes is applied but never reported back as a change.
+    const reported = () => page.evaluate(() =>
+      window.__messages.filter((message) => message.type === "ngy-pdf-zoom-changed").length);
+    const reportsBefore = await reported();
+    await page.evaluate(() => window.postMessage(
+      { type: "ngy-pdf-zoom", zoomMilli: 1000 },
+      window.location.origin,
+    ));
+    const shrunk = await settle(page);
+    assert.ok(await pageWidth() < widthBefore, "the pushed scale must re-lay the column out");
+    assert.equal(shrunk.anchor?.page, 12);
+    await page.waitForTimeout(500);
+    assert.equal(await reported(), reportsBefore,
+      "the host's own scale must not come back as a change");
+  } finally {
+    await page.close();
+  }
 });

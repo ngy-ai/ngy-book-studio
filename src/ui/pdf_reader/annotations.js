@@ -9,9 +9,9 @@
   const ownDocument = () => {
     const url = new URL(window.location.href);
     return window.top === window && (
-      (url.protocol === "moyepdf:" && url.hostname === "viewer") ||
+      (url.protocol === "ngypdf:" && url.hostname === "viewer") ||
       ((url.protocol === "http:" || url.protocol === "https:") &&
-        url.hostname === "moyepdf.viewer")
+        url.hostname === "ngypdf.viewer")
     );
   };
   if (!ownDocument()) return;
@@ -932,11 +932,11 @@
     },
     ready: () => ready,
   });
-  Object.defineProperty(window, "moyeAnnotations", { value: api });
+  Object.defineProperty(window, "ngyAnnotations", { value: api });
 
   function install() {
     if (!document.body || ready) return;
-    host = element("moye-reader-notes");
+    host = element("ngy-reader-notes");
     // Outside body: host chrome is never part of a book-text anchor.
     host.style.cssText = "all:initial!important;position:fixed!important;inset:0!important;" +
       "z-index:2147483646!important;pointer-events:none!important;display:block!important;" +

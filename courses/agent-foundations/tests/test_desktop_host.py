@@ -6,13 +6,13 @@ import sys
 
 import pytest
 
-from moye_lab.runner import COURSE_ROOT
+from ngy_lab.runner import COURSE_ROOT
 
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows desktop host")
 
 
 def command():
-    return [sys.executable, "-I", "-u", str(COURSE_ROOT / "moye_lab" / "desktop_host.py")]
+    return [sys.executable, "-I", "-u", str(COURSE_ROOT / "ngy_lab" / "desktop_host.py")]
 
 
 def test_closing_desktop_control_pipe_cancels_the_attempt(tmp_path):

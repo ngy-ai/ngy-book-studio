@@ -11,7 +11,7 @@
 起始代码使用以下公共协议，`result` 的算法由你补全：
 
 ```python
-from moye_lab.chapter_support import load_case, call_tool, finish
+from ngy_lab.chapter_support import load_case, call_tool, finish
 
 def run(task, model, tools, limits, emit):
     state = load_case(task, model, tools)

@@ -18,7 +18,10 @@ use std::{
 use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 
-pub use crate::indexing::{TranslationBlockInfo, TranslationBlockList};
+pub use crate::indexing::{
+    TranslationBlockDetail, TranslationBlockInfo, TranslationBlockList, TranslationBlockProbe,
+    TranslationBlockRequest,
+};
 pub use crate::job_diagnostics::{
     BACKGROUND_JOB_LOG_LIMIT, BackgroundJobLogEntry, BackgroundJobLogSnapshot, JobLogLevel,
 };
@@ -200,8 +203,10 @@ fn default_auto_run_background_jobs() -> bool {
 /// Upper bound of background model jobs running at the same time. The indexing
 /// worker spawns this many tasks once and parks the ones above the configured
 /// concurrency, so raising or lowering the setting takes effect without a
-/// restart.
-pub const MAX_BACKGROUND_JOB_CONCURRENCY: usize = 8;
+/// restart. Parked slots only sleep on the idle poll interval, so the bound is
+/// deliberately generous; the actual pressure still comes from the concurrency
+/// the user configures.
+pub const MAX_BACKGROUND_JOB_CONCURRENCY: usize = 1024;
 /// Fewer than one worker cannot make progress.
 pub const MIN_BACKGROUND_JOB_CONCURRENCY: usize = 1;
 /// One job at a time keeps memory and network pressure predictable; users on
@@ -270,9 +275,10 @@ impl Default for PersistedPdfReaderSettings {
     }
 }
 
-/// Target language for the reading-time book translation. `None` keeps the
-/// original text only; translation is opt-in through the AI settings window.
-pub(crate) const DEFAULT_TRANSLATION_LANGUAGE: Option<&str> = None;
+/// Target language for the reading-time book translation. Simplified Chinese is
+/// the out-of-the-box choice shown by the AI settings window; `None` (the
+/// window's "不翻译（仅原文）" entry) keeps the original text only.
+pub(crate) const DEFAULT_TRANSLATION_LANGUAGE: Option<&str> = Some("zh-Hans");
 
 fn default_translation_language() -> Option<String> {
     DEFAULT_TRANSLATION_LANGUAGE.map(str::to_string)
@@ -333,6 +339,46 @@ impl Default for PersistedTranslationSettings {
 #[serde(deny_unknown_fields)]
 struct PersistedBookTranslationDisplay {
     display_mode: TranslationDisplayMode,
+}
+
+/// One reading surface whose page size the reader can change by hand.
+///
+/// A book is read by exactly one surface per unit, but an Office book can be
+/// read as reflowable chapters and as enhanced page images in different
+/// windows, so the surfaces never share a value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReaderZoomSurface {
+    /// EPUB / MOBI / AZW / KFX / structured Office chapters: font pixels.
+    Text,
+    /// Continuous PDF pages: thousandths of the reader's base page scale.
+    Pdf,
+    /// Office enhanced preview and DjVu pages: thousandths of one page, where
+    /// `0` is the reader's own "fit the window".
+    Page,
+}
+
+impl ReaderZoomSurface {
+    fn key(self, book_id: &str) -> String {
+        db::settings::reader_zoom_book_key(self.name(), book_id)
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Pdf => "pdf",
+            Self::Page => "page",
+        }
+    }
+}
+
+/// One book's own page size for one reading surface. It lives under its own
+/// settings key (see `db::settings::reader_zoom_book_key`) so a window that
+/// never changed its page size keeps the reader's default, and so deleting the
+/// book takes the row with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedReaderZoom {
+    value: u32,
 }
 
 /// Persisted provider choices. Secrets intentionally cannot be represented by
@@ -676,7 +722,7 @@ pub fn language_is_target(source: Option<&str>, target: &str) -> bool {
 pub enum VisualPageSourceKind {
     /// Microsoft Office COM enhancement pages (Windows only).
     OfficeEnhanced,
-    /// Imported DjVu scans rasterized by the portable `moye-djvu-png` renderer.
+    /// Imported DjVu scans rasterized by the portable `ngy-djvu-png` renderer.
     Djvu,
 }
 
@@ -1302,6 +1348,67 @@ impl AppServices {
             })
             .await
             .context("译文显示方式保存线程异常退出")?
+    }
+
+    /// One book's remembered page size for one reading surface, written by the
+    /// reading window. `None` means the surface still uses its own default,
+    /// which is also what an unreadable row falls back to: a corrupt page size
+    /// must never stop a book from opening. The value comes back unclamped
+    /// because every surface measures its page in its own unit and clamps what
+    /// it reads against its own range.
+    pub async fn reader_zoom(
+        &self,
+        book_id: String,
+        surface: ReaderZoomSurface,
+    ) -> Result<Option<u32>> {
+        ensure!(!book_id.trim().is_empty(), "图书 ID 不能为空");
+        let key = surface.key(&book_id);
+        let db_path = self.db_path.clone();
+        self.runtime
+            .handle()
+            .spawn_blocking(move || {
+                let conn = db::open_conn(&db_path)?;
+                Ok(db::settings::get(&conn, &key)?
+                    .and_then(|row| {
+                        serde_json::from_str::<PersistedReaderZoom>(&row.value_json).ok()
+                    })
+                    .map(|persisted| persisted.value))
+            })
+            .await
+            .context("阅读页面大小查询线程异常退出")?
+    }
+
+    /// Stores one surface's page size for one book. Book deletion removes the
+    /// row with the book; see `db::transactions::delete_document`.
+    pub async fn set_reader_zoom(
+        &self,
+        book_id: String,
+        surface: ReaderZoomSurface,
+        value: u32,
+    ) -> Result<()> {
+        ensure!(!book_id.trim().is_empty(), "图书 ID 不能为空");
+        let key = surface.key(&book_id);
+        let db_path = self.db_path.clone();
+        self.runtime
+            .handle()
+            .spawn_blocking(move || {
+                let mut conn = db::open_conn(&db_path)?;
+                let tx = conn.transaction().context("无法开始保存阅读页面大小")?;
+                let row = db::settings::Setting {
+                    key,
+                    value_json: serde_json::to_string(&PersistedReaderZoom { value })
+                        .context("无法序列化阅读页面大小")?,
+                    updated_at: unix_timestamp()?,
+                };
+                ensure!(
+                    db::settings::upsert(&tx, &row)? == 1,
+                    "阅读页面大小未能保存"
+                );
+                tx.commit().context("无法提交阅读页面大小")?;
+                Ok(())
+            })
+            .await
+            .context("阅读页面大小保存线程异常退出")?
     }
 
     pub fn provider(&self) -> Result<Arc<dyn OpenAiCompatibleProvider>> {
@@ -2069,6 +2176,114 @@ impl AppServices {
             .spawn(async move { indexing.translation_blocks(&job_id).await })
             .await
             .context("后台任务明细线程异常退出")?
+    }
+
+    /// Reads one text block of a whole-book translation task together with the
+    /// request body the worker would send for it, for the task window's debug
+    /// view. Same access rule as [`Self::background_job_translation_blocks`]:
+    /// the task must belong to the current book scope. Rebuilding the body
+    /// re-parses the pinned revision and reads `book_sources`, so it runs on the
+    /// application I/O runtime rather than in the GPUI callback.
+    pub async fn background_job_translation_block_detail(
+        &self,
+        job_id: String,
+        ordinal: usize,
+        book_ids: Vec<String>,
+    ) -> Result<TranslationBlockDetail> {
+        ensure!(!job_id.trim().is_empty(), "后台任务 ID 不能为空");
+        let indexing = Arc::clone(&self.indexing);
+        let db_path = self.db_path.clone();
+        let scope_job_id = job_id.clone();
+        self.runtime
+            .handle()
+            .spawn_blocking(move || {
+                let conn = db::open_conn(&db_path)?;
+                let job = db::index_jobs::get(&conn, &scope_job_id)?.context("后台任务已不存在")?;
+                ensure!(
+                    book_ids.iter().any(|book_id| book_id == &job.book_id),
+                    "后台任务不在当前图书范围内"
+                );
+                Ok(())
+            })
+            .await
+            .context("后台任务明细查询线程异常退出")??;
+        self.runtime
+            .spawn(async move { indexing.translation_block_detail(&job_id, ordinal).await })
+            .await
+            .context("后台任务明细线程异常退出")?
+    }
+
+    /// 重新向模型请求一个文本块并返回它的原始回答，供任务窗口显示失败块的
+    /// 「模型响应」。
+    ///
+    /// 与其它查看入口不同，这一条**会真的发一次模型请求**：任务诊断日志刻意只保存
+    /// 固定分类，所以想知道模型当时答了什么，唯一办法就是拿同一份冻结输入再问一次。
+    /// 因此它必须由用户的明确操作触发，**不得放进任何轮询**，作用域校验与其它查看入口
+    /// 完全一致（任务必须属于当前图书范围）。请求本身可能很慢，所以走应用 I/O runtime。
+    /// 除这一次外部请求外它是只读的：不推进游标、不写译文、不记诊断，回答只回给窗口。
+    pub async fn background_job_translation_block_response(
+        &self,
+        job_id: String,
+        ordinal: usize,
+        book_ids: Vec<String>,
+    ) -> Result<TranslationBlockProbe> {
+        ensure!(!job_id.trim().is_empty(), "后台任务 ID 不能为空");
+        let indexing = Arc::clone(&self.indexing);
+        let db_path = self.db_path.clone();
+        let scope_job_id = job_id.clone();
+        self.runtime
+            .handle()
+            .spawn_blocking(move || {
+                let conn = db::open_conn(&db_path)?;
+                let job = db::index_jobs::get(&conn, &scope_job_id)?.context("后台任务已不存在")?;
+                ensure!(
+                    book_ids.iter().any(|book_id| book_id == &job.book_id),
+                    "后台任务不在当前图书范围内"
+                );
+                Ok(())
+            })
+            .await
+            .context("后台任务明细查询线程异常退出")??;
+        self.runtime
+            .spawn(async move { indexing.probe_translation_block_response(&job_id, ordinal).await })
+            .await
+            .context("后台任务明细查询线程异常退出")?
+    }
+
+    /// Re-runs the named text blocks of a translation task.
+    ///
+    /// The blocks come from the task window's inspector, so they are ordinals of
+    /// the pinned revision. Same access rule as the inspection reads: the task
+    /// must belong to the current book scope. An empty set is rejected here so a
+    /// UI bug cannot requeue a whole task by accident.
+    pub async fn background_job_retry_translation_blocks(
+        &self,
+        job_id: String,
+        ordinals: Vec<usize>,
+        book_ids: Vec<String>,
+    ) -> Result<bool> {
+        ensure!(!job_id.trim().is_empty(), "后台任务 ID 不能为空");
+        ensure!(!ordinals.is_empty(), "没有可重试的文本块");
+        let indexing = Arc::clone(&self.indexing);
+        let db_path = self.db_path.clone();
+        let scope_job_id = job_id.clone();
+        self.runtime
+            .handle()
+            .spawn_blocking(move || {
+                let conn = db::open_conn(&db_path)?;
+                let job = db::index_jobs::get(&conn, &scope_job_id)?.context("后台任务已不存在")?;
+                ensure!(
+                    book_ids.iter().any(|book_id| book_id == &job.book_id),
+                    "后台任务不在当前图书范围内"
+                );
+                Ok(())
+            })
+            .await
+            .context("后台任务重试线程异常退出")??;
+        self.runtime
+            .spawn(async move { indexing.retry_translation_blocks(&job_id, ordinals).await })
+            .await
+            .context("后台任务重试线程异常退出")?
     }
 
     /// Applies one state transition using the coordinator that owns the job
@@ -3729,6 +3944,131 @@ mod tests {
         );
     }
 
+    /// The public surface names and the list `delete_document` sweeps are two
+    /// copies of the same set; a new surface must not be able to leave rows
+    /// behind just because nobody extended the sweep.
+    #[test]
+    fn reader_zoom_surfaces_match_the_swept_keys() {
+        for surface in [
+            ReaderZoomSurface::Text,
+            ReaderZoomSurface::Pdf,
+            ReaderZoomSurface::Page,
+        ] {
+            assert!(
+                db::settings::READER_ZOOM_SURFACES.contains(&surface.name()),
+                "{} is missing from the keys a deleted book sweeps",
+                surface.name()
+            );
+        }
+        assert_eq!(
+            db::settings::READER_ZOOM_SURFACES.len(),
+            3,
+            "every swept key needs a ReaderZoomSurface that can write it"
+        );
+    }
+
+    #[test]
+    fn per_book_reader_zoom_is_stored_per_surface_and_leaves_with_the_book() {
+        let temp = tempfile::tempdir().unwrap();
+        let services = AppServices::open_with_credentials(
+            temp.path(),
+            Arc::new(MemoryCredentialStore::default()),
+        )
+        .unwrap();
+        let book_id = services
+            .runtime()
+            .block_on(async {
+                services
+                    .spawn_library(|library| Ok(library.create_book("Zoom book", "Author")?.id))
+                    .await
+                    .context("library test worker stopped")?
+            })
+            .unwrap();
+
+        // A book whose page size was never changed keeps the reader's default.
+        assert_eq!(
+            block_on_without_tokio(services.reader_zoom(book_id.clone(), ReaderZoomSurface::Text))
+                .unwrap(),
+            None
+        );
+
+        // The surfaces never share a value: an Office book is read as chapters
+        // and as page images, and each window keeps its own page size.
+        block_on_without_tokio(services.set_reader_zoom(
+            book_id.clone(),
+            ReaderZoomSurface::Text,
+            22,
+        ))
+        .unwrap();
+        block_on_without_tokio(services.set_reader_zoom(
+            book_id.clone(),
+            ReaderZoomSurface::Page,
+            1_750,
+        ))
+        .unwrap();
+        assert_eq!(
+            block_on_without_tokio(services.reader_zoom(book_id.clone(), ReaderZoomSurface::Text))
+                .unwrap(),
+            Some(22)
+        );
+        assert_eq!(
+            block_on_without_tokio(services.reader_zoom(book_id.clone(), ReaderZoomSurface::Page))
+                .unwrap(),
+            Some(1_750)
+        );
+        assert_eq!(
+            block_on_without_tokio(services.reader_zoom(book_id.clone(), ReaderZoomSurface::Pdf))
+                .unwrap(),
+            None
+        );
+
+        // An unreadable row means "no choice yet" and never a failed open.
+        let key = db::settings::reader_zoom_book_key("pdf", &book_id);
+        db::settings::upsert(
+            &db::open_conn(&services.db_path).unwrap(),
+            &db::settings::Setting {
+                key: key.clone(),
+                value_json: "{\"value\":\"wide\"}".to_string(),
+                updated_at: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            block_on_without_tokio(services.reader_zoom(book_id.clone(), ReaderZoomSurface::Pdf))
+                .unwrap(),
+            None
+        );
+
+        // Deleting the book takes every surface's row with it.
+        block_on_without_tokio(services.set_reader_zoom(
+            book_id.clone(),
+            ReaderZoomSurface::Pdf,
+            1_250,
+        ))
+        .unwrap();
+        let removal = book_id.clone();
+        services
+            .runtime()
+            .block_on(async {
+                services
+                    .spawn_library(move |library| library.remove_book(&removal))
+                    .await
+                    .context("library mutation worker stopped")?
+            })
+            .unwrap();
+        for surface in db::settings::READER_ZOOM_SURFACES {
+            assert!(
+                db::settings::get(
+                    &db::open_conn(&services.db_path).unwrap(),
+                    &db::settings::reader_zoom_book_key(surface, &book_id)
+                )
+                .unwrap()
+                .is_none(),
+                "a deleted book must not leave its {surface} page size behind"
+            );
+        }
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn office_opt_in_replaces_persisted_visual_pages_through_app_services() {
@@ -3850,7 +4190,7 @@ mod tests {
         .unwrap();
         assert_eq!(pages.len(), 2);
         assert!(pages.iter().all(|page| {
-            page.renderer == "moye-office-com-enhanced"
+            page.renderer == "ngy-office-com-enhanced"
                 && page.fidelity == "office_enhanced"
                 && serde_json::from_str::<crate::document::DocumentLocator>(&page.locator_json)
                     .unwrap()
@@ -4425,6 +4765,10 @@ mod tests {
         .unwrap();
         let mut settings = services.provider_settings().unwrap();
         settings.auto_run_background_jobs = false;
+        // This test only counts the derived indexing jobs, so it keeps
+        // translation off instead of also picking up the paused whole-book
+        // translation task a fresh install configures by default.
+        settings.default_language = None;
         block_on_without_tokio(services.configure_provider(settings.clone(), ApiKeyUpdate::Keep))
             .unwrap();
 
@@ -4537,7 +4881,7 @@ mod tests {
     }
 
     #[test]
-    fn translation_language_defaults_off_and_round_trips_through_its_own_key() {
+    fn translation_language_defaults_to_simplified_chinese_and_round_trips_through_its_own_key() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join(db::DATABASE_FILE);
         let conn = db::open_or_recreate(&db_path).unwrap();
@@ -4553,7 +4897,17 @@ mod tests {
             Arc::new(MemoryCredentialStore::default()),
         )
         .unwrap();
-        assert_eq!(services.provider_settings().unwrap().default_language, None);
+        // A fresh install translates into Simplified Chinese without the user
+        // touching the settings window; the jobs it creates stay paused until
+        // automatic background execution is enabled.
+        assert_eq!(
+            services
+                .provider_settings()
+                .unwrap()
+                .default_language
+                .as_deref(),
+            Some("zh-Hans")
+        );
 
         let mut settings = services.provider_settings().unwrap();
         settings.default_language = Some("ja".to_string());
@@ -5103,6 +5457,15 @@ mod tests {
         )
         .unwrap();
         let runtime = services.runtime();
+
+        // This book is created with translation switched off (the shipped
+        // default is Simplified Chinese), so nothing is queued for it yet.
+        let mut settings = services.provider_settings().unwrap();
+        settings.default_language = None;
+        runtime
+            .block_on(services.configure_provider(settings, ApiKeyUpdate::Keep))
+            .unwrap();
+
         let book = runtime
             .block_on(async {
                 services
@@ -5112,12 +5475,14 @@ mod tests {
             })
             .unwrap();
 
-        // Translation is opt-in: nothing is queued while it is disabled.
+        // Translation is off: nothing is queued.
         let jobs = runtime
             .block_on(services.background_jobs_for_books(vec![book.id.clone()]))
             .unwrap();
         assert!(jobs.iter().all(|job| job.kind != "translation"));
 
+        // Saving a target language enqueues the books that were imported while
+        // translation was off.
         let mut settings = services.provider_settings().unwrap();
         settings.default_language = Some("zh-Hans".to_string());
         runtime
@@ -5266,7 +5631,7 @@ mod tests {
         .unwrap();
         assert_eq!(pages.len(), document.units.len());
         assert!(pages.iter().all(|page| {
-            page.renderer == "moye-structural-png"
+            page.renderer == "ngy-structural-png"
                 && page.document_revision == book.revision
                 && page.unit_revision == book.revision
                 && page.profile_id.starts_with("render-profile-")
@@ -5325,7 +5690,7 @@ mod tests {
             width: 8,
             height: 8,
             render_scale: 1.0,
-            renderer: "moye-structural-svg".to_string(),
+            renderer: "ngy-structural-svg".to_string(),
             renderer_version: "0.0.1".to_string(),
             document_revision: book.revision,
             unit_revision: unit.revision.get(),
@@ -5352,7 +5717,7 @@ mod tests {
             book_id: book.id.clone(),
             source_id: source.id.clone(),
             document_revision: crate::document::Revision::new(book.revision),
-            renderer: "moye-structural-svg".to_string(),
+            renderer: "ngy-structural-svg".to_string(),
             renderer_version: "0.0.1".to_string(),
             fidelity: crate::preview::RenderFidelity::Structural,
             unit_ids: document.units.iter().map(|unit| unit.id.clone()).collect(),
@@ -5389,7 +5754,7 @@ mod tests {
                 std::time::Duration::from_secs(5),
             ))
             .unwrap();
-        assert_eq!(completed.spec.renderer, "moye-structural-png");
+        assert_eq!(completed.spec.renderer, "ngy-structural-png");
         let pages =
             db::visual_pages::list_for_source(&db::open_conn(&db_path).unwrap(), &source.id)
                 .unwrap();
@@ -5397,7 +5762,7 @@ mod tests {
         assert!(
             pages
                 .iter()
-                .all(|page| page.renderer == "moye-structural-png")
+                .all(|page| page.renderer == "ngy-structural-png")
         );
     }
 
@@ -5445,7 +5810,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(pages.len(), 1);
-        assert_eq!(pages[0].renderer, "moye-windows-pdf-png");
+        assert_eq!(pages[0].renderer, "ngy-windows-pdf-png");
         let key = BlobKey::parse(&pages[0].object_key).unwrap();
         let png = services
             .runtime()
@@ -5488,7 +5853,7 @@ mod tests {
         assert!(
             normalized_pages
                 .iter()
-                .all(|page| page.renderer == "moye-structural-png")
+                .all(|page| page.renderer == "ngy-structural-png")
         );
     }
 

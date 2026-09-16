@@ -374,7 +374,7 @@ fn render_package(document: &BookDocument, assets: &[EpubAsset<'_>]) -> String {
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="book-id" xml:lang="{}">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
-    <dc:identifier id="book-id">urn:moye:{}</dc:identifier>
+    <dc:identifier id="book-id">urn:ngy:{}</dc:identifier>
     <dc:title>{}</dc:title>
     <dc:language>{}</dc:language>
 "#,
@@ -509,6 +509,20 @@ fn render_epub_unit(
         body.push_str(&format!("<h1>{}</h1>", escape_xml(&unit.title)));
     }
     render_blocks(&unit.document.blocks, asset_hrefs, &mut body)?;
+    // This document is served as `application/xhtml+xml`, so a named reference
+    // the parser cannot resolve replaces the whole chapter with WebView2's
+    // "Entity 'nbsp' not defined" page. `render_blocks` reaches raw HTML
+    // through ammonia, whose serializer spells U+00A0 `&nbsp;`.
+    let body = crate::markup::xml_safe_entities(&body);
+    if body.rewritten_count > 0 {
+        tracing::debug!(
+            target: "ngy_reader",
+            unit = %unit.id,
+            rewritten = body.rewritten_count,
+            entities = ?body.rewritten,
+            "阅读器投影：把未定义的命名实体改写为数值引用"
+        );
+    }
     Ok(format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE html>
@@ -518,7 +532,7 @@ fn render_epub_unit(
 "#,
         escape_xml(language),
         escape_xml(&unit.title),
-        body,
+        body.html,
     ))
 }
 
@@ -1752,6 +1766,55 @@ mod tests {
         let wrapped = wrap_visual_line(&"中".repeat(50), PDF_LINE_WIDTH);
         assert_eq!(wrapped.len(), 2);
         assert_eq!(wrapped.concat(), "中".repeat(50));
+    }
+
+    #[test]
+    fn normalized_epub_chapter_is_strict_xhtml_when_raw_html_has_named_entities() {
+        let (mut document, assets, _) = sample();
+        let raw = "<p>alpha&nbsp;<span>&mdash;</span> beta</p>";
+        document.units[0].document.blocks = vec![Block::RawHtml {
+            id: "raw-entity".to_string(),
+            source: raw.to_string(),
+            plain_text: crate::document::raw_html_plain_text(raw).expect("plain text"),
+        }];
+
+        let bytes = BuiltinDocumentExporter
+            .export_bytes(&document, ExportFormat::Epub, &assets)
+            .expect("export EPUB");
+        let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).expect("valid ZIP");
+        let mut chapter = String::new();
+        std::io::Read::read_to_string(
+            &mut archive
+                .by_name("EPUB/text/unit-0001.xhtml")
+                .expect("chapter entry"),
+            &mut chapter,
+        )
+        .expect("read chapter");
+
+        // The chapter is served as `application/xhtml+xml`; a named reference
+        // XML cannot resolve replaces the whole page with a parser error.
+        assert!(!chapter.contains("&nbsp;"), "{chapter}");
+        assert!(!chapter.contains("&mdash;"), "{chapter}");
+        assert!(chapter.contains("&#160;"), "{chapter}");
+        // The `<!DOCTYPE html>` declaration carries no entity definitions, so
+        // DTD parsing has to be enabled for an XML parser to reach the body —
+        // exactly the situation WebView2 is in.
+        let xml = resvg::usvg::roxmltree::Document::parse_with_options(
+            &chapter,
+            resvg::usvg::roxmltree::ParsingOptions {
+                allow_dtd: true,
+                ..Default::default()
+            },
+        )
+        .expect("strict XHTML");
+        let text = xml
+            .root_element()
+            .descendants()
+            .filter(|node| node.is_text())
+            .filter_map(|node| node.text())
+            .collect::<String>();
+        // The rewrite must keep the characters themselves: U+00A0 and U+2014.
+        assert!(text.ends_with("alpha\u{a0}\u{2014} beta"), "{text:?}");
     }
 
     #[test]

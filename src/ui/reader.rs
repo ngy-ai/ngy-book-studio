@@ -7,15 +7,16 @@ use super::{
 };
 use anyhow::ensure;
 use gpui::{DragMoveEvent, EmptyView, Pixels};
-use moye_epub_editor::{
+use ngy_book_studio::{
     chat::ChatWindowKind,
     document::{BookDocument, DocumentLocator, SourceLocator},
     media::MediaService,
     reader::{
-        AuthorizedReaderAsset, ReaderResourceAuthorizations, ResourceResponse,
-        load_resource_with_range,
+        AuthorizedReaderAsset, READER_FONT_SIZE_DEFAULT, READER_FONT_SIZE_MAX,
+        READER_FONT_SIZE_MIN, ReaderResourceAuthorizations, ResourceResponse,
+        load_resource_with_range, reader_appearance_script, reader_font_size,
     },
-    services::{AppServices, TranslationDisplayMode},
+    services::{AppServices, ReaderZoomSurface, TranslationDisplayMode},
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -30,6 +31,10 @@ use translations::{ManualTranslationRequest, ReaderTranslations};
 pub(super) mod selection_menu;
 
 const MAX_READER_SELECTION_BYTES: usize = 32 * 1024;
+/// The chapter runtime reports the text size once the reader stops wheeling;
+/// the window waits a little longer before writing it, so a burst of wheel
+/// notches still leaves exactly one row.
+const TEXT_SIZE_SAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(400);
 const READER_NAVIGATION_DEFAULT_WIDTH: f32 = 286.;
 const READER_NAVIGATION_MIN_WIDTH: f32 = 200.;
 const READER_NAVIGATION_MAX_WIDTH: f32 = 480.;
@@ -58,7 +63,7 @@ const READER_INITIALIZATION_SCRIPT: &str = r#"
 
   const insideTranslation = (node) => {
     const element = node && (node.nodeType === 1 ? node : node.parentElement);
-    return !!(element && element.closest?.("[data-moye-translation]"));
+    return !!(element && element.closest?.("[data-ngy-translation]"));
   };
 
   // Reading-time translations are a display layer. Selections and AI references
@@ -66,7 +71,7 @@ const READER_INITIALIZATION_SCRIPT: &str = r#"
   const bookText = (range) => {
     const fragment = range.cloneContents();
     if (fragment.querySelectorAll) {
-      for (const node of Array.from(fragment.querySelectorAll("[data-moye-translation]"))) {
+      for (const node of Array.from(fragment.querySelectorAll("[data-ngy-translation]"))) {
         node.remove();
       }
     }
@@ -77,7 +82,7 @@ const READER_INITIALIZATION_SCRIPT: &str = r#"
   // was translated from; the translation runtime owns that mapping and returns
   // null when the selection touches no applied translation.
   const translationOriginalRange = (range) => {
-    const resolve = window.moyeTranslations?.originalRange;
+    const resolve = window.ngyTranslations?.originalRange;
     return typeof resolve === "function" ? resolve(range) : null;
   };
 
@@ -141,6 +146,60 @@ const READER_INITIALIZATION_SCRIPT: &str = r#"
         active.matches("input,textarea,select,[contenteditable='true']"))) send();
   }, true);
   window.addEventListener("pagehide", () => window.clearTimeout(timer), { once: true });
+
+  // Ctrl + wheel resizes the reading text. The size is one custom property on
+  // the root element, so the chapter reflows instead of the WebView zooming;
+  // the host remembers it per book and the range matches
+  // `ngy_book_studio::reader`, which clamps the same value when it is applied.
+  const MIN_TEXT_SIZE = 14;
+  const MAX_TEXT_SIZE = 30;
+  const TEXT_SIZE_STEP = 2;
+  // Wheel notches arrive in bursts; report the size once the reader stops.
+  const TEXT_SIZE_REPORT_MS = 250;
+  let sizeTimer = 0;
+
+  // The reader stylesheet always defines the size; a document without it is not
+  // a chapter and must not report a size of its own.
+  const currentTextSize = () => {
+    const applied = parseFloat(getComputedStyle(document.documentElement)
+      .getPropertyValue("--ngy-font-size"));
+    return Number.isFinite(applied) ? applied : 0;
+  };
+
+  const applyTextSize = (size) => {
+    document.documentElement.style.setProperty("--ngy-font-size", `${size}px`);
+  };
+
+  const reportTextSize = () => {
+    window.clearTimeout(sizeTimer);
+    const size = currentTextSize();
+    if (!ownDocument() || size === 0) return;
+    try {
+      window.ipc?.postMessage(JSON.stringify({
+        type: "reader_text_size",
+        font_size: Math.round(size),
+      }));
+    } catch {
+      // A closed host simply drops the size; the next chapter re-applies it.
+    }
+  };
+
+  window.addEventListener("wheel", (event) => {
+    if (!event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
+    if (event.deltaY === 0) return;
+    const size = currentTextSize();
+    if (size === 0) return;
+    // Held Ctrl means "resize", so the chapter must not also scroll under the
+    // pointer by the same notch.
+    event.preventDefault();
+    if (!ownDocument()) return;
+    const stepped = size + (event.deltaY < 0 ? TEXT_SIZE_STEP : -TEXT_SIZE_STEP);
+    applyTextSize(Math.min(MAX_TEXT_SIZE, Math.max(MIN_TEXT_SIZE, stepped)));
+    window.clearTimeout(sizeTimer);
+    sizeTimer = window.setTimeout(reportTextSize, TEXT_SIZE_REPORT_MS);
+  }, { passive: false });
+
+  window.addEventListener("pagehide", () => window.clearTimeout(sizeTimer), { once: true });
 })();
 "#;
 
@@ -157,6 +216,11 @@ enum ReaderIpcMessage {
     },
     SelectionChanged {
         selected_text: String,
+    },
+    /// Sent by the chapter runtime after Ctrl + wheel changed the reading text
+    /// size. The host owns the stored size, so the runtime only reports it.
+    ReaderTextSize {
+        font_size: u32,
     },
     CitationNavigationResult {
         request_id: u64,
@@ -185,6 +249,10 @@ pub(super) enum ReaderWebEvent {
     SelectionChanged {
         url: String,
         selected_text: Option<String>,
+    },
+    TextSize {
+        url: String,
+        font_size: u8,
     },
     CitationNavigationResult {
         url: String,
@@ -605,6 +673,11 @@ pub struct ReaderApp {
     protocol_gate: Option<ReaderProtocolGate>,
     closing_webview: Option<WeakEntity<WebView>>,
     closing: bool,
+    /// Reading text size of this book's chapters, in pixels. It is applied to
+    /// every chapter the window opens and remembered per book.
+    text_size: u8,
+    /// Pending write of the reading text size, replaced on every new value.
+    text_size_save_task: Option<Task<()>>,
     /// URL of the page currently shown, so the translation display preference can
     /// be re-applied live when it changes in the AI settings.
     current_reader_url: Option<String>,
@@ -935,6 +1008,19 @@ fn reader_ipc_event(uri: &gpui_component::wry::http::Uri, body: &str) -> Option<
             })
         }
         ReaderIpcMessage::CitationNavigationResult { .. } => None,
+        // The chapter runtime clamps the same range; a size outside it means the
+        // message did not come from that runtime, so it is rejected rather than
+        // clamped into a value the reader never chose.
+        ReaderIpcMessage::ReaderTextSize { font_size }
+            if (u32::from(READER_FONT_SIZE_MIN)..=u32::from(READER_FONT_SIZE_MAX))
+                .contains(&font_size) =>
+        {
+            Some(ReaderWebEvent::TextSize {
+                url: uri.to_string(),
+                font_size: font_size as u8,
+            })
+        }
+        ReaderIpcMessage::ReaderTextSize { .. } => None,
     }
 }
 
@@ -1577,6 +1663,8 @@ impl ReaderApp {
             protocol_gate: None,
             closing_webview: None,
             closing: false,
+            text_size: ngy_book_studio::reader::READER_FONT_SIZE_DEFAULT,
+            text_size_save_task: None,
             current_reader_url: None,
             closing_for_removed_book: false,
             progress_close_ready: false,
@@ -1595,6 +1683,7 @@ impl ReaderApp {
         }));
         reader.start_translation_refresh(cx);
         reader.load_translation_display_override(cx);
+        reader.load_text_size(cx);
         reader
     }
 
@@ -1890,6 +1979,7 @@ impl ReaderApp {
             ReaderWebEvent::SelectionChanged { url, selected_text } => {
                 self.sync_selection(&url, selected_text, cx)
             }
+            ReaderWebEvent::TextSize { url, font_size } => self.sync_text_size(&url, font_size, cx),
             ReaderWebEvent::CitationNavigationResult {
                 url,
                 request_id,
@@ -1921,6 +2011,7 @@ impl ReaderApp {
         self.run_pending_citation_navigation(url, cx);
         self.configure_annotations(cx);
         self.configure_translations(url, cx);
+        self.apply_text_size(cx);
         cx.notify();
     }
 
@@ -2000,6 +2091,90 @@ impl ReaderApp {
         cx.notify();
     }
 
+    /// The chapter runtime already applied the size the reader wheeled to, so
+    /// this only records it. A message from a chapter the window has since left
+    /// is ignored: the size belongs to the book, not to a superseded document.
+    fn sync_text_size(&mut self, url: &str, font_size: u8, cx: &mut Context<Self>) {
+        if self.closing
+            || self.book.spine_index_for_url(url) != Some(self.current_spine)
+            || self.text_size == font_size
+        {
+            return;
+        }
+        self.text_size = font_size;
+        self.schedule_text_size_save(cx);
+        cx.notify();
+    }
+
+    /// Re-applies this book's text size to the chapter on screen.
+    fn apply_text_size(&mut self, cx: &mut Context<Self>) {
+        let Some(webview) = self.webview.as_ref() else {
+            return;
+        };
+        let script = reader_appearance_script(self.text_size);
+        if let Err(error) = webview.read(cx).raw().evaluate_script(&script) {
+            tracing::warn!(%error, "cannot apply the reading text size");
+        }
+    }
+
+    /// Reads this book's remembered text size once per window. Until it arrives
+    /// the window shows the default, so an unreadable row keeps that default
+    /// rather than blocking the chapter.
+    fn load_text_size(&mut self, cx: &mut Context<Self>) {
+        let book_id = self.book_id.clone();
+        let services = Arc::clone(&self.services);
+        cx.spawn(async move |view, cx| {
+            let stored = services.reader_zoom(book_id, ReaderZoomSurface::Text).await;
+            let _ = view.update(cx, |this, cx| {
+                let stored = match stored {
+                    Ok(stored) => stored,
+                    Err(error) => {
+                        tracing::warn!(%error, "cannot read the book's reading text size");
+                        return;
+                    }
+                };
+                let Some(stored) = stored else {
+                    return;
+                };
+                if this.closing {
+                    return;
+                }
+                let stored = u8::try_from(stored)
+                    .map(reader_font_size)
+                    .unwrap_or(READER_FONT_SIZE_DEFAULT);
+                if this.text_size == stored {
+                    return;
+                }
+                this.text_size = stored;
+                this.apply_text_size(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn schedule_text_size_save(&mut self, cx: &mut Context<Self>) {
+        let book_id = self.book_id.clone();
+        let services = Arc::clone(&self.services);
+        let text_size = self.text_size;
+        // Replacing the pending task drops the previous one, so the row always
+        // ends up with the size the reader stopped at.
+        self.text_size_save_task = Some(cx.spawn(async move |view, cx| {
+            cx.background_executor()
+                .timer(TEXT_SIZE_SAVE_DEBOUNCE)
+                .await;
+            let result = services
+                .set_reader_zoom(book_id, ReaderZoomSurface::Text, u32::from(text_size))
+                .await;
+            let _ = view.update(cx, |this, cx| {
+                this.text_size_save_task = None;
+                if let Err(error) = result {
+                    this.set_error(format!("无法保存本书的阅读文字大小：{error:#}"), cx);
+                }
+            });
+        }));
+    }
+
     fn explain_selection(&mut self, url: &str, selected_text: &str, cx: &mut Context<Self>) {
         if self.closing || self.webview_build_gate.close_requested {
             return;
@@ -2013,7 +2188,7 @@ impl ReaderApp {
         }
         if let Some(webview) = self.webview.as_ref() {
             let script = format!(
-                "window.moyeAnnotations?.explainSelection({});",
+                "window.ngyAnnotations?.explainSelection({});",
                 serde_json::json!(selected_text)
             );
             if let Err(error) = webview.read(cx).raw().evaluate_script(&script) {
@@ -2425,7 +2600,7 @@ fn reader_explanation_reference(
 
 fn reader_reference_hints(
     book_id: &str,
-    spine: &[moye_epub_editor::reader::SpineItem],
+    spine: &[ngy_book_studio::reader::SpineItem],
     progress_locators: &[DocumentLocator],
     current_spine: usize,
     selected_text: Option<&str>,
@@ -2690,16 +2865,14 @@ mod tests {
             services
                 .spawn_library(|library| {
                     let created = library.create_book("测试图书", "作者")?;
-                    let mut editor = moye_epub_editor::editing::DocumentEditor::new(
+                    let mut editor = ngy_book_studio::editing::DocumentEditor::new(
                         library.document(&created.id)?,
                     )?;
                     for index in 1..=3 {
-                        editor.add_unit(
-                            moye_epub_editor::editing::NewContentUnit::html_chapter(
-                                format!("第 {} 章", index + 1),
-                                index,
-                            ),
-                        )?;
+                        editor.add_unit(ngy_book_studio::editing::NewContentUnit::html_chapter(
+                            format!("第 {} 章", index + 1),
+                            index,
+                        ))?;
                     }
                     library.apply_document(editor.into_document())
                 })
@@ -2882,15 +3055,15 @@ mod tests {
     #[test]
     fn ai_reference_options_include_current_then_all_chapters() {
         let spine = vec![
-            moye_epub_editor::reader::SpineItem {
+            ngy_book_studio::reader::SpineItem {
                 href: "one.xhtml".to_string(),
                 title: "One".to_string(),
             },
-            moye_epub_editor::reader::SpineItem {
+            ngy_book_studio::reader::SpineItem {
                 href: "two.xhtml".to_string(),
                 title: "Two".to_string(),
             },
-            moye_epub_editor::reader::SpineItem {
+            ngy_book_studio::reader::SpineItem {
                 href: "three.xhtml".to_string(),
                 title: "Three".to_string(),
             },
@@ -3006,7 +3179,7 @@ mod tests {
 
     #[test]
     fn reader_selection_is_bounded_normalized_and_frozen_on_the_current_chapter() {
-        let spine = vec![moye_epub_editor::reader::SpineItem {
+        let spine = vec![ngy_book_studio::reader::SpineItem {
             href: "one.xhtml".to_string(),
             title: "One".to_string(),
         }];
@@ -3078,6 +3251,56 @@ mod tests {
             assert!(
                 READER_INITIALIZATION_SCRIPT.contains(marker),
                 "missing {marker}"
+            );
+        }
+    }
+
+    /// The chapter runtime clamps the same text-size range the host does, and
+    /// reports it under the message the host parses. Both are copies of one
+    /// decision, so a test has to keep them together.
+    #[test]
+    fn the_chapter_runtime_shares_the_host_text_size_range() {
+        for marker in [
+            format!("MIN_TEXT_SIZE = {READER_FONT_SIZE_MIN};"),
+            format!("MAX_TEXT_SIZE = {READER_FONT_SIZE_MAX};"),
+            "reader_text_size".to_string(),
+            "event.preventDefault()".to_string(),
+            "{ passive: false }".to_string(),
+        ] {
+            assert!(
+                READER_INITIALIZATION_SCRIPT.contains(&marker),
+                "missing {marker}"
+            );
+        }
+
+        // The runtime's own step is the host's step: a notch that moved the text
+        // by a different amount than the stored one would drift on every wheel.
+        assert!(
+            READER_INITIALIZATION_SCRIPT.contains(&format!(
+                "TEXT_SIZE_STEP = {};",
+                ngy_book_studio::reader::READER_FONT_SIZE_STEP
+            )),
+            "the chapter runtime must step by the host's text size step"
+        );
+
+        // An out-of-range report is not the chapter runtime's message, so it is
+        // dropped instead of being clamped into a size the reader never chose.
+        let own_uri = "epubreader://book/Text/one.xhtml".parse().unwrap();
+        assert_eq!(
+            reader_ipc_event(&own_uri, r#"{"type":"reader_text_size","font_size":22}"#),
+            Some(ReaderWebEvent::TextSize {
+                url: "epubreader://book/Text/one.xhtml".to_string(),
+                font_size: 22,
+            })
+        );
+        for rejected in ["9", "31", "-1"] {
+            assert!(
+                reader_ipc_event(
+                    &own_uri,
+                    &format!(r#"{{"type":"reader_text_size","font_size":{rejected}}}"#)
+                )
+                .is_none(),
+                "font_size {rejected} must not reach the window"
             );
         }
     }

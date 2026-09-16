@@ -38,7 +38,7 @@ pub(crate) fn install<E: Send + 'static>(
     let handler = ContextMenuRequestedEventHandler::create(Box::new(move |_, args| {
         if !gate() {
             tracing::debug!(
-                target: "moye_ai",
+                target: "ngy_ai",
                 stage = "context_menu_closed",
                 "AI explanation menu ignored after shutdown"
             );
@@ -46,14 +46,14 @@ pub(crate) fn install<E: Send + 'static>(
         }
         let Some(args) = args else {
             tracing::debug!(
-                target: "moye_ai",
+                target: "ngy_ai",
                 stage = "context_menu_missing_args",
                 "AI explanation menu received no target"
             );
             return Ok(());
         };
         tracing::debug!(
-            target: "moye_ai",
+            target: "ngy_ai",
             stage = "context_menu_requested",
             "AI explanation menu requested"
         );
@@ -68,7 +68,7 @@ pub(crate) fn install<E: Send + 'static>(
         );
         if let Err(error) = &result {
             tracing::warn!(
-                target: "moye_ai",
+                target: "ngy_ai",
                 stage = "context_menu_failed",
                 hresult = error.code().0,
                 "AI explanation menu could not be added"
@@ -82,7 +82,7 @@ pub(crate) fn install<E: Send + 'static>(
     unsafe { webview.add_ContextMenuRequested(&handler, &mut token) }
         .context("注册阅读选区 AI 解释菜单失败")?;
     tracing::debug!(
-        target: "moye_ai",
+        target: "ngy_ai",
         stage = "context_menu_registered",
         "AI explanation menu registered"
     );
@@ -111,7 +111,7 @@ fn append_explain_item<E: Send + 'static>(
         target.IsRequestedForMainFrame(&mut is_main_frame)?;
     }
     tracing::debug!(
-        target: "moye_ai",
+        target: "ngy_ai",
         stage = "context_menu_target",
         has_selection = has_selection.as_bool(),
         is_editable = is_editable.as_bool(),
@@ -136,7 +136,7 @@ fn append_explain_item<E: Send + 'static>(
     let frame_document = document_uri(&frame_url);
     let origin_accepted = matching_documents(page_document.as_ref(), frame_document.as_ref());
     tracing::debug!(
-        target: "moye_ai",
+        target: "ngy_ai",
         stage = "context_menu_origin",
         page_private = page_document.is_some(),
         frame_private = frame_document.is_some(),
@@ -150,7 +150,7 @@ fn append_explain_item<E: Send + 'static>(
     unsafe { target.SelectionText(&mut selection)? };
     let selection = CoTaskMemPWSTR::from(selection).to_string();
     tracing::debug!(
-        target: "moye_ai",
+        target: "ngy_ai",
         stage = "context_menu_selection",
         selection_bytes = selection.len(),
         "AI explanation menu selection captured"
@@ -171,7 +171,7 @@ fn append_explain_item<E: Send + 'static>(
     let handler = CustomItemSelectedEventHandler::create(Box::new(move |_, _| {
         if gate() {
             tracing::debug!(
-                target: "moye_ai",
+                target: "ngy_ai",
                 stage = "context_menu_selected",
                 "AI explanation menu command selected"
             );
@@ -189,7 +189,7 @@ fn append_explain_item<E: Send + 'static>(
         items.InsertValueAtIndex(count, &item)?;
     }
     tracing::debug!(
-        target: "moye_ai",
+        target: "ngy_ai",
         stage = "context_menu_added",
         "AI explanation menu command added"
     );

@@ -15,8 +15,8 @@ from pathlib import Path
 
 import pytest
 
-import moye_lab.sandbox_windows as sandbox_windows
-from moye_lab.sandbox_windows import (
+import ngy_lab.sandbox_windows as sandbox_windows
+from ngy_lab.sandbox_windows import (
     PROFILE_MARKER,
     AppContainerProfile,
     SandboxUnavailable,
@@ -100,7 +100,7 @@ def test_profile_cleanup_marker_and_acl_scope(tmp_path):
     assert cleanup_stale_profile(tmp_path) is False
 
 
-@pytest.mark.parametrize("value", [{"profile": "other-app"}, {"profile": "moye-lab-../"}, [], {}])
+@pytest.mark.parametrize("value", [{"profile": "other-app"}, {"profile": "ngy-lab-../"}, [], {}])
 def test_cleanup_rejects_unowned_profile_names(tmp_path, value):
     marker = tmp_path / PROFILE_MARKER
     marker.write_text(json.dumps(value), encoding="utf-8")
@@ -147,10 +147,10 @@ if registry_status == 0:
     profile_registry = profile_key.value
     try:
         try:
-            with winreg.CreateKeyEx(profile_registry, "moye-fixture-probe", 0, winreg.KEY_SET_VALUE) as key:
+            with winreg.CreateKeyEx(profile_registry, "ngy-fixture-probe", 0, winreg.KEY_SET_VALUE) as key:
                 winreg.SetValueEx(key, "fixture", 0, winreg.REG_SZ, "generated probe")
             results["profile_registry_write"] = "ALLOWED"
-            winreg.DeleteKey(profile_registry, "moye-fixture-probe")
+            winreg.DeleteKey(profile_registry, "ngy-fixture-probe")
         except PermissionError:
             results["profile_registry_write"] = "denied"
     finally:
@@ -278,7 +278,7 @@ def test_host_hard_kill_terminates_worker_and_recovers_profile(staged):
 import sys, time
 from pathlib import Path
 sys.path.insert(0, {str(package_root)!r})
-from moye_lab.sandbox_windows import AppContainerProfile
+from ngy_lab.sandbox_windows import AppContainerProfile
 with AppContainerProfile(Path({str(stage)!r})) as profile:
     profile.grant_access(Path({str(runtime)!r}))
     profile.grant_access(Path({str(workspace)!r}))

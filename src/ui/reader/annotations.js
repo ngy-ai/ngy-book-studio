@@ -33,7 +33,7 @@
     const fragment = range.cloneContents();
     if (fragment.querySelectorAll) {
       for (const node of Array.from(
-        fragment.querySelectorAll("[data-moye-translation]"),
+        fragment.querySelectorAll("[data-ngy-translation]"),
       )) {
         node.remove();
       }
@@ -227,7 +227,7 @@
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
       acceptNode(node) {
         return node.parentElement?.closest(
-          "script,style,noscript,template,[data-moye-translation]",
+          "script,style,noscript,template,[data-ngy-translation]",
         ) || host?.contains(node) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
       },
     });
@@ -245,7 +245,7 @@
 
   function insideTranslation(node) {
     const element = node && (node.nodeType === 1 ? node : node.parentElement);
-    return !!(element && element.closest?.("[data-moye-translation]"));
+    return !!(element && element.closest?.("[data-ngy-translation]"));
   }
 
   // Book-text offsets of one range. The reading-time translation layer is
@@ -275,7 +275,7 @@
   /// stands for; the translation runtime owns that mapping and returns `null`
   /// when the selection touches no applied translation.
   function translationOriginalRange(range) {
-    const resolve = window.moyeTranslations?.originalRange;
+    const resolve = window.ngyTranslations?.originalRange;
     return typeof resolve === "function" ? resolve(range) : null;
   }
 
@@ -734,11 +734,11 @@
       return true;
     },
   });
-  Object.defineProperty(window, "moyeAnnotations", { value: api });
+  Object.defineProperty(window, "ngyAnnotations", { value: api });
 
   function install() {
     if (!document.body || ready) return;
-    host = element("moye-reader-notes");
+    host = element("ngy-reader-notes");
     // Outside body: host chrome is never part of a book-text anchor.
     host.style.cssText = "all:initial!important;position:fixed!important;inset:0!important;" +
       "z-index:2147483646!important;pointer-events:none!important;display:block!important;" +

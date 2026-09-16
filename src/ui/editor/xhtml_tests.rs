@@ -4,7 +4,7 @@
 
 use super::*;
 use gpui_component::wry::http::Request;
-use moye_epub_editor::{
+use ngy_book_studio::{
     document::{ContentUnit, SourceLocator, TocTarget},
     library::ImportOutcome,
 };
@@ -35,9 +35,9 @@ fn media_document(book_id: &str) -> (BookDocument, HashMap<String, Arc<Vec<u8>>>
     // bare Boolean attributes; RawHtml also carries a named HTML entity.
     let source = format!(
         "<p>正文 &amp; 特殊字符 &lt;保留&gt;<br>第二行</p><hr>\
-         <figure><img src=\"moye-asset:{}\" alt=\"图像 &amp; &lt;说明&gt;\"></figure>\
-         <audio controls src=\"moye-asset:{}\" title=\"音频标题\"></audio>\
-         <video controls src=\"moye-asset:{}\" poster=\"moye-asset:{}\" title=\"视频标题\"></video>\
+         <figure><img src=\"ngy-asset:{}\" alt=\"图像 &amp; &lt;说明&gt;\"></figure>\
+         <audio controls src=\"ngy-asset:{}\" title=\"音频标题\"></audio>\
+         <video controls src=\"ngy-asset:{}\" poster=\"ngy-asset:{}\" title=\"视频标题\"></video>\
          <div class=\"original-fragment\">保留&nbsp;空格<br>原始片段</div>",
         assets[0].id, assets[1].id, assets[2].id, assets[0].id,
     );
@@ -214,7 +214,7 @@ fn canonical_media_projection_is_strict_xhtml_and_preserves_original_html_source
         assert!(
             chapters[0]
                 .html
-                .contains(&format!("moye-asset:{}", asset.id))
+                .contains(&format!("ngy-asset:{}", asset.id))
         );
     }
     assert_eq!(document, original);
@@ -374,13 +374,13 @@ fn audit_write(directory: &Path, index: usize, stage: &str, xhtml: &str, title: 
 }
 
 #[test]
-#[ignore = "requires MOYE_XHTML_SAMPLE and an empty, isolated MOYE_XHTML_AUDIT_DIR"]
+#[ignore = "requires NGY_XHTML_SAMPLE and an empty, isolated NGY_XHTML_AUDIT_DIR"]
 fn external_sample_editor_xhtml_audit() {
-    let sample = std::env::var_os("MOYE_XHTML_SAMPLE")
-        .expect("set MOYE_XHTML_SAMPLE to an authorized EPUB sample");
+    let sample = std::env::var_os("NGY_XHTML_SAMPLE")
+        .expect("set NGY_XHTML_SAMPLE to an authorized EPUB sample");
     let directory = PathBuf::from(
-        std::env::var_os("MOYE_XHTML_AUDIT_DIR")
-            .expect("set MOYE_XHTML_AUDIT_DIR to a new isolated output directory"),
+        std::env::var_os("NGY_XHTML_AUDIT_DIR")
+            .expect("set NGY_XHTML_AUDIT_DIR to a new isolated output directory"),
     );
     assert!(
         directory.is_absolute(),

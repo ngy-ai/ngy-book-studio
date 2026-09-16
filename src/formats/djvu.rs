@@ -1,7 +1,7 @@
 //! DjVu import.
 //!
 //! DjVu is a scanned-page container: the page bitmaps are never stored in the
-//! canonical model. The `moye-djvu-png` visual renderer publishes one PNG per
+//! canonical model. The `ngy-djvu-png` visual renderer publishes one PNG per
 //! page from the retained original, while the optional hidden text layer
 //! (TXTz/TXTa) becomes the page text so full-text search, AI retrieval and
 //! citations still work. Image-only pages import with empty text and stay

@@ -53,7 +53,7 @@ impl IoRuntime {
         }
         let inner = Builder::new_multi_thread()
             .worker_threads(worker_threads)
-            .thread_name("moye-io")
+            .thread_name("ngy-io")
             .enable_all()
             .build()
             .context("failed to create the application I/O runtime")?;

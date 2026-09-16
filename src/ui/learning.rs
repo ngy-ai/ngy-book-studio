@@ -3,11 +3,11 @@ use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui_component::text::TextView;
-use moye_epub_editor::learning::{
+use ngy_book_studio::learning::{
     LearningEnvironment, LearningLesson, LearningRunReport, LearningRunSummary, LearningService,
     LearningSnapshot, LearningTrace, LearningWorkspace,
 };
-use moye_epub_editor::learning_records::{chapter_scenarios, chapter_title, reference_code_for};
+use ngy_book_studio::learning_records::{chapter_scenarios, chapter_title, reference_code_for};
 
 const MAX_VISIBLE_TRACES: usize = 1_000;
 const CODE_LANGUAGE: &str = "python";
@@ -2712,7 +2712,7 @@ pub(super) fn open_learning_window(services: Arc<AppServices>, cx: &mut App) -> 
                 title: Some("墨页 · AI Agent 学习".into()),
                 ..Default::default()
             }),
-            app_id: Some("dev.moye.epub-editor.learning".to_string()),
+            app_id: Some("dev.ngy.book-studio.learning".to_string()),
             ..Default::default()
         },
         move |window, cx| {
@@ -2816,7 +2816,7 @@ mod tests {
                 .canonicalize()
                 .unwrap();
             let lessons =
-                moye_epub_editor::learning_records::lessons_for((index + 1) as u8).unwrap();
+                ngy_book_studio::learning_records::lessons_for((index + 1) as u8).unwrap();
             assert_eq!(lessons.len(), 1);
             assert_eq!(
                 lessons[0].markdown,

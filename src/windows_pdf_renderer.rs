@@ -39,7 +39,7 @@ pub struct WindowsPdfRenderer;
 impl VisualRenderer for WindowsPdfRenderer {
     fn descriptor(&self) -> RendererDescriptor {
         RendererDescriptor {
-            renderer: "moye-windows-pdf-png".to_string(),
+            renderer: "ngy-windows-pdf-png".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             fidelity: RenderFidelity::Structural,
         }

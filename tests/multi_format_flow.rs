@@ -9,7 +9,7 @@ use lopdf::{
     content::{Content, Operation},
     dictionary,
 };
-use moye_epub_editor::{
+use ngy_book_studio::{
     document::{BookFormat, BookSource, ContentUnitKind, SourceLocator},
     formats::{FormatRegistry, ImportLimits, ImportSource, ProbeConfidence},
     library::{ImportOutcome, LibraryStore},
@@ -73,7 +73,7 @@ fn generated_pdf_and_ooxml_import_into_the_canonical_model() {
                 "{} must produce HTML source",
                 fixture.extension
             );
-            let reparsed = moye_epub_editor::markup::parse_source_for_unit(&unit.source, &unit.id)
+            let reparsed = ngy_book_studio::markup::parse_source_for_unit(&unit.source, &unit.id)
                 .expect("imported HTML remains editable");
             assert_eq!(reparsed.document.plain_text(), unit.plain_text());
             assert_eq!(
@@ -334,29 +334,29 @@ fn fixtures() -> Vec<Fixture> {
             extension: "pdf",
             format: BookFormat::Pdf,
             unit_kind: ContentUnitKind::Page,
-            token: "MoyePdfUniqueToken",
-            bytes: make_pdf("MoyePdfUniqueToken", false),
+            token: "NgyPdfUniqueToken",
+            bytes: make_pdf("NgyPdfUniqueToken", false),
         },
         Fixture {
             extension: "docx",
             format: BookFormat::Docx,
             unit_kind: ContentUnitKind::Chapter,
-            token: "MoyeDocxUniqueToken",
-            bytes: make_office(DocumentFormat::Docx, "MoyeDocxUniqueToken"),
+            token: "NgyDocxUniqueToken",
+            bytes: make_office(DocumentFormat::Docx, "NgyDocxUniqueToken"),
         },
         Fixture {
             extension: "pptx",
             format: BookFormat::Pptx,
             unit_kind: ContentUnitKind::Slide,
-            token: "MoyePptxUniqueToken",
-            bytes: make_office(DocumentFormat::Pptx, "MoyePptxUniqueToken"),
+            token: "NgyPptxUniqueToken",
+            bytes: make_office(DocumentFormat::Pptx, "NgyPptxUniqueToken"),
         },
         Fixture {
             extension: "xlsx",
             format: BookFormat::Xlsx,
             unit_kind: ContentUnitKind::Worksheet,
-            token: "MoyeXlsxUniqueToken",
-            bytes: make_office(DocumentFormat::Xlsx, "MoyeXlsxUniqueToken"),
+            token: "NgyXlsxUniqueToken",
+            bytes: make_office(DocumentFormat::Xlsx, "NgyXlsxUniqueToken"),
         },
     ]
 }

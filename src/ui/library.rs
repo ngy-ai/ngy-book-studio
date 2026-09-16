@@ -2,7 +2,7 @@ use super::*;
 use anyhow::ensure;
 use std::collections::HashMap;
 
-use moye_epub_editor::{
+use ngy_book_studio::{
     agent::PassageRecord,
     annotations::Annotation,
     document::{BookDocument, BookFormat, BookSource as CanonicalBookSource, DocumentLocator},
@@ -607,7 +607,7 @@ fn open_pdf_reader_window(request: PdfReaderWindowRequest, cx: &mut App) {
             ),
             ..Default::default()
         }),
-        app_id: Some("dev.moye.epub-editor.pdf-reader".to_string()),
+        app_id: Some("dev.ngy.book-studio.pdf-reader".to_string()),
         ..Default::default()
     };
     let register_key = singleton_key.clone();
@@ -1315,18 +1315,33 @@ impl EpubReaderApp {
                 }
                 return;
             };
+            let selected_path = path.clone();
+            tracing::info!(
+                target: "ngy_import",
+                path = %selected_path.display(),
+                "图书库界面：已选择文件，开始导入"
+            );
             let task = services.spawn_library_projected(move |library| library.import(&path));
             let outcome = task.await;
             let close_window = view.update_in(cx, |this, _window, cx| {
                 this.is_importing = false;
                 match outcome {
                     Ok(Ok(mutation)) => {
-                        let message = match &mutation.value {
-                            ImportOutcome::Added(book) => format!("《{}》已加入图书库", book.title),
+                        let (message, book_id) = match &mutation.value {
+                            ImportOutcome::Added(book) => {
+                                (format!("《{}》已加入图书库", book.title), book.id.clone())
+                            }
                             ImportOutcome::AlreadyExists(book) => {
-                                format!("《{}》已经在图书库中", book.title)
+                                (format!("《{}》已经在图书库中", book.title), book.id.clone())
                             }
                         };
+                        tracing::info!(
+                            target: "ngy_import",
+                            path = %selected_path.display(),
+                            book_id = %book_id,
+                            result = %message,
+                            "图书库界面：导入成功"
+                        );
                         if this
                             .apply_shared_library_projection(mutation.generation, mutation.snapshot)
                         {
@@ -1339,16 +1354,32 @@ impl EpubReaderApp {
                             });
                         }
                     }
-                    Ok(Err(error)) => this.set_library_request_error(
-                        request_id,
-                        format!("导入失败：{error:#}"),
-                        cx,
-                    ),
-                    Err(error) => this.set_library_request_error(
-                        request_id,
-                        format!("导入任务异常停止：{error}"),
-                        cx,
-                    ),
+                    Ok(Err(error)) => {
+                        tracing::error!(
+                            target: "ngy_import",
+                            path = %selected_path.display(),
+                            error = %format!("{error:#}"),
+                            "图书库界面：导入失败"
+                        );
+                        this.set_library_request_error(
+                            request_id,
+                            format!("导入失败：{error:#}"),
+                            cx,
+                        );
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            target: "ngy_import",
+                            path = %selected_path.display(),
+                            error = %error,
+                            "图书库界面：导入任务异常停止"
+                        );
+                        this.set_library_request_error(
+                            request_id,
+                            format!("导入任务异常停止：{error}"),
+                            cx,
+                        );
+                    }
                 }
                 this.finish_library_request(cx)
             });
@@ -1655,7 +1686,7 @@ impl EpubReaderApp {
 
     /// Opens (or prepares and then opens) the DjVu page reader for a book.
     ///
-    /// Page images are published by the local `moye-djvu-png` render job, so
+    /// Page images are published by the local `ngy-djvu-png` render job, so
     /// the first open may show a preparation notice; the render resumes from
     /// its durable cursor and the user can cancel it from the book menu.
     fn open_persisted_djvu_reader(
@@ -2265,7 +2296,7 @@ impl EpubReaderApp {
                                 title: Some(format!("《{}》", record.title).into()),
                                 ..Default::default()
                             }),
-                            app_id: Some("dev.moye.epub-editor.reader".to_string()),
+                            app_id: Some("dev.ngy.book-studio.reader".to_string()),
                             ..Default::default()
                         };
                         if application_is_exiting(cx) {
@@ -2630,7 +2661,7 @@ impl EpubReaderApp {
                         title: Some(format!("编辑《{}》", record.title).into()),
                         ..Default::default()
                     }),
-                    app_id: Some("dev.moye.epub-editor.editor".to_string()),
+                    app_id: Some("dev.ngy.book-studio.editor".to_string()),
                     ..Default::default()
                 };
                 if application_is_exiting(cx) {
@@ -5627,7 +5658,7 @@ pub fn wrap_root(app: Entity<EpubReaderApp>, window: &mut Window, cx: &mut Conte
 #[cfg(test)]
 mod tests {
     use super::*;
-    use moye_epub_editor::document::{
+    use ngy_book_studio::document::{
         BlockDocument, ContentUnit, ContentUnitKind, DocumentLocator, Revision,
     };
 
@@ -5707,8 +5738,8 @@ mod tests {
                 book_title: "测试图书".to_string(),
                 unit_id: "unit-2".to_string(),
                 unit_title: "第二章".to_string(),
-                document_revision: moye_epub_editor::document::Revision::new(1),
-                unit_revision: moye_epub_editor::document::Revision::new(1),
+                document_revision: ngy_book_studio::document::Revision::new(1),
+                unit_revision: ngy_book_studio::document::Revision::new(1),
                 text: "命中的正文".to_string(),
                 locator: DocumentLocator::unit("book-1", "unit-2"),
                 relevance: Some(0.75),
@@ -5811,7 +5842,7 @@ mod tests {
 
     #[test]
     fn annotation_navigation_uses_stable_unit_identity_and_rejects_stale_notes() {
-        use moye_epub_editor::annotations::{AnnotationKind, TextAnchor};
+        use ngy_book_studio::annotations::{AnnotationKind, TextAnchor};
         let mut document = BookDocument::created("book-notes", "笔记测试");
         for id in ["first", "second"] {
             document.units.push(ContentUnit::new(

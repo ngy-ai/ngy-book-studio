@@ -6,7 +6,7 @@ from types import ModuleType
 
 import pytest
 
-from moye_lab.desktop_compat import _DeferredOverlapped
+from ngy_lab.desktop_compat import _DeferredOverlapped
 
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows CPython extension")
 

@@ -335,6 +335,9 @@ pub(crate) fn delete_document(conn: &mut Connection, book_id: &str) -> Result<Ve
     // key cascades: leaving them behind would apply a deleted book's choice to a
     // later book that reuses the same ID.
     settings::delete(&tx, &settings::translation_display_book_key(book_id))?;
+    for surface in settings::READER_ZOOM_SURFACES {
+        settings::delete(&tx, &settings::reader_zoom_book_key(surface, book_id))?;
+    }
     let unreferenced = blobs::list_unreferenced(&tx)?;
     tx.commit().context("无法提交文档删除事务")?;
     Ok(unreferenced)
@@ -1601,7 +1604,7 @@ fn validate_visual_page_unit_for_source(
                 .ok()
                 .and_then(|index| index.checked_add(1));
             ensure!(
-                page.renderer == "moye-office-com-enhanced"
+                page.renderer == "ngy-office-com-enhanced"
                     && page.fidelity == "office_enhanced"
                     && matches!(source.format.as_str(), "doc" | "docx" | "xlsx")
                     && page.unit_revision == Revision::INITIAL.get()
@@ -1704,7 +1707,7 @@ pub(crate) fn set_office_enhancement(
         ensure!(
             renderers
                 .iter()
-                .any(|renderer| renderer.renderer == "moye-office-com-enhanced"),
+                .any(|renderer| renderer.renderer == "ngy-office-com-enhanced"),
             "Office 增强 renderer 未注册"
         );
     }
@@ -1876,7 +1879,7 @@ fn renderer_for_source<'a>(
         && office_enhancements::is_enabled(conn, &source.book_id)?
         && let Some(renderer) = renderers
             .iter()
-            .find(|renderer| renderer.renderer == "moye-office-com-enhanced")
+            .find(|renderer| renderer.renderer == "ngy-office-com-enhanced")
     {
         return Ok(renderer);
     }
@@ -1885,7 +1888,7 @@ fn renderer_for_source<'a>(
         && source.format == "pdf"
         && let Some(renderer) = renderers
             .iter()
-            .find(|renderer| renderer.renderer == "moye-windows-pdf-png")
+            .find(|renderer| renderer.renderer == "ngy-windows-pdf-png")
     {
         return Ok(renderer);
     }
@@ -1901,7 +1904,7 @@ fn renderer_for_source<'a>(
     }
     renderers
         .iter()
-        .find(|renderer| renderer.renderer == "moye-structural-png")
+        .find(|renderer| renderer.renderer == "ngy-structural-png")
         .or_else(|| (renderers.len() == 1).then(|| &renderers[0]))
         .context("视觉任务恢复找不到当前来源所需的 renderer")
 }
@@ -3731,7 +3734,7 @@ mod tests {
             book_id: fixture.book.id.clone(),
             source_id: fixture.source.id.clone(),
             document_revision: Revision::new(fixture.book.revision),
-            renderer: "moye-structural-svg".to_string(),
+            renderer: "ngy-structural-svg".to_string(),
             renderer_version: "0.0.1".to_string(),
             fidelity: crate::preview::RenderFidelity::Structural,
             unit_ids: fixture.units.iter().map(|unit| unit.id.clone()).collect(),
@@ -3819,7 +3822,7 @@ mod tests {
         assert_eq!(visual_job.status, IndexJobStatus::Queued);
         let (spec, completed_pages) = decode_persisted_visual_job(&visual_job.cursor_json).unwrap();
         assert_eq!(completed_pages, 0);
-        assert_eq!(spec.renderer, "moye-structural-png");
+        assert_eq!(spec.renderer, "ngy-structural-png");
         assert_eq!(spec.renderer_version, descriptor.version);
         assert!(
             visual_pages::list_for_source(&conn, "source-1")
@@ -3894,7 +3897,7 @@ mod tests {
 
         let structural = crate::preview::VisualRenderer::descriptor(&StructuralPngRenderer);
         let enhanced = RendererDescriptor {
-            renderer: "moye-office-com-enhanced".to_string(),
+            renderer: "ngy-office-com-enhanced".to_string(),
             version: "test-office-renderer".to_string(),
             fidelity: crate::preview::RenderFidelity::OfficeEnhanced,
         };
@@ -3992,7 +3995,7 @@ mod tests {
 
         let structural = crate::preview::VisualRenderer::descriptor(&StructuralPngRenderer);
         let enhanced = RendererDescriptor {
-            renderer: "moye-office-com-enhanced".to_string(),
+            renderer: "ngy-office-com-enhanced".to_string(),
             version: "test-office-renderer".to_string(),
             fidelity: crate::preview::RenderFidelity::OfficeEnhanced,
         };
@@ -4074,7 +4077,7 @@ mod tests {
         insert_document(&mut conn, &fixture.graph(), true).unwrap();
         let structural = crate::preview::VisualRenderer::descriptor(&StructuralPngRenderer);
         let enhanced = RendererDescriptor {
-            renderer: "moye-office-com-enhanced".to_string(),
+            renderer: "ngy-office-com-enhanced".to_string(),
             version: "test-office-renderer".to_string(),
             fidelity: crate::preview::RenderFidelity::OfficeEnhanced,
         };

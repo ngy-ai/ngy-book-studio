@@ -27,7 +27,7 @@ new Script(expected.toString("utf8")).runInNewContext({
 
 const bundleSource = expected.toString("utf8");
 for (const marker of [
-  "__moyeEditorTrustedShell",
+  "__ngyEditorTrustedShell",
   "epubeditor.shell",
   "epubeditor.content",
   'searchParams.set("mode","source")',

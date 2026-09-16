@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use moye_epub_editor::{
+use ngy_book_studio::{
     credentials::MemoryCredentialStore,
     job_diagnostics::JobLogErrorKind,
     library::ImportOutcome,
@@ -643,12 +643,23 @@ fn assert_one_correction(endpoint: &TranslationEndpoint) {
         2,
         "one correction is the complete retry budget"
     );
+    assert_corrected_main_path(endpoint);
+}
+
+/// 「冻结输入 + 一次纠正」这两次请求的全部约束，与总请求数无关：逐片段回退只允许在
+/// 这两步**之后**再发请求（`AGENTS.md`），但主路径这两次本身必须逐字一致。
+fn assert_corrected_main_path(endpoint: &TranslationEndpoint) {
+    let requests = endpoint.requests();
+    assert!(
+        requests.len() >= 2,
+        "the main path must ask twice before anything else: {requests:?}"
+    );
     assert_eq!(
         requests[0], requests[1],
         "correction must preserve the source and all segment IDs"
     );
     let full = endpoint.full_requests();
-    assert_eq!(full.len(), 2);
+    assert!(full.len() >= 2, "both main-path bodies must be captured");
     for key in ["model", "temperature", "max_tokens"] {
         assert_eq!(full[0][key], full[1][key], "correction must preserve {key}");
     }
@@ -661,6 +672,16 @@ fn assert_one_correction(endpoint: &TranslationEndpoint) {
         !full[1].to_string().contains(INVALID_RESPONSE_SENTINEL),
         "raw rejected model output must not enter the repair prompt"
     );
+}
+
+/// Segments asked for by each captured request, in arrival order. A fragment request
+/// carries exactly one leaf, so the shape alone tells the main path and the
+/// fallback apart.
+fn request_segment_counts(requests: &[Value]) -> Vec<usize> {
+    requests
+        .iter()
+        .map(|request| request["segments"].as_array().unwrap().len())
+        .collect()
 }
 
 #[test]
@@ -1136,49 +1157,105 @@ fn editing_one_chapter_keeps_the_other_chapters_translation() {
     });
 }
 
+/// 响应少写一条片段时，主路径（整块 + 一次纠正）两次都没通过，随后逐片段回退只问了
+/// 第一个文字叶、同样被拒绝，整块因此跳过：不允许保存半段译文，全书唯一的文本块没译成，
+/// 任务判失败。
+///
+/// 现场（2026-09-13，`block 79/80/81`）就是这一类：弱模型把整段译文合并进 `id=0`，
+/// 两次尝试后仍判 `segment_count_mismatch`，连续三块让整本图书失败。
 #[test]
-fn incomplete_or_duplicate_response_ids_fail_before_persisting_a_block() {
-    for mode in [ReplyMode::MissingId, ReplyMode::DuplicateId] {
-        let endpoint = TranslationEndpoint::start("错误：", mode);
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("invalid-response.epub");
-        write_epub(&path, "<p>First <strong>second</strong> third.</p>");
-        let services = AppServices::open_with_credentials(
-            temp.path().join("library"),
-            Arc::new(MemoryCredentialStore::default()),
-        )
-        .unwrap();
-        services.runtime().block_on(async {
+fn an_incomplete_response_is_never_persisted_as_a_partial_block() {
+    let endpoint = TranslationEndpoint::start("错误：", ReplyMode::MissingId);
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("invalid-response.epub");
+    write_epub(&path, "<p>First <strong>second</strong> third.</p>");
+    let services = AppServices::open_with_credentials(
+        temp.path().join("library"),
+        Arc::new(MemoryCredentialStore::default()),
+    )
+    .unwrap();
+    services.runtime().block_on(async {
+        services
+            .configure_providers(settings(&endpoint), BTreeMap::new())
+            .await
+            .unwrap();
+        let (book_id, unit_id) = import(&services, &path).await;
+        let job = wait_translation(&services, &book_id, BackgroundJobStatus::Paused).await;
+        assert!(
             services
-                .configure_providers(settings(&endpoint), BTreeMap::new())
+                .control_background_job(job.id, BackgroundJobAction::Resume)
                 .await
-                .unwrap();
-            let (book_id, unit_id) = import(&services, &path).await;
-            let job = wait_translation(&services, &book_id, BackgroundJobStatus::Paused).await;
-            assert!(
-                services
-                    .control_background_job(job.id, BackgroundJobAction::Resume)
-                    .await
-                    .unwrap()
-            );
-            let failed = wait_translation(&services, &book_id, BackgroundJobStatus::Failed).await;
-            assert!(failed.error.is_some());
-            assert_eq!(failed.progress.completed, 0);
-            assert_one_correction(&endpoint);
+                .unwrap()
+        );
+        let failed = wait_translation(&services, &book_id, BackgroundJobStatus::Failed).await;
+        assert!(failed.error.is_some());
+        assert_eq!(failed.progress.completed, 0);
+        let requests = endpoint.requests();
+        assert_eq!(
+            request_segment_counts(&requests),
+            vec![3, 3, 1],
+            "主路径是完整文本块的两次请求，回退再按片段逐条问，第一条被拒就停"
+        );
+        assert_corrected_main_path(&endpoint);
+        assert_eq!(row_count(&services), 0, "少一条片段的响应绝不能落库");
+        assert!(
+            services
+                .translation_blocks_for_unit(book_id, unit_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    });
+}
+
+/// 片段 ID 重复的响应同属「模型答了、但片段不完整」：整块请求两次都不通过后，逐片段
+/// 回退把三个文字叶各问一次，全部通过并按原顺序拼回一条完整的 `StoredTranslation`。
+/// 回退是唯一一条「弱模型也能翻完」的路径，这条回归把它固定下来：请求形状、落库行数与
+/// 片段边界空白都必须与主路径一致。
+#[test]
+fn a_duplicate_id_response_is_repaired_one_fragment_at_a_time() {
+    let endpoint = TranslationEndpoint::start("译：", ReplyMode::DuplicateId);
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("duplicate-id-response.epub");
+    write_epub(&path, "<p>First <strong>second</strong> third.</p>");
+    let services = AppServices::open_with_credentials(
+        temp.path().join("library"),
+        Arc::new(MemoryCredentialStore::default()),
+    )
+    .unwrap();
+    services.runtime().block_on(async {
+        services
+            .configure_providers(settings(&endpoint), BTreeMap::new())
+            .await
+            .unwrap();
+        let (book_id, unit_id) = import(&services, &path).await;
+        let succeeded = translate(&services, &book_id).await;
+        assert!(succeeded.error.is_none());
+        let requests = endpoint.requests();
+        assert_eq!(
+            request_segment_counts(&requests),
+            vec![3, 3, 1, 1, 1],
+            "整块 + 一次纠正都拿不到不重复的 ID，回退改为每个文字叶各问一次"
+        );
+        assert_corrected_main_path(&endpoint);
+        assert_eq!(row_count(&services), 1);
+        let blocks = services
+            .translation_blocks_for_unit(book_id, unit_id)
+            .await
+            .unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].segments.len(), 3, "回退结果按原顺序拼回整块");
+        for (segment, request) in blocks[0].segments.iter().zip(&requests[2..]) {
+            let leaf = request["segments"][0]["text"].as_str().unwrap();
+            assert_eq!(segment.source, leaf, "回退按文字叶切分，顺序不变");
+            let core = leaf.trim();
             assert_eq!(
-                row_count(&services),
-                0,
-                "{mode:?} must not persist a partial paragraph"
+                segment.translated,
+                segment.source.replacen(core, &format!("译：{core}"), 1),
+                "片段边界空白仍由原文恢复"
             );
-            assert!(
-                services
-                    .translation_blocks_for_unit(book_id, unit_id)
-                    .await
-                    .unwrap()
-                    .is_empty()
-            );
-        });
-    }
+        }
+    });
 }
 
 #[test]
@@ -1259,22 +1336,22 @@ fn a_bare_segment_array_answer_is_accepted_without_a_correction() {
 /// cargo test --test translation_flow -- --ignored --nocapture a_local_model
 /// ```
 ///
-/// 需要 127.0.0.1:11434 上的 Ollama（`MOYE_REPLAY_ENDPOINT` / `MOYE_REPLAY_MODEL`
-/// 可覆盖）；`MOYE_REPLAY_LOG` 调诊断级别。默认测试不运行它，也不触碰用户图书库。
+/// 需要 127.0.0.1:11434 上的 Ollama（`NGY_REPLAY_ENDPOINT` / `NGY_REPLAY_MODEL`
+/// 可覆盖）；`NGY_REPLAY_LOG` 调诊断级别。默认测试不运行它，也不触碰用户图书库。
 #[test]
 #[ignore = "manual gate: needs a local OpenAI-compatible model endpoint"]
 fn a_local_model_replays_the_previously_rejected_blocks() {
     // 诊断行必须能直接在输出里看到，才能和现场日志逐条比对。
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            std::env::var("MOYE_REPLAY_LOG")
+            std::env::var("NGY_REPLAY_LOG")
                 .map(tracing_subscriber::EnvFilter::new)
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,moye_ai=debug")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,ngy_ai=debug")),
         )
         .try_init();
-    let base_url = std::env::var("MOYE_REPLAY_ENDPOINT")
+    let base_url = std::env::var("NGY_REPLAY_ENDPOINT")
         .unwrap_or_else(|_| "http://127.0.0.1:11434/v1/".to_string());
-    let model = std::env::var("MOYE_REPLAY_MODEL").unwrap_or_else(|_| "qwen3.5:0.8b".to_string());
+    let model = std::env::var("NGY_REPLAY_MODEL").unwrap_or_else(|_| "qwen3.5:0.8b".to_string());
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("local-model-replay.epub");
     // 与现场日志逐字一致：连片段切分方式（inline 元素边界）都照抄。
@@ -1569,7 +1646,7 @@ fn one_untranslatable_block_is_skipped_and_the_run_continues() {
         assert_eq!(skipped[0].metrics.ordinal, Some(1));
         assert_eq!(
             skipped[0].level,
-            moye_epub_editor::job_diagnostics::JobLogLevel::Warning
+            ngy_book_studio::job_diagnostics::JobLogLevel::Warning
         );
         for entry in &logs.entries {
             assert!(
@@ -1594,8 +1671,10 @@ fn one_untranslatable_block_is_skipped_and_the_run_continues() {
     });
 }
 
+/// 连续失败的文本块不再中止整轮：每个块都会被尝试，其余块照常翻译，任务以
+/// `Succeeded` 收尾。跳过是终态——修复路径是明细里按块重试，不是再赌一次整轮。
 #[test]
-fn consecutive_untranslatable_blocks_fail_the_run_without_losing_progress() {
+fn consecutive_untranslatable_blocks_are_skipped_until_the_whole_book_is_visited() {
     let endpoint = TranslationEndpoint::start("失败：", ReplyMode::PoisonedBlock);
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("consecutive-skips.epub");
@@ -1624,17 +1703,16 @@ fn consecutive_untranslatable_blocks_fail_the_run_without_losing_progress() {
                 .await
                 .unwrap()
         );
-        let failed = wait_translation(&services, &book_id, BackgroundJobStatus::Failed).await;
+        // 一个成功块 + 三个连续失败块 + 一个成功块：四个可译块各花两次严格尝试，
+        // 三个毒块各再走一次逐片段回退（= 1 次请求），最后一个块仍然被请求。
+        let finished = wait_translation(&services, &book_id, BackgroundJobStatus::Succeeded).await;
 
-        // 一个成功块加三个连续失败块：第三个失败块上停止，最后一个块不再请求。
-        assert_eq!(endpoint.requests().len(), 7);
-        let error = failed.error.unwrap();
-        assert!(error.contains("连续 3 个文本块"));
-        assert!(!error.contains(POISON_SENTINEL));
-        assert!(error.len() < 1024);
-        // 失败沿用最后一个已提交游标，重试仍会从第一个未翻译块开始。
-        assert_eq!(failed.progress.completed, 1);
-        assert_eq!(row_count(&services), 1);
+        assert_eq!(endpoint.requests().len(), 11);
+        assert!(finished.error.is_none());
+        // 游标走到整本末尾，跳过与缓存命中一样推进；失败块就是没有译文的那三个。
+        assert_eq!(finished.progress.completed, 5);
+        assert_eq!(finished.progress.total, Some(5));
+        assert_eq!(row_count(&services), 2);
     });
 }
 

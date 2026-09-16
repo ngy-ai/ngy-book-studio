@@ -304,7 +304,7 @@ impl std::fmt::Debug for LibraryStore {
 impl LibraryStore {
     pub fn default_data_dir() -> Result<PathBuf> {
         let project_dirs =
-            ProjectDirs::from("dev", "moye", "Moye EPUB Reader").context("无法确定应用数据目录")?;
+            ProjectDirs::from("dev", "ngy", "ngy_book_studio").context("无法确定应用数据目录")?;
         Ok(project_dirs.data_local_dir().to_path_buf())
     }
 
@@ -599,14 +599,29 @@ impl LibraryStore {
     }
 
     pub fn import(&mut self, source_path: &Path) -> Result<ImportOutcome> {
+        tracing::info!(target: "ngy_import", path = %source_path.display(), "图书库：开始导入");
         let imported = self
             .registry
-            .import_path(source_path, &ImportLimits::default())?;
+            .import_path(source_path, &ImportLimits::default())
+            .inspect_err(|error| {
+                tracing::error!(
+                    target: "ngy_import",
+                    path = %source_path.display(),
+                    error = %format!("{error:#}"),
+                    "图书库：导入解析失败"
+                );
+            })?;
         if let Some(existing) = self
             .books
             .iter()
             .find(|book| book.id == imported.document.id)
         {
+            tracing::info!(
+                target: "ngy_import",
+                book_id = %existing.id,
+                title = %existing.title,
+                "图书库：内容哈希已存在，跳过写入"
+            );
             return Ok(ImportOutcome::AlreadyExists(existing.clone()));
         }
         let original = imported
@@ -615,14 +630,39 @@ impl LibraryStore {
         let source_name = imported_source_name(&imported.document);
         let media_type = original.metadata.media_type.clone();
         let source_bytes = original.bytes.clone();
-        let record = self.persist_document(
-            imported,
-            source_bytes.as_slice(),
-            &media_type,
-            source_name,
-            "original",
-            None,
-        )?;
+        tracing::info!(
+            target: "ngy_import",
+            book_id = %imported.document.id,
+            title = %imported.document.title,
+            media_type = %media_type,
+            source_name = ?source_name,
+            units = imported.document.units.len(),
+            assets = imported.document.assets.len(),
+            "图书库：开始持久化"
+        );
+        let record = self
+            .persist_document(
+                imported,
+                source_bytes.as_slice(),
+                &media_type,
+                source_name,
+                "original",
+                None,
+            )
+            .inspect_err(|error| {
+                tracing::error!(
+                    target: "ngy_import",
+                    path = %source_path.display(),
+                    error = %format!("{error:#}"),
+                    "图书库：持久化失败"
+                );
+            })?;
+        tracing::info!(
+            target: "ngy_import",
+            book_id = %record.id,
+            title = %record.title,
+            "图书库：导入已提交"
+        );
         Ok(self.finish_committed_import(record))
     }
 
@@ -2769,6 +2809,19 @@ mod tests {
     use crate::annotations::AnnotationKind;
     use crate::editing::{DocumentEditor, NewContentUnit};
 
+    /// How long a background publication, or the hand-off to the publication
+    /// gate, may take in these tests.
+    ///
+    /// `cargo test --all-targets` runs this binary next to ~900 other cases, so
+    /// the machine is oversubscribed while an assertion waits here: a budget
+    /// tight enough for an idle machine (5s) failed a full-suite run at
+    /// `concurrent_reuse_cannot_be_deleted_by_a_stale_gc_candidate` with the
+    /// publisher still inside `persist_document` (SQLite transaction + blob
+    /// write) after the gate had opened. A stall, not a deadlock: every lock
+    /// this side hands over is released before the wait. 30s matches the
+    /// fixture budgets in `tests/translation_flow.rs`.
+    const BACKGROUND_PUBLICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
     fn initial_note_draft(
         library: &LibraryStore,
         book_id: &str,
@@ -4101,7 +4154,7 @@ mod tests {
         });
         started_rx.recv().unwrap();
         attempted_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(BACKGROUND_PUBLICATION_TIMEOUT)
             .expect("publisher reached the publication gate");
         assert!(
             matches!(
@@ -4128,7 +4181,7 @@ mod tests {
         );
         drop(publication_guard);
         let republished = finished_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(BACKGROUND_PUBLICATION_TIMEOUT)
             .unwrap()
             .unwrap();
         publish_thread.join().unwrap();

@@ -100,7 +100,7 @@ impl LearningService {
                     std::fs::create_dir_all(&directory).context("无法准备学习备份目录")?;
                     let directory =
                         std::fs::canonicalize(directory).context("无法定位学习备份目录")?;
-                    Ok(shell_dialog_directory(&directory))
+                    Ok(crate::startup::shell_dialog_directory(&directory))
                 })
                 .await?
             })
@@ -248,26 +248,6 @@ impl LearningService {
     }
 }
 
-// The file APIs accept canonical \\?\ paths, but the Shell parsing used by
-// native-dialog rejects them. Change only the dialog's display location.
-fn shell_dialog_directory(path: &Path) -> PathBuf {
-    #[cfg(target_os = "windows")]
-    {
-        use std::path::{Component, Prefix};
-        let mut components = path.components();
-        if let Some(Component::Prefix(prefix)) = components.next() {
-            let mut directory = match prefix.kind() {
-                Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:", char::from(drive))),
-                Prefix::VerbatimUNC(server, share) => PathBuf::from(r"\\").join(server).join(share),
-                _ => return path.to_path_buf(),
-            };
-            directory.extend(components);
-            return directory;
-        }
-    }
-    path.to_path_buf()
-}
-
 const MAX_PROTOCOL_BYTES: u64 = 4 * 1024 * 1024;
 const HOST_DEADLINE: Duration = Duration::from_secs(185);
 const CANCEL_GRACE: Duration = Duration::from_secs(3);
@@ -290,7 +270,7 @@ fn host_command(root: &Path) -> Command {
     let mut command = Command::new(root.join(".venv/Scripts/python.exe"));
     command
         .args(["-I", "-u"])
-        .arg(root.join("moye_lab/desktop_host.py"));
+        .arg(root.join("ngy_lab/desktop_host.py"));
     command.current_dir(root).env_clear();
     for key in [
         "SystemRoot",
@@ -327,7 +307,7 @@ fn execute(
         "隔离运行目前只支持 Windows 10/11"
     );
     let directory = tempfile::Builder::new()
-        .prefix("moye-learning-run-")
+        .prefix("ngy-learning-run-")
         .tempdir()
         .context("无法创建独立运行目录")?;
     let started = Instant::now();
@@ -800,7 +780,7 @@ fn failed_report(
 fn probe_environment(root: &std::path::Path) -> LearningEnvironment {
     let ready = cfg!(target_os = "windows")
         && root.join(".venv/Scripts/python.exe").is_file()
-        && root.join("moye_lab/desktop_host.py").is_file();
+        && root.join("ngy_lab/desktop_host.py").is_file();
     LearningEnvironment {
         ready,
         message: if ready {
@@ -989,27 +969,6 @@ mod tests {
     }
 
     #[cfg(target_os = "windows")]
-    #[test]
-    fn shell_dialog_directory_converts_drive_and_unc_prefixes_only() {
-        for (input, expected) in [
-            (
-                r"\\?\C:\Users\学习资料\archives",
-                r"C:\Users\学习资料\archives",
-            ),
-            (
-                r"\\?\UNC\server\share\learning\archives",
-                r"\\server\share\learning\archives",
-            ),
-            (r"C:\Users\学习资料\archives", r"C:\Users\学习资料\archives"),
-        ] {
-            assert_eq!(
-                shell_dialog_directory(Path::new(input)),
-                PathBuf::from(expected)
-            );
-        }
-    }
-
-    #[cfg(target_os = "windows")]
     mod supervisor_control_flow {
         use super::*;
         use std::{fs, os::windows::process::CommandExt};
@@ -1066,7 +1025,7 @@ raise SystemExit(5)
                 "run uv sync --locked in courses/agent-foundations first"
             );
             let directory = tempfile::Builder::new()
-                .prefix("moye-supervisor-test-")
+                .prefix("ngy-supervisor-test-")
                 .tempdir()
                 .unwrap();
             let script = directory.path().join("controlled_host.py");

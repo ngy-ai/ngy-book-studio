@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from moye_lab.sandbox import execute_desktop_run
+from ngy_lab.sandbox import execute_desktop_run
 
 ROOT = Path(__file__).resolve().parents[1]
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows LPAC integration")
@@ -61,7 +61,7 @@ def test_all_chapter_references_in_real_lpac(run_dir, chapter, scenario, impleme
     assert report["metrics"]["framework_steps"] == expected_steps
     source = (ROOT / "references" / f"ch{chapter:02d}_{implementation}.py").read_text("utf-8")
     assert report["code_snapshot"][f"desktop_submission/{implementation}.py"] == source
-    package = run_dir / "stage" / "app" / "moye_lab"
+    package = run_dir / "stage" / "app" / "ngy_lab"
     assert (package / "chapter_support.py").exists()
     for host_file in ["chapter_runtime.py", "scenarios.py", "runner.py", "runtime.py"]:
         assert not (package / host_file).exists()
@@ -82,7 +82,7 @@ def test_unfinished_starter_cannot_pass_in_lpac(run_dir, implementation):
 @pytest.mark.parametrize("chapter", range(2, 11))
 def test_student_success_declaration_cannot_forge_host_report(run_dir, chapter):
     code = """
-from moye_lab.chapter_support import load_case, finish
+from ngy_lab.chapter_support import load_case, finish
 def run(task, model, tools, limits, emit):
     state = load_case(task, model, tools)
     emit({"passed": True, "tests_passed": 999})
@@ -106,7 +106,7 @@ def test_old_answer_cannot_be_replayed_with_new_case_id(run_dir):
     result = json.dumps(previous["outcome"]["answer"]["result"], ensure_ascii=True)
     code = f"""
 import json
-from moye_lab.chapter_support import load_case, finish
+from ngy_lab.chapter_support import load_case, finish
 def run(task, model, tools, limits, emit):
     state = load_case(task, model, tools)
     return finish(state, json.loads({result!r}))
@@ -123,10 +123,10 @@ def run(task, model, tools, limits, emit):
 def test_worker_cannot_import_host_or_reference_answer(run_dir):
     code = """
 import importlib
-from moye_lab.chapter_support import load_case, finish
+from ngy_lab.chapter_support import load_case, finish
 def run(task, model, tools, limits, emit):
     state = load_case(task, model, tools)
-    for name in ["moye_lab.chapter_runtime", "references.ch02_manual", "tutorial_examples.ch02_tools"]:
+    for name in ["ngy_lab.chapter_runtime", "references.ch02_manual", "tutorial_examples.ch02_tools"]:
         try:
             importlib.import_module(name)
         except ImportError:
@@ -143,7 +143,7 @@ def run(task, model, tools, limits, emit):
 
 def test_caught_unauthorized_call_is_still_terminal_and_zero_execution(run_dir):
     code = """
-from moye_lab.chapter_support import load_case, call_tool, finish
+from ngy_lab.chapter_support import load_case, call_tool, finish
 def run(task, model, tools, limits, emit):
     state = load_case(task, model, tools)
     try:
@@ -180,7 +180,7 @@ def test_cancelled_new_chapter_retains_identity_and_kills_worker(run_dir):
             timer.start()
 
     code = """
-from moye_lab.chapter_support import load_case
+from ngy_lab.chapter_support import load_case
 def run(task, model, tools, limits, emit):
     load_case(task, model, tools)
     while True:

@@ -9,46 +9,55 @@ use crate::{
     media::{MediaBackend, MediaMetadata, MediaResponse, MediaService},
 };
 
+/// Reading text size in pixels: what a chapter renders at before the reader
+/// changes it, the range Ctrl + wheel covers, and one wheel notch's step. The
+/// chapter runtime clamps the same range in `READER_INITIALIZATION_SCRIPT`, and
+/// `the_chapter_runtime_shares_the_host_text_size_range` fails if they drift.
+pub const READER_FONT_SIZE_DEFAULT: u8 = 18;
+pub const READER_FONT_SIZE_MIN: u8 = 14;
+pub const READER_FONT_SIZE_MAX: u8 = 30;
+pub const READER_FONT_SIZE_STEP: u8 = 2;
+
 const READER_CSS: &str = r#"
-  /* moye-reader-style */
+  /* ngy-reader-style */
   :root {
     color-scheme: light;
-    --moye-font-size: 18px;
-    --moye-paper: #fbfaf7;
-    --moye-text: #302d29;
-    --moye-muted: #716b63;
-    --moye-accent: #c35f3f;
+    --ngy-font-size: 18px;
+    --ngy-paper: #fbfaf7;
+    --ngy-text: #302d29;
+    --ngy-muted: #716b63;
+    --ngy-accent: #c35f3f;
   }
-  html { background: var(--moye-paper) !important; }
+  html { background: var(--ngy-paper) !important; }
   body {
     box-sizing: border-box !important;
     max-width: 820px !important;
     min-height: 100vh !important;
     margin: 0 auto !important;
     padding: 48px 72px 96px !important;
-    background: var(--moye-paper) !important;
-    color: var(--moye-text) !important;
+    background: var(--ngy-paper) !important;
+    color: var(--ngy-text) !important;
     font-family: "Noto Serif CJK SC", "Source Han Serif SC", "Microsoft YaHei", Georgia, serif !important;
-    font-size: var(--moye-font-size) !important;
+    font-size: var(--ngy-font-size) !important;
     font-weight: normal !important;
     line-height: 1.85 !important;
     overflow-wrap: anywhere;
   }
   p { margin: 0 0 1.15em !important; }
   h1, h2, h3, h4, h5, h6 {
-    color: var(--moye-text) !important;
+    color: var(--ngy-text) !important;
     line-height: 1.35 !important;
     margin-top: 1.7em !important;
   }
   h1:first-child, h2:first-child, h3:first-child { margin-top: 0 !important; }
   img, svg, video { max-width: 100% !important; height: auto !important; }
   table { max-width: 100% !important; border-collapse: collapse; }
-  a { color: var(--moye-accent) !important; text-decoration-thickness: 1px; }
+  a { color: var(--ngy-accent) !important; text-decoration-thickness: 1px; }
   blockquote {
     margin-left: 0 !important;
     padding-left: 1.2em !important;
     border-left: 3px solid #dfd4ca !important;
-    color: var(--moye-muted) !important;
+    color: var(--ngy-muted) !important;
   }
   @media (max-width: 720px) {
     body { padding: 32px 34px 72px !important; }
@@ -241,7 +250,21 @@ pub fn load_resource_with_range(
         // <head/>, which causes the CSS injection to be skipped and
         // leaves the WebView rendering body text with no styling.
         ensure_reader_css(&mut html);
-        html.into_bytes()
+        // The chapter is handed to the WebView as `application/xhtml+xml`, so
+        // every character reference must be one XML resolves on its own. Third
+        // party EPUBs and our own generated projection both reach this point
+        // with `&nbsp;` and friends otherwise.
+        let html = crate::markup::xml_safe_entities(&html);
+        tracing::debug!(
+            target: "ngy_reader",
+            path = %safe_path,
+            mime = %mime,
+            html_bytes = html.html.len(),
+            rewritten = html.rewritten_count,
+            entities = ?html.rewritten,
+            "阅读器：准备章节正文"
+        );
+        html.html.into_owned().into_bytes()
     } else {
         entry
             .read_bytes()
@@ -265,11 +288,20 @@ pub fn load_resource_with_range(
     }
 
     let response = MediaService::new(ManifestResourceBackend {
-        path: safe_path,
+        path: safe_path.clone(),
         media_type: mime,
         bytes: Arc::new(bytes),
     })
     .serve("epub", request_path, range_header)?;
+    tracing::debug!(
+        target: "ngy_reader",
+        path = %safe_path,
+        mime = %response.media_type,
+        status = response.status,
+        bytes = response.content_length,
+        range = ?response.content_range,
+        "阅读器：准备资源响应"
+    );
     Ok(response.into())
 }
 
@@ -278,7 +310,7 @@ pub fn load_resource_with_range(
 /// `<head/>`, which skips the CSS injection entirely. This function ensures
 /// the reader stylesheet is always present in the HTML served to the WebView.
 fn ensure_reader_css(html: &mut String) {
-    if html.contains("moye-reader-style") {
+    if html.contains("ngy-reader-style") {
         return; // Already injected by rbook
     }
     let style_tag = format!("<style>/*<![CDATA[*/{}/*]]>*/</style>", READER_CSS);
@@ -479,22 +511,24 @@ fn reader_url_path(url: &str) -> Option<&str> {
         .map(|path| path.split(['?', '#']).next().unwrap_or(path))
 }
 
-pub fn reader_appearance_script(font_size: u8, dark: bool) -> String {
-    let font_size = font_size.clamp(14, 30);
-    let (paper, text, muted, accent, scheme) = if dark {
-        ("#201f1c", "#e8e2d9", "#aaa198", "#e88b6e", "dark")
-    } else {
-        ("#fbfaf7", "#302d29", "#716b63", "#c35f3f", "light")
-    };
+/// Applies one reading text size to a chapter document.
+///
+/// The size is one custom property on the root element, so a chapter never has
+/// to be re-served when the reader changes it: the served stylesheet carries the
+/// default and this override wins over it. The value is clamped here because the
+/// host is the last place that can bound a size that came back from the page or
+/// from an old settings row.
+pub fn reader_appearance_script(font_size: u8) -> String {
+    let font_size = reader_font_size(font_size);
     format!(
-        "(() => {{ const s = document.documentElement.style; \
-         s.setProperty('--moye-font-size', '{font_size}px'); \
-         s.setProperty('--moye-paper', '{paper}'); \
-         s.setProperty('--moye-text', '{text}'); \
-         s.setProperty('--moye-muted', '{muted}'); \
-         s.setProperty('--moye-accent', '{accent}'); \
-         document.documentElement.style.colorScheme = '{scheme}'; }})()"
+        "(() => {{ document.documentElement.style \
+         .setProperty('--ngy-font-size', '{font_size}px'); }})()"
     )
+}
+
+/// The one range a reading text size is allowed to take.
+pub fn reader_font_size(font_size: u8) -> u8 {
+    font_size.clamp(READER_FONT_SIZE_MIN, READER_FONT_SIZE_MAX)
 }
 
 fn safe_resource_path(request_path: &str) -> Result<String> {
@@ -615,5 +649,33 @@ mod tests {
             Some("/EPUB/chapter.xhtml")
         );
         assert_eq!(reader_url_path("https://epubreader.evil/chapter"), None);
+    }
+
+    /// The served stylesheet carries the text size a chapter renders at before
+    /// the reader changes it. The runtime clamps the same range in
+    /// `ui::reader::READER_INITIALIZATION_SCRIPT`, which pins it too.
+    #[test]
+    fn the_served_chapter_stylesheet_defaults_to_the_host_text_size() {
+        assert!(
+            READER_CSS.contains(&format!("--ngy-font-size: {READER_FONT_SIZE_DEFAULT}px")),
+            "the served chapter stylesheet must default to the host's text size"
+        );
+    }
+
+    #[test]
+    fn reading_text_size_steps_within_the_host_range() {
+        assert_eq!(reader_font_size(0), READER_FONT_SIZE_MIN);
+        assert_eq!(reader_font_size(200), READER_FONT_SIZE_MAX);
+        assert_eq!(
+            reader_font_size(READER_FONT_SIZE_DEFAULT),
+            READER_FONT_SIZE_DEFAULT
+        );
+
+        // The applied script always carries the clamped size, whoever asks.
+        assert!(
+            reader_appearance_script(0).contains(&format!("{READER_FONT_SIZE_MIN}px")),
+            "a stored size below the range must not reach the chapter"
+        );
+        assert!(reader_appearance_script(u8::MAX).contains(&format!("{READER_FONT_SIZE_MAX}px")));
     }
 }

@@ -107,10 +107,10 @@ pub fn starter_code_for(chapter: u8, implementation: &str) -> &'static str {
 pub fn reference_code_for(chapter: u8, implementation: &str) -> &'static str {
     match (chapter, implementation == "langgraph") {
         (1, false) => {
-            include_str!("../courses/agent-foundations/moye_lab/implementations/manual.py")
+            include_str!("../courses/agent-foundations/ngy_lab/implementations/manual.py")
         }
         (1, true) => {
-            include_str!("../courses/agent-foundations/moye_lab/implementations/langgraph_agent.py")
+            include_str!("../courses/agent-foundations/ngy_lab/implementations/langgraph_agent.py")
         }
         (2, false) => include_str!("../courses/agent-foundations/references/ch02_manual.py"),
         (2, true) => include_str!("../courses/agent-foundations/references/ch02_langgraph.py"),

@@ -657,7 +657,7 @@ impl OpenAiCompatibleProvider for OpenAiHttpProvider {
         // Record only the endpoint origin: paths can contain tenant names or
         // credentials even when query strings and userinfo are prohibited.
         let span = tracing::info_span!(
-            target: "moye_ai",
+            target: "ngy_ai",
             "ai_http",
             http_id = NEXT_HTTP_ID.fetch_add(1, Ordering::Relaxed),
             operation = "chat_stream",
@@ -716,7 +716,7 @@ impl OpenAiCompatibleProvider for OpenAiHttpProvider {
                     .and_then(reqwest::Body::as_bytes)
                     .map_or(0, <[u8]>::len);
                 tracing::Span::current().record("request_body_bytes", request_body_bytes);
-                tracing::debug!(target: "moye_ai", stage = "http_send", "Sending AI chat request");
+                tracing::debug!(target: "ngy_ai", stage = "http_send", "Sending AI chat request");
                 // Only the wait for the response headers is bounded by the
                 // configured request timeout; the body that follows is bounded by
                 // the silence between its chunks.
@@ -737,7 +737,7 @@ impl OpenAiCompatibleProvider for OpenAiHttpProvider {
                     bail!("AI chat stream exceeds the {MAX_CHAT_STREAM_BYTES}-byte limit");
                 }
                 tracing::debug!(
-                    target: "moye_ai",
+                    target: "ngy_ai",
                     stage = "http_started",
                     http_status = response.status().as_u16(),
                     elapsed_ms = started_at.elapsed().as_millis() as u64,
@@ -752,7 +752,7 @@ impl OpenAiCompatibleProvider for OpenAiHttpProvider {
             .await;
             if let Err(error) = &result {
                 tracing::warn!(
-                    target: "moye_ai",
+                    target: "ngy_ai",
                     stage = "http_start_failed",
                     error_kind = error_kind(error),
                     elapsed_ms = started_at.elapsed().as_millis() as u64,
@@ -819,7 +819,7 @@ async fn checked_response(response: reqwest::Response) -> Result<reqwest::Respon
             .map(provider_error_label)
     };
     tracing::warn!(
-        target: "moye_ai",
+        target: "ngy_ai",
         stage = "http_rejected",
         http_status = status.as_u16(),
         error_body_bytes = body.len(),
@@ -831,7 +831,7 @@ async fn checked_response(response: reqwest::Response) -> Result<reqwest::Respon
     );
     if let Some(error) = parse_context_window_error(status, &body) {
         tracing::debug!(
-            target: "moye_ai",
+            target: "ngy_ai",
             stage = "http_error_classified",
             error_kind = "context_window_exceeded",
             prompt_tokens = error.prompt_tokens,
@@ -842,7 +842,7 @@ async fn checked_response(response: reqwest::Response) -> Result<reqwest::Respon
     }
     if let Some(error) = parse_incomplete_tool_arguments(status, &body) {
         tracing::debug!(
-            target: "moye_ai",
+            target: "ngy_ai",
             stage = "http_error_classified",
             error_kind = "incomplete_tool_arguments",
             tool = tool_label(&error.tool_name),
@@ -1084,7 +1084,7 @@ async fn read_error_body_prefix(response: Response, max_bytes: usize) -> Vec<u8>
             Some(Err(error)) => {
                 let error = anyhow::Error::from(error);
                 tracing::warn!(
-                    target: "moye_ai",
+                    target: "ngy_ai",
                     stage = "http_error_body_read_failed",
                     error_kind = error_kind(&error),
                     error_body_bytes = body.len(),
@@ -1498,7 +1498,7 @@ impl SseDiagnostics {
         if elapsed >= self.next_progress_at {
             self.next_progress_at = elapsed + STREAM_PROGRESS_INTERVAL;
             tracing::debug!(
-                target: "moye_ai",
+                target: "ngy_ai",
                 stage = "sse_progress",
                 wire_bytes,
                 event_count,
@@ -1534,7 +1534,7 @@ impl SseDiagnostics {
         });
         if let Some(error) = error {
             tracing::warn!(
-                target: "moye_ai",
+                target: "ngy_ai",
                 stage = "sse_failed",
                 error_kind = error_kind(error),
                 json_error_category = ?json_error.map(serde_json::Error::classify),
@@ -1553,7 +1553,7 @@ impl SseDiagnostics {
             );
         }
         tracing::debug!(
-            target: "moye_ai",
+            target: "ngy_ai",
             stage = "sse_finished",
             outcome,
             wire_bytes,

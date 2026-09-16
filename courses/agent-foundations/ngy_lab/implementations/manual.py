@@ -1,7 +1,7 @@
 """The reference agent loop written directly in Python."""
 
-from moye_lab.contracts import AgentOutcome, BudgetExceeded, Emit, Model, RunLimits, Tools
-from moye_lab.implementations.common import Session, parse_final
+from ngy_lab.contracts import AgentOutcome, BudgetExceeded, Emit, Model, RunLimits, Tools
+from ngy_lab.implementations.common import Session, parse_final
 
 
 def run(task: str, model: Model, tools: Tools, limits: RunLimits, emit: Emit) -> AgentOutcome:

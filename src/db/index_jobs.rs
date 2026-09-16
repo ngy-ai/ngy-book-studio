@@ -465,6 +465,28 @@ pub(crate) fn reset_terminal(
     .context("无法为新模型重新投递索引任务")
 }
 
+/// Resets one translation job for a per-block retry.
+///
+/// Unlike [`reset_terminal`], this also accepts `paused`: new translation jobs
+/// start paused (auto-run is off by default), and repairing a failed block before
+/// resuming the task is the normal case. A running job is still refused — the
+/// caller must pause it first rather than race the executor's own cursor writes.
+pub(crate) fn reset_for_translation_block_retry(
+    conn: &Connection,
+    job_id: &str,
+    cursor_json: &str,
+    updated_at: u64,
+) -> Result<usize> {
+    conn.execute(
+        "UPDATE index_jobs SET status = 'queued', pause_requested = 0,
+         cancel_requested = 0, cursor_json = ?2, error = NULL, updated_at = ?3,
+         started_at = NULL, finished_at = NULL
+         WHERE id = ?1 AND status IN ('succeeded', 'failed', 'cancelled', 'paused')",
+        params![job_id, cursor_json, updated_at as i64],
+    )
+    .context("无法为重试文本块重新投递翻译任务")
+}
+
 pub(crate) fn update_state(
     conn: &Connection,
     job_id: &str,

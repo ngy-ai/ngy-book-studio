@@ -10,9 +10,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from moye_lab import live, runner
-from moye_lab.live import LiveConfig
-from moye_lab.scenarios import get_scenario
+from ngy_lab import live, runner
+from ngy_lab.live import LiveConfig
+from ngy_lab.scenarios import get_scenario
 
 _DEFAULT_FINAL = object()
 

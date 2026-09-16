@@ -5,8 +5,8 @@ from typing import Any, TypedDict
 from langgraph.graph import END, START, StateGraph
 from langsmith import tracing_context
 
-from moye_lab.contracts import AgentOutcome, BudgetExceeded, Emit, Message, Model, RunLimits, Tools
-from moye_lab.implementations.common import Session, parse_final
+from ngy_lab.contracts import AgentOutcome, BudgetExceeded, Emit, Message, Model, RunLimits, Tools
+from ngy_lab.implementations.common import Session, parse_final
 
 
 class AgentState(TypedDict):

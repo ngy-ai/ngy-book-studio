@@ -289,10 +289,10 @@ reply = {"role": "assistant", "content": json.dumps(answer, ensure_ascii=False)}
 import json
 import time
 
-from moye_lab.contracts import RunLimits
-from moye_lab.implementations.common import initial_messages, parse_final
-from moye_lab.runtime import ObservedModel, ScriptedModel, ToolBroker
-from moye_lab.scenarios import get_scenario
+from ngy_lab.contracts import RunLimits
+from ngy_lab.implementations.common import initial_messages, parse_final
+from ngy_lab.runtime import ObservedModel, ScriptedModel, ToolBroker
+from ngy_lab.scenarios import get_scenario
 
 scenario = get_scenario("normal")
 limits = RunLimits()
@@ -338,7 +338,7 @@ uv run --locked python workspaces/observe.py
 不是独立实现证据：
 
 ```powershell
-uv run --locked python -m moye_lab run --implementation manual --scenario normal
+uv run --locked python -m ngy_lab run --implementation manual --scenario normal
 ```
 
 上一节的列表与函数现在组成了真正的请求反馈循环。[第三步](03-build-manual.md)

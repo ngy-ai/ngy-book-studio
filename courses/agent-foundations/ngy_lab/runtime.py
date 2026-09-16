@@ -8,8 +8,8 @@ import json
 import time
 from typing import Any
 
-from moye_lab.contracts import BudgetExceeded, Message, Model, ProtocolError, RunLimits
-from moye_lab.scenarios import Scenario
+from ngy_lab.contracts import BudgetExceeded, Message, Model, ProtocolError, RunLimits
+from ngy_lab.scenarios import Scenario
 
 TOOL_SCHEMAS = [
     {

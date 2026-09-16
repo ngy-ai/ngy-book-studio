@@ -15,7 +15,7 @@ sys.path.append(str(APP_ROOT.parent / "runtime" / "Lib" / "site-packages"))
 
 from desktop_compat import install_deferred_overlapped  # noqa: E402
 
-from moye_lab.contracts import (  # noqa: E402
+from ngy_lab.contracts import (  # noqa: E402
     AgentOutcome,
     BudgetExceeded,
     LabError,
@@ -100,7 +100,7 @@ def main():
     sys.stdout, sys.stderr = Console("stdout"), Console("stderr")
     try:
         install_deferred_overlapped()
-        name = "moye_isolated_submission"
+        name = "ngy_isolated_submission"
         spec = importlib.util.spec_from_file_location(name, APP_ROOT / "submission.py")
         module = importlib.util.module_from_spec(spec)
         sys.modules[name] = module

@@ -34,8 +34,54 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
 
 ## 代码地图
 
-- `src/main.rs`：日志、数据目录、WebView2 探测、`AppServices`/GPUI 初始化和图书库
-  主窗口。
+- `src/main.rs`：WebView2 探测、启动顺序与 GPUI 主窗口。数据目录不再用默认位置后，
+  启动分成两段：`startup::plan_launch` 只判断能不能直接用记住的目录，需要用户确认时开
+  设置窗口（`src/ui/data_dir_setup.rs`）；窗口确认后才完成待办搬迁、装日志、打开
+  `AppServices`、开主窗口。顺序不能反：搬迁必须排在日志与图书库之前，否则旧目录已经被
+  日志文件或数据库打开，整体重命名会失败。这些都在 `cx.background_executor()` 上跑：
+  数据目录可能在网络盘上，GPUI 回调里阻塞会直接卡住界面。打开图书库/主窗口失败时清除
+  记录并把原因显示回设置窗口（没有设置窗口就先开一个），不把坏目录留在配置里让每次启动
+  都停在同一条错误上；搬迁失败则**保留**配置（`StartupFailure::forget_config` 为 false），
+  下次启动继续重试，原因同时写进 stderr（那时文件日志还没装）。日志写不进去只降级为
+  控制台并把原因写进 stderr —— 此时文件日志还没装，弹原生对话框会撞上 GPUI 的 `App`
+  借用。
+- `src/startup.rs`：数据目录的解析与引导配置。数据目录不再固定用 `ProjectDirs` 的
+  默认位置：首次启动（或上次选择已失效）时由用户在设置窗口确认，选择写进**图书库之外**的
+  `bootstrap.json`（`%APPDATA%\ngy\ngy_book_studio\config\`），下次启动直接使用。
+  `settings` 表在图书库里，所以它不能用来记录图书库的位置。本模块不碰界面：
+  `plan_launch` 返回 `Ready` 或 `NeedsSetup { reason, suggestion }`，`suggestion` 就是
+  设置窗口输入框的初值（首次运行是推荐路径，上次目录失效时是上次的选择）；用户点确认后
+  才由 `apply_data_dir` 校验并落盘。目录在写入配置之前必须通过 `ensure_data_dir_usable`
+  （建目录 + 写删探针），避免把只读目录记下来让每次启动都停在同一条错误上；配置读不出来
+  按“重新询问”处理并说明原因，不静默回落默认目录。`normalize_input_path` 把输入框文本
+  整理成路径（去首尾空白与成对引号）。
+  `NGY_DATA_DIR` 只在 debug 构建生效、优先级最高且不写配置，用于测试与隔离环境。
+  `shell_dialog_directory` 是 native-dialog 唯一需要的 `\\?\` 前缀转换点（设置窗口的
+  「浏览…」与学习中心恢复对话框都走它）。**对话框初始位置必须是存在的目录**：Windows 上
+  native-dialog 传给 `wfd`，`SHCreateItemFromParsingName` 解析不存在的路径会失败并让整个
+  对话框打不开（首次启动时推荐路径恰恰还没建出来），所以位置一律经 `dialog_start_directory`
+  取存在的目录 —— 输入路径不存在就沿父目录上溯，一个都取不到就不设置位置。
+  更改数据目录走 `apply_data_dir_change`：只写配置并记下待搬迁的旧目录（`move_from` /
+  `move_overwrite`），搬迁由重启后的新进程在打开图书库**之前**用 `complete_pending_move`
+  完成 —— 当前进程占着旧目录里的库和日志，运行中搬不动。搬迁语义是「新目录成为旧目录的
+  完整副本、旧目录清空」：同卷先删掉空的目标目录再 `rename`，跨卷复制成功后才删源目录
+  （删源失败只记警告，数据两份都在）。目标非空即报错 —— 合并两个书库没有明确定义；目标
+  已有 `library.db` 时只在用户确认过覆盖（`move_overwrite`）后先删掉它自己的库文件 ——
+  清掉之后仍非空一样报错。搬迁失败**不清配置**：
+  `move_from` 就是下次重试的线索，用户换成别的空目录也照样保留。`complete_pending_move`
+  只在本次启动真正要用配置里那个目录时才搬，`NGY_DATA_DIR` 覆盖的隔离环境不会把真实
+  书库搬走。
+- `src/ui/data_dir_setup.rs`：数据目录设置窗口。输入框预填推荐路径或上次的选择，可直接
+  编辑、可用「浏览…」调系统目录选择器；点「确认并启动」或回车后才校验目录并写配置，
+  校验（`startup::apply_data_dir`）在后台执行器上做。目录不可用、图书库打不开都把原因
+  显示在同一个窗口里让用户改路径重试（`report_failure`），启动期间不接受第二次提交也不
+  响应关窗；确认成功才交回 `src/main.rs` 打开主窗口，然后关掉自己。它不写真实
+  `bootstrap.json` 的路径由调用方注入，因此可测。
+- `src/logging.rs`：日志落盘。`tracing` 输出同时写控制台和数据目录下的
+  `logs/ngy-book-studio.<YYYY-MM-DD>.log`，按 UTC 日期滚动、启动时清理超过 7 天的
+  同类文件（只认自己的前缀 + 合法日期，其它文件不动）。日志目录不是独立选项：它固定
+  是 `<数据目录>/logs/`。日志文件建不出来不是启动失败，降级为只写控制台并由 `main.rs`
+  提示；写入失败不 panic（GPUI 回调不可 unwind），只报一次 stderr 后继续丢文件副本。
 - `src/services.rs`、`src/runtime.rs`：进程级服务组合与独立 Tokio runtime；统一持有
   图书库、对象存储、格式注册表、搜索、AI、Office 和后台任务。GPUI 回调跑在自己的
   executor 上，不是 Tokio 上下文：UI 可达的服务方法必须把数据库、对象存储、`tokio::fs`
@@ -77,6 +123,34 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   `BlockDocument`、`TocNode` 和 `DocumentLocator`。
 - `src/formats/`：`DocumentImporter` 注册表及 EPUB、PDF、Office、Kindle、KFX、DjVu
   适配器；`office_oxide`、`ebook-rs`、`djvu-rs` 等第三方类型必须在本目录内转换为统一模型。
+  `kindle.rs`：`ebook-rs` 只认 PalmDOC（压缩 1/2），因此 HUFF/CDIC（压缩 17480，
+  `kindlegen -c2` 与多数 Amazon KF8 文件使用）由 `kindle_huff.rs` 自行解码后重写为
+  未压缩容器再交给解析器。重写必须保持记录索引不变——正文按头部已声明的
+  `text_record_count` 个槽位分片，其后所有记录原样复制，`first_image_index` 与
+  `recindex=` 重写才继续成立；解码前必须先按 `extra_record_flags` 剥掉记录尾部的
+  数据区，否则填充位会被解码成杂散符号；拼接后按 PalmDOC 的 `text_length` 截断，
+  末条记录的位填充差异只体现在该处。HUFF/CDIC 只改正文压缩方式，仍保留字节一致的
+  原件，加密（`encryption != 0`）与 DRM 一样继续拒绝。
+  **`extra_record_flags` 非零时正文记录尾部带数据区，PalmDOC 路径同样必须先剥。**
+  `ebook-rs` 把 `text_record_count` 条记录原样拼接后才试 UTF-8，失败就整段回退
+  WINDOWS-1252；尾部数据区正好让这一段不是合法 UTF-8，于是中文按 CP1252 逐字节
+  解码，阅读页显示 `ä½œè€…ç®€ä»‹` 而不是 `作者简介`（英文书 ASCII 两种编码相同，
+  所以只有 CJK 书暴露）。区域在压缩流之外：位 15..1 是区域，大小写在区域末尾的
+  大端 varint，位 0 的多字节重叠字节最后剥；剥掉后记录保持原压缩方式，解码仍交给
+  `ebook-rs`。两条路径的容器重组都走 `repack_palm_db()`，不要各写一份偏移重算。
+  `ebook-rs` 对 PalmDB 既不给资源清单也不给封面（`MobiBook::parse` 的 `opf.manifest`
+  恒空、`cover_href` 恒 None），`kindle:embed:` 因此没有可解析的资源，共享的重写遍历
+  会把整条 `src` 删掉——资源必须由本模块自己扫记录表：MOBI 头 `0x6C` 是第一个资源
+  记录，从它起的每条记录（无论是不是图片）都占一个号，`kindle:embed:<base32>` 与
+  MOBI `recindex` 指的都是这个从 1 起算的号，封面号是 EXTH 201 相对同一起点的偏移。
+  `kindle:embed:` 的编号是 base32，而 `ebook-rs` 只替换它按十进制补零恰好命中的那几条
+  （`0001`..`0009`），其余原样留下，两种写法都要映射回同一个号。它同样不读 MOBI 目录：
+  切分只认 `<h1>`/`<h2>`/`<h3>` 并给每段贴上 `Section <n>`，转换过的书会被切成几百段，
+  因此章节改为按“带文字的一级标题”分组，标题取该 `<h1>` 的文本；KF8 的样式表存放在
+  flow 记录里，会以不带标签的裸 CSS 落在正文末尾，必须在进模型前清掉。章节标题取可见
+  文本时要解命名实体，而那个扫描窗口必须按字符边界收口（`entity_scan_window`）：
+  `str::len()` 是字节数，中文标题里一个没写成实体的 `&`（`Tom & Jerry 汤姆和杰瑞历险记续篇`）
+  会让第 34 字节落进三字节字符内部，`&value[..len.min(34)]` 直接 panic 掉整次导入。
   `kfx.rs`：`ebook-rs::KfxBook` 是启发式文字抽取而非完整 KFX/Ion 解析（`resources` 恒空、
   metadata 有占位默认值），因此只保留原件 + 抽取正文，导入前必须过 `validate_kfx_text`
   三项守卫（可见字符下限、无法解码字符比例、成词比例），解析不出正文一律拒绝，
@@ -85,6 +159,19 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   （其余跳过但保留可解析子项）；导入阶段不产出页面图片。
 - `src/markup.rs`、`src/editing.rs`、`src/export.rs`：HTML 解析清洗、事务式
   模型编辑，以及原件/EPUB/PDF 稳定导出。
+  **XHTML 只能出现 XML 能自行解析的字符引用。** 阅读器把章节按
+  `application/xhtml+xml` 交给 WebView，除 `&amp;` `&lt;` `&gt;` `&quot;` `&apos;`
+  和数值引用外，任何命名实体都会让 WebView2 用 "Entity 'nbsp' not defined" 的
+  解析错误页替换整章。所有 HTML 序列化器都会踩这一点：ammonia/html5ever 把 U+00A0
+  写成 `&nbsp;`（`sanitize_html`、导出的 `sanitize_raw_html`），面向 HTML 解析器
+  编写的 EPUB 又常用 `&mdash;`、`&ldquo;`。因此凡是要嵌入 XHTML 的片段都必须过
+  `markup::xml_safe_entities()`：它按 html5ever 的实体表把这类引用改写成数值引用
+  （U+00A0 的引用在多码点实体处也逐码点展开），文字内容不变，找不到的引用名原样保留。
+  `markup::serialize_xhtml()` 走 `write_xhtml_value` 已满足该约定（编辑器用它）；
+  `export.rs::render_epub_unit()` 在拼好整章正文后统一改写一次，因为 `render_blocks`/
+  `render_inlines` 的 `RawHtml` 分支直接落 ammonia 输出。`reader::load_resource_with_range()`
+  在服务边界再做一次，覆盖未经过我们导出器的第三方 EPUB 章节。新增 XHTML 组装点必须
+  走同一层，不要各自再写一份转义。
 - `src/storage.rs`、`src/media.rs`：应用自有 `BlobStore`、基于 `object_store` 的本地
   BLAKE3 内容寻址实现，以及带图书归属校验和 Range 支持的媒体响应。
 - `src/library.rs`：SQLite 与对象存储之上的图书库业务编排、导入/创建/保存/删除、
@@ -109,10 +196,13 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   `MAX_BACKGROUND_JOB_CONCURRENCY` 个 worker，只有序号小于当前并发的 worker 扫描队列，
   每个任务提交后按配置间隔休眠；两者由 AI 设置“后台任务”经
   `IndexingCoordinator::configure_scheduling` 实时发布，写坏的值按范围钳制。
+  同一个「任务并发」既是任务上限，也是**单个整本翻译的块窗口上限**：一轮里最多同时开
+  `concurrency` 个文本块请求（`walk_translation_blocks` 的窗口，每轮重读设置，所以运行中
+  调大只让 walk 走得更前、不打断任何在飞请求），因此一本翻译自己也会出现多个「处理中」。
   `indexing.rs` 另实现整本图书翻译任务
-  `kind="translation"`：任务标识为 `translation:<source_id>:<target_language>`，游标复用
-  `next_ordinal` 作为文本块序号，逐块调用对话模型 `chat_stream` 写入 `translations` 表，
-  可暂停/恢复/重试/取消；文本块按 `content_units.block_json` 的 `BlockDocument` 确定性
+  `kind="translation"`：任务标识为 `translation:<source_id>:<target_language>`，游标用
+  `next_ordinal` 记录「第一块尚未提交的文本块」，并按序调用对话模型 `chat_stream` 写入
+  `translations` 表，可暂停/恢复/重试/取消；文本块按 `content_units.block_json` 的 `BlockDocument` 确定性
   提取（段落、标题、引用、列表项、表格单元格；代码保持原样），以
   `(document_revision, unit_revision, target_language, 对话模型)` 判定失效并重译。目标语言
   或对话模型变化由 `AppServices::configure_translations` 经
@@ -144,22 +234,97 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   只能猜模型意图，必须继续拒绝并保留原始终止行列。格式说明必须显式要求结构字符用半角
   ASCII、全角标点只能出现在 `text` 值里，纠正提示按固定失败分类复述要修的部分。
   分段协议校验失败时使用冻结的原始输入和服务额外纠正一次，不回传模型的错误输出，
-  不把纯文本猜分段，也不重试 HTTP、流中断或输出上限错误。重试前后检查任务控制与身份，
-  失败沿用本执行游标，不能读取新任务游标后将新任务标为失败。纠正在两次请求后仍失败的
-  文本块保留原文并继续翻译其余块：按块记 `ProtocolSkipped` 警告（块序号、总数、固定分类），
-  并像缓存命中一样持久推进游标（执行器要求内存游标与持久游标始终一致）。只有在同一轮里
-  连续 `MAX_CONSECUTIVE_TRANSLATION_SKIPS` 个块失败，或整本图书的每个块都没能翻译成功时，
-  任务才判失败：判失败前先把持久游标回滚到本轮第一个未翻译块之前，使重试仍会重新尝试
-  这些块。诊断使用 `moye_ai`、
+  不把纯文本猜分段，也不为 HTTP、流中断这类 provider 失败做协议纠正。重试前后检查任务
+  控制与身份，失败沿用本执行游标，不能读取新任务游标后将新任务标为失败。
+  **块级重发（2026-09-15 起，`TRANSLATION_BLOCK_RETRIES = 5`）**：一个文本块的一轮失败后，
+  整块按同一份冻结输入重发，最多 5 次，所以一个块最多 6 轮（一轮 = 两次严格尝试 + 一次协议
+  纠正）。重发轮的第一发带着上一轮的失败分类，因此重发不是逐字相同的请求；每轮开始时先在
+  同一把 `transitions` 门闩内复查控制请求与来源版本。**只有协议类失败（`ResponseError`）才
+  重发**：provider、数据库与取消错误立即上抛让整次运行失败，重发同一个请求解决不了它们。
+  失败分类跨轮累积（`rejected_kinds` 属于整块而不是某一轮），否则轮 1 的
+  `segment_count_mismatch` 会被后面轮次的 `incomplete_json` 顶掉，最后一轮就不肯走逐片段
+  回退。逐片段回退只留给最后一轮：它是整块的最后手段，前面几轮只做严格尝试与纠正，免得一个
+  多片段块把请求预算耗在重复的逐片段请求上。注意 `TRANSLATION_TEMPERATURE` 恒为 0，同一份
+  请求重发在确定性模型上会拿到逐字相同的答案（现场：块 3579/3620 在两次运行里的响应字节数
+  完全相同），重发真正救回的是截断与采样抖动这类非确定性失败；要救「确定性不合格」的块，
+  只能靠失败分类不同的重发提示，而不是重发次数。
+  纠正在两次请求后仍失败的文本块保留原文并继续翻译其余块：按块记 `ProtocolSkipped` 警告（块序号、总数、固定分类），
+  并像缓存命中一样持久推进游标（执行器要求内存游标与持久游标始终一致）。**没有连续跳过上限，
+  也没有「整本图书没有任何有效译文」的中止条件**：跳过多少块都要一直走到书末，运行一律按
+  `RunOutcome::Succeeded` 收尾，游标永不回滚（2026-09-15 起按用户要求「失败了就跳过，直到整本
+  书的文本块都运行完」；原 `MAX_CONSECUTIVE_TRANSLATION_SKIPS` 常量与
+  `publish_untranslated_failure` 回滚入口已删除）。跳过因此不再有运行级表现：只有 provider、
+  数据库与取消失败才让整次运行失败，「这批块没译出来」只存在于文本块明细里。
+  **块级并行（2026-09-15 起）**：一次整本翻译按「任务并发」同时打开多个文本块请求，窗口用
+  `JobCursor.inflight`（升序块号）记录，只有整本翻译会填它，其它任务恒空。三条规则必须同时
+  成立：① 提交严格按 ordinal 顺序（`resolved: BTreeMap` 只在 `next_ordinal` 处出队，
+  `TranslationRun::commit` 先 `next_ordinal = ordinal + 1` 再 `close_inflight`），因此
+  `next_ordinal` 永不越过还在等的块，被中断的运行只会重做、绝不会把没翻完的块当成已完成；
+  ② 控制检查与游标写入必须在同一个 `transitions` 门闩内（否则一次按块重试重置出来的新游标
+  会被这一轮的旧游标覆盖），但等 provider 响应时绝不持锁；③ 暂停/取消/换版本/被替换一律先
+  `settle()` 清空窗口并落盘，再按**清空后的**游标发布结果 —— 发布里的 JSON 必须与库里那份
+  逐字相同，否则 `finalize_running_from_cursor` 匹配不上，任务卡在「处理中」；`Abandoned`
+  一个字节都不写。块请求不借用游标：它拿到的是 `TranslationBlockScope`（块号、revision、
+  运行最后持久化的 JSON），每次控制轮询拿它与库里那一行比对，所以窗口前进不会被误判成
+  「这一行已经不属于我」。
+  被跳过的块靠明细里的两条重试路径修复，都必须复用同一个 worker 与同一套跳过规则：页顶
+  「重新翻译」前的「重试失败块（N）」重跑本次全部未翻译块，块行内「重试」只重跑该块
+  （`retry_translation_blocks(job, vec![ordinal])`，**不得顺带重发其它失败块**）。实现方式是把
+  目标序号写进游标 `retry_ordinals` 并把 `next_ordinal` 退回最小的目标序号，让 worker 只走这一段：
+  非目标块照常推进游标但不发请求。请求里已经有译文的块会被过滤掉，所以重试不会覆盖已有译文或
+  人工修订；从 `paused` 起始的翻译任务也要能重试（新任务默认暂停），这条走独立的
+  `reset_for_translation_block_retry`，不得放宽通用的 `reset_terminal`（视觉替换依赖它拒绝
+  活跃任务）。
+  「截断不额外纠正」不等于「让整次运行失败」：`finish_reason=length` 的截断必须按固定
+  分类 `response_truncated` 返回，才能落进上面这条按块跳过、推进游标的规则。它没有运行级
+  含义，同一种请求换个请求形状只会再截断一次，因此既不额外纠正也不做逐片段回退；返回成不
+  透明的错误则会让整本书永远停在同一个退化文本块上——现场 2026-09-15，block 1762
+  （`qwen3.5:0.8b`，3 个片段）：两次运行都在 4096 个输出 token 处截断，响应各 4425 字节、
+  一个完整容器都没有，任务只有 attempts 在涨、`next_ordinal` 不动。块级重发对截断同样生效
+  （每轮一发、每次都在同一个上限处停下），用尽重试后才按块跳过。
+  整块重发的**最后一轮**里、两次严格尝试都用完时，**多片段文本块**再走一次逐片段回退
+  （`SegmentFallback`）：每个文字叶
+  单独一次请求，`source` 与 `segments` 都只含该片段本身，因此模型没有可越界翻译的内容，校验
+  仍是同一套严格解码（单片段只要一个 `id=0` 的答案）。现场（2026-09-13，block 79/80/81，
+  `qwen3.5:0.8b`）是弱模型把整段译文合并进 `id=0`，两次尝试后仍判 `segment_count_mismatch`，
+  连续三块（当时连续跳过上限是 3，会结束整次运行；该上限已于 2026-09-15 取消，现在只会继续
+  往下走）；主路径仍必须先是「冻结输入 + 一次纠正」那两次请求，回退只允许发生
+  在这一步之后。回退只针对「模型答了、但片段不完整」的固定分类（`segment_count_mismatch`、
+  `missing_segment_id`、`unknown_segment_id`、`duplicate_segment_id`、`empty_segment_text`、
+  `invalid_segment_text`、`positional_segments`）：JSON 层面的失败说明模型没写出答案，换请求
+  形状无用；片段数超过 `MAX_TRANSLATION_FRAGMENT_FALLBACKS` 的块也不回退，直接沿用跳过规则。
+  **判定读整块的失败分类（跨重发轮累积），不是只读最后一次。** 纠正提示与块级重发都会改变
+  模型写出的错误形状：现场
+  2026-09-15（block 1786/1787，`qwen3.5:0.8b`）attempt 1 把 3 个片段合并进 `id=0`
+  （`segment_count_mismatch`），纠正之后模型开始按段写、但 JSON 没闭合（`containers=0
+  open_container=true segment_markers=3`，恰好等于期望段数），最后一次的分类因此变成
+  `invalid_json` / `incomplete_json`。两次说的是同一个能力上限（写不完多段 JSON），而逐片段
+  请求正是它能满足的形状；只看最后一次会把这两块白白跳过，连着 1785 一起被跳过（当时还会
+  凑够连续三块、结束整次运行：`translation_run_finish result="failed" next_ordinal=1785`）。
+  `positional_segments`
+  是 `require_segment_objects` 单独报出的类别：模型按段答了、段数往往也对，只是把
+  `{"id","text"}` 写成了 serde 可接受的位置序列（`{"translations":[[0,"译文"]]}`，现场
+  block 1785，4 个片段写出 5/4 个标记）；它与真正结构无效的 `invalid_schema` 分开，
+  任务日志仍沿用 `InvalidSchema` 分类。结果按原顺序拼成一条
+  `StoredTranslation`（边界空白由 `parse_response` 从片段自身恢复，缓存键仍按整块原文计算）；
+  任意一个片段仍不通过就整块跳过，绝不保存部分译文，provider/数据库/取消失败仍让整次运行失败。
+  诊断使用 `ngy_ai`、
   `translation_run_id`、块序号、尝试次数、固定错误分类、JSON 行列/数量、响应字节数与
   流块分类计数（`content_events`、`empty_content_events`、`unrecognized_events`），
   不记录原文、译文、任意字段名或解析器错误正文。空 `content` 块与“本客户端不消费的块”
   必须分开计数：否则“120 秒超时、2886 个事件、0 字节正文”会被读成健康但缓慢的回答。
+  逐块形状读数同样只含数字与固定标签：`translation_source_resolved`（提取走 `epub` 还是
+  `canonical_html`、修订、对象字节数、是否校验原件章节路径）、`translation_blocks_extraction_start`
+  与 `translation_blocks_extracted`（单元数、spine、多片段块与单元数）、`translation_block_start`
+  的 `segment_chars`、每次尝试的 `system_bytes`/`user_bytes`/`expected_ids`、解码后的
+  `translation_response_decoded`（`decoded_segments`/`decoded_ids`/`merged_into_one`）、逐片段
+  回退的 `translation_fragment_*` 与收尾的 `translation_run_stats`（saved/cached/untranslated/
+  回退次数）——它们是把「模型少写片段」和「模型没写出答案」分开的唯一依据，不得在其中打印原文。
   翻译流不再按总时长掐断：每 10 秒输出一条 `translation_stream_progress`（已用时、距上次
   事件的静默、正文块数/字节数、完整 JSON 容器数、未闭合容器、片段标记数、思考块状态、
   答案重复标记），流结束时把同一组形状计数写进 `translation_stream`，失败时另存
   `translation_response_salvaged`。这些计数只说明“模型没写出答案 / 思考没结束 / 答案重复
-  输出 / 容器被打断”，不含任何正文；`MOYE_DUMP_TRANSLATION_RAW` 仍是唯一会打印响应与
+  输出 / 容器被打断”，不含任何正文；`NGY_DUMP_TRANSLATION_RAW` 仍是唯一会打印响应与
   冻结输入的开关，并且现在也覆盖流失败。流没有正常结束（含 `ProviderTimeout` 静默超时）
   但已收到的字节能通过完整分段校验（只有一个完整容器、id 不多不少）时采用该答案并记警告；
   两个答案、缺片段、容器被截断或校验失败一律不猜、按原样失败，此时 provider 失败仍让
@@ -174,6 +339,19 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   `&&`/`||`/`+=`/`-=`/`*=`/`/=`/`</`/`/>` 之一即判为代码。裸 `=` 与全角 `；`/`：` 不算信号，
   行内 `<code>`（正文提到代码）不影响该段翻译；两侧规则不一致会让代码块吃掉后续同文本
   正文块的译文。判断只看非代码叶子的行（`<br>` 记为换行，匹配文本不变）。
+  三组信号是 2026-09-15 补上的（现场《RUST AND SCALA FOR BEGINNERS》azw3，块 3579/3580/
+  3588/3620/3623）：行内含字符串拼接（`+"`、`"+`，含空格形式）或调用/下标里的引号
+  （`("`、`")`、`('`、`')`）、含转义序列（`\n`、`\t`、`\"`、`\\` …）、以语句关键字
+  （`def`/`fn`/`let`/`const`/`struct`/`return`/`println`/`printf`/`console`/`system` 等 25 个）
+  开头且同一行还出现 `(`/`=`/`{`/`[`、出现无空格的类型注解（`a:Int`、`):Int`）。这些块此前
+  逃过判定后，模型要在 JSON 里转义 `"\n"` 这类字面量，两次尝试加逐片段回退仍判
+  `segment_count_mismatch`/`incomplete_json`/`empty_segment_text` 而被跳过。**孤立的引号
+  永远不算信号**：散文把引用写成 `He said "hello" to me.`，只看引号会把每段带引文的正文都
+  留在原文；关键字同样必须与同一行的代码形状一起出现（英文句子也会以 `let`/`use` 开头）。
+  代价是含代码字段名的散文段会被一起跳过（实测这本书 2961 个散文块里 3 个），保留原文
+  比送进模型更安全。**改动这套规则必须把 `indexing::TRANSLATION_BLOCKS_VERSION` 加一**：
+  块数会变，旧游标的序号不再指向同一块，`JobCursor::from_job` 见到版本不符就把翻译任务
+  退回书首重扫（已存译文仍按缓存键命中，重扫不花请求）。
   文本叶节点必须去掉 ECMAScript `\s`
   和 Unicode `Cf` 格式字符后仍有可见字符，才能成为翻译槽：EPUB 常用 ZWSP 缩进代码行，
   ZWSP 不属于 `\s`，送进协议后模型只会回空白，`empty_segment_text` 会拒绝该文本块
@@ -213,13 +391,13 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   的手工行和没有手工译文的行一样被删掉，不会留下再也显示不出来的孤儿行。
 - `src/preview.rs`、`src/windows_pdf_renderer.rs`、`src/djvu_renderer.rs`：`VisualRenderer`、
   结构化页面 PNG 光栅化、Windows PDF 原页光栅化与纯 Rust DjVu 逐页光栅化、
-  可暂停/恢复/重试/取消的持久任务和本地 PDF.js 资产路由。DjVu 渲染器（`moye-djvu-png`）
+  可暂停/恢复/重试/取消的持久任务和本地 PDF.js 资产路由。DjVu 渲染器（`ngy-djvu-png`）
   不加 `cfg(windows)`，页与内容单元严格 1:1（`content_unit_id` + `SourceLocator::DjvuPage`），
   必须在 `db::transactions::{renderer_for_source, visual_job_spec}` 里按 `format == "djvu"`
   选中；新增 renderer 时这三处（注册、恢复选择、任务构造）必须同时更新，否则导入时
   创建的 `visual-render:{source_id}` 任务会退回结构化 SVG 渲染。
   渲染器选择失败/未注册会在恢复期报「找不到当前来源所需的 renderer」，不要用
-  `moye-structural-png` 兜底掩盖 DjVu 页面缺失。
+  `ngy-structural-png` 兜底掩盖 DjVu 页面缺失。
 - `src/ai.rs`、`src/credentials.rs`：OpenAI-compatible models/chat streaming/embeddings
   接口、端点策略和 Windows Credential Manager 密钥存储。
   端点配置的“请求超时”不再作为 reqwest 的整段请求超时：`Client` 只保留 10 秒连接超时，
@@ -260,6 +438,41 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   隔离，每任务 500 行、全库 50000 行、文件页数限制约 64 MiB。记录不依赖窗口打开，
   日志失败不得改变任务结果；不接受任意正文、URL 或错误字符串，不逐 token 记录。
   日志读取经服务重新核验当前任务归属，时间明确为 UTC，保留清理与无历史记录须可见。
+  翻译任务的「文本块明细」不止由持久游标推导：`BlockInspector` 的已处理/待处理来自
+  游标（`completed` 就是 `next_ordinal`），「处理中」来自游标 JSON 里的 `inflight` 窗口集合
+  —— 整本翻译会同时开多块，单看游标说不出在跑哪几块；旧格式游标、写坏的 JSON、非运行态一律
+  当作「没有在飞的块」，不得凭空把游标那一块显示成处理中。失败块必须来自该任务最新一次执行的
+  `ProtocolSkipped` 与带 ordinal 的 `StepFailed`
+  事件（回滚式失败只把游标退回第一个未翻译块，命名不了整批失败块）。失败块从游标给的状态
+  里移出，四个计数必须恒等于块总数；筛选、跳到当前进度、复制都要按同一个视图计算。
+  任务失败时明细页顶部必须给出持久化的失败原因与本次未翻译的块编号，`RunFailed` 也要带
+  `error_kind`，否则头部失败行只剩位置。  `JobLogErrorKind::label()` 是闭合表的固定中文说明，
+  只能用于呈现，不得改写成错误正文。
+  文本块明细每行的“查看”按钮打开只读调试面板（`TranslationBlockDetail`）：它**不读**任何
+  持久化的请求副本——请求 body、系统提示与用户消息从不入库（见 `job_diagnostics.rs` 的闭合
+  事件约定），面板按被钉住的修订**重新解析文本块并按需重建** `translation_request`。
+  因此 worker（`translate_block`）与检查器必须共用同一个 `translation_prompt()`，不得各写
+  一份；`translation_request` 的温度固定为 `TRANSLATION_TEMPERATURE = 0.0`，两边一起生效。
+  模型名取任务的持久游标（任务执行过就以它钉住的模型为准），只有从未执行的任务才回落到
+  AI 设置的 `models.translation.model`（可能为空）。读取路径与列表同为**只读**：不认领、
+  不推进、不发布任务，也不写 `translations`；单块读取复用 `load_translation_blocks` 后按
+  `ordinal` 线性查找，代价与列表同量级，可由用户点击触发。面板必须给正文硬高度上限并套
+  内层滚动容器——GPUI 无法光栅化超出纹理上限的自然高度长文本。
+  **失败块的「模型响应」页是整个窗口里唯一会真的发模型请求的地方**
+  （`Indexing::probe_translation_block_response` → `TranslationBlockProbe`，服务层
+  `background_job_translation_block_response`）。它存在的理由正是上面那条约定：诊断日志
+  只保存固定分类，想知道模型到底答了什么就只能拿同一份冻结输入再问一次。硬约束：
+  (1) 只能由用户点「重新请求一次」触发，**不得放进轮询、也不得在打开面板时自动发**，请求
+  进行中按钮必须禁用；(2) 除这一次外部请求外仍然只读——不推进游标、不写 `translations`、
+  不记 `JobLogEvent`，`MockMergeProvider` 用例同时断言这三条；(3) 响应**不落库、不落日志**，
+  只回给窗口，与请求 body 同一待遇；(4) 用**配置的**翻译模型和 provider（即旁边「重试」
+  按钮会用的那个），不是任务游标钉住的模型名——查看入口回答的是「现在的模型会答什么」；
+  (5) 判定必须复用 worker 自己的 `translation::parse_response`（连同 `execution_identity`），
+  不得另写一套解码规则，否则窗口说的分类会和日志里的分类不一致；(6) 收集流必须宽容
+  （`collect_probe_response`）：截断、围栏、散文一律带原文返回并写明结束原因，只有
+  provider/传输失败才报错，因为那时根本没有答案可显示。取消/关闭面板丢弃回答由
+  `BlockDetailState::generation` 门控，与详情加载同一把守卫。
+  「模型响应」只对失败块出现（`block_detail_tabs(failed)`）：译好的块没有重问的必要。
   `src/ui/background_jobs/layout_tests.rs` 以 56 个任务、500 条日志和长详情验证
   900×640 / 1180×820 下的真实 GPUI 布局、鼠标分页和滚动归零。外层横排使用
   `flex().flex_row()` 的默认 stretch；`h_flex()` 会注入 `items_center()`，不能用于
@@ -293,7 +506,8 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   单调门控 `evaluate_script` 注入；打开新章后的迟到完成不得覆盖当前章。译文逐块写入，
   一章不必等整本任务结束：窗口按 2 秒轮询本书未完成翻译任务的游标 `completed`，前进时
   重新读取当前单元，并按（单元、显示方式、译文载荷）指纹跳过未变化的推送，任务结束再
-  补一次读取；轮询查询必须走应用 I/O runtime，不得阻塞 GPUI 回调。
+  补一次读取；块级并行下 `completed` 仍按序逐块前进，只是可能一次跳好几块（在飞的块
+  全部提交后一次到位），跳变是正常的。轮询查询必须走应用 I/O runtime，不得阻塞 GPUI 回调。
   显示方式有“双语 / 原文 / 译文”三种。系统配置的 `translation.preferences.v1`
   （`bilingual`/`original-only`/`translation-only`，默认 `translation-only`）只是全局默认；
   阅读窗口工具栏的三态切换写入本书自己的 settings 行
@@ -305,15 +519,24 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   `ReaderTranslations::effective` 为准，`apply_translation_display_mode` 负责重算并重新推送。
   原文模式不查询译文表：推送空 `blocks` 让前端 `clear()` 撤掉已有译文层并恢复被隐藏的
   原文（列表包装也要还原），也不再轮询任务游标；指纹包含模式标签，因此同一批译文在
-  模式之间切换仍会重写页面。前端按
+  模式之间切换仍会重写页面。  前端按
   “规范化原文文本（重复文本按文档顺序消歧）”匹配正文块级元素，译文块一律标记
-  `data-moye-translation` 并插入原文之前，默认「译文在上、虚线分隔、原文在下」，
-  点击译文切换该段的仅译文/双语；表格单元格把译文插到单元格内部且不参与切换。
+  `data-ngy-translation` 并插入原文之前，默认「译文在上、虚线分隔、原文在下」。
+  **译文文字本身不是控件**：单击、拖选译文都只做选择与复制，不再切换该段的显示；
+  「译文」模式下每段译文末尾有一个 `[data-ngy-translation-reveal]` 图标按钮
+  （`button` + 内联 SVG，1em、`opacity:0.45`、`aria-label`/`title` 在
+  「显示原文」与「收起原文」之间切换），点它展开/收起该段原文——它是该模式下回到
+  原文的唯一入口，因此只在 `translation-only` 模式且该块可折叠时才存在。图标带 SVG
+  且不含任何文字节点，`role` 只经属性表达：译文层的 `textContent` 必须仍等于它显示的
+  译文（图标加 `<title>` 或字形就会跟着选区被复制）。计数因此是「译文块数 - 表格
+  单元格 - 含媒体段落」；表格单元格把译文插到单元格内部且不参与切换（保持双语、没有
+  图标），含媒体段落同理（不能隐藏图片）。图标是 `<button>` 而 `MEDIA` 匹配按钮，
+  可折叠判定必须在插入任何 chrome 之前算出，否则会把自己排除掉。
   译文节点必须从 `annotations.js` 的 `textIndex()` 与选区文本中排除（跨译文选区按
   fragment 过滤译文后再取文本），原文文本节点始终保留在 `body`，使笔记 UTF-16 锚点、
   版本校验和重叠标记语义不受翻译影响。落在译文层内的选区**不能丢弃**：`currentSelection()`
   与 `READER_INITIALIZATION_SCRIPT` 的 `boundedSelection()` 都先调用
-  `moyeTranslations.originalRange(range)`（`translations.js` 拥有该映射：记录每个译文叶子
+  `ngyTranslations.originalRange(range)`（`translations.js` 拥有该映射：记录每个译文叶子
   由哪个原文叶子重建，取选区命中叶子中首个到最后一个原文叶子的跨度），拿不到映射才返回空。
   译文与原文没有逐字符对应，粒度因此是“叶子”：单叶段落等于整段，行内 `<strong>` 等只映射
   该叶子；`choose()` 对非 AI 解释动作改用当前选区，避免点击早于 80ms 防抖时用旧快照。
@@ -332,7 +555,7 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   URL 属性；逐项核验源文字叶节点，匹配失败保留原文。直接列表项保留 li 和编号，内部
   原文包装必须可在 clear 时恢复；含媒体段落保持双语，不能隐藏图片。HTML/XHTML 均须支持。
   手工修改单块译文（`TranslatedBlock::manual` + 每块 `key`）：页面在每个译文叶子旁提供
-  「编辑译文 / 保存 / 取消 / 恢复机器译文」（`data-moye-translation-controls`，默认 `opacity:0`
+  「编辑译文 / 保存 / 取消 / 恢复机器译文」（`data-ngy-translation-controls`，默认 `opacity:0`
   且 `pointer-events:none`，悬停或 `focusin` 时显现——用 `visibility:hidden` 会把按钮移出 Tab
   序列，键盘用户将无法进入编辑）。控制行自身放在该 host 的 shadow root
   （`attachShadow({mode:"open"})`）里：按钮文字是 chrome，留在译文层的 light DOM 里会跟着
@@ -349,12 +572,13 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   `set_manual_translation`：两处上限必须一致，页面与宿主都必须拒绝空译文，只有「恢复」允许
   空片段列表。
   `src/ui/reader/translations.test.cjs` 是可选 DOM 门禁（Node + 已安装 Playwright），
-  覆盖双语顺序、重复文本消歧、嵌套块、单元格插入、点击切换与笔记/选区排除，
+  覆盖双语顺序、重复文本消歧、嵌套块、单元格插入、译文末尾图标的展开/收起（含“单击译文
+  不再切换”）与笔记/选区排除，
   以及手工译文用例：编辑→保存的请求形状、失败后保留输入、重推延后到取消之后、空译文不发请求、
   编辑时选区仍解析回原文（HTML/XHTML）。
   2026-09-11 格式回归：11 项 HTML/XHTML DOM 用例通过；`tests/translation_flow.rs`
   通过本机 mock SSE 验证请求、严格回填、重启、缓存失效、切端点与重译。真实 Windows
-  独立 EPUB 的 14 块中文译文验证标题/强调/颜色/换行/列表/表格/上下标/代码和点击切换，
+  独立 EPUB 的 14 块中文译文验证标题/强调/颜色/换行/列表/表格/上下标/代码和段内切换，
   重启仍保留译文，取消/确认退出正常，两次错误日志为空；未连接真实模型或用户书库。
   2026-09-12 手工译文：`tests/translation_flow.rs` 新用例覆盖手工译文覆盖机器文本、重启与换
   端点后仍显示、恢复后回到机器文本且不新增模型请求，并拒绝改写原文/截断/超大/未知块/空译文；
@@ -401,13 +625,14 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   2026-09-12 真实模型门禁：`tests/translation_flow.rs` 的
   `a_local_model_replays_the_previously_rejected_blocks` 默认 `#[ignore]`，把现场日志里的三个
   文本块（含 inline 边界，片段切分逐字一致）交给本机模型复跑真实翻译任务，需要
-  127.0.0.1:11434 上的 Ollama（`MOYE_REPLAY_ENDPOINT` / `MOYE_REPLAY_MODEL` / `MOYE_REPLAY_LOG`
+  127.0.0.1:11434 上的 Ollama（`NGY_REPLAY_ENDPOINT` / `NGY_REPLAY_MODEL` / `NGY_REPLAY_LOG`
   可覆盖）。它断言持久化任务日志里不出现 `JobLogErrorKind::InvalidSchema`，并断言两个 2 段块
   必须落库；3 段的段落会被小模型合并成一段而按数量检查跳过，那是协议该做的拒绝、不得判成
   任务失败。对 `qwen3.5:0.8b` 的实测：全部拒绝都是 `segment_count_mismatch`
   （`expected_segments=2/3 actual_segments=1`），2 块落库、1 块跳过，
   `translation_run_untranslated` 而非 `run_failed`；修复前同一批块是 3/3 `invalid_schema`、
-  连续 3 块未译后整本任务失败。换模型后重跑该门禁即可复验，不要把它并入默认测试。
+  连续 3 块未译后整本任务失败（该中止条件已于 2026-09-15 取消）。换模型后重跑该门禁即可复验，
+  不要把它并入默认测试。
 - `src/ui/pdf_reader/annotations.rs`、`annotations.js`：PDF 页面笔记宿主与页面桥接，
   复用同一张 `annotations` 表、互斥标记规则、人工/AI 想法流程与展示清洗。锚点作用域
   是单页的 PDF.js 文字层：宿主无法复刻该投影，因此
@@ -425,9 +650,9 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   宿主 `current_page`、阅读进度与笔记面板不随滚动前进，该页也不会被回收卸载；保存或
   取消后再跟随真实阅读位置。可选 DOM 门禁 `node --test src/ui/pdf_reader/annotations.test.cjs`
   与 `node --test src/ui/pdf_reader/viewer.test.cjs` 使用已安装 Playwright，
-  `MOYE_TEST_CHROMIUM` 可指定浏览器；不为测试安装或修改项目依赖。前者用合成多页文字层
+  `NGY_TEST_CHROMIUM` 可指定浏览器；不为测试安装或修改项目依赖。前者用合成多页文字层
   覆盖按页笔记、按页命中与草稿钉页；后者用测试内生成的最小 PDF 驱动提交的 `assets/pdfjs`
-  产物，覆盖整本连续滚动成列、远离阅读位置的页面回收与返回重绘、`moye-pdf-page-changed`
+  产物，覆盖整本连续滚动成列、远离阅读位置的页面回收与返回重绘、`ngy-pdf-page-changed`
   与按页选区上报，以及紧凑阅读的 URL 参数与“切换不跳动”。
   `src/ui/notes.rs` 是“本书笔记”与“全部笔记”共用的原生浏览窗口，查询当前数据库，
   不使用图书窗口的旧投影推断范围；保留单表存储。列表按最近更新排序，搜索、类型筛选和
@@ -467,7 +692,7 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   AI 解释通过独立 Submitted/Completed/Failed 事件绑定请求，只有已保存的最终回复能成为
   AI 想法；失败保留待保存回复供重试或放弃。人工草稿/已接受写入阻止切章关闭。
   可选 DOM 门禁 `node --test src/ui/reader/annotations.test.cjs` 使用已安装 Playwright，
-  `MOYE_TEST_CHROMIUM` 可指定浏览器；不为测试安装或修改项目依赖。该门禁同时覆盖命中
+  `NGY_TEST_CHROMIUM` 可指定浏览器；不为测试安装或修改项目依赖。该门禁同时覆盖命中
   划线时有想法打开相关列表、无想法改为选中划线并显示七按钮菜单两条分支。
   2026-09-09：隔离 EPUB 在真实 Windows 窗口逐项验证四种标记、人工想法保存、未保存
   草稿阻止切章、笔记删除；浮动菜单与原生右键分别通过本地 mock SSE 生成 AI 想法。
@@ -490,7 +715,7 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
 - `web/pdf/` 与 `assets/pdfjs/`：固定版本 PDF.js shell、lockfile、清单和提交的本地
   资产；不得改为 CDN 或运行时联网获取。`web/pdf/src/viewer.mjs` 是上下连续滚动的实现：
   页列一次性布局，`IntersectionObserver` 按需绘制、远离阅读位置后回收为占位页；滚动
-  停止约 150ms 才上报 `moye-pdf-page-changed`，并复用最近一次 `moye-pdf-go-to` 的
+  停止约 150ms 才上报 `ngy-pdf-page-changed`，并复用最近一次 `ngy-pdf-go-to` 的
   `requestId` 以保持宿主过期请求拒绝语义。读取 URL 的 `compact=1` 后给 `<html>` 设置
   `data-pdf-compact`：这是“PDF 紧凑阅读”唯一的页间距契约，宿主对已打开窗口也用同一
   属性做实时更新。改动 `web/pdf/src/` 后必须在 `web/pdf` 执行
@@ -527,13 +752,35 @@ WebView2 Runtime，以及 `rustfmt`/`clippy` 组件。仓库没有固定具体 R
 仓库会自动发现三个二进制目标，且没有 `default-run`。运行产品时必须显式选择：
 
 ```powershell
-cargo run --locked --bin moye-epub-editor
-cargo build --locked --bin moye-epub-editor
-cargo build --release --locked --bin moye-epub-editor
+cargo run --locked --bin ngy-book-studio
+cargo build --locked --bin ngy-book-studio
+cargo build --release --locked --bin ngy-book-studio
 ```
 
 不要使用裸的 `cargo run` 或 `cargo run --release`，否则 Cargo 无法确定要运行哪个
 二进制。
+
+### 数据目录与日志位置
+
+数据目录在首次启动时由用户确认，不再使用 `ProjectDirs` 的默认位置；选择记录在
+`%APPDATA%\ngy\ngy_book_studio\config\bootstrap.json`（实现见 `src/startup.rs`）。
+设置界面是应用自己的窗口（`src/ui/data_dir_setup.rs`）：输入框里预填推荐路径或上次的
+选择，可以直接改、可以点「浏览…」调系统目录选择器，点「确认并启动」（或回车）后才校验
+并记录；校验在后台执行器上做，失败原因显示在同一个窗口里。关闭设置窗口即放弃启动。
+日志固定在 `<数据目录>/logs/`，按 UTC 日期分文件、保留 7 天。目录写入配置之前必须
+通过“建目录 + 写删探针”校验；记下的目录之后不可用时会重新询问并说明原因，不会静默
+回落默认目录。系统配置页显示两个目录位置，并提供更改数据目录与打开目录的入口。
+
+更改数据目录等于**搬迁**：设置界面选新位置后写配置并记下待搬迁的旧目录，随后自动重启
+墨页；新进程在打开图书库之前把旧目录整体搬过去（同卷重命名，跨卷复制后才删源），旧目录
+随之清空。搬迁失败不会静默：保留记录、把原因显示在设置窗口里，确认原位置可重试，换成
+别的空目录也可以。搬迁期间没有进度界面，也不能中断（大书库跨卷复制会看到启动等待）。
+目标目录里已经有一个图书库时必须先确认覆盖 —— 那会删掉它原有的内容，不可撤销；目标
+非空又不含图书库时直接报错，要求换一个空目录。
+
+自动化与人工冒烟不得选真实书库：debug 构建的 `NGY_DATA_DIR` 优先级高于配置与设置窗口，
+且不写配置、不执行待办搬迁（搬迁只在本次真的要用配置里那个目录时才做）。发布构建忽略
+该变量，避免普通用户被环境变量改走目录。
 
 常用最终验证命令：
 
@@ -552,7 +799,7 @@ cargo clippy --all-targets --locked
 
 ```powershell
 cargo test --lib --locked
-cargo test --bin moye-epub-editor --locked
+cargo test --bin ngy-book-studio --locked
 cargo test --test epub_flow --locked
 cargo test --test multi_format_flow --locked
 cargo test --test openai_compatible_flow --locked
@@ -566,38 +813,43 @@ cargo test --test openai_compatible_flow --locked
 `src/ui/reader/translations.test.cjs`、`src/ui/reader/annotations.test.cjs`、
 `src/ui/pdf_reader/annotations.test.cjs`、`src/ui/pdf_reader/viewer.test.cjs` 用
 `node --test <file>` 运行。它们只使用本机已安装的 Playwright，不为测试安装依赖、
-不触碰用户数据，`MOYE_TEST_CHROMIUM` 可指定浏览器。改动 `src/ui/**/*.js` 的交互代码
+不触碰用户数据，`NGY_TEST_CHROMIUM` 可指定浏览器。改动 `src/ui/**/*.js` 的交互代码
 或 `web/pdf` 产物时建议跑对应门禁，并在 `ROADMAP.md` 或本文件记下结果。
 
-本机（2026-09-12）可用组合：Node 26.8.1 由 fnm 安装在
-`E:\ai\fnm\node-versions\v26.8.1\installation`（`fnm list` 可查，非交互 shell 默认
-不在 `PATH` 上），Playwright 1.61.1 借自本机已有安装（`NODE_PATH` 指向其
-`node_modules`，本次为另一个项目的 pnpm 目录），浏览器复用
-`%LOCALAPPDATA%\ms-playwright\chromium-1228`：
+本机（2026-09-15 复核）可用组合：Node 22.22.2 用工作台自带的
+`C:\Users\admin\.workbuddy\binaries\node\versions\22.22.2-3\node.exe`，Playwright 1.63.0
+借自 `%TEMP%\moye-pw\node_modules`（临时目录，装 Playwright 1.63.0，里面另有 `*.cjs`
+诊断脚本，被清理后需换一处已安装的包），`NODE_PATH` 指向它。**浏览器必须显式指定**：
+Playwright 1.63 默认要 `chromium-1243`（本机只有 `chromium-1228`），不设
+`NGY_TEST_CHROMIUM` 会在 `before` 钩子里以 `Executable doesn't exist at ...1243` 失败全部用例：
 
-```powershell
-$env:PATH = "E:\ai\fnm\node-versions\v26.8.1\installation;" + $env:PATH
-$env:NODE_PATH = "E:\projects\deepseek-harness\node_modules\.pnpm\node_modules"
-node --test src/ui/reader/translations.test.cjs
+```bash
+NODE_PATH='C:\Users\admin\AppData\Local\Temp\moye-pw\node_modules' \
+NGY_TEST_CHROMIUM='C:\Users\admin\AppData\Local\ms-playwright\chromium_headless_shell-1228\chrome-headless-shell-win64\chrome-headless-shell.exe' \
+"$NODE" --test src/ui/reader/translations.test.cjs
 ```
+
+`NODE_PATH` 与 `NGY_TEST_CHROMIUM` 都要写 Windows 路径（Git Bash 的 `/c/...` 形式
+Node 认不出来，`require("playwright")` 会 `MODULE_NOT_FOUND`）。
 
 门禁失败先分清产品缺陷与用例缺陷：XHTML 夹具必须带 `xmlns`（否则元素不再具备 HTML
 接口），异步重绘要用 `waitForFunction` 等，而不是在同一个任务里直接读结果。
 
 ### AI 问答诊断日志
 
-AI 日志统一使用 `moye_ai` target。未设置 `RUST_LOG` 时，默认
-`warn,moye_ai=info`，记录问答开始、完成、取消及失败；详细排障使用
-`warn,moye_ai=debug`。日志输出到终端，并带源码文件和行号；不会自动写入文件。
-需要保留一次复现时，在 PowerShell 中运行：
+AI 日志统一使用 `ngy_ai` target。未设置 `RUST_LOG` 时，默认
+`warn,ngy_ai=info`，记录问答开始、完成、取消及失败；详细排障使用
+`warn,ngy_ai=debug`。日志同时写终端和数据目录下的
+`logs/ngy-book-studio.<YYYY-MM-DD>.log`（见 `src/logging.rs`），终端输出带源码文件
+和行号。数据目录确定之前的启动阶段没有日志，需要整段启动过程时，在 PowerShell 中运行：
 
 ```powershell
-$env:RUST_LOG = "warn,moye_ai=debug"
-$aiLog = Join-Path ([System.IO.Path]::GetTempPath()) ("moye-ai-" + [guid]::NewGuid() + ".log")
-cargo run --locked --bin moye-epub-editor 2>&1 | Tee-Object -FilePath $aiLog
+$env:RUST_LOG = "warn,ngy_ai=debug"
+$aiLog = Join-Path ([System.IO.Path]::GetTempPath()) ("ngy-ai-" + [guid]::NewGuid() + ".log")
+cargo run --locked --bin ngy-book-studio 2>&1 | Tee-Object -FilePath $aiLog
 ```
 
-开发验证还须按下文 GUI 冒烟要求设置唯一 `MOYE_DATA_DIR`。环境变量只作用于从该
+开发验证还须按下文 GUI 冒烟要求设置唯一 `NGY_DATA_DIR`。环境变量只作用于从该
 终端新启动的进程；复现结束后恢复原来的 `RUST_LOG`，或原来未设置时用
 `Remove-Item Env:RUST_LOG` 移除。不要用全局 `trace` 抓取 HTTP 请求正文。
 
@@ -615,6 +867,40 @@ cargo run --locked --bin moye-epub-editor 2>&1 | Tee-Object -FilePath $aiLog
 - 不逐 token 打日志。新增日志必须使用同一 target、继承异步 span，并经
   `src/ai_diagnostics.rs` 的分类/摘要函数处理不可信值；不能直接格式化任意错误链。
   HTTP/SSE 故障与日志脱敏回归位于 `tests/openai_compatible_flow.rs`。
+
+### 导入诊断日志
+
+导入链路统一使用 `ngy_import` target。未设置 `RUST_LOG` 时，默认
+`warn,ngy_ai=info,ngy_import=debug,ngy_reader=debug`：记录 UI 选中的路径、注册表候选与选定解析器、
+各格式适配器阶段、库持久化和最终结果，Kindle 另按记录打印压缩/尾部/解压字节数。
+这些日志是“界面提示导入失败但控制台为空”这类反馈的第一手依据，新增导入分支时必须
+同时补齐对应阶段日志与失败日志。需要保留一次复现时：
+
+```powershell
+$env:RUST_LOG = "warn,ngy_ai=info,ngy_import=debug,ngy_reader=debug"
+$importLog = Join-Path ([System.IO.Path]::GetTempPath()) ("ngy-import-" + [guid]::NewGuid() + ".log")
+cargo run --locked --bin ngy-book-studio 2>&1 | Tee-Object -FilePath $importLog
+```
+
+导入路径上的日志只记录字节数、记录序号、格式、置信度、媒体类型、稳定 ID 与受控错误
+分类；不记录正文、译文、选区、密钥或完整文件内容。用户可见的失败仍以界面提示为准，
+日志只用于定位阶段，不能替代界面上的错误信息。
+
+不需要 GUI 复现一次导入时，`examples/probe_import.rs` 会走同一格式层与
+`LibraryStore` 路径，把库落到临时目录并在其后重新打开，用于区分“解析失败”与
+“持久化/回读失败”。它不写真实数据目录，但也不覆盖界面状态机与文件对话框。
+
+### 阅读器诊断日志
+
+阅读器资源供给统一使用 `ngy_reader` target，未设置 `RUST_LOG` 时同样默认开启 debug：
+每章打印请求路径、媒体类型、正文字节数、被改写的命名实体名与数量；每份二进制资源打印
+状态码、字节数与 Range；`export.rs` 生成阅读器投影时每章打印一次实体改写汇总。
+“章节打开后是渲染错误页而不是正文”这类反馈先看这里——它只报告实体名和计数，不含正文。
+
+因为 WebView 只给出 “Entity 'xxx' not defined” 和行号，脱离 GUI 定位这类问题用
+`examples/probe_reader.rs`：它导入到临时库、走 `LibraryStore::reader_epub_bytes`
+生成投影，再用 `reader::load_resource` 取出 WebView 真正会收到的字节，按行/列报告
+XML 解析不了的命名实体。
 
 ## Python 课程实验包
 
@@ -652,7 +938,7 @@ uv sync --locked
 uv run --locked ruff format --check .
 uv run --locked ruff check .
 uv run --locked python -m pytest -q
-uv run --locked python -m moye_lab compare --scenario all
+uv run --locked python -m ngy_lab compare --scenario all
 ```
 
 `runs/`、`workspaces/`、`.venv/` 和缓存均忽略，不提交运行报告、个人作答、凭据或
@@ -666,7 +952,7 @@ Windows Credential Manager 命名空间，不复用产品凭据、环境变量�
 核验回填、来源、重试与预算；学生 `emit` 和框架节点标注只是展示信息。CLI 的进程内
 运行器仍只执行已审查代码，不能把它当作隔离执行器。
 
-桌面从课程 `.venv/Scripts/python.exe -I -u moye_lab/desktop_host.py` 启动受信宿主，
+桌面从课程 `.venv/Scripts/python.exe -I -u ngy_lab/desktop_host.py` 启动受信宿主，
 宿主通过受限 RPC 执行一次性 Windows LPAC 工作进程，不在宿主导入学生代码。每次
 复制独立解释器、依赖与课程接口，课程文件仅从暂存区读取；模型、资料、工具校验和评分
 留在宿主。固定允许 `registryRead` 以初始化系统 DLL，不授予网络能力；启动前核验
@@ -739,9 +1025,9 @@ DRM-free/非加密样本：`sample.epub`、`sample.pdf`、`sample.doc`、`sample
 `sample.pptx`、`sample.xlsx`、`sample.mobi`、`sample.azw`、`sample.azw3`。
 
 ```powershell
-$env:MOYE_FORMAT_CORPUS = "C:\path\to\moye-format-corpus"
+$env:NGY_FORMAT_CORPUS = "C:\path\to\ngy-format-corpus"
 cargo test --test format_corpus_gate --locked -- --ignored --nocapture
-Remove-Item Env:MOYE_FORMAT_CORPUS
+Remove-Item Env:NGY_FORMAT_CORPUS
 ```
 
 该门禁对每种格式验证魔数/容器识别、统一模型、稳定 locator、规范化编辑、FTS 搜索、
@@ -878,14 +1164,14 @@ EPUB/PDF/原件导出、重新打开及原件字节一致性。
   默认或关闭时，新导入、创建或保存编辑仍须在文档事务内创建 `visual_render`、`vision`、
   `embedding` 三类任务，但初始状态为 `Paused` 且未开始；已有任务不随设置切换改变状态，
   用户仍可在后台任务窗口逐项恢复。
-  同一 key 还保存后台任务调度（`concurrency` 1–8 默认 1、`interval_ms` 0–60000 默认 10），
+  同一 key 还保存后台任务调度（`concurrency` 1–1024 默认 1、`interval_ms` 0–60000 默认 10），
   读取时钳制而不是报错，坏行不得让图书库无法打开；两者不属于 Provider JSON，保存后经
   `configure_scheduling` 立即作用于后续任务，正在运行的任务不被打断。
 - PDF 紧凑阅读使用独立 settings key（`pdf.reader.preferences.v1`，默认关闭，AI 设置
   “系统配置”中的“PDF 紧凑阅读”默认不勾选），同样不得扩展 Provider JSON；新 key 必须
   加入 `AI_SETTINGS_KEYS`，否则 `snapshot_ai_settings`/`restore_ai_settings` 的失败回滚
   会不对称（`restore_ai_settings` 校验备份行数）。页间距只有一份契约：宿主用
-  `moyepdf://viewer/viewer.html?...&compact=1` 让新窗口在首帧前设置
+  `ngypdf://viewer/viewer.html?...&compact=1` 让新窗口在首帧前设置
   `<html data-pdf-compact="1">`，保存设置后再用一次 `evaluate_script` 切换同一属性，
   因此已打开的阅读窗口无需重开即可跟随；两种通道必须幂等，前端不要为该偏好新增 API。
   该偏好作用于所有 PDF 阅读窗口（含 Office 增强预览）：`src/ui/mod.rs` 的
@@ -896,8 +1182,9 @@ EPUB/PDF/原件导出、重新打开及原件字节一致性。
   仍存在的差额（<0.5px 不动手），并用 `takeRecords()` 丢弃自己的两条记录；
   锚点页必须取“视口中心覆盖的那一页”（草稿钉住的页优先），不能用 `currentPage`——
   它只跟踪已绘制的页，刚滚到、仍在占位状态的页会让它滞后一页，补偿就会少算一个页间距。
-- 默认显示语言使用独立 settings key（`translation.preferences.v1`，默认关闭，AI 设置
-  “系统配置”中的下拉默认选“不翻译（仅原文）”，预设中/英/日/韩/法/德/西/俄等），同样
+- 默认显示语言使用独立 settings key（`translation.preferences.v1`，AI 设置
+  “系统配置”中的下拉默认选“中文（简体）”，预设中/英/日/韩/法/德/西/俄等，也提供“不翻译
+  （仅原文）”），同样
   不得扩展 Provider JSON，且必须加入 `AI_SETTINGS_KEYS`。`ProviderSettings::validate`
   只接受 `TRANSLATION_LANGUAGES` 中的标签，UI 与校验共用这份常量。目标语言变化或对话
   模型/端点变化由 `configure_translation` + `reconfigure_translation_jobs` 重排翻译任务；
@@ -1015,20 +1302,22 @@ EPUB/PDF/原件导出、重新打开及原件字节一致性。
 
 ## GUI 冒烟与完成标准
 
-Debug 构建支持 `MOYE_DATA_DIR`；Release 构建忽略它并访问真实 LocalAppData。人工
-GUI 验证必须使用唯一隔离目录。
+Debug 构建支持 `NGY_DATA_DIR`；Release 构建忽略它并访问真实 LocalAppData。设置了它
+的进程不弹数据目录设置窗口、也不写 `bootstrap.json`、不执行待办搬迁；未设置时首次启动
+会打开该窗口（输入框预填推荐路径，确认后才启动）。人工 GUI 验证必须使用唯一隔离目录 ——
+尤其别在隔离环境里去点「更改数据目录」，那会往真实配置里写搬迁记录。
 
 全目标测试会因 dev-dependency 合并 GPUI 的 `test-support` 特性；不要直接用测试
 命令留下的产品 EXE 作最终 GUI 验收。先单独执行产品构建
-`cargo build --locked --bin moye-epub-editor` 或下方的产品 `cargo run`。
+`cargo build --locked --bin ngy-book-studio` 或下方的产品 `cargo run`。
 GPUI 0.2.2 的测试执行器在真实 Windows
 dispatcher 上会直接拒绝带超时的等待，从而在退出时产生
 `timed out waiting on app_will_quit`；不能未经正常产品构建复测就将它认定为应用退出故障。
 
 ```powershell
-$env:MOYE_DATA_DIR = Join-Path ([System.IO.Path]::GetTempPath()) ("moye-agent-" + [guid]::NewGuid())
+$env:NGY_DATA_DIR = Join-Path ([System.IO.Path]::GetTempPath()) ("ngy-agent-" + [guid]::NewGuid())
 $env:RUST_LOG = "error"
-cargo run --locked --bin moye-epub-editor
+cargo run --locked --bin ngy-book-studio
 ```
 
 涉及 UI、WebView、导航、编辑器、Office 或窗口生命周期时，除自动验证外还要实际

@@ -11,8 +11,8 @@
 //! chapter being read when new blocks land, so a finished chapter appears
 //! without switching away and back.
 use super::*;
-use moye_epub_editor::services::{BackgroundJobStatus, TranslatedBlock, TranslationDisplayMode};
-use moye_epub_editor::translation::TranslationSegment;
+use ngy_book_studio::services::{BackgroundJobStatus, TranslatedBlock, TranslationDisplayMode};
+use ngy_book_studio::translation::TranslationSegment;
 
 /// Task kind of a whole-book translation job, as persisted in `index_jobs`.
 const TRANSLATION_JOB_KIND: &str = "translation";
@@ -135,7 +135,7 @@ impl ReaderApp {
         let Some(webview) = self.webview.as_ref() else {
             return;
         };
-        let script = format!("window.moyeTranslations?.{method}({value});");
+        let script = format!("window.ngyTranslations?.{method}({value});");
         if let Err(error) = webview.read(cx).raw().evaluate_script(&script) {
             self.set_error(format!("无法更新译文显示：{error}"), cx);
         }

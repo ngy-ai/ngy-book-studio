@@ -3,8 +3,8 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 use crate::document::{DocumentLocator, SourceLocator};
 
-/// Identifies SQLite files owned by this application (ASCII "MOYE").
-pub(super) const APPLICATION_ID: i64 = 0x4D4F_5945;
+/// Identifies SQLite files owned by this application (ASCII "NGYB").
+pub(super) const APPLICATION_ID: i64 = 0x4E47_5942;
 /// Development schemas are deliberately rebuilt instead of migrated.
 pub(super) const SCHEMA_VERSION: i64 = 14;
 
@@ -892,7 +892,7 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
              locator_json TEXT NOT NULL,
              created_at INTEGER NOT NULL CHECK(created_at >= 0),
              CHECK(content_unit_id IS NOT NULL OR (
-                 renderer = 'moye-office-com-enhanced'
+                 renderer = 'ngy-office-com-enhanced'
                  AND fidelity = 'office_enhanced'
                  AND unit_revision = 0
              ))
@@ -920,7 +920,7 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
              locator_json TEXT NOT NULL,
              created_at INTEGER NOT NULL CHECK(created_at >= 0),
              CHECK(content_unit_id IS NOT NULL OR (
-                 renderer = 'moye-office-com-enhanced'
+                 renderer = 'ngy-office-com-enhanced'
                  AND fidelity = 'office_enhanced'
                  AND unit_revision = 0
              ))
@@ -1508,7 +1508,7 @@ fn document_relations_are_valid(conn: &Connection) -> Result<bool> {
                         OR p.unit_revision <> u.revision
                     ))
                     OR (p.content_unit_id IS NULL AND (
-                        p.renderer <> 'moye-office-com-enhanced'
+                        p.renderer <> 'ngy-office-com-enhanced'
                         OR p.fidelity <> 'office_enhanced'
                         OR s.format NOT IN ('doc', 'docx', 'xlsx')
                         OR p.unit_revision <> 0
@@ -1544,7 +1544,7 @@ fn document_relations_are_valid(conn: &Connection) -> Result<bool> {
                         OR p.unit_revision <> u.revision
                     ))
                     OR (p.content_unit_id IS NULL AND (
-                        p.renderer <> 'moye-office-com-enhanced'
+                        p.renderer <> 'ngy-office-com-enhanced'
                         OR p.fidelity <> 'office_enhanced'
                         OR s.format NOT IN ('doc', 'docx', 'xlsx')
                         OR p.unit_revision <> 0
@@ -1958,7 +1958,7 @@ mod tests {
                  document_revision, unit_revision, profile_id, fidelity,
                  locator_json, created_at)
                  VALUES ('page', 'book', 'source', NULL, 0, 'objects/page',
-                         1, 1, 1.0, 'moye-office-com-enhanced', '1', 1, 0, 'profile',
+                         1, 1, 1.0, 'ngy-office-com-enhanced', '1', 1, 0, 'profile',
                          'office_enhanced', '{}', 1);",
         )
         .unwrap();

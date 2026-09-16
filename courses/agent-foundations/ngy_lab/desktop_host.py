@@ -1,4 +1,4 @@
-"""JSONL desktop host: python -I -u <absolute path>/moye_lab/desktop_host.py."""
+"""JSONL desktop host: python -I -u <absolute path>/ngy_lab/desktop_host.py."""
 
 import json
 import os
@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from moye_lab.sandbox import execute_desktop_run  # noqa: E402
+from ngy_lab.sandbox import execute_desktop_run  # noqa: E402
 
 _write_lock = threading.Lock()
 
@@ -37,7 +37,7 @@ def read_control_line(buffer, maximum):
 
 def main():
     if len(sys.argv) == 3 and sys.argv[1] == "--cleanup":
-        from moye_lab.sandbox_windows import cleanup_stale_profile
+        from ngy_lab.sandbox_windows import cleanup_stale_profile
 
         cleanup_stale_profile(Path(sys.argv[2]))
         return 0

@@ -5,7 +5,8 @@ use super::reader::{
 };
 use super::*;
 use gpui::{DragMoveEvent, EmptyView, Focusable};
-use moye_epub_editor::document::DocumentLocator;
+use ngy_book_studio::document::DocumentLocator;
+use ngy_book_studio::services::ReaderZoomSurface;
 
 mod annotations;
 use annotations::{PdfAnnotationAction, PdfAnnotations};
@@ -18,6 +19,10 @@ const PDF_PROTOCOL_CSP: &str = "default-src 'none'; script-src 'self'; worker-sr
     style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; font-src 'self' data:; \
     connect-src 'self'; media-src 'none'; object-src 'none'; frame-src 'none'; \
     child-src 'none'; base-uri 'none'; form-action 'none'";
+/// The viewer reports the page scale once the reader stops wheeling; the window
+/// waits a little longer before writing it, so a burst of wheel notches still
+/// leaves exactly one row.
+const PDF_ZOOM_SAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(400);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct PdfReaderPage {
@@ -60,16 +65,16 @@ pub(super) struct PdfReaderInit {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type")]
 pub(super) enum PdfIpcMessage {
-    #[serde(rename = "moye-pdf-viewer-ready")]
+    #[serde(rename = "ngy-pdf-viewer-ready")]
     ViewerReady,
-    #[serde(rename = "moye-pdf-ready")]
+    #[serde(rename = "ngy-pdf-ready")]
     Ready {
         #[serde(rename = "requestId")]
         request_id: u64,
         #[serde(rename = "pageCount")]
         page_count: u32,
     },
-    #[serde(rename = "moye-pdf-page-changed")]
+    #[serde(rename = "ngy-pdf-page-changed")]
     PageChanged {
         #[serde(rename = "requestId")]
         request_id: u64,
@@ -78,7 +83,7 @@ pub(super) enum PdfIpcMessage {
         #[serde(rename = "pageCount")]
         page_count: u32,
     },
-    #[serde(rename = "moye-pdf-selection-changed")]
+    #[serde(rename = "ngy-pdf-selection-changed")]
     SelectionChanged {
         #[serde(rename = "requestId")]
         request_id: u64,
@@ -87,7 +92,7 @@ pub(super) enum PdfIpcMessage {
         #[serde(rename = "selectedText")]
         selected_text: String,
     },
-    #[serde(rename = "moye-pdf-error")]
+    #[serde(rename = "ngy-pdf-error")]
     Error {
         #[serde(rename = "requestId")]
         request_id: u64,
@@ -101,7 +106,7 @@ pub(super) enum PdfIpcMessage {
     },
     /// Sent by the native WebView2 context menu, not by page script. The menu
     /// callback validated the private page/frame document before queueing it.
-    #[serde(rename = "moye-pdf-explain-selection")]
+    #[serde(rename = "ngy-pdf-explain-selection")]
     ExplainSelection {
         #[serde(rename = "selectedText")]
         selected_text: String,
@@ -111,10 +116,17 @@ pub(super) enum PdfIpcMessage {
     /// Sent by the bundled viewer when Ctrl + Arrow is pressed. The host owns
     /// page state, reading progress and note re-binding, so the shell only asks
     /// for a relative step instead of rendering a page on its own.
-    #[serde(rename = "moye-pdf-request-page")]
+    #[serde(rename = "ngy-pdf-request-page")]
     RequestPage {
         /// -1 for the previous page, +1 for the next page.
         delta: i32,
+    },
+    /// Sent by the bundled viewer after Ctrl + wheel changed the page scale.
+    /// The host owns the stored page size, so the shell only reports it.
+    #[serde(rename = "ngy-pdf-zoom-changed")]
+    ZoomChanged {
+        #[serde(rename = "zoomMilli")]
+        zoom_milli: u32,
     },
 }
 
@@ -168,18 +180,30 @@ fn validated_pdf_selection(
 }
 
 fn is_pdf_navigation_url(url: &str) -> bool {
-    url.starts_with("moyepdf://viewer/")
-        || url.starts_with("http://moyepdf.viewer/")
-        || url.starts_with("https://moyepdf.viewer/")
+    url.starts_with("ngypdf://viewer/")
+        || url.starts_with("http://ngypdf.viewer/")
+        || url.starts_with("https://ngypdf.viewer/")
+}
+
+/// Page scale the reader opens at, in thousandths of the viewer's base scale
+/// (one PDF point becomes 1.5 CSS pixels). The bundled viewer clamps and steps
+/// the same range under Ctrl + wheel; `the_bundled_viewer_zooms_in_the_host_range`
+/// fails if the two copies drift apart.
+const PDF_ZOOM_DEFAULT_MILLI: u32 = 1_500;
+const PDF_ZOOM_MIN_MILLI: u32 = 500;
+const PDF_ZOOM_MAX_MILLI: u32 = 4_000;
+
+fn pdf_zoom_milli(zoom_milli: u32) -> u32 {
+    zoom_milli.clamp(PDF_ZOOM_MIN_MILLI, PDF_ZOOM_MAX_MILLI)
 }
 
 fn pdf_viewer_url(initial_page: u32, compact_reading: bool) -> String {
     // The default URL stays byte-identical to the pre-preference one; the
     // preference is only named when it is enabled.
     if compact_reading {
-        format!("moyepdf://viewer/viewer.html?startPage={initial_page}&compact=1")
+        format!("ngypdf://viewer/viewer.html?startPage={initial_page}&compact=1")
     } else {
-        format!("moyepdf://viewer/viewer.html?startPage={initial_page}")
+        format!("ngypdf://viewer/viewer.html?startPage={initial_page}")
     }
 }
 
@@ -192,6 +216,17 @@ fn pdf_compact_reading_script(compact_reading: bool) -> &'static str {
     } else {
         "document.documentElement.removeAttribute(\"data-pdf-compact\");"
     }
+}
+
+/// Sends one page scale to an already open viewer. The viewer keeps the page
+/// being read at the top of the window while it re-lays out, and reports the
+/// scale back once the reader stops wheeling.
+fn pdf_zoom_script(zoom_milli: u32) -> String {
+    let payload = serde_json::json!({
+        "type": "ngy-pdf-zoom",
+        "zoomMilli": pdf_zoom_milli(zoom_milli),
+    });
+    format!("window.postMessage({payload}, window.location.origin);")
 }
 
 fn pdf_progress_write(
@@ -256,7 +291,7 @@ pub(super) async fn build_pdf_reader_webview(
             };
             let _ = ipc_sender.try_send(message);
         })
-        .with_custom_protocol("moyepdf".to_string(), move |_, request| {
+        .with_custom_protocol("ngypdf".to_string(), move |_, request| {
             let Some((mime, body)) = pdf_resource(protocol_pdf.as_slice(), request.uri().path())
             else {
                 return gpui_component::wry::http::Response::builder()
@@ -405,6 +440,12 @@ pub struct PdfReaderApp {
     preview_label: String,
     /// Global PDF reading preference, applied to this window's viewer document.
     pdf_compact_reading: bool,
+    /// Page scale of this window's viewer, in thousandths of its base scale.
+    /// It is remembered per book and pushed to the viewer, which owns the
+    /// layout: the host never measures a page.
+    pdf_zoom_milli: u32,
+    /// Pending write of this book's page scale, replaced on every new value.
+    pdf_zoom_save_task: Option<Task<()>>,
 }
 
 impl PdfReaderApp {
@@ -535,6 +576,8 @@ impl PdfReaderApp {
             persist_progress_enabled: persist_progress,
             preview_label,
             pdf_compact_reading,
+            pdf_zoom_milli: PDF_ZOOM_DEFAULT_MILLI,
+            pdf_zoom_save_task: None,
         };
         if let Some(progress_events) = progress_events {
             reader.progress_sync_task = Some(cx.spawn(async move |view, cx| {
@@ -549,7 +592,93 @@ impl PdfReaderApp {
             }));
         }
         reader.sync_ai_reference(cx);
+        reader.load_pdf_zoom(cx);
         reader
+    }
+
+    /// Reads this book's remembered page scale once per window.
+    ///
+    /// The viewer is already building by then, so the stored scale reaches it
+    /// either on `ngy-pdf-viewer-ready` or here, whichever comes last; a viewer
+    /// that already laid its pages out re-lays them out at the new scale while
+    /// keeping the page the reader is looking at. An unreadable row keeps the
+    /// default instead of failing the window.
+    fn load_pdf_zoom(&mut self, cx: &mut Context<Self>) {
+        let book_id = self.book_id.clone();
+        let services = Arc::clone(&self.services);
+        cx.spawn(async move |view, cx| {
+            let stored = services.reader_zoom(book_id, ReaderZoomSurface::Pdf).await;
+            let _ = view.update(cx, |this, cx| {
+                let stored = match stored {
+                    Ok(stored) => stored,
+                    Err(error) => {
+                        tracing::warn!(%error, "cannot read the book's PDF page scale");
+                        return;
+                    }
+                };
+                if this.closing {
+                    return;
+                }
+                let Some(stored) = stored else {
+                    return;
+                };
+                this.set_pdf_zoom_milli(stored, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Applies a page scale to this window's viewer. The viewer keeps the page
+    /// being read in place, so this is safe for an open document, and a viewer
+    /// that is still building keeps the scale for its first layout.
+    fn set_pdf_zoom_milli(&mut self, zoom_milli: u32, cx: &mut Context<Self>) {
+        let zoom_milli = pdf_zoom_milli(zoom_milli);
+        if self.pdf_zoom_milli == zoom_milli {
+            return;
+        }
+        self.pdf_zoom_milli = zoom_milli;
+        self.push_pdf_zoom(cx);
+    }
+
+    /// Sends this window's page scale to the viewer document. Safe to call more
+    /// than once: the viewer only re-lays out when the scale really changes, and
+    /// a viewer that is still building simply receives it when it reports ready.
+    fn push_pdf_zoom(&mut self, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
+        let Some(webview) = self.webview.clone() else {
+            return;
+        };
+        let script = pdf_zoom_script(self.pdf_zoom_milli);
+        if let Err(error) = webview.read(cx).raw().evaluate_script(&script) {
+            // Presentation only: a missed update must not turn into reader error.
+            tracing::warn!(%error, "cannot apply the PDF page scale");
+        }
+    }
+
+    fn schedule_pdf_zoom_save(&mut self, cx: &mut Context<Self>) {
+        let book_id = self.book_id.clone();
+        let services = Arc::clone(&self.services);
+        let zoom_milli = self.pdf_zoom_milli;
+        // Replacing the pending task drops the previous one, so the row always
+        // ends up with the scale the reader stopped at.
+        self.pdf_zoom_save_task = Some(cx.spawn(async move |view, cx| {
+            cx.background_executor().timer(PDF_ZOOM_SAVE_DEBOUNCE).await;
+            let result = services
+                .set_reader_zoom(book_id, ReaderZoomSurface::Pdf, zoom_milli)
+                .await;
+            let _ = view.update(cx, |this, cx| {
+                this.pdf_zoom_save_task = None;
+                if let Err(error) = result {
+                    this.notice = Some(Notice {
+                        text: format!("无法保存本书的 PDF 页面大小：{error:#}"),
+                        error: true,
+                    });
+                    cx.notify();
+                }
+            });
+        }));
     }
 
     fn on_ai_sidebar_event(
@@ -800,6 +929,7 @@ impl PdfReaderApp {
                 // The document is loaded, so a preference saved while this
                 // WebView was still building now reaches a live page.
                 self.push_pdf_compact_reading(cx);
+                self.push_pdf_zoom(cx);
                 self.notice = Some(Notice {
                     text: "正在解析本地 PDF…".to_string(),
                     error: false,
@@ -888,6 +1018,18 @@ impl PdfReaderApp {
                 };
                 self.request_page(target, cx);
             }
+            // The viewer already re-laid out at the scale the reader wheeled to,
+            // so the host only stores it. A scale outside the range the viewer
+            // clamps means the message did not come from it, and is dropped
+            // rather than clamped into a size the reader never chose.
+            PdfIpcMessage::ZoomChanged { zoom_milli }
+                if (PDF_ZOOM_MIN_MILLI..=PDF_ZOOM_MAX_MILLI).contains(&zoom_milli) =>
+            {
+                if self.pdf_zoom_milli != zoom_milli {
+                    self.pdf_zoom_milli = zoom_milli;
+                    self.schedule_pdf_zoom_save(cx);
+                }
+            }
             _ => return,
         }
         cx.notify();
@@ -906,7 +1048,7 @@ impl PdfReaderApp {
         }
         self.page_request_id = self.page_request_id.wrapping_add(1).max(1);
         let payload = serde_json::json!({
-            "type": "moye-pdf-go-to",
+            "type": "ngy-pdf-go-to",
             "requestId": self.page_request_id,
             "pageNumber": page_number,
         });
@@ -1907,21 +2049,21 @@ mod tests {
 
     #[test]
     fn protocol_navigation_stays_on_the_private_origin() {
-        assert!(is_pdf_navigation_url("moyepdf://viewer/viewer.html"));
-        assert!(is_pdf_navigation_url("http://moyepdf.viewer/pdf.mjs"));
+        assert!(is_pdf_navigation_url("ngypdf://viewer/viewer.html"));
+        assert!(is_pdf_navigation_url("http://ngypdf.viewer/pdf.mjs"));
         assert!(!is_pdf_navigation_url("https://example.com/document.pdf"));
-        assert!(!is_pdf_navigation_url("moyepdf://attacker/viewer.html"));
+        assert!(!is_pdf_navigation_url("ngypdf://attacker/viewer.html"));
     }
 
     #[test]
     fn compact_reading_only_changes_the_viewer_url_when_enabled() {
         assert_eq!(
             pdf_viewer_url(7, false),
-            "moyepdf://viewer/viewer.html?startPage=7"
+            "ngypdf://viewer/viewer.html?startPage=7"
         );
         assert_eq!(
             pdf_viewer_url(7, true),
-            "moyepdf://viewer/viewer.html?startPage=7&compact=1"
+            "ngypdf://viewer/viewer.html?startPage=7&compact=1"
         );
         // A parameter must never leave the private origin or its viewer path.
         assert!(is_pdf_navigation_url(&pdf_viewer_url(7, true)));
@@ -1942,7 +2084,7 @@ mod tests {
     #[test]
     fn ipc_page_change_is_typed() {
         let message = serde_json::from_str::<PdfIpcMessage>(
-            r#"{"type":"moye-pdf-page-changed","requestId":7,"pageNumber":3,"pageCount":9,"pdfjsVersion":"5.7.284"}"#,
+            r#"{"type":"ngy-pdf-page-changed","requestId":7,"pageNumber":3,"pageCount":9,"pdfjsVersion":"5.7.284"}"#,
         )
         .expect("typed page message");
         assert!(matches!(
@@ -1952,6 +2094,50 @@ mod tests {
                 page_number: 3,
                 page_count: 9
             }
+        ));
+    }
+
+    /// The bundled viewer steps and clamps the same page scale the host stores,
+    /// and reports it under the message the host parses. Both are copies of one
+    /// decision, so a test has to keep them together.
+    #[test]
+    fn the_bundled_viewer_zooms_in_the_host_range() {
+        let viewer = ngy_book_studio::preview::PDFJS_VIEWER_SCRIPT;
+        for expected in [
+            format!("PAGE_ZOOM_DEFAULT_MILLI = {PDF_ZOOM_DEFAULT_MILLI};"),
+            format!("PAGE_ZOOM_MIN_MILLI = {PDF_ZOOM_MIN_MILLI};"),
+            format!("PAGE_ZOOM_MAX_MILLI = {PDF_ZOOM_MAX_MILLI};"),
+            "\"ngy-pdf-zoom-changed\"".to_string(),
+        ] {
+            assert!(
+                viewer.contains(&expected),
+                "the bundled viewer is missing {expected}"
+            );
+        }
+        // The URL the host opens is the only scale the viewer starts from, and
+        // the scale it reports back is a number the host can clamp.
+        let script = pdf_zoom_script(PDF_ZOOM_DEFAULT_MILLI);
+        assert!(script.contains("window.postMessage"));
+        assert!(script.contains(&format!("\"zoomMilli\":{PDF_ZOOM_DEFAULT_MILLI}")));
+        assert!(
+            script.contains("\"type\":\"ngy-pdf-zoom\""),
+            "the viewer must receive the same message type it waits for"
+        );
+
+        assert_eq!(pdf_zoom_milli(0), PDF_ZOOM_MIN_MILLI);
+        assert_eq!(pdf_zoom_milli(u32::MAX), PDF_ZOOM_MAX_MILLI);
+        assert_eq!(
+            pdf_zoom_milli(PDF_ZOOM_DEFAULT_MILLI),
+            PDF_ZOOM_DEFAULT_MILLI
+        );
+
+        let changed = serde_json::from_str::<PdfIpcMessage>(
+            r#"{"type":"ngy-pdf-zoom-changed","zoomMilli":1750,"pdfjsVersion":"5.7.284"}"#,
+        )
+        .expect("typed page scale message");
+        assert!(matches!(
+            changed,
+            PdfIpcMessage::ZoomChanged { zoom_milli: 1_750 }
         ));
     }
 
@@ -1990,7 +2176,7 @@ mod tests {
     #[test]
     fn ipc_selection_change_is_typed_and_bounded() {
         let message = serde_json::from_str::<PdfIpcMessage>(
-            r#"{"type":"moye-pdf-selection-changed","requestId":7,"pageNumber":3,"selectedText":"  first\n\tsecond  ","pdfjsVersion":"5.7.284"}"#,
+            r#"{"type":"ngy-pdf-selection-changed","requestId":7,"pageNumber":3,"selectedText":"  first\n\tsecond  ","pdfjsVersion":"5.7.284"}"#,
         )
         .expect("typed selection message");
         let PdfIpcMessage::SelectionChanged {
@@ -2068,8 +2254,8 @@ mod tests {
             book_id: "book-a".to_string(),
             unit_id: "unit-3".to_string(),
             unit_index: None,
-            document_revision: moye_epub_editor::document::Revision::new(1),
-            unit_revision: moye_epub_editor::document::Revision::new(1),
+            document_revision: ngy_book_studio::document::Revision::new(1),
+            unit_revision: ngy_book_studio::document::Revision::new(1),
             locator: references[0].locator.clone(),
             label: "Page 3".to_string(),
             quote: None,

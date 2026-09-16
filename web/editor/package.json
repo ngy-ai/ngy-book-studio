@@ -1,8 +1,8 @@
 {
-  "name": "@moye/prosemirror-editor",
+  "name": "@ngy/prosemirror-editor",
   "version": "0.1.0",
   "private": true,
-  "description": "Pinned, offline ProseMirror bundle embedded by the Moye editor WebView.",
+  "description": "Pinned, offline ProseMirror bundle embedded by the Ngy editor WebView.",
   "type": "module",
   "packageManager": "npm@10.9.2",
   "scripts": {

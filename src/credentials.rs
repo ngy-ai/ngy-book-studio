@@ -10,7 +10,7 @@ pub trait CredentialStore: Send + Sync {
     fn delete_api_key(&self, endpoint: &str) -> Result<()>;
 }
 
-const SERVICE_NAME: &str = "dev.moye.epub-reader.openai-compatible";
+const SERVICE_NAME: &str = "dev.ngy.book-studio.openai-compatible";
 
 fn account_name(endpoint: &str) -> Result<String> {
     let endpoint = endpoint.trim();

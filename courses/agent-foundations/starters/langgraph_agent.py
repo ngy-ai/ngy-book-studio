@@ -1,6 +1,6 @@
 """练习起点：用真实 StateGraph 节点和边复现手搓版的行为。"""
 
-from moye_lab.contracts import AgentOutcome, Emit, Model, RunLimits, Tools
+from ngy_lab.contracts import AgentOutcome, Emit, Model, RunLimits, Tools
 
 
 def run(task: str, model: Model, tools: Tools, limits: RunLimits, emit: Emit) -> AgentOutcome:

@@ -282,7 +282,7 @@ impl LocalBlobStore {
         // a harmless child and take its parent to obtain its native path
         // spelling without touching the filesystem.
         let root_probe =
-            ObjectPath::parse("__moye_root_probe__").context("无法创建本地对象存储根目录探针")?;
+            ObjectPath::parse("__ngy_root_probe__").context("无法创建本地对象存储根目录探针")?;
         let root = backend
             .path_to_filesystem(&root_probe)
             .context("无法解析本地对象存储根目录")?

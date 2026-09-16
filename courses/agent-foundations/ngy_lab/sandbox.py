@@ -15,19 +15,19 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from moye_lab import COURSE_ID, COURSE_VERSION, REPORT_VERSION, RULES_VERSION
-from moye_lab.chapter_runtime import ChapterModel, ChapterTools, evaluate_chapter, make_case
-from moye_lab.contracts import AgentOutcome, BudgetExceeded, LabError, ProtocolError, RunLimits
-from moye_lab.desktop_compat import COMPATIBILITY_ID
-from moye_lab.implementations.common import (
+from ngy_lab import COURSE_ID, COURSE_VERSION, REPORT_VERSION, RULES_VERSION
+from ngy_lab.chapter_runtime import ChapterModel, ChapterTools, evaluate_chapter, make_case
+from ngy_lab.contracts import AgentOutcome, BudgetExceeded, LabError, ProtocolError, RunLimits
+from ngy_lab.desktop_compat import COMPATIBILITY_ID
+from ngy_lab.implementations.common import (
     _finite_json_float,
     _reject_non_finite,
     _unique_json_object,
     _validate_json_unicode,
 )
-from moye_lab.runner import COURSE_ROOT, evaluate, source_snapshot
-from moye_lab.runtime import ObservedModel, ScriptedModel, ToolBroker, json_text
-from moye_lab.scenarios import get_scenario
+from ngy_lab.runner import COURSE_ROOT, evaluate, source_snapshot
+from ngy_lab.runtime import ObservedModel, ScriptedModel, ToolBroker, json_text
+from ngy_lab.scenarios import get_scenario
 
 MAX_PACKET_BYTES = 1024 * 1024
 MAX_CODE_BYTES = 128 * 1024
@@ -136,18 +136,18 @@ def stage_runtime(run_dir, code, cancel, progress):
         raise LabError("课程环境缺少锁定的 LangGraph 依赖，请先运行 uv sync --locked")
     _copy_tree(site_packages, runtime / "Lib" / "site-packages", cancel)
     app = stage / "app"
-    package = app / "moye_lab"
+    package = app / "ngy_lab"
     implementations = package / "implementations"
     implementations.mkdir(parents=True)
     (package / "__init__.py").write_text("", encoding="utf-8")
     (implementations / "__init__.py").write_text("", encoding="utf-8")
     for name in ("contracts.py", "chapter_support.py"):
-        shutil.copyfile(COURSE_ROOT / "moye_lab" / name, package / name)
+        shutil.copyfile(COURSE_ROOT / "ngy_lab" / name, package / name)
     shutil.copyfile(
-        COURSE_ROOT / "moye_lab" / "implementations" / "common.py", implementations / "common.py"
+        COURSE_ROOT / "ngy_lab" / "implementations" / "common.py", implementations / "common.py"
     )
     for name in ("desktop_worker.py", "desktop_compat.py"):
-        shutil.copyfile(COURSE_ROOT / "moye_lab" / name, app / name)
+        shutil.copyfile(COURSE_ROOT / "ngy_lab" / name, app / name)
     (app / "submission.py").write_text(code, encoding="utf-8")
     (stage / "work").mkdir()
     return stage
@@ -380,7 +380,7 @@ def execute_desktop_run(request, cancel=None, progress=None):
     if code is None:
         if chapter == 1:
             name = "manual.py" if implementation == "manual" else "langgraph_agent.py"
-            code = (COURSE_ROOT / "moye_lab" / "implementations" / name).read_text("utf-8")
+            code = (COURSE_ROOT / "ngy_lab" / "implementations" / name).read_text("utf-8")
         else:
             code = (COURSE_ROOT / "references" / f"ch{chapter:02d}_{implementation}.py").read_text(
                 "utf-8"
@@ -409,7 +409,7 @@ def execute_desktop_run(request, cancel=None, progress=None):
     try:
         if sys.platform != "win32":
             raise LabError("隔离运行目前只支持 Windows 10/11")
-        from moye_lab.sandbox_windows import AppContainerProfile
+        from ngy_lab.sandbox_windows import AppContainerProfile
 
         stage = stage_runtime(run_dir, code, cancel, progress)
         _check_cancel(cancel)

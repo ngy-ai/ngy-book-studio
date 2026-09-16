@@ -1,6 +1,6 @@
 """第 3 章 manual 独立练习骨架。"""
 
-from moye_lab.chapter_support import finish, load_case
+from ngy_lab.chapter_support import finish, load_case
 
 
 def prepare(data):
@@ -9,7 +9,7 @@ def prepare(data):
 
 
 def perform(data, plan, state, tools):
-    # 需要调用工具时：from moye_lab.chapter_support import call_tool
+    # 需要调用工具时：from ngy_lab.chapter_support import call_tool
     # call_tool(state, tools, 名称, 参数) 返回 ok/data 或 ok/error。
     # 返回本章 result 字典；宿主会独立核验真实动作与本次数据。
     raise NotImplementedError("再实现 perform：保留实际工具响应并形成候选结果")

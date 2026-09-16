@@ -1,6 +1,6 @@
 //! Opt-in parser gate for real, externally sourced documents.
 //!
-//! Set `MOYE_FORMAT_CORPUS` to a directory containing `sample.epub`,
+//! Set `NGY_FORMAT_CORPUS` to a directory containing `sample.epub`,
 //! `sample.pdf`, `sample.doc`, `sample.docx`, `sample.pptx`, `sample.xlsx`,
 //! `sample.mobi`, `sample.azw`, `sample.azw3`, `sample.kfx` (DRM-free), and
 //! `sample.djvu`, then run:
@@ -12,18 +12,18 @@
 
 use std::{env, fs, io::Cursor, path::Path, sync::Arc};
 
-use moye_epub_editor::{
+use ngy_book_studio::{
     document::{BookFormat, BookSource},
     formats::{FormatRegistry, ImportLimits, ImportSource, ProbeConfidence},
     library::{ImportOutcome, LibraryStore},
 };
 
 #[test]
-#[ignore = "requires the external MOYE_FORMAT_CORPUS fixture directory"]
+#[ignore = "requires the external NGY_FORMAT_CORPUS fixture directory"]
 fn real_documents_cross_the_canonical_import_gate() {
-    let root = env::var_os("MOYE_FORMAT_CORPUS")
+    let root = env::var_os("NGY_FORMAT_CORPUS")
         .map(std::path::PathBuf::from)
-        .expect("set MOYE_FORMAT_CORPUS to the external fixture directory");
+        .expect("set NGY_FORMAT_CORPUS to the external fixture directory");
     let registry = FormatRegistry::with_builtin_importers();
 
     for (file_name, expected_format) in [
@@ -115,7 +115,7 @@ fn validate_sample(
         .units
         .first()
         .unwrap_or_else(|| panic!("{file_name} has no editable content unit"));
-    let edited_token = format!("MoyeCorpusEdited{expected_format:?}");
+    let edited_token = format!("NgyCorpusEdited{expected_format:?}");
     let updated = library
         .update_content_unit_source(
             &record.id,

@@ -7,7 +7,7 @@ use super::{
     },
 };
 use gpui::{Pixels, PromptButton, PromptLevel};
-use moye_epub_editor::{
+use ngy_book_studio::{
     chat::ChatWindowKind,
     document::{
         AssetRef, AssetRole, Block, BookDocument, BookFormat, BookSource, ContentUnitKind, Inline,
@@ -33,8 +33,8 @@ const EDITOR_SHELL_ORIGIN: &str = "http://epubeditor.shell";
 const EDITOR_SHELL_ORIGIN: &str = "epubeditor://shell";
 const EDITOR_SHELL_CSP: &str = "default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src http://epubeditor.content epubeditor://content data:; media-src http://epubeditor.content epubeditor://content data:; connect-src http://epubeditor.content epubeditor://content; frame-src 'none'; object-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'";
 const EDITOR_CONTENT_CSP: &str = "default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; media-src 'self' data:; connect-src 'none'; frame-src 'none'; object-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'";
-const EDITOR_TRUSTED_SHELL: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><html xmlns=\"http://www.w3.org/1999/xhtml\" lang=\"zh-CN\"><head><meta charset=\"utf-8\"/><title>墨页富文本编辑器</title></head><body><main data-moye-editor-shell=\"trusted\"></main></body></html>";
-const EDITOR_ASSET_PATH_PREFIX: &str = ".moye/assets/";
+const EDITOR_TRUSTED_SHELL: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><html xmlns=\"http://www.w3.org/1999/xhtml\" lang=\"zh-CN\"><head><meta charset=\"utf-8\"/><title>墨页富文本编辑器</title></head><body><main data-ngy-editor-shell=\"trusted\"></main></body></html>";
+const EDITOR_ASSET_PATH_PREFIX: &str = ".ngy/assets/";
 const MAX_EDITOR_ASSET_ID_BYTES: usize = 256;
 const MAX_EDITOR_SELECTION_BYTES: usize = 32 * 1024;
 const MAX_EDITOR_MEDIA_TITLE_CHARS: usize = 512;
@@ -1240,7 +1240,7 @@ fn rewrite_editor_resource_attributes(
 
 fn rewrite_editor_asset_urls(html: &str, assets: &HashMap<String, EditorMediaAsset>) -> String {
     rewrite_editor_resource_attributes(html, |value| {
-        let asset_id = value.strip_prefix("moye-asset:")?;
+        let asset_id = value.strip_prefix("ngy-asset:")?;
         if ensure_editor_asset_id(asset_id).is_err() || !assets.contains_key(asset_id) {
             return None;
         }
@@ -1268,7 +1268,7 @@ fn canonicalize_editor_asset_urls(
         if ensure_editor_asset_id(&asset_id).is_err() || !assets.contains_key(&asset_id) {
             return None;
         }
-        Some(format!("moye-asset:{asset_id}"))
+        Some(format!("ngy-asset:{asset_id}"))
     })
 }
 
@@ -1688,7 +1688,7 @@ fn preview_document_from_source(
     title: &str,
     unit_id: &str,
     source: &str,
-) -> Result<(String, String, moye_epub_editor::document::BlockDocument)> {
+) -> Result<(String, String, ngy_book_studio::document::BlockDocument)> {
     let parsed = parse_source_for_unit(source, unit_id)?;
     let html = serialize_xhtml(&parsed.document)?;
     let fallback = editor_document_shell(title, &html);
@@ -3652,8 +3652,7 @@ impl EditorApp {
                 request_id,
                 action,
             });
-            let script =
-                format!("window.__moyeEditorSend && window.__moyeEditorSend({request_id});");
+            let script = format!("window.__ngyEditorSend && window.__ngyEditorSend({request_id});");
             if let Err(error) = webview.read(cx).raw().evaluate_script(&script) {
                 self.pending_snapshot = None;
                 self.pending_export_path = None;
@@ -5542,9 +5541,9 @@ impl EditorApp {
             return;
         };
         let script = if locked {
-            r#"document.activeElement && document.activeElement.blur(); document.querySelector('.ProseMirror')?.setAttribute('contenteditable','false'); document.querySelectorAll('[data-moye-editor-ui="toolbar"] button').forEach((button) => button.disabled = true);"#
+            r#"document.activeElement && document.activeElement.blur(); document.querySelector('.ProseMirror')?.setAttribute('contenteditable','false'); document.querySelectorAll('[data-ngy-editor-ui="toolbar"] button').forEach((button) => button.disabled = true);"#
         } else {
-            r#"document.querySelector('.ProseMirror')?.setAttribute('contenteditable','true'); document.querySelectorAll('[data-moye-editor-ui="toolbar"] button').forEach((button) => button.disabled = false);"#
+            r#"document.querySelector('.ProseMirror')?.setAttribute('contenteditable','true'); document.querySelectorAll('[data-ngy-editor-ui="toolbar"] button').forEach((button) => button.disabled = false);"#
         };
         if let Err(error) = webview.read(cx).raw().evaluate_script(script) {
             tracing::warn!(locked, %error, "cannot update rich-text write lock");
@@ -6918,7 +6917,7 @@ fn freeze_editor_reference_hints(
 #[cfg(test)]
 mod editor_tests {
     use super::*;
-    use moye_epub_editor::document::{BlockDocument, ContentUnit};
+    use ngy_book_studio::document::{BlockDocument, ContentUnit};
     use tempfile::tempdir;
 
     #[test]
@@ -7016,7 +7015,7 @@ mod editor_tests {
 
     fn document_with_audio(book_id: &str, asset: AssetRef) -> BookDocument {
         let source = format!(
-            "<audio controls=\"controls\" src=\"moye-asset:{}\"></audio>",
+            "<audio controls=\"controls\" src=\"ngy-asset:{}\"></audio>",
             asset.id
         );
         let mut document = BookDocument::created(book_id, "媒体测试");
@@ -7108,7 +7107,7 @@ mod editor_tests {
             "unit-a",
             ContentUnitKind::Chapter,
             "第一章",
-            "<img src=\"moye-asset:image\" />",
+            "<img src=\"ngy-asset:image\" />",
             BlockDocument::new(vec![Block::Image {
                 id: "image-block".to_string(),
                 asset_id: referenced_id.clone(),
@@ -7358,12 +7357,12 @@ mod editor_tests {
         let mut parent = TocNode::new(
             "parent",
             "上级",
-            moye_epub_editor::document::TocTarget::unit("unit-a"),
+            ngy_book_studio::document::TocTarget::unit("unit-a"),
         );
         parent.children.push(TocNode::new(
             "child",
             "下级",
-            moye_epub_editor::document::TocTarget::unit("unit-b"),
+            ngy_book_studio::document::TocTarget::unit("unit-b"),
         ));
         assert_eq!(0, toc_depth_for_unit(&[parent.clone()], "unit-a"));
         assert_eq!(1, toc_depth_for_unit(&[parent], "unit-b"));
@@ -8188,17 +8187,17 @@ mod editor_tests {
     #[test]
     fn trusted_bridge_supplies_prosemirror_editor_contract() {
         assert!(
-            EDITOR_INITIALIZATION_SCRIPT.starts_with("(()=>{const __moyeEditorTrustedShell=()=>{"),
+            EDITOR_INITIALIZATION_SCRIPT.starts_with("(()=>{const __ngyEditorTrustedShell=()=>{"),
             "the complete ProseMirror bundle must wait for an XHTML document element"
         );
         assert!(
             EDITOR_INITIALIZATION_SCRIPT
-                .contains("DOMContentLoaded\",__moyeEditorStart,{once:true}")
+                .contains("DOMContentLoaded\",__ngyEditorStart,{once:true}")
         );
         for marker in [
             "contenteditable",
             "ProseMirror",
-            "__moyeProseMirror",
+            "__ngyProseMirror",
             "bullet_list",
             "ordered_list",
             "table_cell",
@@ -8226,7 +8225,7 @@ mod editor_tests {
             );
         }
         let send_installed = EDITOR_INITIALIZATION_SCRIPT
-            .find("window.__moyeEditorSend=")
+            .find("window.__ngyEditorSend=")
             .expect("snapshot bridge installation");
         let ready_sent = EDITOR_INITIALIZATION_SCRIPT
             .find("ready:!0")
@@ -8393,7 +8392,7 @@ mod editor_tests {
         let document = document_with_audio("book-a", asset.clone());
         let href = "EPUB/Text/ch.xhtml".to_string();
         let html = format!(
-            "<html><body><audio SRC = 'moye-asset:{}'></audio><p>src=\"moye-asset:{}\"</p><audio src=\"moye-asset:unknown\"></audio></body></html>",
+            "<html><body><audio SRC = 'ngy-asset:{}'></audio><p>src=\"ngy-asset:{}\"</p><audio src=\"ngy-asset:unknown\"></audio></body></html>",
             asset.id, asset.id
         );
         let state = EditorWebState::new("book-a".to_string(), href.clone(), html);
@@ -8412,8 +8411,8 @@ mod editor_tests {
         let page = String::from_utf8(page.body().to_vec()).unwrap();
         let private_path = editor_asset_path(&asset.id);
         assert!(page.contains(&format!("SRC = '{private_path}'")));
-        assert!(page.contains(&format!("<p>src=\"moye-asset:{}\"</p>", asset.id)));
-        assert!(page.contains("src=\"moye-asset:unknown\""));
+        assert!(page.contains(&format!("<p>src=\"ngy-asset:{}\"</p>", asset.id)));
+        assert!(page.contains("src=\"ngy-asset:unknown\""));
 
         let media = editor_protocol_response(
             &state,
@@ -8451,7 +8450,7 @@ mod editor_tests {
                 ready: false,
             })
             .unwrap();
-        assert!(canonical.html.contains(&format!("moye-asset:{}", asset.id)));
+        assert!(canonical.html.contains(&format!("ngy-asset:{}", asset.id)));
         assert!(!canonical.html.contains(EDITOR_ASSET_PATH_PREFIX));
 
         let canonical_absolute = state
@@ -8473,7 +8472,7 @@ mod editor_tests {
         assert!(
             canonical_absolute
                 .html
-                .contains(&format!("moye-asset:{}", asset.id))
+                .contains(&format!("ngy-asset:{}", asset.id))
         );
         #[cfg(target_os = "windows")]
         {
@@ -8496,7 +8495,7 @@ mod editor_tests {
             assert!(
                 canonical_windows
                     .html
-                    .contains(&format!("moye-asset:{}", asset.id))
+                    .contains(&format!("ngy-asset:{}", asset.id))
             );
         }
     }
@@ -8762,9 +8761,9 @@ mod editor_tests {
                 .is_err()
         );
         for uri in [
-            "epubeditor://content/.moye/assets/../secret",
-            "epubeditor://content/.moye/assets/bad%2Fid",
-            "epubeditor://content/.moye/assets/unknown",
+            "epubeditor://content/.ngy/assets/../secret",
+            "epubeditor://content/.ngy/assets/bad%2Fid",
+            "epubeditor://content/.ngy/assets/unknown",
         ] {
             let response = editor_protocol_response(&state, &protocol_request(uri, None));
             assert_eq!(response.status(), 404, "{uri}");

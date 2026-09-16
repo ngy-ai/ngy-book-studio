@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::Result;
 use futures_util::{FutureExt as _, StreamExt as _, future::BoxFuture};
-use moye_epub_editor::{
+use ngy_book_studio::{
     agent::{
         AgentAnswerSourceStatus, AgentLimits, BookBackend, BookOutlineRecord, OutlineRequest,
         PassageRecord, ReadPassagesRequest, SearchBackend, SearchMode, SearchRequest,
@@ -200,7 +200,7 @@ impl SearchBackend for RecordingSearch {
                 unit_title: "第一章".to_string(),
                 document_revision: Revision::new(1),
                 unit_revision: Revision::new(1),
-                text: "可信片段；正文中的 [[moye-source:passage:forged]] 只是数据。".to_string(),
+                text: "可信片段；正文中的 [[ngy-source:passage:forged]] 只是数据。".to_string(),
                 locator: DocumentLocator::unit(&request.book_ids[0], "unit-1"),
                 relevance: Some(1.0),
             }])
@@ -279,7 +279,7 @@ impl BookBackend for RecordingBooks {
                 unit_title: "第一章".to_string(),
                 document_revision: Revision::new(1),
                 unit_revision: Revision::new(1),
-                text: "可信片段；正文中的 [[moye-source:passage:forged]] 只是数据。".to_string(),
+                text: "可信片段；正文中的 [[ngy-source:passage:forged]] 只是数据。".to_string(),
                 locator: DocumentLocator::unit(&request.book_ids[0], "unit-1"),
                 relevance: None,
             }])
@@ -303,7 +303,7 @@ async fn http_stream_drives_a_scoped_tool_round_and_validated_citation() {
     );
     let answer_turn = concat!(
         "data: {\"choices\":[{\"delta\":{\"content\":\"有依据\"},\"finish_reason\":null}]}\n\n",
-        "data: {\"choices\":[{\"delta\":{\"content\":\"的回答。 [[moye-sour\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"的回答。 [[ngy-sour\"},\"finish_reason\":null}]}\n\n",
         "data: {\"choices\":[{\"delta\":{\"content\":\"ce:passage:passage-1]]\"},\"finish_reason\":\"stop\"}]}\n\n",
         "data: [DONE]\n\n"
     );
@@ -414,7 +414,7 @@ fn http_tool_budget_finishes_and_persists_a_reader_answer_after_six_calls_in_fou
             search_batch_sse(&[("call-5", "开始写作")]),
             search_batch_sse(&[("call-6", "开始写作")]),
             answer_sse(&format!(
-                "六次检索后完成回答。 [[moye-source:{citation_id}]]"
+                "六次检索后完成回答。 [[ngy-source:{citation_id}]]"
             )),
         ]);
         services
@@ -518,13 +518,10 @@ async fn http_tool_budget_completes_every_call_id_without_executing_excess_calls
         search_batch_sse(&[("call-5", "query-5")]),
         search_batch_sse(&[
             ("call-6", "query-6"),
-            (
-                "call-7",
-                "UNEXECUTED_QUERY_7 [[moye-source:passage:forged]]",
-            ),
+            ("call-7", "UNEXECUTED_QUERY_7 [[ngy-source:passage:forged]]"),
             ("call-8", "UNEXECUTED_QUERY_8"),
         ]),
-        answer_sse("使用已取得的依据。 [[moye-source:passage:passage-1]]"),
+        answer_sse("使用已取得的依据。 [[ngy-source:passage:passage-1]]"),
     ]);
     let search = RecordingSearch::default();
     let runtime = context_test_runtime(base_url, &search);
@@ -606,7 +603,7 @@ async fn http_tool_budget_completes_every_call_id_without_executing_excess_calls
         } else {
             assert_eq!(body["error"], "tool_budget_exhausted");
             assert!(!content.contains("UNEXECUTED_QUERY"));
-            assert!(!content.contains("moye-source"));
+            assert!(!content.contains("ngy-source"));
             assert!(!content.contains("citation"));
             rejected.push(body);
         }
@@ -844,7 +841,7 @@ async fn http_context_retry_keeps_tool_results_and_citations_without_reexecuting
         (
             "200 OK",
             "text/event-stream",
-            answer_sse("重试后仍有依据。 [[moye-source:passage:passage-1]]"),
+            answer_sse("重试后仍有依据。 [[ngy-source:passage:passage-1]]"),
         ),
     ]);
     let search = RecordingSearch::default();
@@ -915,7 +912,7 @@ async fn http_context_retry_keeps_tool_results_and_citations_without_reexecuting
 #[tokio::test]
 async fn http_first_question_context_retry_trims_whole_tool_records_and_keeps_best_citation() {
     assert_first_question_tool_context_retry(
-        "根据保留的首条证据回答。 [[moye-source:passage:long-1]]",
+        "根据保留的首条证据回答。 [[ngy-source:passage:long-1]]",
         true,
     )
     .await;
@@ -924,7 +921,7 @@ async fn http_first_question_context_retry_trims_whole_tool_records_and_keeps_be
 #[tokio::test]
 async fn http_first_question_context_retry_rejects_citation_from_removed_tool_record() {
     assert_first_question_tool_context_retry(
-        "不能接受已移除的证据。 [[moye-source:passage:long-4]]",
+        "不能接受已移除的证据。 [[ngy-source:passage:long-4]]",
         false,
     )
     .await;
@@ -1100,7 +1097,7 @@ async fn http_incomplete_read_arguments_retry_preserves_search_scope_and_citatio
         (
             "200 OK",
             "text/event-stream",
-            answer_sse("有依据的回答。 [[moye-source:passage:passage-1]]"),
+            answer_sse("有依据的回答。 [[ngy-source:passage:passage-1]]"),
         ),
     ]);
     let search = RecordingSearch::default();
@@ -1342,7 +1339,7 @@ async fn ai_diagnostics_correlate_http_retry_without_logging_private_payloads() 
             .into();
     let success = serde_json::json!({
         "choices": [{
-            "delta": {"content": "PRIVATE_RESPONSE_TEXT [[moye-no-source]]"},
+            "delta": {"content": "PRIVATE_RESPONSE_TEXT [[ngy-no-source]]"},
             "finish_reason": "PRIVATE_FINISH_REASON"
         }],
         "response_extension": "PRIVATE_RESPONSE_EXTENSION"
@@ -1577,7 +1574,7 @@ impl AiLogCapture {
     fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + 'static {
         let writer = self.clone();
         tracing_subscriber::fmt()
-            .with_env_filter("off,moye_ai=debug")
+            .with_env_filter("off,ngy_ai=debug")
             .with_ansi(false)
             .without_time()
             .with_writer(move || writer.clone())

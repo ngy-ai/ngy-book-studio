@@ -1,6 +1,6 @@
 """第 4 章 manual 参考示范；阅读或运行示范不代表独立完成。"""
 
-from moye_lab.chapter_support import call_tool, finish, load_case
+from ngy_lab.chapter_support import call_tool, finish, load_case
 
 
 def prepare(data):

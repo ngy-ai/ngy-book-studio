@@ -8,14 +8,14 @@
 
 use std::collections::{HashMap, HashSet};
 
-use gpui::{AnyElement, rems};
+use gpui::{AnyElement, ScrollWheelEvent, rems};
 use gpui_component::text::{TextView, TextViewStyle};
 
 use super::reader::{ReadingProgressWrite, ReadingProgressWriteEvent, ReadingProgressWriter};
 use super::*;
-use moye_epub_editor::{
+use ngy_book_studio::{
     document::{DocumentLocator, SourceLocator},
-    services::{PublishedVisualPage, VisualPageSourceKind},
+    services::{PublishedVisualPage, ReaderZoomSurface, VisualPageSourceKind},
 };
 
 /// Zoom steps are thousandths; `ZOOM_FIT` means "fit the window".
@@ -23,6 +23,9 @@ const ZOOM_FIT: u32 = 0;
 const ZOOM_MIN_MILLI: u32 = 250;
 const ZOOM_MAX_MILLI: u32 = 4_000;
 const ZOOM_STEP_MILLI: u32 = 250;
+/// Ctrl + wheel notches arrive in bursts; the page size is written after the
+/// reader stops changing it instead of once per notch.
+const ZOOM_SAVE_DEBOUNCE_MS: u64 = 400;
 const PAGE_TEXT_PANEL_WIDTH: f32 = 330.;
 /// One page of hidden text is shown at a time; the cap only guards the panel
 /// against a pathological page, the full text stays in the content unit.
@@ -113,8 +116,8 @@ fn page_window_title(kind: VisualPageSourceKind) -> &'static str {
 
 fn page_window_app_id(kind: VisualPageSourceKind) -> &'static str {
     match kind {
-        VisualPageSourceKind::OfficeEnhanced => "dev.moye.epub-editor.office-slides",
-        VisualPageSourceKind::Djvu => "dev.moye.epub-editor.djvu-reader",
+        VisualPageSourceKind::OfficeEnhanced => "dev.ngy.book-studio.office-slides",
+        VisualPageSourceKind::Djvu => "dev.ngy.book-studio.djvu-reader",
     }
 }
 
@@ -229,6 +232,8 @@ struct PageImageApp {
     /// `ZOOM_FIT` renders the whole page fitted to the window; any other value
     /// is an explicit pixel zoom in thousandths.
     zoom_milli: u32,
+    /// Pending write of this book's page size, replaced on every new change.
+    zoom_save_task: Option<Task<()>>,
     /// Page text loaded from the canonical units; present only for DjVu, where
     /// the hidden text layer is the page's searchable text.
     page_texts: Vec<Option<String>>,
@@ -293,6 +298,7 @@ impl PageImageApp {
             pages,
             current,
             zoom_milli: ZOOM_FIT,
+            zoom_save_task: None,
             page_texts,
             text_panel_open: false,
             progress_writer: None,
@@ -327,6 +333,7 @@ impl PageImageApp {
             app.queue_progress(cx);
         }
         app.load_page_texts(window, cx);
+        app.load_zoom(cx);
         app
     }
 
@@ -549,8 +556,7 @@ impl PageImageApp {
         } else {
             self.zoom_milli.saturating_add(ZOOM_STEP_MILLI)
         };
-        self.zoom_milli = next.min(ZOOM_MAX_MILLI);
-        cx.notify();
+        self.set_zoom_milli(next.min(ZOOM_MAX_MILLI), cx);
     }
 
     fn zoom_out(&mut self, cx: &mut Context<Self>) {
@@ -559,17 +565,99 @@ impl PageImageApp {
         } else {
             self.zoom_milli.saturating_sub(ZOOM_STEP_MILLI)
         };
-        self.zoom_milli = if next < ZOOM_MIN_MILLI {
-            ZOOM_FIT
-        } else {
-            next
-        };
-        cx.notify();
+        self.set_zoom_milli(
+            if next < ZOOM_MIN_MILLI {
+                ZOOM_FIT
+            } else {
+                next
+            },
+            cx,
+        );
     }
 
     fn reset_zoom(&mut self, cx: &mut Context<Self>) {
-        self.zoom_milli = ZOOM_FIT;
+        self.set_zoom_milli(ZOOM_FIT, cx);
+    }
+
+    /// Ctrl + wheel, the same scale the zoom buttons drive. The page size
+    /// belongs to the book, so every change below is also remembered.
+    fn zoom_from_wheel(&mut self, zoom_in: bool, cx: &mut Context<Self>) {
+        self.set_zoom_milli(zoom_after_wheel(self.zoom_milli, zoom_in), cx);
+    }
+
+    fn set_zoom_milli(&mut self, zoom_milli: u32, cx: &mut Context<Self>) {
+        if self.zoom_milli == zoom_milli {
+            return;
+        }
+        self.zoom_milli = zoom_milli;
+        self.schedule_zoom_save(cx);
         cx.notify();
+    }
+
+    /// Reads this book's remembered page size once per window. Until it arrives
+    /// the window is fitted to the window, so an unreadable row keeps that
+    /// default rather than blocking the pages.
+    fn load_zoom(&mut self, cx: &mut Context<Self>) {
+        let book_id = self.book_id.clone();
+        let services = Arc::clone(&self.services);
+        cx.spawn(async move |view, cx| {
+            let stored = services.reader_zoom(book_id, ReaderZoomSurface::Page).await;
+            let _ = view.update(cx, |this, cx| {
+                let stored = match stored {
+                    Ok(stored) => stored,
+                    Err(error) => {
+                        tracing::warn!(%error, "cannot read the book's page size");
+                        return;
+                    }
+                };
+                if this.closing {
+                    return;
+                }
+                let Some(stored) = stored else {
+                    return;
+                };
+                if this.zoom_milli != ZOOM_FIT {
+                    // The reader already changed it in this window; the older
+                    // row must not pull the page back.
+                    return;
+                }
+                this.set_zoom_milli(
+                    if stored == ZOOM_FIT {
+                        ZOOM_FIT
+                    } else {
+                        stored.clamp(ZOOM_MIN_MILLI, ZOOM_MAX_MILLI)
+                    },
+                    cx,
+                );
+            });
+        })
+        .detach();
+    }
+
+    fn schedule_zoom_save(&mut self, cx: &mut Context<Self>) {
+        let book_id = self.book_id.clone();
+        let services = Arc::clone(&self.services);
+        let zoom_milli = self.zoom_milli;
+        // Replacing the pending task drops the previous one, so the row always
+        // ends up with the size the reader stopped at.
+        self.zoom_save_task = Some(cx.spawn(async move |view, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(ZOOM_SAVE_DEBOUNCE_MS))
+                .await;
+            let result = services
+                .set_reader_zoom(book_id, ReaderZoomSurface::Page, zoom_milli)
+                .await;
+            let _ = view.update(cx, |this, cx| {
+                this.zoom_save_task = None;
+                if let Err(error) = result {
+                    this.notice = Some(Notice {
+                        text: format!("无法保存本书的页面大小：{error:#}"),
+                        error: true,
+                    });
+                    cx.notify();
+                }
+            });
+        }));
     }
 
     fn toggle_text_panel(&mut self, cx: &mut Context<Self>) {
@@ -761,6 +849,56 @@ fn zoomed_size(width: u32, height: u32, zoom_milli: u32) -> (f32, f32) {
     )
 }
 
+/// One Ctrl + wheel notch moves the page by one zoom step.
+///
+/// `ZOOM_FIT` is the reader's own "fit the window", not a size to step from: a
+/// page smaller than the window would only add empty margin, so scrolling down
+/// there stays put while scrolling up leaves it at 100%.
+fn zoom_after_wheel(zoom_milli: u32, zoom_in: bool) -> u32 {
+    if zoom_milli == ZOOM_FIT {
+        return if zoom_in {
+            ZOOM_MIN_MILLI * 4
+        } else {
+            ZOOM_FIT
+        };
+    }
+    if zoom_in {
+        zoom_milli
+            .saturating_add(ZOOM_STEP_MILLI)
+            .min(ZOOM_MAX_MILLI)
+    } else {
+        let next = zoom_milli.saturating_sub(ZOOM_STEP_MILLI);
+        if next < ZOOM_MIN_MILLI {
+            ZOOM_FIT
+        } else {
+            next
+        }
+    }
+}
+
+/// Ctrl + wheel over the page.
+///
+/// A plain notch is left to the reader so it keeps scrolling the page; with
+/// Ctrl held the notch becomes one zoom step and is swallowed, so a scroller
+/// under the pointer cannot also scroll by the same amount.
+fn zoom_wheel_listener(
+    app: Entity<PageImageApp>,
+) -> impl Fn(&ScrollWheelEvent, &mut Window, &mut App) + 'static {
+    move |event, window, cx| {
+        if !event.modifiers.control {
+            return;
+        }
+        let delta = event.delta.pixel_delta(window.line_height()).y;
+        if f32::from(delta) == 0.0 {
+            return;
+        }
+        cx.stop_propagation();
+        app.update(cx, |this, cx| {
+            this.zoom_from_wheel(f32::from(delta) > 0.0, cx);
+        });
+    }
+}
+
 /// A selectable, naturally sized page text view inside an outer scroller.
 ///
 /// `TextView` 0.5.1 keeps selection endpoints in its own bounds, so its
@@ -846,6 +984,7 @@ impl Render for PageImageApp {
                 .items_center()
                 .justify_center()
                 .overflow_hidden()
+                .on_scroll_wheel(zoom_wheel_listener(cx.entity()))
                 .child(img(page_image).size_full().object_fit(ObjectFit::Contain))
                 .into_any_element()
         } else {
@@ -868,9 +1007,15 @@ impl Render for PageImageApp {
                         .overflow_y_scroll()
                         .track_scroll(&scroll)
                         .child(
+                            // The listener sits inside the scroller on purpose:
+                            // bubble handlers run from the innermost element
+                            // outwards, so this one can stop a Ctrl + wheel
+                            // notch before the scroller turns it into a scroll.
                             div()
+                                .id("page-image-zoom-content")
                                 .p_4()
                                 .flex_shrink_0()
+                                .on_scroll_wheel(zoom_wheel_listener(cx.entity()))
                                 .child(img(page_image).w(px(width)).h(px(height))),
                         ),
                 )
@@ -1353,8 +1498,8 @@ mod tests {
             book_id: "book".to_string(),
             unit_id: "unit-1".to_string(),
             unit_index: None,
-            document_revision: moye_epub_editor::document::Revision::new(1),
-            unit_revision: moye_epub_editor::document::Revision::new(1),
+            document_revision: ngy_book_studio::document::Revision::new(1),
+            unit_revision: ngy_book_studio::document::Revision::new(1),
             locator: Some(pages[0].locator.clone()),
             label: "第一页".to_string(),
             quote: None,
@@ -1381,7 +1526,7 @@ mod tests {
                 DocumentLocator::text("book", "unit-1", "block-1", 0, 1)
                     .with_source(exact_source_coordinate.clone()),
                 pages[0].locator.clone().with_region(
-                    moye_epub_editor::document::NormalizedRect::new(0, 0, 100, 100),
+                    ngy_book_studio::document::NormalizedRect::new(0, 0, 100, 100),
                 ),
             ];
         for locator in differing_locators {
@@ -1519,8 +1664,8 @@ mod tests {
             book_id: "book".to_string(),
             unit_id: "unit-1".to_string(),
             unit_index: None,
-            document_revision: moye_epub_editor::document::Revision::new(1),
-            unit_revision: moye_epub_editor::document::Revision::new(1),
+            document_revision: ngy_book_studio::document::Revision::new(1),
+            unit_revision: ngy_book_studio::document::Revision::new(1),
             locator: Some(pages[0].locator.clone()),
             label: "增强预览第一页".to_string(),
             quote: None,
@@ -1551,5 +1696,21 @@ mod tests {
 
         assert_eq!(zoomed_size(800, 1_200, 500), (400.0, 600.0));
         assert_eq!(zoomed_size(1, 1, 250), (1.0, 1.0));
+    }
+
+    #[test]
+    fn wheel_zoom_steps_within_range_and_returns_to_fit() {
+        // Fit is the floor: a page can be enlarged out of it, never shrunk into
+        // empty margin.
+        assert_eq!(zoom_after_wheel(ZOOM_FIT, false), ZOOM_FIT);
+        assert_eq!(zoom_after_wheel(ZOOM_FIT, true), 1_000);
+
+        assert_eq!(zoom_after_wheel(1_000, true), 1_250);
+        assert_eq!(zoom_after_wheel(1_000, false), 750);
+        assert_eq!(zoom_after_wheel(ZOOM_MAX_MILLI, true), ZOOM_MAX_MILLI);
+        // One notch below the smallest explicit size falls back to fit instead
+        // of leaving a size the fit button could never reach again.
+        assert_eq!(zoom_after_wheel(ZOOM_MIN_MILLI, false), ZOOM_FIT);
+        assert_eq!(zoom_after_wheel(ZOOM_FIT + 1, false), ZOOM_FIT);
     }
 }

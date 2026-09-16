@@ -1,6 +1,6 @@
 """练习起点：请在此处亲手实现循环，不要导入参考实现。"""
 
-from moye_lab.contracts import AgentOutcome, Emit, Model, RunLimits, Tools
+from ngy_lab.contracts import AgentOutcome, Emit, Model, RunLimits, Tools
 
 
 def run(task: str, model: Model, tools: Tools, limits: RunLimits, emit: Emit) -> AgentOutcome:

@@ -1,5 +1,5 @@
 [project]
-name = "moye-agent-foundations"
+name = "ngy-agent-foundations"
 version = "0.1.0"
 description = "墨页第一章：工具调用循环与失败处理的开发实验包"
 requires-python = ">=3.12,<3.13"

@@ -11,9 +11,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from moye_lab import credentials
-from moye_lab.contracts import BudgetExceeded, LabError, ProtocolError
-from moye_lab.live import (
+from ngy_lab import credentials
+from ngy_lab.contracts import BudgetExceeded, LabError, ProtocolError
+from ngy_lab.live import (
     MAX_ARGUMENT_BYTES,
     MAX_CONTENT_BYTES,
     MAX_RESPONSE_BYTES,
@@ -520,7 +520,7 @@ def test_credential_namespace_cannot_access_reader_or_arbitrary_targets(monkeypa
         credentials, "_native_api", lambda: pytest.fail("must reject before native access")
     )
     for target in (
-        "dev.moye.epub-reader.openai-compatible",
+        "dev.ngy.book-studio.openai-compatible",
         "other-app",
         "",
         credentials.NAMESPACE,

@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from moye_lab.contracts import (
+from ngy_lab.contracts import (
     AgentOutcome,
     BudgetExceeded,
     Emit,

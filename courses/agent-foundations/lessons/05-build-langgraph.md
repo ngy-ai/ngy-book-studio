@@ -153,8 +153,8 @@ from typing import TypedDict
 from langgraph.graph import END, START, StateGraph
 from langsmith import tracing_context
 
-from moye_lab.contracts import BudgetExceeded
-from moye_lab.implementations.common import Session, parse_final
+from ngy_lab.contracts import BudgetExceeded
+from ngy_lab.implementations.common import Session, parse_final
 
 
 class AgentState(TypedDict):
@@ -262,7 +262,7 @@ def run(task, model, tools, limits, emit):
 命令行用户可把完整代码保存到 `workspaces/first-agent/langgraph_agent.py`，再运行：
 
 ```powershell
-uv run --locked python -m moye_lab run --implementation workspaces/first-agent/langgraph_agent.py --scenario normal
+uv run --locked python -m ngy_lab run --implementation workspaces/first-agent/langgraph_agent.py --scenario normal
 ```
 
 开头的小图可单独保存为 `workspaces/graph_demo.py`，用

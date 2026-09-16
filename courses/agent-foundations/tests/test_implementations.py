@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from moye_lab.contracts import BudgetExceeded, LabError, ProtocolError, RunLimits
-from moye_lab.implementations import common, langgraph_agent, manual
+from ngy_lab.contracts import BudgetExceeded, LabError, ProtocolError, RunLimits
+from ngy_lab.implementations import common, langgraph_agent, manual
 
 
 def answer(value=None, sources=None):

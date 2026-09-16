@@ -39,14 +39,14 @@ let browser;
 before(async () => {
   browser = await chromium.launch({
     headless: true,
-    ...(process.env.MOYE_TEST_CHROMIUM ? { executablePath: process.env.MOYE_TEST_CHROMIUM } : {}),
+    ...(process.env.NGY_TEST_CHROMIUM ? { executablePath: process.env.NGY_TEST_CHROMIUM } : {}),
   });
 });
 after(async () => { await browser?.close(); });
 
 async function pageWithFixture() {
   const page = await browser.newPage({ viewport: { width: 1000, height: 1200 } });
-  await page.route("http://moyepdf.viewer/**", (route) => route.fulfill({
+  await page.route("http://ngypdf.viewer/**", (route) => route.fulfill({
     status: 200, contentType: "text/html; charset=utf-8", body: fixture,
     headers: { "content-security-policy": "default-src 'none';script-src 'none';style-src 'unsafe-inline'" },
   }));
@@ -56,18 +56,18 @@ async function pageWithFixture() {
     const originalAttach = Element.prototype.attachShadow;
     Element.prototype.attachShadow = function(options) {
       const result = originalAttach.call(this, options);
-      if (this.localName === "moye-reader-notes") window.__notesRoot = result;
+      if (this.localName === "ngy-reader-notes") window.__notesRoot = result;
       return result;
     };
     ${source}
   ` });
-  await page.goto("http://moyepdf.viewer/viewer.html");
+  await page.goto("http://ngypdf.viewer/viewer.html");
   await page.waitForFunction(() => !!window.__notesRoot);
-  const configured = await page.evaluate(() => window.moyeAnnotations.configure({
+  const configured = await page.evaluate(() => window.ngyAnnotations.configure({
     session: "doc-session", revision: 0, notes_enabled: true,
   }));
   assert.equal(configured, true);
-  await page.evaluate(() => window.moyeAnnotations.setCurrentPage(1));
+  await page.evaluate(() => window.ngyAnnotations.setCurrentPage(1));
   return page;
 }
 
@@ -82,13 +82,13 @@ async function waitForMessage(page, action) {
 
 // Declares the mounted window and answers the page listing like the host does.
 async function loadPages(page, notesByPage) {
-  await page.evaluate(() => window.moyeAnnotations.setPages([1, 2, 3]));
+  await page.evaluate(() => window.ngyAnnotations.setPages([1, 2, 3]));
   const declared = await waitForMessage(page, "pages_rendered");
   assert.deepEqual(declared.pages, [1, 2, 3]);
   assert.equal(declared.page, 1);
   const listing = await waitForMessage(page, "list");
   assert.deepEqual(listing.pages, [1, 2, 3]);
-  return page.evaluate(({ listing, notesByPage }) => window.moyeAnnotations.result({
+  return page.evaluate(({ listing, notesByPage }) => window.ngyAnnotations.result({
     session: listing.session,
     revision: listing.revision,
     request_id: listing.request_id,
@@ -150,7 +150,7 @@ test("every mounted page keeps its own notes, marks and text layer", async () =>
     assert.equal(await page.evaluate(() =>
       document.querySelector('.pdf-page[data-page="2"] .textLayer').innerHTML), beforeHtml);
     // A page that is not mounted is not declared, so the host stops serving it.
-    await page.evaluate(() => window.moyeAnnotations.setPages([1, 3]));
+    await page.evaluate(() => window.ngyAnnotations.setPages([1, 3]));
     const narrowed = await waitForMessage(page, "pages_rendered");
     assert.deepEqual(narrowed.pages, [1, 3]);
     await page.waitForFunction(() => window.__notesRoot.querySelectorAll(".mark").length === 1);
@@ -217,14 +217,14 @@ test("an unsaved draft pins its page and blocks the other page's notes", async (
     const draft = await waitForMessage(page, "draft_changed");
     assert.equal(draft.page, 3);
     assert.equal(draft.dirty, true);
-    assert.equal(await page.evaluate(() => window.moyeAnnotations.lockedPage()), 3);
+    assert.equal(await page.evaluate(() => window.ngyAnnotations.lockedPage()), 3);
     assert.equal(await page.evaluate(() => window.__notesRoot.querySelector(".editor").hidden), false);
     // Scrolling elsewhere never moves the pinned page while the draft is open.
-    await page.evaluate(() => window.moyeAnnotations.setCurrentPage(1));
-    assert.equal(await page.evaluate(() => window.moyeAnnotations.lockedPage()), 3);
+    await page.evaluate(() => window.ngyAnnotations.setCurrentPage(1));
+    assert.equal(await page.evaluate(() => window.ngyAnnotations.lockedPage()), 3);
     // Cancelling releases the pin and reports the cleared draft.
     await page.evaluate(() => window.__notesRoot.querySelector(".editor .cancel").click());
-    await page.waitForFunction(() => window.moyeAnnotations.lockedPage() === null);
+    await page.waitForFunction(() => window.ngyAnnotations.lockedPage() === null);
     const cleared = (await messages(page, "draft_changed")).at(-1);
     assert.equal(cleared.dirty, false);
     assert.equal(cleared.page, 3);

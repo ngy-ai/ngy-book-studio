@@ -7,7 +7,7 @@
 (() => {
   "use strict";
 
-  const MARK = "data-moye-translation";
+  const MARK = "data-ngy-translation";
   const XHTML = "http://www.w3.org/1999/xhtml";
   const SELECTOR = "p, h1, h2, h3, h4, h5, h6, li, blockquote, td, th";
   const SKIPPED = new Set(["script", "style", "noscript", "template"]);
@@ -51,6 +51,23 @@
     "border:1px solid currentColor!important;border-radius:0.25em!important;background:transparent!important;" +
     "color:inherit!important;font:inherit!important;cursor:pointer!important;";
   const EDITABLE_STYLE = "outline:1px dashed rgba(90,130,200,0.75)!important;border-radius:2px!important;";
+  // The reveal control trails the last translated character of a block. In
+  // 「译文」mode the original is hidden, and this icon is the only way back to
+  // it: clicking the translated text itself no longer toggles, because that is
+  // where a reader selects and copies, and a drag used to flip the paragraph.
+  // The icon is a `<button>` carrying an inline SVG and no text node at all, so
+  // it can sit in the flow without joining the block's text: the layer's
+  // `textContent` must stay exactly the translation it displays.
+  const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
+  const REVEAL_STYLE = "display:inline-block!important;width:1em!important;height:1em!important;" +
+    "margin:0 0 0 0.25em!important;padding:0!important;border:0!important;background:transparent!important;" +
+    "color:inherit!important;opacity:0.45!important;cursor:pointer!important;vertical-align:-0.12em!important;" +
+    "font:inherit!important;line-height:1!important;";
+  const REVEAL_STROKE = "M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12z";
+  // Shown while the original is hidden: an open eye reads as 「显示原文」.
+  const REVEAL_SHOW = [REVEAL_STROKE, "M12 9.4a2.6 2.6 0 1 0 0 5.2 2.6 2.6 0 0 0 0-5.2z"];
+  // Shown once the original is back: the same eye struck through reads as 「收起原文」.
+  const REVEAL_HIDE = [...REVEAL_SHOW, "M3.5 3.5l17 17"];
 
   let session = "";
   let revision = 0;
@@ -85,15 +102,39 @@
   const CODE_OPERATORS = [
     "=>", "->", "::", ":=", "==", "!=", "<=", ">=", "&&", "||", "+=", "-=", "*=", "/=", "</", "/>",
   ];
+  // Statement keywords only count together with a code shape on the same line:
+  // prose opens sentences with `let` / `use` / `return` too.
+  const CODE_LINE_KEYWORDS = [
+    "def", "fn", "func", "impl", "struct", "enum", "trait", "class", "let", "var", "const",
+    "static", "public", "private", "protected", "pub", "use", "import", "package", "export",
+    "return", "println", "printf", "console", "system",
+  ];
+  // A bare quote is never a signal: prose wraps quoted words in spaces, so a quote
+  // on its own would keep every paragraph with a quotation in the original language.
+  const CODE_STRING_SHAPES = ["+\"", "\"+", "+ \"", "\" +", "(\"", "\")", "('", "')"];
   const trimCodeLine = (value) =>
     value.replace(/^[\s\u200b\ufeff\u00ad]+|[\s\u200b\ufeff\u00ad]+$/gu, "");
+  const hasCodeStringShape = (line) =>
+    CODE_STRING_SHAPES.some((shape) => line.includes(shape)) || /\\[ntrbf0\\'"]/.test(line);
+  const hasCodeKeyword = (line) => {
+    const word = /^[A-Za-z0-9_.]+/.exec(line)?.[0];
+    if (!word || !CODE_LINE_KEYWORDS.includes(word)) return false;
+    const rest = line.slice(word.length);
+    return rest.includes("(") || rest.includes("=") || rest.includes("{") || rest.includes("[");
+  };
+  // An unspaced type annotation (`a:Int`). Prose writes `Note: the file`, and a URL
+  // has a slash after its colon.
+  const hasTypeAnnotation = (line) => /:[A-Za-z]/.test(line);
   const isCodeLine = (value) => {
     const line = trimCodeLine(value);
     if (!line) return false;
     return CODE_LINE_ENDINGS.some((ending) => line.endsWith(ending))
       || (line.startsWith("<") && line.endsWith(">"))
       || CODE_LINE_PREFIXES.some((prefix) => line.startsWith(prefix))
-      || CODE_OPERATORS.some((operator) => line.includes(operator));
+      || CODE_OPERATORS.some((operator) => line.includes(operator))
+      || hasCodeStringShape(line)
+      || hasCodeKeyword(line)
+      || hasTypeAnnotation(line);
   };
   const looksLikeSourceCode = (lines) => lines.split("\n").some(isCodeLine);
   const tag = (element) => element.localName?.toLowerCase() || "";
@@ -201,13 +242,28 @@
     state.hidden = false;
   };
 
+  /// Points the trailing icon at the state of its block: an eye while the
+  /// original is hidden, a struck-through eye once it is visible again. The
+  /// label lives on the button as an attribute; SVG `<title>` or a glyph would
+  /// be text inside the layer and would be copied with the translation.
+  const renderReveal = (state) => {
+    const reveal = state.reveal;
+    if (!reveal) return;
+    reveal.show.style.setProperty("display", state.hidden ? "block" : "none", "important");
+    reveal.hide.style.setProperty("display", state.hidden ? "none" : "block", "important");
+    const label = state.hidden ? "显示原文" : "收起原文";
+    reveal.element.setAttribute("aria-label", label);
+    reveal.element.setAttribute("title", label);
+  };
+
   const setCollapsed = (state, collapsed) => {
     if (collapsed) {
       state.original.style.setProperty("display", "none", "important");
       state.hidden = true;
     } else if (state.hidden) restoreOriginal(state);
     state.divider.style.display = collapsed ? "none" : "block";
-    state.layer.setAttribute("data-moye-collapsed", collapsed ? "1" : "0");
+    state.layer.setAttribute("data-ngy-collapsed", collapsed ? "1" : "0");
+    renderReveal(state);
   };
 
   const button = (label, handler) => {
@@ -231,14 +287,14 @@
     controls.textContent = "";
     if (state.error) {
       const error = create("span");
-      error.className = "moye-translation-error";
+      error.className = "ngy-translation-error";
       error.textContent = state.error;
       error.style.setProperty("color", "#c0392b", "important");
       error.style.setProperty("margin-right", "0.5em", "important");
       controls.append(error);
     } else if (state.manual) {
       const marker = create("span");
-      marker.className = "moye-translation-manual";
+      marker.className = "ngy-translation-manual";
       marker.textContent = "已手工修改";
       marker.style.setProperty("margin-right", "0.5em", "important");
       controls.append(marker);
@@ -274,7 +330,7 @@
     state.error = "";
     for (const pair of state.pairs) {
       const editable = create("span");
-      editable.className = "moye-translation-editable";
+      editable.className = "ngy-translation-editable";
       editable.setAttribute("contenteditable", "true");
       editable.style.cssText = EDITABLE_STYLE;
       editable.textContent = pair.value;
@@ -407,14 +463,55 @@
     renderControls(state);
   };
 
+  const svgIcon = (paths) => {
+    const svg = document.createElementNS(SVG_NAMESPACE, "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("fill", "none");
+    svg.setAttribute("stroke", "currentColor");
+    svg.setAttribute("stroke-width", "2");
+    svg.setAttribute("stroke-linecap", "round");
+    svg.setAttribute("stroke-linejoin", "round");
+    svg.setAttribute("aria-hidden", "true");
+    svg.setAttribute("focusable", "false");
+    svg.setAttribute("style", "display:block;width:1em;height:1em;");
+    for (const d of paths) {
+      const path = document.createElementNS(SVG_NAMESPACE, "path");
+      path.setAttribute("d", d);
+      svg.append(path);
+    }
+    return svg;
+  };
+
+  /// Appends the reveal icon to the end of one block's translated text. The
+  /// block is addressed through the state it was built with, so the icon only
+  /// ever collapses the paragraph it belongs to.
+  const appendReveal = (state, text) => {
+    const element = create("button");
+    element.type = "button";
+    element.className = "ngy-translation-reveal";
+    element.setAttribute("data-ngy-translation-reveal", "1");
+    element.style.cssText = REVEAL_STYLE;
+    const show = svgIcon(REVEAL_SHOW);
+    const hide = svgIcon(REVEAL_HIDE);
+    element.append(show, hide);
+    element.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      setCollapsed(state, !state.hidden);
+    });
+    state.reveal = { element, show, hide };
+    text.append(element);
+    renderReveal(state);
+  };
+
   const insert = (element, entry, translated, translateOnly) => {
     const inPlace = isCell(element) || tag(element) === "li";
     const layer = create("div");
     layer.setAttribute(MARK, "1");
-    layer.className = "moye-translation-block";
+    layer.className = "ngy-translation-block";
     layer.style.cssText = "display:block!important;margin:0!important;padding:0!important;";
     const text = create(inPlace ? "div" : tag(element));
-    text.className = "moye-translation-text";
+    text.className = "ngy-translation-text";
     copyStyles(element, text, !inPlace);
     text.style.setProperty("display", "block", "important");
     if (inPlace) {
@@ -428,7 +525,7 @@
       if (result) text.append(result);
     }
     const divider = create("div");
-    divider.className = "moye-translation-divider";
+    divider.className = "ngy-translation-divider";
     divider.style.cssText = "display:block;border-top:1px dashed rgba(120,120,120,0.5);margin:0.35em 0;";
     layer.append(text, divider);
 
@@ -453,33 +550,23 @@
       key: typeof entry.key === "string" ? entry.key : "",
       manual: entry.manual === true,
       editing: false, request: 0, requestManual: false, error: "", hovering: false,
-      controls: null, showControls: null,
+      controls: null, showControls: null, reveal: null,
       display: original.style.getPropertyValue("display"),
       priority: original.style.getPropertyPriority("display"),
       hadStyle: original.hasAttribute("style"),
     };
     layerStates.set(layer, state);
-    // Computed before any chrome is added: a control button inside an LI must not
-    // disable that item's click-to-collapse behaviour.
-    const toggleable = !isCell(element) && !element.querySelector(MEDIA);
-    const onToggle = (event) => {
-      // Dragging to copy a translation, or editing one, must not collapse it.
-      if (state.editing || state.request || window.getSelection()?.toString()) return;
-      event.preventDefault();
-      event.stopPropagation();
-      setCollapsed(state, !state.hidden);
-    };
-    if (toggleable) {
-      text.style.setProperty("cursor", "pointer", "important");
-      text.addEventListener("click", onToggle);
-      layer.addEventListener("click", (event) => {
-        if (event.target === layer) onToggle(event);
-      });
-    }
+    // 「译文」is the only mode that hides the original, so the reveal icon only
+    // exists there, and a block that may not be collapsed at all — a table cell
+    // or a paragraph carrying media — stays bilingual without one. Decided
+    // before any chrome is inserted: the icon is a `<button>` and `MEDIA`
+    // matches buttons, so a later check would disable itself.
+    const revealable = translateOnly && !isCell(element) && !element.querySelector(MEDIA);
     if (inPlace) element.insertBefore(layer, element.firstChild);
     else element.parentNode.insertBefore(layer, element);
+    if (revealable) appendReveal(state, text);
     appendControls(state);
-    setCollapsed(state, translateOnly && toggleable);
+    setCollapsed(state, revealable);
     applied.push(state);
   };
 
@@ -494,11 +581,11 @@
   const appendControls = (state) => {
     if (!state.key) return;
     const host = create("span");
-    host.className = "moye-translation-controls";
-    host.setAttribute("data-moye-translation-controls", "1");
+    host.className = "ngy-translation-controls";
+    host.setAttribute("data-ngy-translation-controls", "1");
     host.style.cssText = CONTROLS_STYLE;
     const row = create("span");
-    row.className = "moye-translation-row";
+    row.className = "ngy-translation-row";
     row.style.cssText = CONTROLS_ROW_STYLE;
     host.attachShadow({ mode: "open" }).append(row);
     state.controls = row;
@@ -615,7 +702,7 @@
     return merged;
   };
 
-  window.moyeTranslations = Object.freeze({
+  window.ngyTranslations = Object.freeze({
     configure,
     result: applyResult,
     clear: () => { session = ""; deferred = null; clear(); },

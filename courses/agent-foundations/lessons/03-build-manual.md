@@ -40,7 +40,7 @@ run(task, model, tools, limits, emit)
 `AgentOutcome` 是课程定义的结果对象。下面可在课程 Python 环境独立运行：
 
 ```python
-from moye_lab.contracts import AgentOutcome
+from ngy_lab.contracts import AgentOutcome
 
 result = AgentOutcome("incomplete", "starter_todo", None, [])
 print(result.status)
@@ -62,8 +62,8 @@ print(result.stop_reason)
 与预算对象，输出是一个包含两条字典的列表。下面例子可单独运行：
 
 ```python
-from moye_lab.contracts import RunLimits
-from moye_lab.implementations.common import initial_messages
+from ngy_lab.contracts import RunLimits
+from ngy_lab.implementations.common import initial_messages
 
 messages = initial_messages("请根据资料调查松果项目。", RunLimits())
 print(len(messages))
@@ -125,7 +125,7 @@ for call in calls:
 
 ```python
 import json
-from moye_lab.implementations.common import parse_final
+from ngy_lab.implementations.common import parse_final
 
 answer_data = {
     "start_date": {"value": None, "source_ids": []},
@@ -157,8 +157,8 @@ print(answer["start_date"]["value"] is None)
 不同的学习证据；看完整代码不用假装是独立完成。
 
 ```python
-from moye_lab.contracts import AgentOutcome, BudgetExceeded
-from moye_lab.implementations.common import initial_messages, parse_final
+from ngy_lab.contracts import AgentOutcome, BudgetExceeded
+from ngy_lab.implementations.common import initial_messages, parse_final
 
 
 def run(task, model, tools, limits, emit):
@@ -219,7 +219,7 @@ D2 结果；下一次模型缺少 D1 对应反馈。这个错误不能靠“工�
 在课程目录运行：
 
 ```powershell
-uv run --locked python -m moye_lab run --implementation workspaces/first-agent/manual.py --scenario normal
+uv run --locked python -m ngy_lab run --implementation workspaces/first-agent/manual.py --scenario normal
 ```
 
 桌面与 CLI 工作区独立，不会自动互相同步。到这里，第二步的演示已经成为你的完整

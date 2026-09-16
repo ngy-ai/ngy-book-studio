@@ -122,7 +122,7 @@ impl OfficeComWorker {
     pub fn start() -> Result<Self> {
         let (sender, receiver) = mpsc::channel::<WorkItem>();
         thread::Builder::new()
-            .name("moye-office-sta".to_string())
+            .name("ngy-office-sta".to_string())
             .spawn(move || {
                 while let Ok(work) = receiver.recv() {
                     let result = execute_request(&work.request);
@@ -165,9 +165,9 @@ fn execute_request(request: &OfficeEnhanceRequest) -> Result<OfficeEnhanceOutput
             "-Command",
             OFFICE_SCRIPT,
         ])
-        .env("MOYE_OFFICE_SOURCE", &request.source)
-        .env("MOYE_OFFICE_TARGET", &request.target)
-        .env("MOYE_OFFICE_KIND", request.kind.command_name())
+        .env("NGY_OFFICE_SOURCE", &request.source)
+        .env("NGY_OFFICE_TARGET", &request.target)
+        .env("NGY_OFFICE_KIND", request.kind.command_name())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -302,9 +302,9 @@ fn hide_child_window(_: &mut Command) {}
 /// are only ever exported to a separate target.
 const OFFICE_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
-$source = [Environment]::GetEnvironmentVariable('MOYE_OFFICE_SOURCE')
-$target = [Environment]::GetEnvironmentVariable('MOYE_OFFICE_TARGET')
-$kind = [Environment]::GetEnvironmentVariable('MOYE_OFFICE_KIND')
+$source = [Environment]::GetEnvironmentVariable('NGY_OFFICE_SOURCE')
+$target = [Environment]::GetEnvironmentVariable('NGY_OFFICE_TARGET')
+$kind = [Environment]::GetEnvironmentVariable('NGY_OFFICE_KIND')
 $app = $null
 $document = $null
 try {

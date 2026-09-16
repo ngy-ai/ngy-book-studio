@@ -8,7 +8,7 @@
 
 use super::*;
 use gpui::{Modifiers, TestAppContext, VisualTestContext};
-use moye_epub_editor::document::{
+use ngy_book_studio::document::{
     BlockDocument, ContentUnit as DocumentUnit, SourceLocator, TocTarget,
 };
 use std::time::{Duration, Instant};
@@ -1027,7 +1027,7 @@ fn rejected_rich_body_cannot_be_saved_by_an_unchanged_ack_and_can_be_corrected(
     cx: &mut TestAppContext,
 ) {
     let (fixture, visual) = open_unchanged_media_page(cx);
-    let depth = moye_epub_editor::document::MAX_DOCUMENT_DEPTH + 8;
+    let depth = ngy_book_studio::document::MAX_DOCUMENT_DEPTH + 8;
     let rejected_body = format!(
         "<body xmlns=\"http://www.w3.org/1999/xhtml\">{}<p>合法 XML，但超过正文层级上限</p>{}</body>",
         "<div>".repeat(depth),

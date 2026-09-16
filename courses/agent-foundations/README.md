@@ -88,21 +88,21 @@ uv sync --locked
 命令行用户先在课程目录创建自己的工作区：
 
 ```powershell
-uv run --locked python -m moye_lab new-workspace first-agent
+uv run --locked python -m ngy_lab new-workspace first-agent
 ```
 
 `manual.py`、`langgraph_agent.py` 是自己的实现文件，`learning-record.md` 保存
 作答。把第三、四步完整手搓代码放入前者，第五步完整图代码放入后者，再运行：
 
 ```powershell
-uv run --locked python -m moye_lab run --implementation workspaces/first-agent/manual.py --scenario normal
-uv run --locked python -m moye_lab run --implementation workspaces/first-agent/langgraph_agent.py --scenario normal
+uv run --locked python -m ngy_lab run --implementation workspaces/first-agent/manual.py --scenario normal
+uv run --locked python -m ngy_lab run --implementation workspaces/first-agent/langgraph_agent.py --scenario normal
 ```
 
 对照自己的两版实现：
 
 ```powershell
-uv run --locked python -m moye_lab compare --scenario normal --manual workspaces/first-agent/manual.py --langgraph workspaces/first-agent/langgraph_agent.py
+uv run --locked python -m ngy_lab compare --scenario normal --manual workspaces/first-agent/manual.py --langgraph workspaces/first-agent/langgraph_agent.py
 ```
 
 `manual`、`langgraph` 这两个不带文件路径的名称指内置参考实现。用于检查环境时可以

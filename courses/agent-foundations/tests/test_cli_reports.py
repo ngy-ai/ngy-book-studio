@@ -10,13 +10,13 @@ from pathlib import Path
 
 import pytest
 
-from moye_lab.runner import COURSE_ROOT
-from moye_lab.runtime import json_text
+from ngy_lab.runner import COURSE_ROOT
+from ngy_lab.runtime import json_text
 
 
 @pytest.fixture
 def course(tmp_path):
-    for directory in ("moye_lab", "starters", "worksheets"):
+    for directory in ("ngy_lab", "starters", "worksheets"):
         shutil.copytree(
             COURSE_ROOT / directory,
             tmp_path / directory,
@@ -30,7 +30,7 @@ def course(tmp_path):
 def cli(course: Path, *arguments: str):
     environment = dict(os.environ, PYTHONUTF8="1", PYTHONDONTWRITEBYTECODE="1")
     return subprocess.run(
-        [sys.executable, "-B", "-m", "moye_lab", *arguments],
+        [sys.executable, "-B", "-m", "ngy_lab", *arguments],
         cwd=course,
         env=environment,
         text=True,
@@ -64,8 +64,8 @@ def test_pair_produces_trace_and_verifiable_code_snapshots(course):
         digest = hashlib.sha256(json_text(snapshot).encode("utf-8")).hexdigest()
         assert report["request"]["code_sha256"] == digest
         assert "uv.lock" in snapshot
-        assert "moye_lab/implementations/common.py" in snapshot
-        assert "moye_lab/scenarios.py" in snapshot
+        assert "ngy_lab/implementations/common.py" in snapshot
+        assert "ngy_lab/scenarios.py" in snapshot
         timeout = [
             r
             for r in report["observations"]["tool_calls"]
@@ -103,7 +103,7 @@ def test_new_learner_can_create_attempt_and_preserve_first_work(course):
 def test_custom_code_path_is_actually_executed(course):
     assert cli(course, "new-workspace", "custom").returncode == 0
     implementation = course / "workspaces" / "custom" / "manual.py"
-    implementation.write_text("from moye_lab.implementations.manual import run\n", encoding="utf-8")
+    implementation.write_text("from ngy_lab.implementations.manual import run\n", encoding="utf-8")
     result = cli(course, "run", "--implementation", "workspaces/custom/manual.py")
     assert result.returncode == 0, result.stdout + result.stderr
     report = json.loads(next((course / "runs").glob("*/report.json")).read_text("utf-8"))

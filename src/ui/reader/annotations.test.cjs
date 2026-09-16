@@ -25,7 +25,7 @@ let browser;
 before(async () => {
   browser = await chromium.launch({
     headless: true,
-    ...(process.env.MOYE_TEST_CHROMIUM ? { executablePath: process.env.MOYE_TEST_CHROMIUM } : {}),
+    ...(process.env.NGY_TEST_CHROMIUM ? { executablePath: process.env.NGY_TEST_CHROMIUM } : {}),
   });
 });
 after(async () => { await browser?.close(); });
@@ -42,14 +42,14 @@ async function pageWithFixture(html = fixture, viewport = { width: 1150, height:
     const originalAttach = Element.prototype.attachShadow;
     Element.prototype.attachShadow = function(options) {
       const result = originalAttach.call(this, options);
-      if (this.localName === 'moye-reader-notes') window.__notesRoot = result;
+      if (this.localName === 'ngy-reader-notes') window.__notesRoot = result;
       return result;
     };
     ${selectionBridge}
     ${source}
   ` });
   await page.goto("http://epubreader.book/chapter.html");
-  await page.evaluate(() => window.moyeAnnotations.configure({ session: "chapter-session", revision: 1, notes: [] }));
+  await page.evaluate(() => window.ngyAnnotations.configure({ session: "chapter-session", revision: 1, notes: [] }));
   await page.waitForFunction(() => !!window.__notesRoot && window.__messages.some((message) => message.action === "list"));
   return page;
 }
@@ -82,7 +82,7 @@ async function lastMessage(page, action) {
 }
 
 async function result(page, message, fields) {
-  return page.evaluate(({ message, fields }) => window.moyeAnnotations.result({
+  return page.evaluate(({ message, fields }) => window.ngyAnnotations.result({
     session: message.session, revision: message.revision, request_id: message.request_id, ...fields,
   }), { message, fields });
 }
@@ -94,7 +94,7 @@ test("seven selection commands render mutually exclusive host marks at exact UTF
     for (const kind of ["highlight", "wavy", "underline", "underline"]) {
       await select(page);
       const visible = await page.evaluate(() => {
-        const host = document.querySelector("moye-reader-notes");
+        const host = document.querySelector("ngy-reader-notes");
         return { closed: host.shadowRoot === null,
           labels: [...window.__notesRoot.querySelectorAll(".tool")].map((node) => node.getAttribute("aria-label")) };
       });
@@ -138,9 +138,9 @@ test("seven selection commands render mutually exclusive host marks at exact UTF
     await click(page, ".toggle");
     assert.equal(await page.evaluate(() => window.__notesRoot.querySelector(".drawer-title").textContent), "本章笔记");
     assert.equal(await page.evaluate(() => window.__notesRoot.querySelectorAll(".note.underline").length), 1);
-    if (process.env.MOYE_ANNOTATIONS_SCREENSHOT) {
+    if (process.env.NGY_ANNOTATIONS_SCREENSHOT) {
       await select(page);
-      await page.screenshot({ path: process.env.MOYE_ANNOTATIONS_SCREENSHOT });
+      await page.screenshot({ path: process.env.NGY_ANNOTATIONS_SCREENSHOT });
     }
   } finally { await page.close(); }
 });
@@ -178,7 +178,7 @@ test("clicking a mark lists its thoughts when it has any and selects the mark wh
       { id: "other-human", kind: "human_comment", anchor: { ...mark.anchor, start: mark.anchor.start + 1 },
         content: "同一句中另一个范围的其它想法" },
     ];
-    await page.evaluate((notes) => window.moyeAnnotations.render({ session: "chapter-session", revision: 1, notes }), notes);
+    await page.evaluate((notes) => window.ngyAnnotations.render({ session: "chapter-session", revision: 1, notes }), notes);
     await clickMark();
     await page.waitForFunction(() => window.__notesRoot.querySelector(".drawer-title").textContent === "划线相关笔记");
     assert.deepEqual(await page.evaluate(() => [...window.__notesRoot.querySelectorAll(".note[data-note-id]")]
@@ -230,10 +230,10 @@ test("native AI explanation uses the frozen context-menu anchor and can retry a 
       document.querySelector("#second").dispatchEvent(new MouseEvent("contextmenu", { bubbles: true }));
       window.getSelection().removeAllRanges();
     });
-    assert.equal(await page.evaluate(() => window.moyeAnnotations.explainSelection("Alpha beta 😀 gamma")), true);
+    assert.equal(await page.evaluate(() => window.ngyAnnotations.explainSelection("Alpha beta 😀 gamma")), true);
     const request = await lastMessage(page, "ai_explain");
     const aiText = "AI 解释：这是生成的想法，不是人工想法。\n<script>never executed</script>";
-    await page.evaluate(({ request, aiText }) => window.moyeAnnotations.state({
+    await page.evaluate(({ request, aiText }) => window.ngyAnnotations.state({
       session: request.session, revision: request.revision, request_id: request.request_id,
       phase: "streaming", content: aiText,
     }), { request, aiText });
@@ -247,7 +247,7 @@ test("native AI explanation uses the frozen context-menu anchor and can retry a 
     await result(page, retry, { ok: true, notes: [{ id: "ai-1", kind: "ai_comment", anchor: request.anchor, content: aiText }] });
     assert.equal(await page.evaluate(() => window.__notesRoot.querySelector(".note-type").textContent), "AI 想法");
     assert.equal(await page.evaluate(() => [...window.__notesRoot.querySelectorAll(".note button")].some((node) => node.textContent === "编辑")), false);
-    assert.equal(await page.evaluate(() => window.moyeAnnotations.explainSelection("different text")), false);
+    assert.equal(await page.evaluate(() => window.ngyAnnotations.explainSelection("different text")), false);
   } finally { await page.close(); }
 });
 
@@ -278,7 +278,7 @@ test("native AI explanation accepts the block-separated text WebView2 reports", 
     // The exact comparison the native menu used to be gated on: normalizing
     // both sides still leaves a space where the frozen quote has none.
     assert.notEqual(reported.replace(/\s+/gu, " ").trim(), quote);
-    assert.equal(await page.evaluate((text) => window.moyeAnnotations.explainSelection(text), reported), true);
+    assert.equal(await page.evaluate((text) => window.ngyAnnotations.explainSelection(text), reported), true);
     const request = await lastMessage(page, "ai_explain");
     assert.equal(request.anchor.quote, quote);
     assert.deepEqual([request.anchor.start, request.anchor.end], [0, quote.replace(/\s/gu, "").length]);
@@ -300,7 +300,7 @@ test("native AI explanation accepts a <br> selection reported with a newline", a
     });
     assert.ok(reported.includes("\n"), `the menu text keeps the line break: ${JSON.stringify(reported)}`);
     assert.notEqual(reported.replace(/\s+/gu, " ").trim(), "Alphabeta");
-    assert.equal(await page.evaluate((text) => window.moyeAnnotations.explainSelection(text), reported), true);
+    assert.equal(await page.evaluate((text) => window.ngyAnnotations.explainSelection(text), reported), true);
     assert.equal((await lastMessage(page, "ai_explain")).anchor.quote, "Alphabeta");
   } finally { await page.close(); }
 });
@@ -313,7 +313,7 @@ test("stale sessions cannot mutate notes; deletion failure restores its button",
     const request = await lastMessage(page, "highlight");
     const note = { id: "note-1", kind: "highlight", anchor: request.anchor, content: null };
     await result(page, request, { ok: true, notes: [note] });
-    const stale = await page.evaluate(() => window.moyeAnnotations.render({ session: "old-session", revision: 1, notes: [] }));
+    const stale = await page.evaluate(() => window.ngyAnnotations.render({ session: "old-session", revision: 1, notes: [] }));
     assert.equal(stale, false);
     await click(page, ".toggle");
     await click(page, ".note .danger");
@@ -334,7 +334,7 @@ test("oversized selections are rejected without truncating the original selectio
       const range = document.createRange();
       range.selectNodeContents(document.querySelector("#long"));
       window.getSelection().addRange(range);
-      return window.moyeAnnotations.explainSelection();
+      return window.ngyAnnotations.explainSelection();
     });
     assert.equal(accepted, false);
     assert.equal(await page.evaluate(() => window.getSelection().toString().length), 12000);
@@ -485,12 +485,12 @@ test("the trusted bridge stays absent on external documents and child frames", a
     }));
     await page.addInitScript({ content: `${selectionBridge}\n${source}` });
     await page.goto("http://external.invalid/chapter");
-    assert.equal(await page.evaluate(() => typeof window.moyeAnnotations), "undefined");
+    assert.equal(await page.evaluate(() => typeof window.ngyAnnotations), "undefined");
     await page.goto("http://epubreader.book/chapter");
-    assert.equal(await page.evaluate(() => typeof window.moyeAnnotations), "object");
+    assert.equal(await page.evaluate(() => typeof window.ngyAnnotations), "object");
     const frame = page.frames().find((frame) => frame !== page.mainFrame());
     assert.ok(frame);
-    assert.equal(await frame.evaluate(() => typeof window.moyeAnnotations), "undefined");
+    assert.equal(await frame.evaluate(() => typeof window.ngyAnnotations), "undefined");
   } finally { await page.close(); }
 });
 
@@ -613,7 +613,7 @@ test("clicking overlapping marks shows only associated ranges and keeps that sco
     assert.equal(await page.evaluate(() => window.__notesRoot.querySelectorAll(".note.highlight,.note.wavy,.note.underline").length), 0);
 
     notes = [...notes, { id: "first-new-ai", kind: "ai_comment", anchor: first.anchor, content: "刷新增加的无关想法" }];
-    await page.evaluate((notes) => window.moyeAnnotations.render({ session: "chapter-session", revision: 1, notes }), notes);
+    await page.evaluate((notes) => window.ngyAnnotations.render({ session: "chapter-session", revision: 1, notes }), notes);
     assert.equal(await title(), "划线相关笔记");
     assert.deepEqual(await visibleIds(), relatedIds);
     await select(page, "#second");
@@ -647,7 +647,7 @@ test("clicking overlapping marks shows only associated ranges and keeps that sco
     assert.deepEqual(await visibleIds(), notes.map((note) => note.id).sort());
 
     await clickBeta();
-    await page.evaluate((notes) => window.moyeAnnotations.configure({ session: "next-chapter-session", revision: 2, notes }), notes);
+    await page.evaluate((notes) => window.ngyAnnotations.configure({ session: "next-chapter-session", revision: 2, notes }), notes);
     assert.equal(await title(), "本章笔记");
     assert.deepEqual(await visibleIds(), notes.map((note) => note.id).sort());
   } finally { await page.close(); }
@@ -876,7 +876,7 @@ for (const mime of ["text/html", "application/xhtml+xml"]) {
           const accepted = await page.evaluate((chapterQuote) => {
             window.__notesRoot.querySelector('.note[data-note-id="joint-human"] .content')
               .dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, composed: true }));
-            return window.moyeAnnotations.explainSelection(chapterQuote);
+            return window.ngyAnnotations.explainSelection(chapterQuote);
           }, chapterQuote);
           assert.equal(accepted, false, "A note reused the previously frozen chapter context-menu selection");
           assert.equal(await page.evaluate(() => window.__messages
@@ -933,3 +933,67 @@ for (const mime of ["text/html", "application/xhtml+xml"]) {
     } finally { await page.close(); }
   });
 }
+
+/// The chapter runtime owns the Ctrl + wheel gesture: it resizes the reading
+/// text inside the range the host clamps, never scrolls the chapter by the same
+/// notch, and reports the size it stopped at once per burst.
+test("ctrl + wheel resizes the chapter text within the host range and reports it once", async () => {
+  const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  try {
+    await page.route("http://epubreader.book/**", (route) => route.fulfill({
+      status: 200, contentType: "text/html; charset=utf-8",
+      body: `<!doctype html><html><head><style>:root{--ngy-font-size:18px}
+        body{font-size:var(--ngy-font-size);margin:0;height:4000px}</style></head>
+        <body><p>正文</p></body></html>`,
+      headers: { "content-security-policy": "default-src 'none';script-src 'none';style-src 'unsafe-inline'" },
+    }));
+    await page.addInitScript({ content: `
+      window.__messages = [];
+      window.ipc = { postMessage: (body) => window.__messages.push(JSON.parse(body)) };
+      ${selectionBridge}
+    ` });
+    await page.goto("http://epubreader.book/chapter.html");
+
+    const textSize = () => page.evaluate(() =>
+      document.documentElement.style.getPropertyValue("--ngy-font-size"));
+    const scrollY = () => page.evaluate(() => window.scrollY);
+    const wheel = (deltaY, ctrlKey = true) => page.evaluate(({ deltaY, ctrlKey }) =>
+      window.dispatchEvent(new WheelEvent("wheel", {
+        deltaY, ctrlKey, cancelable: true, bubbles: true,
+      })), { deltaY, ctrlKey });
+
+    // A notch is one step, and Ctrl means resize rather than scroll.
+    await page.evaluate(() => window.scrollTo(0, 400));
+    assert.equal(await scrollY(), 400);
+    await wheel(-120);
+    assert.equal(await textSize(), "20px");
+    assert.equal(await scrollY(), 400, "a Ctrl + wheel notch must not also scroll the chapter");
+
+    // A plain wheel keeps scrolling and leaves the text alone.
+    await wheel(-120, false);
+    assert.equal(await textSize(), "20px");
+
+    // The range is a wall, not a wrap-around, however many notches arrive.
+    for (let notch = 0; notch < 20; notch += 1) await wheel(-120);
+    assert.equal(await textSize(), "30px");
+    for (let notch = 0; notch < 40; notch += 1) await wheel(120);
+    assert.equal(await textSize(), "14px");
+
+    const reports = () => page.evaluate(() =>
+      window.__messages.filter((message) => message.type === "reader_text_size")
+        .map((message) => message.font_size));
+    // Every report stays inside the range the host accepts.
+    await page.waitForTimeout(500);
+    const settled = await reports();
+    assert.ok(settled.length > 0, "the runtime must report the size it applied");
+    assert.ok(settled.every((size) => size >= 14 && size <= 30), `${settled}`);
+    assert.equal(settled.at(-1), 14);
+
+    // One burst of notches leaves exactly one report, at the size it stopped at.
+    const before = settled.length;
+    for (let notch = 0; notch < 5; notch += 1) await wheel(-120);
+    assert.equal(await textSize(), "24px");
+    await page.waitForTimeout(500);
+    assert.deepEqual((await reports()).slice(before), [24]);
+  } finally { await page.close(); }
+});

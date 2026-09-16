@@ -50,7 +50,7 @@ message = {
     "params": {
         "protocolVersion": data["protocol_version"],
         "capabilities": {},
-        "clientInfo": {"name": "moye-practice", "version": "1.0.0"},
+        "clientInfo": {"name": "ngy-practice", "version": "1.0.0"},
     },
 }
 ```

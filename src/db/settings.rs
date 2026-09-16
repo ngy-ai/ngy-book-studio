@@ -8,6 +8,23 @@ pub(crate) fn translation_display_book_key(book_id: &str) -> String {
     format!("translation.display.book.v1.{book_id}")
 }
 
+/// Settings key of one reading surface's remembered page size for one book.
+///
+/// Every surface measures its own page size in its own unit (the reflowable
+/// reader in font pixels, the fixed-layout ones in thousandths of a page), so
+/// each keeps its own row instead of sharing one value that would have to be
+/// reinterpreted per reader. Same ownership rule as the translation display
+/// choice: the `settings` table has no foreign key, so whoever deletes a book
+/// must delete these keys with it.
+pub(crate) fn reader_zoom_book_key(surface: &str, book_id: &str) -> String {
+    format!("reader.zoom.{surface}.book.v1.{book_id}")
+}
+
+/// Every reading surface that remembers a page size. `delete_document` sweeps
+/// this list, and `services::ReaderZoomSurface` is the public name for the same
+/// set; `reader_zoom_surfaces_match_the_swept_keys` fails if the two drift.
+pub(crate) const READER_ZOOM_SURFACES: [&str; 3] = ["text", "pdf", "page"];
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Setting {
     pub(crate) key: String,

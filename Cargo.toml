@@ -1,5 +1,5 @@
 [package]
-name = "moye-epub-editor"
+name = "ngy-book-studio"
 version = "0.1.0"
 edition = "2024"
 description = "A native Windows library, reader, editor, and AI workspace for books and documents"

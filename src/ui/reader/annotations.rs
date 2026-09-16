@@ -1,7 +1,7 @@
 //! Trusted host boundary for the reader's single-table notes.
 use super::*;
 use crate::ui::ai_sidebar::{AiAnswerCompleted, AiExplanationFailed, AiExplanationSubmitted};
-use moye_epub_editor::annotations::{Annotation, AnnotationDraft, AnnotationKind, TextAnchor};
+use ngy_book_studio::annotations::{Annotation, AnnotationDraft, AnnotationKind, TextAnchor};
 
 // This bounds only the derived display. Stored Markdown retains its existing
 // limits and is never replaced with HTML.
@@ -157,7 +157,7 @@ impl ReaderApp {
         let Some(webview) = self.webview.as_ref() else {
             return;
         };
-        let script = format!("window.moyeAnnotations?.{method}({value});");
+        let script = format!("window.ngyAnnotations?.{method}({value});");
         if let Err(error) = webview.read(cx).raw().evaluate_script(&script) {
             self.set_error(format!("无法更新阅读笔记界面：{error}"), cx);
         }

@@ -2,6 +2,7 @@ mod ai_controller;
 mod ai_settings;
 mod ai_sidebar;
 mod background_jobs;
+mod data_dir_setup;
 mod editor;
 mod learning;
 mod library;
@@ -13,6 +14,7 @@ mod reader;
 #[cfg(test)]
 mod application_exit_tests;
 
+pub(crate) use data_dir_setup::{DataDirSetupWindow, open_data_dir_setup_window};
 pub(crate) use library::{EpubReaderApp, wrap_root};
 
 use ai_controller::AiSidebarController;
@@ -63,7 +65,8 @@ use gpui_component::{
         HandleError, HasWindowHandle, RawWindowHandle, Win32WindowHandle, WindowHandle,
     },
 };
-use moye_epub_editor::{
+use native_dialog::DialogBuilder;
+use ngy_book_studio::{
     chat::ChatWindowKind,
     document::{BookDocument, BookFormat, BookSource as CanonicalBookSource, SourceLocator},
     export::ExportFormat,
@@ -72,7 +75,6 @@ use moye_epub_editor::{
     reader::OpenedBook,
     services::AppServices,
 };
-use native_dialog::DialogBuilder;
 use serde::Deserialize;
 
 const PAPER: u32 = 0xf7f5f0;

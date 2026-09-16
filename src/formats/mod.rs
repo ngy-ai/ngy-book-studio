@@ -8,6 +8,7 @@ mod djvu;
 mod epub;
 mod kfx;
 mod kindle;
+pub(crate) mod kindle_huff;
 mod office;
 mod pdf;
 
@@ -388,6 +389,13 @@ impl FormatRegistry {
     }
 
     pub fn import(&self, source: &ImportSource, limits: &ImportLimits) -> Result<ImportedBook> {
+        tracing::info!(
+            target: "ngy_import",
+            file_name = ?source.file_name,
+            extension = ?source.extension(),
+            bytes = source.bytes.len(),
+            "导入：读取源文件完成，开始探测格式"
+        );
         if source.bytes.len() as u64 > limits.max_source_bytes {
             bail!("import source exceeds the configured size limit");
         }
@@ -398,6 +406,16 @@ impl FormatRegistry {
             .map(|importer| (importer, importer.probe(source)))
             .filter(|(_, probe)| probe.confidence != ProbeConfidence::NoMatch)
             .collect::<Vec<_>>();
+        for (importer, probe) in &candidates {
+            tracing::debug!(
+                target: "ngy_import",
+                importer = importer.capabilities().importer,
+                format = ?probe.format,
+                confidence = ?probe.confidence,
+                detail = ?probe.detail,
+                "导入：候选解析器"
+            );
+        }
         let best = candidates
             .iter()
             .map(|(_, probe)| probe.confidence)
@@ -415,13 +433,37 @@ impl FormatRegistry {
                 .join(", ");
             bail!("book format is ambiguous between: {formats}");
         }
-        let (importer, _) = best_candidates[0];
-        let imported = importer.import(source, limits)?;
+        let (importer, probe) = best_candidates[0];
+        tracing::info!(
+            target: "ngy_import",
+            importer = importer.capabilities().importer,
+            format = ?probe.format,
+            confidence = ?probe.confidence,
+            detail = ?probe.detail,
+            "导入：已选定解析器"
+        );
+        let imported = importer.import(source, limits).inspect_err(|error| {
+            tracing::error!(
+                target: "ngy_import",
+                importer = importer.capabilities().importer,
+                error = %format!("{error:#}"),
+                "导入：解析器返回错误"
+            );
+        })?;
         imported.validate(limits)?;
+        tracing::info!(
+            target: "ngy_import",
+            book_id = %imported.document.id,
+            title = %imported.document.title,
+            units = imported.document.units.len(),
+            assets = imported.document.assets.len(),
+            "导入：解析与安全校验完成"
+        );
         Ok(imported)
     }
 
     pub fn import_path(&self, path: &Path, limits: &ImportLimits) -> Result<ImportedBook> {
+        tracing::info!(target: "ngy_import", path = %path.display(), "导入：开始读取文件");
         let source = ImportSource::from_path(path, limits)?;
         self.import(&source, limits)
             .with_context(|| format!("failed to import {}", path.display()))
@@ -541,7 +583,7 @@ fn rewrite_media_attributes(
             ) else {
                 return false;
             };
-            attribute.value = format!("moye-asset:{asset_id}").into();
+            attribute.value = format!("ngy-asset:{asset_id}").into();
             true
         });
     }
@@ -780,10 +822,10 @@ mod tests {
         )
         .expect("rewrite imported media");
 
-        assert!(rewritten.contains("moye-asset:image-id"));
-        assert!(rewritten.contains("moye-asset:audio-id"));
-        assert!(rewritten.contains("moye-asset:video-id"));
-        assert!(rewritten.contains("moye-asset:poster-id"));
+        assert!(rewritten.contains("ngy-asset:image-id"));
+        assert!(rewritten.contains("ngy-asset:audio-id"));
+        assert!(rewritten.contains("ngy-asset:video-id"));
+        assert!(rewritten.contains("ngy-asset:poster-id"));
         assert!(!rewritten.contains("outside.png"));
         assert!(!rewritten.contains("tracker.png"));
         assert!(!rewritten.contains("not-in-manifest.png"));

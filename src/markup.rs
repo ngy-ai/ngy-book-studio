@@ -77,6 +77,103 @@ pub fn serialize_xhtml(document: &BlockDocument) -> Result<String> {
     Ok(output)
 }
 
+/// The named character references XML predefines, so they need no DTD.
+const XML_PREDEFINED_ENTITIES: [&str; 5] = ["amp", "lt", "gt", "quot", "apos"];
+
+/// An HTML fragment rewritten so an XML parser accepts it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct XmlSafeHtml<'a> {
+    pub html: Cow<'a, str>,
+    /// Distinct named references that were rewritten, in first-seen order.
+    pub rewritten: Vec<&'a str>,
+    /// How many references were rewritten in total.
+    pub rewritten_count: usize,
+}
+
+/// Rewrites named character references XML does not predefine into numeric
+/// character references.
+///
+/// The reader serves chapters as `application/xhtml+xml`, where only `&amp;`
+/// `&lt;` `&gt;` `&quot;` `&apos;` and numeric references resolve; any other
+/// name makes WebView2 show its parse-error page ("Entity 'nbsp' not defined")
+/// instead of the chapter. HTML serializers produce exactly that: html5ever
+/// spells U+00A0 `&nbsp;`, and EPUB sources written for HTML parsers use
+/// `&mdash;`, `&ldquo;` and friends. Numbers are always legal and the
+/// codepoints come from the same entity table the HTML parser uses, so the
+/// rendered text is unchanged and a numeric reference stays valid in an HTML
+/// context too.
+///
+/// A reference whose name is not in that table is left exactly as it is: only a
+/// real entity can be rewritten, and guessing at malformed markup would corrupt
+/// the text.
+pub fn xml_safe_entities(html: &str) -> XmlSafeHtml<'_> {
+    if !html.contains('&') {
+        return XmlSafeHtml {
+            html: Cow::Borrowed(html),
+            rewritten: Vec::new(),
+            rewritten_count: 0,
+        };
+    }
+    let mut output = String::with_capacity(html.len());
+    let mut rewritten: Vec<&str> = Vec::new();
+    let mut rewritten_count = 0_usize;
+    let mut copied_until = 0_usize;
+    let mut cursor = 0_usize;
+    while let Some(offset) = html[cursor..].find('&') {
+        let amp = cursor + offset;
+        let name_start = amp + 1;
+        let name_end = html[name_start..]
+            .find(|character: char| !character.is_ascii_alphanumeric())
+            .map(|length| name_start + length)
+            .unwrap_or(html.len());
+        let name = &html[name_start..name_end];
+        if name.is_empty()
+            || !html[name_end..].starts_with(';')
+            || XML_PREDEFINED_ENTITIES.contains(&name)
+        {
+            cursor = name_end.max(amp + 1);
+            continue;
+        }
+        // Keys keep the trailing `;`. The build script also registers every
+        // strict prefix of a name as `(0, 0)`, so a zero first codepoint means
+        // "prefix of a longer name", never an entity of its own.
+        let Some(&(first, second)) =
+            html5ever::data::NAMED_ENTITIES.get(&html[name_start..=name_end])
+        else {
+            cursor = name_end + 1;
+            continue;
+        };
+        if first == 0 {
+            cursor = name_end + 1;
+            continue;
+        }
+        output.push_str(&html[copied_until..amp]);
+        output.push_str(&format!("&#{first};"));
+        if second != 0 {
+            output.push_str(&format!("&#{second};"));
+        }
+        copied_until = name_end + 1;
+        if !rewritten.contains(&name) {
+            rewritten.push(name);
+        }
+        rewritten_count += 1;
+        cursor = name_end + 1;
+    }
+    if rewritten_count == 0 {
+        return XmlSafeHtml {
+            html: Cow::Borrowed(html),
+            rewritten,
+            rewritten_count,
+        };
+    }
+    output.push_str(&html[copied_until..]);
+    XmlSafeHtml {
+        html: Cow::Owned(output),
+        rewritten,
+        rewritten_count,
+    }
+}
+
 /// Block-level element names whose visible text forms one translatable run.
 /// This is the same candidate set the reader's translation layer matches, so
 /// the persisted译文 and the rendered chapter stay aligned.
@@ -175,6 +272,42 @@ const CODE_LINE_PREFIXES: [&str; 8] = [
 const CODE_OPERATORS: [&str; 16] = [
     "=>", "->", "::", ":=", "==", "!=", "<=", ">=", "&&", "||", "+=", "-=", "*=", "/=", "</", "/>",
 ];
+/// Keywords that open a statement. Prose opens sentences with words from the
+/// same list too ("let me explain …", "use the following …"), so a keyword only
+/// counts together with a code shape on the same line — see `has_code_keyword`.
+const CODE_LINE_KEYWORDS: [&str; 25] = [
+    "def",
+    "fn",
+    "func",
+    "impl",
+    "struct",
+    "enum",
+    "trait",
+    "class",
+    "let",
+    "var",
+    "const",
+    "static",
+    "public",
+    "private",
+    "protected",
+    "pub",
+    "use",
+    "import",
+    "package",
+    "export",
+    "return",
+    "println",
+    "printf",
+    "console",
+    "system",
+];
+/// Shapes of a string literal that only source code writes. A quote on its own
+/// never counts: prose wraps quoted words in spaces and punctuation (`He said
+/// "hello" to me.`), so treating any quote as code would keep every paragraph
+/// containing a quotation in the original language. The last four entries are the
+/// call and index forms: `println("x")`, `func('a')`.
+const CODE_STRING_SHAPES: [&str; 8] = ["+\"", "\"+", "+ \"", "\" +", "(\"", "\")", "('", "')"];
 
 /// ECMAScript whitespace plus the invisible format characters EPUBs use to indent
 /// code lines, which `trim` alone would keep in front of `//` or `#`.
@@ -182,6 +315,55 @@ fn trim_code_line(value: &str) -> &str {
     value.trim_matches(|ch: char| {
         ch.is_whitespace() || matches!(ch, '\u{200b}' | '\u{feff}' | '\u{00ad}')
     })
+}
+
+/// Whether one line carries a string literal the way source code does:
+/// concatenation, an argument list, or an escape sequence.
+fn has_code_string_shape(line: &str) -> bool {
+    CODE_STRING_SHAPES.iter().any(|shape| line.contains(shape)) || has_escape_sequence(line)
+}
+
+/// 转义序列（`\n`、`\"`、`\\` …）。散文把换行写成真正的换行，不会写这两个字符。
+fn has_escape_sequence(line: &str) -> bool {
+    let mut characters = line.chars();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            continue;
+        }
+        if matches!(
+            characters.next(),
+            Some('n' | 't' | 'r' | 'b' | 'f' | '0' | '\\' | '\'' | '"')
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 语句关键字开头的行。关键字本身不足以判定：英文句子也可能以 `let` / `use` /
+/// `return` 开头，所以同一行还必须出现调用、赋值、花括号或下标。
+fn has_code_keyword(line: &str) -> bool {
+    let word = line
+        .split_once(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '.'))
+        .map_or(line, |(word, _)| word);
+    if !CODE_LINE_KEYWORDS.contains(&word) {
+        return false;
+    }
+    let rest = &line[word.len()..];
+    rest.contains('(') || rest.contains('=') || rest.contains('{') || rest.contains('[')
+}
+
+/// 无空格的类型注解（`a:Int`、`):Int`、`x:String`）。散文的冒号后面跟着空格
+/// （`Note: the file`），`https://example.test` 这类 URL 的冒号后是斜杠。
+fn has_type_annotation(line: &str) -> bool {
+    let mut previous = '\0';
+    for character in line.chars() {
+        if previous == ':' && character.is_ascii_alphabetic() {
+            return true;
+        }
+        previous = character;
+    }
+    false
 }
 
 fn is_code_line(line: &str) -> bool {
@@ -198,6 +380,9 @@ fn is_code_line(line: &str) -> bool {
         || CODE_OPERATORS
             .iter()
             .any(|operator| trimmed.contains(operator))
+        || has_code_string_shape(trimmed)
+        || has_code_keyword(trimmed)
+        || has_type_annotation(trimmed)
 }
 
 /// Whether one whole block is source code rather than prose.
@@ -458,7 +643,7 @@ pub fn sanitize_html(source: &str) -> String {
         ])
         // Network schemes are deliberately absent. Relative links are retained
         // for EPUB asset rewriting and `data:` is useful for small safe images.
-        .url_schemes(HashSet::from(["data", "moye-asset", "asset"]))
+        .url_schemes(HashSet::from(["data", "ngy-asset", "asset"]))
         .url_relative(ammonia::UrlRelative::Custom(Box::new(safe_relative)));
     builder.clean(source).to_string()
 }
@@ -1089,12 +1274,12 @@ fn safe_link(href: &str) -> bool {
         || lower.starts_with("https://")
         || lower.starts_with("mailto:")
         || lower.starts_with("asset:")
-        || lower.starts_with("moye-asset:")
+        || lower.starts_with("ngy-asset:")
         || lower.starts_with("data:image/")
 }
 
 fn asset_id_from_href(href: &str) -> Option<String> {
-    href.strip_prefix("moye-asset:")
+    href.strip_prefix("ngy-asset:")
         .or_else(|| href.strip_prefix("asset:"))
         .map(str::trim)
         .filter(|id| !id.is_empty() && !id.contains(['/', '\\', '#', '?']))
@@ -1229,7 +1414,7 @@ fn write_html_image(
     caption: &[Inline],
     output: &mut String,
 ) {
-    output.push_str("<figure><img src=\"moye-asset:");
+    output.push_str("<figure><img src=\"ngy-asset:");
     output.push_str(&escape_html(asset_id));
     output.push_str("\" alt=\"");
     output.push_str(&escape_html(alt));
@@ -1254,11 +1439,11 @@ fn write_html_media(
 ) {
     output.push_str("<figure><");
     output.push_str(tag);
-    output.push_str(" controls src=\"moye-asset:");
+    output.push_str(" controls src=\"ngy-asset:");
     output.push_str(&escape_html(asset_id));
     output.push('"');
     if let Some(poster) = poster_asset_id {
-        output.push_str(" poster=\"moye-asset:");
+        output.push_str(" poster=\"ngy-asset:");
         output.push_str(&escape_html(poster));
         output.push('"');
     }
@@ -1322,7 +1507,7 @@ fn write_html_inlines(inlines: &[Inline], output: &mut String) {
                 alt,
                 title,
             } => {
-                output.push_str("<img src=\"moye-asset:");
+                output.push_str("<img src=\"ngy-asset:");
                 output.push_str(&escape_html(asset_id));
                 output.push_str("\" alt=\"");
                 output.push_str(&escape_html(alt));
@@ -1376,7 +1561,7 @@ mod tests {
         );
         // An image-only chapter has nothing to translate.
         assert!(
-            block_texts_from_html(r#"<div id="Cover"><img src="moye-asset:cover"></div>"#)
+            block_texts_from_html(r#"<div id="Cover"><img src="ngy-asset:cover"></div>"#)
                 .unwrap()
                 .is_empty()
         );
@@ -1454,21 +1639,32 @@ mod tests {
             "<p>count =&gt; count + 1</p>",
             "<p>total += 1</p>",
             "<p>&lt;div class=\"code\"&gt;</p>",
+            // 现场（2026-09-15，《RUST AND SCALA FOR BEGINNERS》azw3，块 3579/3588/
+            // 3620/3623）：一行代码被语法高亮的 span 切成 3–5 个片段，模型要在 JSON
+            // 里转义 `"\n"` 这种字面量，两次尝试后整块被跳过。
+            "<p>println(result1+\"\\n\"+result2+\"\\n\"+result3)</p>",
+            "<p>println(&quot;10 + 10 = &quot;+result)</p>",
+            // 同一本书的块 3580：类型注解加注释头。
+            "<p>def functionExample(a:Int = 0, b:Int = 0):Int = { // Parameters with default values as 0</p>",
         ] {
             assert!(
                 translation_blocks_from_html(source).unwrap().is_empty(),
                 "{source} must not be translated"
             );
         }
-        // Prose stays translatable, including the punctuation a code line carries
-        // and inline code that merely appears inside a sentence.
+        // Prose stays translatable, including the punctuation a code line carries,
+        // a quotation, a colon without a following space, a statement keyword at the
+        // start of a sentence, and inline code that merely appears inside a sentence.
         let prose = "<p>见上文（注 1）。</p><p>A note (see above)</p>\
             <p>Read <code>x = 1;</code> now</p><p>https://example.test/a/b</p>\
-            <p>第一章：起步</p><p>a &lt; b 的关系</p>";
+            <p>第一章：起步</p><p>a &lt; b 的关系</p>\
+            <p>He said &quot;hello&quot; to me.</p><p>let me explain the difference</p>\
+            <p>Note: the file is here</p>";
         let blocks = translation_blocks_from_html(prose).unwrap();
-        assert_eq!(blocks.len(), 6);
+        assert_eq!(blocks.len(), 9);
         assert_eq!(blocks[2].segments, ["Read ", " now"]);
         assert_eq!(blocks[5].segments, ["a < b 的关系"]);
+        assert_eq!(blocks[6].text, "He said \"hello\" to me.");
     }
 
     #[test]
@@ -1569,7 +1765,7 @@ mod tests {
         assert_eq!(images.len(), 2);
         assert_eq!(images[0].attribute("alt"), Some("图示 <A> & B"));
         assert_eq!(images[0].attribute("title"), Some("带\"引号\""));
-        assert_eq!(images[1].attribute("src"), Some("moye-asset:inline-image"));
+        assert_eq!(images[1].attribute("src"), Some("ngy-asset:inline-image"));
         for tag in ["br", "hr"] {
             assert!(xml.descendants().any(|node| node.has_tag_name(tag)));
         }
@@ -1592,13 +1788,42 @@ mod tests {
             .descendants()
             .find(|node| node.has_tag_name("video"))
             .unwrap();
-        assert_eq!(video.attribute("poster"), Some("moye-asset:poster-asset"));
+        assert_eq!(video.attribute("poster"), Some("ngy-asset:poster-asset"));
         assert_eq!(serialize_source(&document).unwrap(), original_html);
     }
 
     #[test]
+    fn xml_safe_entities_rewrite_only_references_xml_cannot_resolve() {
+        let safe = xml_safe_entities(
+            "a&nbsp;b &amp; c &mdash; d &acE; e &notanentity; f &#160; g &#x20; h &amp;nbsp;i",
+        );
+        assert_eq!(
+            safe.html,
+            "a&#160;b &amp; c &#8212; d &#8766;&#819; e &notanentity; f &#160; g &#x20; h &amp;nbsp;i"
+        );
+        assert_eq!(safe.rewritten, ["nbsp", "mdash", "acE"]);
+        assert_eq!(safe.rewritten_count, 3);
+    }
+
+    #[test]
+    fn xml_safe_entities_borrow_a_fragment_that_needs_no_rewrite() {
+        for html in [
+            "plain text without references",
+            "already safe: &amp; &lt; &gt; &quot; &apos; &#160; &#xA0;",
+        ] {
+            let safe = xml_safe_entities(html);
+            assert!(
+                matches!(safe.html, Cow::Borrowed(_)),
+                "no rewrite must stay borrowed: {html}"
+            );
+            assert_eq!(safe.rewritten_count, 0);
+            assert!(safe.rewritten.is_empty());
+        }
+    }
+
+    #[test]
     fn xhtml_projection_preserves_cleaned_raw_html_entities_and_quoted_attributes() {
-        let raw = r#"<div title="A &quot;B&quot; &lt;tag> &amp; C">A&nbsp;B &amp; C<picture><source src="moye-asset:source"><img src="moye-asset:raw-image" alt="raw"></picture><hr><script>unsafe()</script></div>"#;
+        let raw = r#"<div title="A &quot;B&quot; &lt;tag> &amp; C">A&nbsp;B &amp; C<picture><source src="ngy-asset:source"><img src="ngy-asset:raw-image" alt="raw"></picture><hr><script>unsafe()</script></div>"#;
         let inline = r#"<span title="x < y &amp; &quot;q&quot;">inline&nbsp;value<br></span>"#;
         let document = BlockDocument::new(vec![
             Block::RawHtml {
@@ -1632,7 +1857,7 @@ mod tests {
             .descendants()
             .find(|node| node.has_tag_name("source"))
             .unwrap();
-        assert_eq!(source.attribute("src"), Some("moye-asset:source"));
+        assert_eq!(source.attribute("src"), Some("ngy-asset:source"));
         assert!(xml.descendants().any(|node| node.has_tag_name("img")));
         assert!(xml.descendants().any(|node| node.has_tag_name("br")));
         assert!(xml.descendants().any(|node| node.has_tag_name("hr")));
@@ -1825,8 +2050,8 @@ line 2</code></pre><table><thead><tr><th>名称</th><th>值</th></tr></thead><tb
         let source = r#"
             <h2 onclick="steal()">Heading</h2>
             <p>Body <strong>bold</strong><script>alert(1)</script></p>
-            <figure><img src="moye-asset:image-1" alt="diagram"><figcaption>Caption</figcaption></figure>
-            <video controls src="moye-asset:video-1" poster="moye-asset:poster-1"></video>
+            <figure><img src="ngy-asset:image-1" alt="diagram"><figcaption>Caption</figcaption></figure>
+            <video controls src="ngy-asset:video-1" poster="ngy-asset:poster-1"></video>
         "#;
         let first = parse_source_for_unit(source, "unit-html").unwrap();
         let second = parse_source_for_unit(&first.canonical_source, "unit-html").unwrap();
@@ -1914,8 +2139,8 @@ line 2</code></pre><table><thead><tr><th>名称</th><th>值</th></tr></thead><tb
             caption: vec![Inline::text("说明")],
         }]);
         let html = serialize_source(&document).unwrap();
-        assert!(html.contains("moye-asset:video-asset"));
-        assert!(html.contains("moye-asset:poster-asset"));
+        assert!(html.contains("ngy-asset:video-asset"));
+        assert!(html.contains("ngy-asset:poster-asset"));
         assert!(!html.contains("blake3/"));
     }
 

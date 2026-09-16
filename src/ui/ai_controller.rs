@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::{Context as _, Result, bail};
 use gpui::{Context, Entity, Task};
-use moye_epub_editor::{
+use ngy_book_studio::{
     agent::{AgentAnswerSourceStatus, AgentCitation, SelectionSnapshot},
     agent_chat::{AgentConversation, ConversationQuestion},
     agent_runtime::{AgentCancellation, AgentRequestCancelled, AgentRunEvent},
@@ -42,7 +42,7 @@ enum UiAgentMessage {
 }
 
 struct UiConversationAnswer {
-    answer: moye_epub_editor::agent_chat::ConversationAnswer,
+    answer: ngy_book_studio::agent_chat::ConversationAnswer,
     sources: Vec<AiSourceLink>,
     source_status: AgentAnswerSourceStatus,
 }
@@ -330,7 +330,7 @@ impl AiSidebarController {
                     }
                 }
                 Ok((true, _, Err(error))) => {
-                    tracing::warn!(target: "moye_ai", stage = "list_sessions_after_scope_reset", error_kind = error_kind(&anyhow::Error::msg(error)), "cannot list sessions after resetting AI scope");
+                    tracing::warn!(target: "ngy_ai", stage = "list_sessions_after_scope_reset", error_kind = error_kind(&anyhow::Error::msg(error)), "cannot list sessions after resetting AI scope");
                     sidebar.apply_session(None, Vec::new(), Vec::new(), cx);
                 }
                 Ok((false, _, Err(error))) => sidebar
@@ -362,7 +362,7 @@ impl AiSidebarController {
         let prepared = match conversation.prepare_request(request_id) {
             Ok(prepared) => prepared,
             Err(error) => {
-                tracing::warn!(target: "moye_ai", request_id, window_kind = ?self.window_kind, stage = "prepare_request", error_kind = error_kind(&error), "AI request preparation failed");
+                tracing::warn!(target: "ngy_ai", request_id, window_kind = ?self.window_kind, stage = "prepare_request", error_kind = error_kind(&error), "AI request preparation failed");
                 let error = friendly_agent_error(&format!("{error:#}"));
                 sidebar.update(cx, |sidebar, cx| {
                     sidebar.fail_answer(request_id, error, cx);
@@ -374,7 +374,7 @@ impl AiSidebarController {
         let trace_id = cancellation.trace_id();
         let started = Instant::now();
         let ui_span = tracing::info_span!(
-            target: "moye_ai",
+            target: "ngy_ai",
             "ai_ui_request",
             trace_id,
             request_id,
@@ -390,7 +390,7 @@ impl AiSidebarController {
         let (ui_tx, ui_rx) = async_channel::unbounded();
 
         let worker = async move {
-            tracing::debug!(target: "moye_ai", stage = "freeze_references", "AI reference preparation started");
+            tracing::debug!(target: "ngy_ai", stage = "freeze_references", "AI reference preparation started");
             let freeze_started = Instant::now();
             let snapshots = match freeze_references(
                 Arc::clone(&services),
@@ -401,14 +401,14 @@ impl AiSidebarController {
             .await
             {
                 Ok(snapshots) => {
-                    tracing::debug!(target: "moye_ai", stage = "freeze_references", snapshots = snapshots.len(), elapsed_ms = freeze_started.elapsed().as_millis() as u64, "AI reference preparation completed");
+                    tracing::debug!(target: "ngy_ai", stage = "freeze_references", snapshots = snapshots.len(), elapsed_ms = freeze_started.elapsed().as_millis() as u64, "AI reference preparation completed");
                     snapshots
                 }
                 Err(error) => {
                     if error.is::<AgentRequestCancelled>() {
-                        tracing::info!(target: "moye_ai", stage = "freeze_references", error_kind = "cancelled", elapsed_ms = freeze_started.elapsed().as_millis() as u64, "AI reference preparation cancelled");
+                        tracing::info!(target: "ngy_ai", stage = "freeze_references", error_kind = "cancelled", elapsed_ms = freeze_started.elapsed().as_millis() as u64, "AI reference preparation cancelled");
                     } else {
-                        tracing::warn!(target: "moye_ai", stage = "freeze_references", error_kind = error_kind(&error), elapsed_ms = freeze_started.elapsed().as_millis() as u64, "AI reference preparation failed");
+                        tracing::warn!(target: "ngy_ai", stage = "freeze_references", error_kind = error_kind(&error), elapsed_ms = freeze_started.elapsed().as_millis() as u64, "AI reference preparation failed");
                     }
                     drop(prepared);
                     let _ = ui_tx
@@ -450,7 +450,7 @@ impl AiSidebarController {
                         if let Some(message) = message
                             && ui_tx.send(message).await.is_err()
                         {
-                                tracing::debug!(target: "moye_ai", stage = "deliver_events", "AI UI receiver closed; cancelling request");
+                                tracing::debug!(target: "ngy_ai", stage = "deliver_events", "AI UI receiver closed; cancelling request");
                                 cancel_conversation.cancel(request_id);
                                 return;
                         }
@@ -486,7 +486,7 @@ impl AiSidebarController {
                         Ok(sources) => sources,
                         Err(error) => {
                             tracing::warn!(
-                                target: "moye_ai",
+                                target: "ngy_ai",
                                 stage = "validate_live_sources",
                                 error_kind = error_kind(&error),
                                 "cannot decorate the already-persisted AI answer with live sources"
@@ -502,9 +502,9 @@ impl AiSidebarController {
                 }
                 Err(error) => {
                     if error.is::<AgentRequestCancelled>() {
-                        tracing::debug!(target: "moye_ai", stage = "conversation_result", error_kind = "cancelled", elapsed_ms = started.elapsed().as_millis() as u64, "AI conversation cancellation returned to the UI");
+                        tracing::debug!(target: "ngy_ai", stage = "conversation_result", error_kind = "cancelled", elapsed_ms = started.elapsed().as_millis() as u64, "AI conversation cancellation returned to the UI");
                     } else {
-                        tracing::warn!(target: "moye_ai", stage = "conversation_result", error_kind = error_kind(&error), elapsed_ms = started.elapsed().as_millis() as u64, "AI conversation returned an error to the UI");
+                        tracing::warn!(target: "ngy_ai", stage = "conversation_result", error_kind = error_kind(&error), elapsed_ms = started.elapsed().as_millis() as u64, "AI conversation returned an error to the UI");
                     }
                     Err(format!("{error:#}"))
                 }
@@ -520,7 +520,7 @@ impl AiSidebarController {
                         .await;
                 }
                 Err(error) => {
-                    tracing::warn!(target: "moye_ai", stage = "refresh_sessions", error_kind = error_kind(&error), "cannot refresh AI conversation list");
+                    tracing::warn!(target: "ngy_ai", stage = "refresh_sessions", error_kind = error_kind(&error), "cannot refresh AI conversation list");
                 }
             }
             let succeeded = result.is_ok();
@@ -528,7 +528,7 @@ impl AiSidebarController {
                 .send(UiAgentMessage::Completed(Box::new(result)))
                 .await
                 .is_ok();
-            tracing::debug!(target: "moye_ai", stage = "deliver_completion", succeeded, delivered, elapsed_ms = started.elapsed().as_millis() as u64, "AI conversation completion sent to UI");
+            tracing::debug!(target: "ngy_ai", stage = "deliver_completion", succeeded, delivered, elapsed_ms = started.elapsed().as_millis() as u64, "AI conversation completion sent to UI");
         };
         runtime.spawn(worker.instrument(worker_span));
 
@@ -547,7 +547,7 @@ impl AiSidebarController {
                             });
                         }
                         UiAgentMessage::Reset => {
-                            tracing::debug!(target: "moye_ai", stage = "reset_provisional_answer", "AI provisional answer reset");
+                            tracing::debug!(target: "ngy_ai", stage = "reset_provisional_answer", "AI provisional answer reset");
                             received_delta = false;
                             answer_committed = false;
                             let _ = sidebar.update(cx, |sidebar, cx| {
@@ -556,7 +556,7 @@ impl AiSidebarController {
                         }
                         UiAgentMessage::Committed => {
                             answer_committed = true;
-                            tracing::debug!(target: "moye_ai", stage = "answer_source_commit", "AI source validation commit received");
+                            tracing::debug!(target: "ngy_ai", stage = "answer_source_commit", "AI source validation commit received");
                         }
                         UiAgentMessage::Sessions {
                             active_thread_id,
@@ -594,15 +594,15 @@ impl AiSidebarController {
                                 }
                             });
                             match applied {
-                                Ok(true) => tracing::debug!(target: "moye_ai", stage = "ui_completion", succeeded, delta_bytes, elapsed_ms = started.elapsed().as_millis() as u64, "AI result applied to sidebar"),
-                                Ok(false) => tracing::debug!(target: "moye_ai", stage = "ui_completion", succeeded, "AI stale completion ignored by sidebar"),
-                                Err(_) => tracing::debug!(target: "moye_ai", stage = "ui_completion", succeeded, "AI completion dropped because sidebar closed"),
+                                Ok(true) => tracing::debug!(target: "ngy_ai", stage = "ui_completion", succeeded, delta_bytes, elapsed_ms = started.elapsed().as_millis() as u64, "AI result applied to sidebar"),
+                                Ok(false) => tracing::debug!(target: "ngy_ai", stage = "ui_completion", succeeded, "AI stale completion ignored by sidebar"),
+                                Err(_) => tracing::debug!(target: "ngy_ai", stage = "ui_completion", succeeded, "AI completion dropped because sidebar closed"),
                             }
                             return;
                         }
                     }
                 }
-                tracing::debug!(target: "moye_ai", stage = "ui_events_closed", delta_bytes, elapsed_ms = started.elapsed().as_millis() as u64, "AI UI event channel closed");
+                tracing::debug!(target: "ngy_ai", stage = "ui_events_closed", delta_bytes, elapsed_ms = started.elapsed().as_millis() as u64, "AI UI event channel closed");
             };
             update.instrument(ui_span).await
         }));
@@ -866,7 +866,7 @@ fn ensure_reference_freeze_active(cancellation: &AgentCancellation) -> Result<()
 
 fn validate_persisted_reference(
     document: &BookDocument,
-    unit: &moye_epub_editor::document::ContentUnit,
+    unit: &ngy_book_studio::document::ContentUnit,
     reference: &AiReferenceHint,
 ) -> Result<()> {
     if let Some(revision) = reference.revision
@@ -910,7 +910,7 @@ async fn load_ui_session_state(
             Ok(messages) => messages,
             Err(error) => {
                 tracing::warn!(
-                    target: "moye_ai",
+                    target: "ngy_ai",
                     stage = "validate_restored_citations",
                     error_kind = error_kind(&error),
                     "cannot validate restored AI citations; restoring message text without sources"
@@ -927,7 +927,7 @@ async fn load_ui_session_state(
     let threads = match conversation.list_sessions(allowed_book_ids).await {
         Ok(threads) => thread_options(threads),
         Err(error) => {
-            tracing::warn!(target: "moye_ai", stage = "list_selected_sessions", error_kind = error_kind(&error), "cannot list AI sessions after selecting a session");
+            tracing::warn!(target: "ngy_ai", stage = "list_selected_sessions", error_kind = error_kind(&error), "cannot list AI sessions after selecting a session");
             fallback_thread
                 .into_iter()
                 .map(|thread| AiThreadOption::new(thread.id, thread.title, thread.scope.book_ids))
@@ -1059,7 +1059,7 @@ fn source_link_from_agent_citation(citation: AgentCitation) -> Option<AiSourceLi
         )
     {
         tracing::warn!(
-            target: "moye_ai",
+            target: "ngy_ai",
             stage = "convert_agent_citation",
             error_kind = "invalid_locator",
             "discarding AI citation with an invalid or mismatched locator"
@@ -1114,7 +1114,7 @@ fn source_link_from_chat_citation(citation: ChatCitation) -> Option<AiSourceLink
             .is_some_and(|unit_id| unit_id != citation.locator.unit_id)
     {
         tracing::warn!(
-            target: "moye_ai",
+            target: "ngy_ai",
             stage = "convert_stored_citation",
             error_kind = "invalid_locator",
             "discarding persisted AI citation with an invalid or mismatched locator"
@@ -1156,10 +1156,10 @@ mod tests {
     use super::*;
     use gpui::{AppContext, TestAppContext};
     use gpui_component::Root;
-    use moye_epub_editor::document::{
+    use ngy_book_studio::document::{
         Block, BlockDocument, BookDocument, ContentUnit, ContentUnitKind, DocumentLocator, Revision,
     };
-    use moye_epub_editor::{
+    use ngy_book_studio::{
         agent::AgentCitationSourceKind,
         chat::{ChatScope, ChatThread, NewChatMessage, NewChatThread, StoredChatMessage},
         library::LibraryStore,

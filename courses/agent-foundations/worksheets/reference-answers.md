@@ -42,9 +42,9 @@ C：`call["arguments"]["document_id"]`。键存在不代表值符合接口要求
 
 ## 第三至五步：实现与失败策略
 
-完整参考实现分别在 [manual.py](../moye_lab/implementations/manual.py) 和
-[langgraph_agent.py](../moye_lab/implementations/langgraph_agent.py)。
-[common.py](../moye_lab/implementations/common.py) 包含协议检查和单步处理。
+完整参考实现分别在 [manual.py](../ngy_lab/implementations/manual.py) 和
+[langgraph_agent.py](../ngy_lab/implementations/langgraph_agent.py)。
+[common.py](../ngy_lab/implementations/common.py) 包含协议检查和单步处理。
 先把你自己的控制流画出来，再对照参考；不要只把参考导入自己的 `run` 后称为完成手搓。
 
 正常循环的关键是完整追加 assistant 消息、处理本轮所有工具调用、回填最终工具

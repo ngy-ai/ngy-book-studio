@@ -6,8 +6,8 @@ import time
 
 import pytest
 
-from moye_lab.desktop_compat import COMPATIBILITY_ID
-from moye_lab.sandbox import SandboxLimits, SandboxStop, _write_packet, execute_desktop_run
+from ngy_lab.desktop_compat import COMPATIBILITY_ID
+from ngy_lab.sandbox import SandboxLimits, SandboxStop, _write_packet, execute_desktop_run
 
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows LPAC integration")
 
@@ -65,11 +65,11 @@ def test_reference_really_runs_across_isolated_rpc_and_host_grades(
         assert report["outcome"]["status"] == "budget_exhausted"
         assert report["outcome"]["stop_reason"] == scenario
     assert not (tmp_path / "sandbox-profile.json").exists()
-    assert not (tmp_path / "stage" / "app" / "moye_lab" / "scenarios.py").exists()
-    assert not (tmp_path / "stage" / "app" / "moye_lab" / "runner.py").exists()
+    assert not (tmp_path / "stage" / "app" / "ngy_lab" / "scenarios.py").exists()
+    assert not (tmp_path / "stage" / "app" / "ngy_lab" / "runner.py").exists()
     assert report["learning"]["mastery"] is None
     assert report["isolation"]["compatibility"] == COMPATIBILITY_ID
-    assert "moye_lab/desktop_compat.py" in report["code_snapshot"]
+    assert "ngy_lab/desktop_compat.py" in report["code_snapshot"]
 
 
 def test_worker_cannot_read_or_modify_ungranted_host_fixture(tmp_path):
@@ -77,7 +77,7 @@ def test_worker_cannot_read_or_modify_ungranted_host_fixture(tmp_path):
     secret.write_text("private-fixture-value", encoding="utf-8")
     code = f"""
 from pathlib import Path
-from moye_lab.contracts import AgentOutcome
+from ngy_lab.contracts import AgentOutcome
 def run(task, model, tools, limits, emit):
     probe = {{}}
     assert Path(__file__).read_text("utf-8")
@@ -106,7 +106,7 @@ def test_asyncio_import_succeeds_while_real_iocp_and_network_stay_denied(tmp_pat
 import asyncio
 import importlib
 import socket
-from moye_lab.contracts import AgentOutcome
+from ngy_lab.contracts import AgentOutcome
 def run(task, model, tools, limits, emit):
     results = {"asyncio_import": bool(asyncio.Future)}
     for attempt in range(2):
@@ -135,7 +135,7 @@ def run(task, model, tools, limits, emit):
 
 def test_forged_worker_pass_is_rejected_by_external_grader(tmp_path):
     code = """
-from moye_lab.contracts import AgentOutcome
+from ngy_lab.contracts import AgentOutcome
 def run(task, model, tools, limits, emit):
     emit({"passed": True, "phase": "assessment"})
     return AgentOutcome("completed", "final_answer", {
@@ -171,10 +171,10 @@ def test_worker_cannot_import_host_grader_or_dispatch_arbitrary_rpc(tmp_path):
     code = """
 import json
 import sys
-from moye_lab.contracts import AgentOutcome
+from ngy_lab.contracts import AgentOutcome
 def run(task, model, tools, limits, emit):
     try:
-        import moye_lab.scenarios
+        import ngy_lab.scenarios
         emit({"host_module": "visible"})
     except ModuleNotFoundError:
         emit({"host_module": "absent"})

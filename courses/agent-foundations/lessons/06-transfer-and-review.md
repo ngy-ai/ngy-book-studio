@@ -167,8 +167,8 @@ print(json.dumps(answer, ensure_ascii=False, indent=2))
 观察。以下命令在课程目录执行，端点、模型名和工作区路径必须替换为自己的配置：
 
 ```powershell
-uv run --locked python -m moye_lab credentials set --base-url https://your-provider.example/v1
-uv run --locked python -m moye_lab run --implementation workspaces/first-agent/manual.py --scenario normal --mode live --base-url https://your-provider.example/v1 --model your-tool-capable-model --allow-remote
+uv run --locked python -m ngy_lab credentials set --base-url https://your-provider.example/v1
+uv run --locked python -m ngy_lab run --implementation workspaces/first-agent/manual.py --scenario normal --mode live --base-url https://your-provider.example/v1 --model your-tool-capable-model --allow-remote
 ```
 
 第一行隐藏输入课程专用凭据，并存入 Windows Credential Manager；不写进代码、

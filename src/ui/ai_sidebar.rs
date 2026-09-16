@@ -4,7 +4,7 @@ use gpui_component::{
     clipboard::Clipboard,
     text::{TextView, TextViewStyle},
 };
-use moye_epub_editor::{
+use ngy_book_studio::{
     agent::AgentAnswerSourceStatus,
     ai::normalize_provider_base_url,
     document::{BookDocument, ContentUnit, DocumentLocator, Revision, SourceLocator},
@@ -2920,7 +2920,7 @@ mod tests {
     use super::*;
     use gpui::{AppContext, TestAppContext};
     use gpui_component::Root;
-    use moye_epub_editor::document::{
+    use ngy_book_studio::document::{
         Block, BlockDocument, ContentUnit, ContentUnitKind, NormalizedRect,
     };
     use std::{cell::RefCell, rc::Rc};

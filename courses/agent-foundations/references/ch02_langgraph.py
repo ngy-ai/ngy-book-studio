@@ -6,7 +6,7 @@ from langgraph.graph import END, START, StateGraph
 from langsmith import tracing_context
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from moye_lab.chapter_support import call_tool, finish, load_case
+from ngy_lab.chapter_support import call_tool, finish, load_case
 
 
 class ReadArguments(BaseModel):

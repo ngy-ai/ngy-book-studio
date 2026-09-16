@@ -17,10 +17,10 @@ export const buildOptions = {
   // guard also ensures the privileged bundle is never evaluated for the
   // untrusted content origin used by Preview and rich-text bootstrap fetches.
   banner: {
-    js: '(()=>{const __moyeEditorTrustedShell=()=>{try{const url=new URL(window.location.href);return(url.protocol==="epubeditor:"&&url.hostname==="shell")||(url.protocol==="http:"&&url.hostname==="epubeditor.shell")}catch{return false}};const __moyeEditorStart=()=>{if(!__moyeEditorTrustedShell())return;',
+    js: '(()=>{const __ngyEditorTrustedShell=()=>{try{const url=new URL(window.location.href);return(url.protocol==="epubeditor:"&&url.hostname==="shell")||(url.protocol==="http:"&&url.hostname==="epubeditor.shell")}catch{return false}};const __ngyEditorStart=()=>{if(!__ngyEditorTrustedShell())return;',
   },
   footer: {
-    js: '};if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",__moyeEditorStart,{once:true})}else{__moyeEditorStart()}})();',
+    js: '};if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",__ngyEditorStart,{once:true})}else{__ngyEditorStart()}})();',
   },
   charset: "utf8",
   format: "iife",

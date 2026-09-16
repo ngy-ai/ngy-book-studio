@@ -9,9 +9,9 @@ import sys
 import uuid
 from pathlib import Path
 
-from moye_lab.contracts import LabError, RunLimits
-from moye_lab.runner import COURSE_ROOT, execute_run, save_report
-from moye_lab.scenarios import SCENARIOS
+from ngy_lab.contracts import LabError, RunLimits
+from ngy_lab.runner import COURSE_ROOT, execute_run, save_report
+from ngy_lab.scenarios import SCENARIOS
 
 
 def parser() -> argparse.ArgumentParser:
@@ -96,8 +96,8 @@ def new_workspace(name: str) -> Path:
 
 
 def configure_credentials(args) -> None:
-    from moye_lab.credentials import delete_api_key, target_for_endpoint, write_api_key
-    from moye_lab.live import normalize_base_url
+    from ngy_lab.credentials import delete_api_key, target_for_endpoint, write_api_key
+    from ngy_lab.live import normalize_base_url
 
     endpoint = normalize_base_url(args.base_url)
     target = target_for_endpoint(endpoint)
@@ -120,7 +120,7 @@ def run_commands(args) -> int:
     )
     live_config = None
     if args.mode == "live":
-        from moye_lab.live import LiveConfig
+        from ngy_lab.live import LiveConfig
 
         if not args.base_url or not args.model:
             raise ValueError("live 模式必须显式指定 --base-url 和 --model；不会自动切换端点")

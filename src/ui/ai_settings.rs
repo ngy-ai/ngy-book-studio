@@ -1,8 +1,9 @@
 use super::*;
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use gpui_component::{Selectable as _, checkbox::Checkbox};
-use moye_epub_editor::{
+use ngy_book_studio::{
     ai::{
         ChatGenerationSettings, DEFAULT_AI_REQUEST_TIMEOUT_SECS, DEFAULT_CHAT_OUTPUT_TOKENS,
         DEFAULT_OLLAMA_OPENAI_BASE_URL, MAX_AI_REQUEST_TIMEOUT_SECS, MAX_EMBEDDING_DIMENSIONS,
@@ -17,6 +18,7 @@ use moye_epub_editor::{
         TranslationDisplayMode, translation_language_label,
     },
 };
+use ngy_book_studio::{logging, startup};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum SettingsTab {
@@ -165,6 +167,14 @@ struct SettingsNotice {
     error: bool,
 }
 
+/// 一次待提交的数据目录更改：新位置、引导配置文件、当前（旧）数据目录。
+#[derive(Clone)]
+struct DataDirChange {
+    target: PathBuf,
+    config_path: PathBuf,
+    from: PathBuf,
+}
+
 struct EndpointDraft {
     id: String,
     name_input: Entity<InputState>,
@@ -256,6 +266,11 @@ pub(super) struct AiSettingsWindow {
     /// How reading-time translations are displayed relative to the original text.
     translation_display_mode: TranslationDisplayMode,
     operation: PendingOperation,
+    /// 目录选择对话框正开着（或更改正在提交）。原生对话框在自己的消息循环里跑，
+    /// 用它挡住重复点击。
+    choosing_data_directory: bool,
+    /// 选中的新目录里已经有一个图书库：等用户确认是否覆盖。
+    confirm_overwrite: Option<DataDirChange>,
     notice: Option<SettingsNotice>,
 }
 
@@ -334,14 +349,14 @@ impl AiSettingsWindow {
             InputState::new(window, cx)
                 .default_value(settings.web_search_timeout_secs.to_string())
                 .placeholder(
-                    moye_epub_editor::web_search::DEFAULT_WEB_SEARCH_TIMEOUT_SECS.to_string(),
+                    ngy_book_studio::web_search::DEFAULT_WEB_SEARCH_TIMEOUT_SECS.to_string(),
                 )
                 .validate(|value, _| value.chars().all(|character| character.is_ascii_digit()))
         });
         let web_search_max_results_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .default_value(settings.web_search_max_results.to_string())
-                .placeholder(moye_epub_editor::web_search::MAX_WEB_SEARCH_RESULTS.to_string())
+                .placeholder(ngy_book_studio::web_search::MAX_WEB_SEARCH_RESULTS.to_string())
                 .validate(|value, _| value.chars().all(|character| character.is_ascii_digit()))
         });
         let background_job_concurrency_input = cx.new(|cx| {
@@ -394,6 +409,8 @@ impl AiSettingsWindow {
             default_language: settings.default_language.clone(),
             translation_display_mode: settings.translation_display_mode,
             operation: PendingOperation::Idle,
+            choosing_data_directory: false,
+            confirm_overwrite: None,
             notice: None,
         }
     }
@@ -1579,7 +1596,7 @@ impl AiSettingsWindow {
                         web_confirm_view.update(cx, |this, cx| {
                             if checked {
                                 let entered = web_url_input.read(cx).value();
-                                match moye_epub_editor::web_search::normalize_web_endpoint(
+                                match ngy_book_studio::web_search::normalize_web_endpoint(
                                     entered.trim(),
                                 ) {
                                     Some(url) => {
@@ -1721,7 +1738,7 @@ impl AiSettingsWindow {
                     )
                     .child(self.render_input_field(
                         "任务并发",
-                        "同时运行的模型任务数量，1–8，默认 1。并发越高占用的内存与网络越多；配置较低的机器建议保持 1。",
+                        "同时运行的模型任务数量，1–1024，默认 1。并发越高占用的内存与网络越多；配置较低的机器建议保持 1。",
                         &self.background_job_concurrency_input,
                     ))
                     .child(self.render_input_field(
@@ -1740,6 +1757,193 @@ impl AiSettingsWindow {
                     ),
             )
             .into_any_element()
+    }
+
+    /// 更改数据目录：选新位置、校验、记录，然后重启墨页完成搬迁。
+    ///
+    /// 运行中的图书库、对象存储和日志都绑在旧目录上，就地搬走会让当前进程立刻失效，
+    /// 所以这里只记录选择：真正的搬迁由重启后的新进程在打开图书库**之前**完成
+    /// （`startup::complete_pending_move`）。重启不是可选项 —— 不重启，本次会话会继续
+    /// 往旧目录里写新导入的书。
+    fn change_data_directory(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.choosing_data_directory {
+            return;
+        }
+        let config_path = match startup::bootstrap_path() {
+            Ok(path) => path,
+            Err(error) => {
+                self.notice = Some(SettingsNotice {
+                    text: format!("无法定位目录设置文件：{error:#}"),
+                    error: true,
+                });
+                cx.notify();
+                return;
+            }
+        };
+        let from = self.services.data_dir().to_path_buf();
+        // 原生对话框在本次实体更新返回之后再显示：Windows 文件对话框跑自己的消息
+        // 循环，在 GPUI 持有 App 借用时弹出会让随后每一帧都 BorrowMutError。
+        let dialog = DialogBuilder::file()
+            .set_owner(window)
+            .set_title("选择数据目录")
+            .set_location(&startup::shell_dialog_directory(&from))
+            .open_single_dir();
+        self.choosing_data_directory = true;
+        self.confirm_overwrite = None;
+        cx.spawn_in(window, async move |view, cx| {
+            let picked = dialog.show();
+            let _ = view.update(cx, |this, cx| {
+                this.choosing_data_directory = false;
+                match picked {
+                    Ok(Some(target)) => this.prepare_data_directory_change(
+                        DataDirChange {
+                            target,
+                            config_path,
+                            from,
+                        },
+                        cx,
+                    ),
+                    // 取消：保留原来的提示，不假装改过。
+                    Ok(None) => cx.notify(),
+                    Err(error) => {
+                        this.notice = Some(SettingsNotice {
+                            text: format!("无法打开目录选择器：{error}"),
+                            error: true,
+                        });
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// 校验选中的新目录：空目录直接提交，已经是一个图书库时先要一次覆盖确认。
+    fn prepare_data_directory_change(&mut self, change: DataDirChange, cx: &mut Context<Self>) {
+        let prepared = cx.background_executor().spawn({
+            let target = change.target.clone();
+            // 建目录、探针写删都在后台：用户可能选到网络盘。
+            async move {
+                startup::ensure_data_dir_usable(&target)?;
+                Ok::<_, anyhow::Error>(startup::holds_a_library(&target))
+            }
+        });
+        cx.spawn(async move |view, cx| {
+            let outcome = prepared.await;
+            let _ = view.update(cx, |this, cx| match outcome {
+                // 目标里已经有一个图书库：覆盖不可逆，先问清楚。
+                Ok(true) => {
+                    this.confirm_overwrite = Some(change);
+                    this.notice = None;
+                    cx.notify();
+                }
+                Ok(false) => this.commit_data_directory_change(change, false, cx),
+                Err(error) => {
+                    this.notice = Some(SettingsNotice {
+                        text: format!("无法使用该目录：{error:#}"),
+                        error: true,
+                    });
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 写下引导配置并重启墨页；搬迁交给重启后的新进程。
+    fn commit_data_directory_change(
+        &mut self,
+        change: DataDirChange,
+        overwrite: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let applied = cx.background_executor().spawn({
+            let (config_path, target, from) = (
+                change.config_path.clone(),
+                change.target.clone(),
+                change.from.clone(),
+            );
+            async move { startup::apply_data_dir_change(&config_path, &target, &from, overwrite) }
+        });
+        self.choosing_data_directory = true;
+        self.confirm_overwrite = None;
+        self.notice = Some(SettingsNotice {
+            text: format!(
+                "正在把数据目录切换到 {}，随后墨页会重新启动并把原目录的内容搬过去…",
+                change.target.display()
+            ),
+            error: false,
+        });
+        cx.notify();
+
+        cx.spawn(async move |view, cx| {
+            let outcome = applied.await;
+            let _ = view.update(cx, |this, cx| {
+                this.choosing_data_directory = false;
+                match outcome {
+                    // 记录已经落盘：重启后新进程会把旧目录的内容搬过来。
+                    Ok(_) => this.restart_application(&change.target, cx),
+                    Err(error) => {
+                        this.notice = Some(SettingsNotice {
+                            text: format!("无法使用该目录：{error:#}"),
+                            error: true,
+                        });
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 重启墨页。搬迁和切换数据目录都要重新打开图书库，只能靠重启。
+    fn restart_application(&mut self, data_dir: &Path, cx: &mut Context<Self>) {
+        let spawned = std::env::current_exe()
+            .map_err(|error| error.to_string())
+            .and_then(|executable| {
+                std::process::Command::new(&executable)
+                    .spawn()
+                    .map(|_| ())
+                    .map_err(|error| format!("{}：{error}", executable.display()))
+            });
+        match spawned {
+            Ok(()) => cx.quit(),
+            Err(error) => {
+                self.notice = Some(SettingsNotice {
+                    text: format!(
+                        "已把数据目录记为 {}。请手动关闭墨页再重新打开：新目录会在下次启动时\
+                         启用，原目录的内容也在那时搬过去。\n\n自动重启失败：{error}",
+                        data_dir.display()
+                    ),
+                    error: true,
+                });
+                cx.notify();
+            }
+        }
+    }
+
+    /// 用系统默认程序打开目录，出问题只提示不打断。
+    fn open_directory(&mut self, path: PathBuf, label: &str, cx: &mut Context<Self>) {
+        #[cfg(target_os = "windows")]
+        {
+            if let Err(error) = open::that_detached(&path) {
+                self.notice = Some(SettingsNotice {
+                    text: format!("无法打开{label}：{error}"),
+                    error: true,
+                });
+                cx.notify();
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (path, label);
+            self.notice = Some(SettingsNotice {
+                text: format!("当前平台不支持在文件管理器中打开{label}。"),
+                error: true,
+            });
+            cx.notify();
+        }
     }
 
     #[inline(never)]
@@ -1763,6 +1967,10 @@ impl AiSettingsWindow {
         let compact_view = cx.entity();
         let language_view = cx.entity();
         let display_mode_view = cx.entity();
+        // 图书库自己记的是标准化路径（Windows 上是 `\\?\C:\…`），菜单、资源管理器和
+        // 对话框都更认常规写法，所以显示与打开都用转换后的路径。
+        let data_dir = startup::shell_dialog_directory(self.services.data_dir());
+        let log_dir = startup::shell_dialog_directory(&logging::log_directory(&data_dir));
         let selected_language = self.default_language.clone();
         let current_label = selected_language
             .as_deref()
@@ -1908,8 +2116,143 @@ impl AiSettingsWindow {
                             ),
                     ),
             )
+            .child(
+                div()
+                    .v_flex()
+                    .gap_3()
+                    .p_4()
+                    .rounded(px(12.))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(SURFACE))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .text_color(rgb(INK))
+                            .child("存储位置"),
+                    )
+                    .child(storage_path_row("数据目录", &data_dir))
+                    .child(storage_path_row("日志目录", &log_dir))
+                    .children(self.render_confirm_overwrite(cx))
+                    .child(
+                        div()
+                            .h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("ai-data-directory-change")
+                                    .label("更改数据目录…")
+                                    .outline()
+                                    .disabled(self.operation.busy() || self.choosing_data_directory)
+                                    .debug_selector(|| "ai-data-directory-change".into())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.change_data_directory(window, cx);
+                                    })),
+                            )
+                            .child({
+                                let directory = data_dir.clone();
+                                Button::new("ai-open-data-directory")
+                                    .label("打开数据目录")
+                                    .outline()
+                                    .debug_selector(|| "ai-open-data-directory".into())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.open_directory(directory.clone(), "数据目录", cx);
+                                    }))
+                            })
+                            .child({
+                                let directory = log_dir.clone();
+                                Button::new("ai-open-log-directory")
+                                    .label("打开日志目录")
+                                    .outline()
+                                    .debug_selector(|| "ai-open-log-directory".into())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.open_directory(directory.clone(), "日志目录", cx);
+                                    }))
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .line_height(gpui::relative(1.5))
+                            .text_color(rgb(MUTED))
+                            .child(
+                                "图书库、笔记、索引、对象存储和日志都放在数据目录里；首次启动时由你选择，\
+                                 记录保存在用户配置目录下的 bootstrap.json。更换位置时整个数据目录会被搬到\
+                                 新位置（旧目录随之清空），墨页会自动重启完成搬迁 —— 搬迁在打开图书库之前\
+                                 进行，所以本次会话不会再有图书写进旧目录。备份或迁移时直接复制整个数据\
+                                 目录即可。日志按 UTC 日期分文件，保留最近 7 天。",
+                            ),
+                    ),
+            )
             .into_any_element()
     }
+
+    /// 目标目录里已经有一个图书库时，先在这里要一次明确的覆盖确认。
+    fn render_confirm_overwrite(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let change = self.confirm_overwrite.clone()?;
+        Some(
+            div()
+                .v_flex()
+                .gap_2()
+                .p_3()
+                .rounded(px(8.))
+                .bg(rgb(0xf7e1df))
+                .child(
+                    div()
+                        .text_sm()
+                        .line_height(gpui::relative(1.5))
+                        .text_color(rgb(0x9f302c))
+                        .child(format!(
+                            "{} 已经是一个图书库。继续会先删掉它的内容，再把当前数据目录的内容\
+                             整体搬过去 —— 这一步不可撤销。",
+                            change.target.display()
+                        )),
+                )
+                .child(
+                    div()
+                        .h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("ai-data-directory-overwrite")
+                                .label("覆盖并重启")
+                                .primary()
+                                .debug_selector(|| "ai-data-directory-overwrite".into())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let Some(change) = this.confirm_overwrite.clone() else {
+                                        return;
+                                    };
+                                    this.commit_data_directory_change(change, true, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("ai-data-directory-overwrite-cancel")
+                                .label("取消")
+                                .outline()
+                                .debug_selector(|| "ai-data-directory-overwrite-cancel".into())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.confirm_overwrite = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+}
+
+/// 存储位置的只读路径行：标签在上、路径在下，长路径换行显示。
+fn storage_path_row(label: &'static str, path: &Path) -> impl IntoElement {
+    div()
+        .v_flex()
+        .gap_0p5()
+        .child(div().text_xs().text_color(rgb(MUTED)).child(label))
+        .child(
+            div()
+                .text_sm()
+                .line_height(gpui::relative(1.4))
+                .text_color(rgb(INK))
+                .child(path.display().to_string()),
+        )
 }
 
 impl Render for AiSettingsWindow {
@@ -2097,7 +2440,7 @@ pub(super) fn open_ai_settings_window(services: Arc<AppServices>, cx: &mut App) 
                         title: Some("墨页 · AI Provider 设置".into()),
                         ..Default::default()
                     }),
-                    app_id: Some("dev.moye.epub-editor.ai-settings".to_string()),
+                    app_id: Some("dev.ngy.book-studio.ai-settings".to_string()),
                     ..Default::default()
                 },
                 move |window, cx| {
@@ -2222,7 +2565,7 @@ fn parse_request_timeout_secs(value: &str) -> Result<u64> {
 }
 
 fn parse_web_search_timeout_secs(value: &str) -> Result<u64> {
-    use moye_epub_editor::web_search::{MAX_WEB_SEARCH_TIMEOUT_SECS, MIN_WEB_SEARCH_TIMEOUT_SECS};
+    use ngy_book_studio::web_search::{MAX_WEB_SEARCH_TIMEOUT_SECS, MIN_WEB_SEARCH_TIMEOUT_SECS};
     let value = value.trim();
     let timeout = value.parse::<u64>().map_err(|_| {
         anyhow::anyhow!(
@@ -2237,7 +2580,7 @@ fn parse_web_search_timeout_secs(value: &str) -> Result<u64> {
 }
 
 fn parse_web_search_max_results(value: &str) -> Result<usize> {
-    use moye_epub_editor::web_search::MAX_WEB_SEARCH_RESULTS;
+    use ngy_book_studio::web_search::MAX_WEB_SEARCH_RESULTS;
     let value = value.trim();
     let count = value.parse::<usize>().map_err(|_| {
         anyhow::anyhow!("联网搜索结果数必须是 1 到 {MAX_WEB_SEARCH_RESULTS} 之间的整数")
@@ -2325,7 +2668,7 @@ fn looks_like_local_ollama(endpoint: &str) -> bool {
 mod tests {
     use super::*;
     use gpui::{Focusable as _, Modifiers, TestAppContext, VisualTestContext};
-    use moye_epub_editor::credentials::MemoryCredentialStore;
+    use ngy_book_studio::credentials::MemoryCredentialStore;
 
     fn redraw(visual: &mut VisualTestContext) {
         visual.run_until_parked();
@@ -2532,7 +2875,11 @@ mod tests {
         click_tab(visual, SettingsTab::System);
         settings.read_with(visual, |view, _| {
             assert_eq!(view.active_tab, SettingsTab::System);
-            assert!(view.default_language.is_none());
+            assert_eq!(
+                view.default_language.as_deref(),
+                Some("zh-Hans"),
+                "the system tab starts on Simplified Chinese",
+            );
         });
         let button = visual
             .debug_bounds("ai-default-language")
@@ -2554,12 +2901,13 @@ mod tests {
                     .as_deref(),
                 Some("ja")
             );
-            assert!(
+            assert_eq!(
                 view.services
                     .provider_settings()
                     .unwrap()
                     .default_language
-                    .is_none(),
+                    .as_deref(),
+                Some("zh-Hans"),
                 "changing the language must not save the draft",
             );
         });
@@ -2888,7 +3236,8 @@ mod tests {
             parse_background_job_concurrency(&MAX_BACKGROUND_JOB_CONCURRENCY.to_string()).unwrap(),
             MAX_BACKGROUND_JOB_CONCURRENCY
         );
-        for invalid in ["", "0", "-1", "1.5", "abc", "9"] {
+        let over_max = (MAX_BACKGROUND_JOB_CONCURRENCY + 1).to_string();
+        for invalid in ["", "0", "-1", "1.5", "abc", over_max.as_str()] {
             assert!(
                 parse_background_job_concurrency(invalid).is_err(),
                 "invalid concurrency unexpectedly accepted: {invalid}"
