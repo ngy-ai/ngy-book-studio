@@ -77,11 +77,15 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   显示在同一个窗口里让用户改路径重试（`report_failure`），启动期间不接受第二次提交也不
   响应关窗；确认成功才交回 `src/main.rs` 打开主窗口，然后关掉自己。它不写真实
   `bootstrap.json` 的路径由调用方注入，因此可测。
-- `src/logging.rs`：日志落盘。`tracing` 输出同时写控制台和数据目录下的
-  `logs/ngy-book-studio.<YYYY-MM-DD>.log`，按 UTC 日期滚动、启动时清理超过 7 天的
-  同类文件（只认自己的前缀 + 合法日期，其它文件不动）。日志目录不是独立选项：它固定
-  是 `<数据目录>/logs/`。日志文件建不出来不是启动失败，降级为只写控制台并由 `main.rs`
-  提示；写入失败不 panic（GPUI 回调不可 unwind），只报一次 stderr 后继续丢文件副本。
+- `src/logging.rs`：日志目录、默认过滤串与保留策略。全局 subscriber 由
+  `main.rs::install_logging` 调用 `ngy_utils_tracing::init` 安装，安装点必须晚于数据目录
+  确定（`LOG_DIR` 由它推出，此前的启动阶段没有日志）。文件层只在 Production/Test 模式
+  落到 `<数据目录>/logs/ngy-book-studio.<YYYY-MM-DD>.log`，按 UTC 日期滚动，启动时清理
+  超过 7 天的同类文件（只认自己的前缀 + 合法日期，其它文件不动）；Development（默认）
+  只写控制台，模式可用第一个命令行参数覆盖。日志目录不是独立选项：它固定是
+  `<数据目录>/logs/`。`main.rs` 持有 init 返回的 guard 并在进程退出前 drop，以免丢掉
+  非阻塞写入的尾日志；init 失败退回 `console_tracing`，两条路都装不上只报 stderr，
+  不 panic（GPUI 回调不可 unwind），也不拦住启动。
 - `src/services.rs`、`src/runtime.rs`：进程级服务组合与独立 Tokio runtime；统一持有
   图书库、对象存储、格式注册表、搜索、AI、Office 和后台任务。GPUI 回调跑在自己的
   executor 上，不是 Tokio 上下文：UI 可达的服务方法必须把数据库、对象存储、`tokio::fs`
@@ -123,6 +127,12 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   `BlockDocument`、`TocNode` 和 `DocumentLocator`。
 - `src/formats/`：`DocumentImporter` 注册表及 EPUB、PDF、Office、Kindle、KFX、DjVu
   适配器；`office_oxide`、`ebook-rs`、`djvu-rs` 等第三方类型必须在本目录内转换为统一模型。
+  导入器必须把来源声明的语言写进 `BookDocument.language`：Kindle/KFX 取 `ebook-rs`
+  元数据，EPUB 取 OPF 的 `dc:language`（`rbook::EpubMetadata::language()`）。
+  `books.language` 是翻译任务跳过「本书已是目标语言」的唯一依据
+  （`transactions::reconfigure_translation_jobs`），EPUB 曾经漏填，于是连声明了
+  `zh-CN` 的中文书都会被排进翻译队列；PDF/Office/DjVu 没有可声明的语言标签，导入后
+  仍是 `None`，这些格式不会因此跳过翻译。
   `kindle.rs`：`ebook-rs` 只认 PalmDOC（压缩 1/2），因此 HUFF/CDIC（压缩 17480，
   `kindlegen -c2` 与多数 Amazon KF8 文件使用）由 `kindle_huff.rs` 自行解码后重写为
   未压缩容器再交给解析器。重写必须保持记录索引不变——正文按头部已声明的
@@ -176,6 +186,13 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   BLAKE3 内容寻址实现，以及带图书归属校验和 Range 支持的媒体响应。
 - `src/library.rs`：SQLite 与对象存储之上的图书库业务编排、导入/创建/保存/删除、
   垃圾回收和兼容现有 UI 的投影。
+  打开图书库时按顺序做两件一次性修复：先 `run_startup_blob_gc` 回收未引用对象，
+  再 `run_startup_language_backfill` 把导入器漏记的声明语言补回 `books.language`。
+  回填只读容器元数据（`formats::declared_language`，EPUB 取 OPF 的 `dc:language`），
+  不碰正文、不覆盖已有语言、不动 `revision` 与 `updated_at`，因此索引、译文、笔记与
+  排序都不受影响；完成标记 `library.language_backfill.v1` 写进 `settings`，让重读原件
+  只发生一次（原件可能很大，不能每次启动都读）。空库不写标记——没有书可查就不该
+  提前用掉这次机会；有条目读不出来或解析失败也不写标记，留给下次启动重试。
 - `src/annotations.rs`、`src/db/annotations.rs`：三种划线、人工想法与 AI 想法统一使用
   `annotations` 一张表。宿主按实际阅读章节 body 文本（排除 script/style/noscript/template，
   移除 ECMAScript 空白）的 UTF-16 起止位置校验 quote、书/单元归属及打开时的版本。
@@ -409,6 +426,12 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   `http_timeout`，后台任务日志与 UI 不因超时改在块间生效而出现新类别。
   `SseDiagnostics` 每 10 秒输出一条与内容无关的传输进度行（`sse_progress`：字节数、事件数、
   正文块数、空块数、距上次事件的时间、最大间隔），结束时不再只给分类计数。
+  **AI 与联网搜索的客户端默认跟随系统代理**（reqwest 自己读 `HTTP_PROXY`/`HTTPS_PROXY`），
+  而默认端点正是本机 Ollama，代理会把它一并接管；「系统配置」的「使用系统代理」开关
+  （`ai.network.preferences.v1`，默认开）关掉后走 `OpenAiHttpProvider::new_with_proxy` /
+  `HttpWebSearch::new_with_proxy` 的 `.no_proxy()` 客户端。代理是系统级偏好，因此**不进
+  `ProviderConfig`**（endpoint 级结构，且被大量测试字面量构造）；两处客户端都只在保存设置
+  时重建，开关对已发出的请求无效。
 - `src/agent.rs`、`src/agent_runtime.rs`、`src/agent_chat.rs`、`src/chat.rs`：只读 Agent
   工具、SSE/tool-call 循环、窗口授权范围、会话/消息/引用持久化与对话编排。
 - `src/office_com.rs`、`src/office_preview.rs`、`src/office_visual.rs`：可选 Office STA

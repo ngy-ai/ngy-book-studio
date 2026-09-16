@@ -552,6 +552,31 @@ LangGraph 依赖。CLI 课程验证与桌面接入的验证分别列出。
   1 项末元素样式断言按文本定位，新增“单击译文不改变显示、图标才是唯一开关”）。
   未做真实 Windows GUI 手工点击复验
 
+- [x] 2026-09-16 EPUB 漏记声明语言，同语言也被排进翻译任务：EPUB 导入器从不读 OPF 的
+  `dc:language`（此前只有 Kindle/KFX 从 `ebook-rs` 元数据写 `BookDocument.language`），
+  于是 `books.language` 为空，「源语言主标签等于目标语言时跳过」对任何 EPUB 都不生效——
+  一份声明 `zh-CN` 的中文 EPUB 在目标 `zh-Hans` 下照样入队。导入器改为读
+  `dc:language`；另增一次性启动修复 `library::run_startup_language_backfill`，把存量
+  书库里 `language` 为空的书按 `formats::declared_language`（只有 EPUB 与 Kindle/KFX
+  有可读标签，PDF/Office/DjVu 没有）从已存原件回填，只补不覆盖、不动 `revision` 与
+  `updated_at`——索引、译文、笔记与排序都不受影响；完成标记 `library.language_backfill.v1`
+  写进 settings，原件只读一次，读不出或解析失败则不留标记、下次重试。
+  回归：`startup_backfill_fills_a_missing_language_once_and_never_replaces_one`、
+  `imports_reads_and_restores_a_real_epub`（新增 `language == "zh-CN"` 断言）；
+  `cargo test --lib library::` 35 项、`formats::` 73 项、`translation_jobs` 3 项通过
+
+- [x] 2026-09-16 AI 与联网搜索的 HTTP 客户端此前不带任何代理策略，reqwest 会自行读取
+  `HTTP_PROXY`/`HTTPS_PROXY`，于是连默认端点（`127.0.0.1` 上的 Ollama）都被本地代理接管，
+  请求发不出去。AI 设置的“系统配置”新增“使用系统代理”开关（settings 键
+  `ai.network.preferences.v1`，默认开启＝保持既有行为）：关闭后
+  `OpenAiHttpProvider::new_with_proxy` 与 `HttpWebSearch::new_with_proxy` 用 `.no_proxy()`
+  建客户端，AI 问答、Embedding、Vision、联网搜索与后台翻译一并直连，Endpoint 的“检测模型”
+  也按同一偏好建客户端。`ProviderConfig` 不加字段（它是 endpoint 级配置，代理是系统级偏好，
+  也避免改动大量测试字面量），开关随保存设置重建客户端，对已在进行的请求无效。
+  回归：`provider_settings_survive_restart_without_persisting_the_api_key`（network 行往返，
+  provider JSON 不含 `use_proxy`）、
+  `tab_clicks_preserve_unsaved_inputs_and_blur_hidden_fields`（开关点击只改草稿不落库）
+
 ## KFX 与 DjVu 导入（2026-09-12）
 
 - [x] 依赖：新增固定版本 `djvu-rs = "=0.32.1"`（MIT、纯 Rust，只启用 `std`，不含
