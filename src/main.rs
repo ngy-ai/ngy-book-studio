@@ -18,6 +18,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
+        Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -30,6 +31,10 @@ const WEBVIEW2_DOWNLOAD_URL: &str =
 /// 日志 subscriber 只能安装一次。用户在设置窗口里改过数据目录后重试启动时，仍沿用
 /// 第一次装好的那个。
 static LOGGING_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// 日志 worker guard 必须存活到进程退出，否则非阻塞写入的尾部日志会丢失。
+/// `ngy_utils_tracing::init` 返回的 guard 存这里，进程退出前显式取走并 drop 以刷盘。
+static LOG_GUARD: Mutex<Option<ngy_utils_tracing::InitResult>> = Mutex::new(None);
 
 fn main() {
     // GPUI's DirectComposition renderer and a child HWND WebView cannot be layered
@@ -65,6 +70,13 @@ fn main() {
                 }
             }
         });
+
+    // run 返回即进程退出：显式取走并 drop 日志 guard，确保非阻塞写入的尾部日志落盘。
+    if let Ok(mut guard) = LOG_GUARD.lock() {
+        if let Some(result) = guard.take() {
+            drop(result);
+        }
+    }
 }
 
 /// 设置窗口的句柄：窗口自己（启动失败时把原因显示回去）和它的窗口句柄（启动成功后
@@ -240,16 +252,42 @@ fn report_startup_failure(cx: &mut App, setup: Option<SetupHandles>, failure: St
     }
 }
 
-/// 安装日志：控制台 + `<数据目录>/logs/`。
+/// 安装日志：由 `ngy_utils_tracing` 安装全局 subscriber，文件日志落到
+/// `<数据目录>/logs/`（Production/Test 模式）。
 ///
-/// 文件日志不可用时降级为只写控制台：此刻还没有文件日志，所以原因写进 stderr，
-/// 不阻断启动 —— 日志写不了不该拦住读书。
+/// 数据目录在启动早期才能确定，所以这里才装 subscriber；在此之前（含设置窗口阶段）
+/// 的 tracing 事件会丢弃。subscriber 只能装一次：`LOGGING_INSTALLED` 保证本函数只跑一次。
 fn install_logging(selection: &DataDirSelection) {
     if LOGGING_INSTALLED.swap(true, Ordering::AcqRel) {
         return;
     }
-    match logging::init(&selection.data_dir) {
-        Ok(log_dir) => {
+
+    // 让 `ngy_utils_tracing` 把文件日志写到 `<数据目录>/logs/`，文件名前缀 `ngy-book-studio`。
+    // 只有 Production/Test 模式才会真正写文件；Development（默认）只写控制台。
+    let log_dir = logging::log_directory(&selection.data_dir);
+    unsafe {
+        std::env::set_var("LOG_DIR", &log_dir);
+    }
+    if std::env::var_os("RUST_LOG").is_none() {
+        unsafe {
+            std::env::set_var("RUST_LOG", logging::DEFAULT_LOG_FILTER);
+        }
+    }
+
+    // 先建目录、清理过期日志，再安装 subscriber。
+    logging::prepare(&selection.data_dir);
+
+    let crates = vec!["ngy-book-studio".to_string()];
+    // 第一个命令行参数作为模式覆盖（development/test/production）。
+    let mode_override = std::env::args().nth(1);
+    match ngy_utils_tracing::init(
+        mode_override.as_deref(),
+        crates.clone(),
+        Some(logging::LOG_PREFIX.to_string()),
+        None,
+    ) {
+        Ok(result) => {
+            *LOG_GUARD.lock().expect("log guard lock poisoned") = Some(result);
             tracing::info!(
                 log_dir = %log_dir.display(),
                 "{}",
@@ -257,8 +295,11 @@ fn install_logging(selection: &DataDirSelection) {
             );
         }
         Err(error) => {
-            logging::init_console_only();
-            eprintln!("[ngy-book-studio] 无法启用文件日志，本次运行只输出到控制台：{error:#}");
+            eprintln!("[ngy-book-studio] 日志初始化失败，仅输出到控制台：{error:#}");
+            // 全局 subscriber 尚未安装时退回控制台日志；已经装过则忽略。
+            if ngy_utils_tracing::console_tracing(crates).is_err() {
+                eprintln!("[ngy-book-studio] 控制台日志也未能安装，本次运行的日志可能全部丢失");
+            }
         }
     }
 }
