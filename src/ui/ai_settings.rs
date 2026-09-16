@@ -265,6 +265,8 @@ pub(super) struct AiSettingsWindow {
     default_language: Option<String>,
     /// How reading-time translations are displayed relative to the original text.
     translation_display_mode: TranslationDisplayMode,
+    /// Whether AI and web-search requests go through the system proxy.
+    use_proxy: bool,
     operation: PendingOperation,
     /// 目录选择对话框正开着（或更改正在提交）。原生对话框在自己的消息循环里跑，
     /// 用它挡住重复点击。
@@ -408,6 +410,7 @@ impl AiSettingsWindow {
             pdf_compact_reading: settings.pdf_compact_reading,
             default_language: settings.default_language.clone(),
             translation_display_mode: settings.translation_display_mode,
+            use_proxy: settings.use_proxy,
             operation: PendingOperation::Idle,
             choosing_data_directory: false,
             confirm_overwrite: None,
@@ -514,6 +517,7 @@ impl AiSettingsWindow {
             pdf_compact_reading: self.pdf_compact_reading,
             default_language: self.default_language.clone(),
             translation_display_mode: self.translation_display_mode,
+            use_proxy: self.use_proxy,
         };
         settings.validate()?;
         Ok(settings)
@@ -1967,6 +1971,7 @@ impl AiSettingsWindow {
         let compact_view = cx.entity();
         let language_view = cx.entity();
         let display_mode_view = cx.entity();
+        let use_proxy_view = cx.entity();
         // 图书库自己记的是标准化路径（Windows 上是 `\\?\C:\…`），菜单、资源管理器和
         // 对话框都更认常规写法，所以显示与打开都用转换后的路径。
         let data_dir = startup::shell_dialog_directory(self.services.data_dir());
@@ -2081,6 +2086,49 @@ impl AiSettingsWindow {
                             .child(
                                 "开启后 PDF 阅读窗口的页面上下贴合，不再保留页间留白；关闭时恢复默认间距。\
                                  页面投影、左右留白与阅读位置不变，标注与笔记仍按页面文字位置保存。",
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .v_flex()
+                    .gap_3()
+                    .p_4()
+                    .rounded(px(12.))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(SURFACE))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .text_color(rgb(INK))
+                            .child("网络"),
+                    )
+                    .child(
+                        Checkbox::new("ai-use-system-proxy")
+                            .checked(self.use_proxy)
+                            .disabled(self.operation.busy())
+                            .label("使用系统代理")
+                            .debug_selector(|| "ai-use-system-proxy".into())
+                            .on_click(move |checked, _, cx| {
+                                let checked = *checked;
+                                use_proxy_view.update(cx, |this, cx| {
+                                    this.use_proxy = checked;
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .line_height(gpui::relative(1.5))
+                            .text_color(rgb(MUTED))
+                            .child(
+                                "开启后 AI 问答、联网搜索与后台翻译请求会走系统代理（环境变量 \
+                                 HTTP_PROXY / HTTPS_PROXY，NO_PROXY 里的地址仍然直连）。关闭后一律\
+                                 直连，本机模型端点（例如 127.0.0.1 上的 Ollama）不会被代理接管。\
+                                 保存后新的请求生效，已在进行的请求不受影响。",
                             ),
                     ),
             )
@@ -2827,6 +2875,26 @@ mod tests {
                     .unwrap()
                     .pdf_compact_reading,
                 "changing the checkbox must not save the reading preference",
+            );
+        });
+
+        let proxy = visual
+            .debug_bounds("ai-use-system-proxy")
+            .expect("system proxy checkbox must be rendered");
+        settings.read_with(visual, |view, _| {
+            assert!(
+                view.use_proxy,
+                "the system proxy stays on until the user opts out",
+            );
+        });
+        visual.simulate_click(proxy.center(), Modifiers::none());
+        redraw(visual);
+        settings.read_with(visual, |view, cx| {
+            assert!(!view.use_proxy);
+            assert!(!view.entered_settings(cx).unwrap().use_proxy);
+            assert!(
+                view.services.provider_settings().unwrap().use_proxy,
+                "changing the checkbox must not save the network preference",
             );
         });
 

@@ -189,10 +189,22 @@ impl std::fmt::Debug for HttpWebSearch {
 
 impl HttpWebSearch {
     pub fn new(config: WebSearchConfig) -> Result<Self> {
+        Self::new_with_proxy(config, crate::ai::DEFAULT_AI_USE_PROXY)
+    }
+
+    /// Mirrors [`crate::ai::OpenAiHttpProvider::new_with_proxy`]: the proxy
+    /// preference is a system-wide setting, so the web-search client follows the
+    /// same switch as the model clients instead of reading the environment
+    /// variables on its own.
+    pub fn new_with_proxy(config: WebSearchConfig, use_proxy: bool) -> Result<Self> {
         config.validated_endpoint()?;
-        let client = Client::builder()
+        let mut builder = Client::builder()
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(config.timeout_secs))
+            .timeout(Duration::from_secs(config.timeout_secs));
+        if !use_proxy {
+            builder = builder.no_proxy();
+        }
+        let client = builder
             .build()
             .context("failed to build web search HTTP client")?;
         Ok(Self { config, client })

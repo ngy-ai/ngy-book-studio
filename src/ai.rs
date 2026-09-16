@@ -25,6 +25,13 @@ pub const DEFAULT_AI_REQUEST_TIMEOUT_SECS: u64 = 120;
 pub const MIN_AI_REQUEST_TIMEOUT_SECS: u64 = 1;
 pub const MAX_AI_REQUEST_TIMEOUT_SECS: u64 = 600;
 pub const DEFAULT_CHAT_OUTPUT_TOKENS: u32 = 4096;
+/// Whether AI and web-search requests honour the system proxy
+/// (`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`) by default. reqwest reads those
+/// variables on its own, so "on" preserves the behaviour of a machine that
+/// exports them; the AI settings window exposes the switch because a proxy also
+/// captures requests to a *local* model endpoint (the default Ollama URL),
+/// where it cannot serve them.
+pub const DEFAULT_AI_USE_PROXY: bool = true;
 /// Deadline for the TCP/TLS handshake only. Every other deadline is expressed
 /// through [`ProviderConfig::request_timeout_secs`].
 const AI_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -574,15 +581,24 @@ impl std::fmt::Debug for OpenAiHttpProvider {
 
 impl OpenAiHttpProvider {
     pub fn new(config: ProviderConfig) -> Result<Self> {
+        Self::new_with_proxy(config, DEFAULT_AI_USE_PROXY)
+    }
+
+    /// `use_proxy` is the system-wide network preference rather than an endpoint
+    /// property, so it is not part of [`ProviderConfig`]. When false the client
+    /// carries an explicit `no_proxy()`, which overrides the environment
+    /// variables reqwest would otherwise pick up.
+    pub fn new_with_proxy(config: ProviderConfig, use_proxy: bool) -> Result<Self> {
         let base_url = config.validated_base_url()?;
         // No client-wide `.timeout()`: reqwest applies that deadline to the whole
         // request *including the response body*, so it cut healthy generations in
         // half. Non-streaming calls are bounded by `within_request_timeout` and
         // streaming replies by the silence between two chunks.
-        let client = Client::builder()
-            .connect_timeout(AI_CONNECT_TIMEOUT)
-            .build()
-            .context("failed to build AI HTTP client")?;
+        let mut builder = Client::builder().connect_timeout(AI_CONNECT_TIMEOUT);
+        if !use_proxy {
+            builder = builder.no_proxy();
+        }
+        let client = builder.build().context("failed to build AI HTTP client")?;
         Ok(Self {
             config,
             client,

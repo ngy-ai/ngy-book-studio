@@ -34,9 +34,9 @@ use crate::windows_pdf_renderer::WindowsPdfRenderer;
 use crate::{
     agent::WebSearchBackend,
     ai::{
-        ChatGenerationSettings, DEFAULT_AI_REQUEST_TIMEOUT_SECS, DEFAULT_OLLAMA_OPENAI_BASE_URL,
-        ModelInfo, OpenAiCompatibleProvider, OpenAiHttpProvider, ProviderConfig,
-        normalize_provider_base_url,
+        ChatGenerationSettings, DEFAULT_AI_REQUEST_TIMEOUT_SECS, DEFAULT_AI_USE_PROXY,
+        DEFAULT_OLLAMA_OPENAI_BASE_URL, ModelInfo, OpenAiCompatibleProvider, OpenAiHttpProvider,
+        ProviderConfig, normalize_provider_base_url,
     },
     chat::ChatRepository,
     credentials::{CredentialStore, SystemCredentialStore},
@@ -64,6 +64,7 @@ const ENDPOINT_ROUTING_SETTINGS_KEY: &str = "ai.openai_compatible.endpoint_routi
 const BACKGROUND_JOB_SETTINGS_KEY: &str = "background_jobs.preferences.v1";
 const PDF_READER_SETTINGS_KEY: &str = "pdf.reader.preferences.v1";
 const TRANSLATION_SETTINGS_KEY: &str = "translation.preferences.v1";
+const NETWORK_SETTINGS_KEY: &str = "ai.network.preferences.v1";
 const WEB_SEARCH_CREDENTIAL_TARGET: &str = "ai.openai_compatible.web_search.v1";
 const MAX_MODEL_NAME_CHARS: usize = 256;
 /// Upper bounds for one published visual page set (Office enhanced preview or
@@ -275,6 +276,26 @@ impl Default for PersistedPdfReaderSettings {
     }
 }
 
+/// Whether AI and web-search requests use the system proxy. Kept in its own
+/// settings key, exactly like the preferences above.
+fn default_ai_use_proxy() -> bool {
+    DEFAULT_AI_USE_PROXY
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedNetworkSettings {
+    use_proxy: bool,
+}
+
+impl Default for PersistedNetworkSettings {
+    fn default() -> Self {
+        Self {
+            use_proxy: default_ai_use_proxy(),
+        }
+    }
+}
+
 /// Target language for the reading-time book translation. Simplified Chinese is
 /// the out-of-the-box choice shown by the AI settings window; `None` (the
 /// window's "不翻译（仅原文）" entry) keeps the original text only.
@@ -421,6 +442,10 @@ pub struct ProviderSettings {
     /// like the target language above.
     #[serde(skip, default = "default_translation_display_mode")]
     pub translation_display_mode: TranslationDisplayMode,
+    /// Whether AI and web-search requests honour the system proxy. Stored under
+    /// its own settings key, like the preferences above.
+    #[serde(skip, default = "default_ai_use_proxy")]
+    pub use_proxy: bool,
     pub embedding_model: String,
     /// Dimension override sent to the embedding provider. Changing this value
     /// invalidates all existing vector indices because stored vectors with the
@@ -489,6 +514,7 @@ impl Default for ProviderSettings {
             pdf_compact_reading: default_pdf_compact_reading(),
             default_language: default_translation_language(),
             translation_display_mode: default_translation_display_mode(),
+            use_proxy: default_ai_use_proxy(),
             embedding_model: DEFAULT_EMBEDDING_MODEL.to_string(),
             embedding_dimensions: DEFAULT_EMBEDDING_DIMENSIONS,
             vision_model: DEFAULT_VISION_MODEL.to_string(),
@@ -1444,7 +1470,10 @@ impl AppServices {
             None
         };
         match settings.web_search_config(api_key)? {
-            Some(config) => Ok(Some(Arc::new(HttpWebSearch::new(config)?))),
+            Some(config) => Ok(Some(Arc::new(HttpWebSearch::new_with_proxy(
+                config,
+                settings.use_proxy,
+            )?))),
             None => Ok(None),
         }
     }
@@ -1763,6 +1792,9 @@ impl AppServices {
         api_key: ApiKeyUpdate,
     ) -> Result<Vec<ModelInfo>> {
         let credentials = Arc::clone(&self.credentials);
+        // Probing an endpoint is a network call like any other, so it respects
+        // the system proxy preference of the saved settings.
+        let use_proxy = self.provider_settings()?.use_proxy;
         let provider = self
             .runtime
             .handle()
@@ -1777,7 +1809,7 @@ impl AppServices {
                     }
                     ApiKeyUpdate::Delete => None,
                 };
-                OpenAiHttpProvider::new(endpoint.provider_config(api_key))
+                OpenAiHttpProvider::new_with_proxy(endpoint.provider_config(api_key), use_proxy)
             })
             .await
             .context("AI provider probe setup worker stopped")??;
@@ -2699,8 +2731,9 @@ fn build_ai_services(
     let build_role = |role| -> Result<Arc<dyn OpenAiCompatibleProvider>> {
         let endpoint = settings.endpoint_for(role)?;
         let api_key = api_keys.get(&endpoint.id).cloned().flatten();
-        Ok(Arc::new(OpenAiHttpProvider::new(
+        Ok(Arc::new(OpenAiHttpProvider::new_with_proxy(
             endpoint.provider_config(api_key),
+            settings.use_proxy,
         )?))
     };
     let provider = build_role(ModelRole::Chat)?;
@@ -2763,13 +2796,14 @@ fn restore_endpoint_keys(
     }
 }
 
-const AI_SETTINGS_KEYS: [&str; 6] = [
+const AI_SETTINGS_KEYS: [&str; 7] = [
     PROVIDER_SETTINGS_KEY,
     CHAT_GENERATION_SETTINGS_KEY,
     ENDPOINT_ROUTING_SETTINGS_KEY,
     BACKGROUND_JOB_SETTINGS_KEY,
     PDF_READER_SETTINGS_KEY,
     TRANSLATION_SETTINGS_KEY,
+    NETWORK_SETTINGS_KEY,
 ];
 
 fn snapshot_ai_settings(db_path: &Path) -> Result<Vec<Option<db::settings::Setting>>> {
@@ -2963,6 +2997,14 @@ fn load_provider_settings(db_path: &Path) -> Result<ProviderSettings> {
     };
     settings.default_language = translation_settings.default_language;
     settings.translation_display_mode = translation_settings.display_mode;
+    settings.use_proxy = match db::settings::get(&tx, NETWORK_SETTINGS_KEY)? {
+        Some(row) => {
+            serde_json::from_str::<PersistedNetworkSettings>(&row.value_json)
+                .context("保存的网络设置无效")?
+                .use_proxy
+        }
+        None => default_ai_use_proxy(),
+    };
     settings.validate()?;
     tx.commit().context("无法完成 AI 设置快照读取")?;
     Ok(settings)
@@ -3027,6 +3069,14 @@ fn save_provider_settings(db_path: &Path, settings: &ProviderSettings) -> Result
             .context("无法序列化 Endpoint 与模型绑定设置")?,
         updated_at,
     };
+    let network = db::settings::Setting {
+        key: NETWORK_SETTINGS_KEY.to_string(),
+        value_json: serde_json::to_string(&PersistedNetworkSettings {
+            use_proxy: settings.use_proxy,
+        })
+        .context("无法序列化网络设置")?,
+        updated_at,
+    };
     let mut conn = db::open_conn(db_path)?;
     let tx = conn.transaction().context("无法开始保存 AI 设置")?;
     ensure!(
@@ -3052,6 +3102,10 @@ fn save_provider_settings(db_path: &Path, settings: &ProviderSettings) -> Result
     ensure!(
         db::settings::upsert(&tx, &routing)? == 1,
         "Endpoint 与模型绑定设置未能保存"
+    );
+    ensure!(
+        db::settings::upsert(&tx, &network)? == 1,
+        "网络设置未能保存"
     );
     tx.commit().context("无法提交 AI 设置")?;
     Ok(())
@@ -4325,6 +4379,7 @@ mod tests {
             background_job_concurrency: 3,
             background_job_interval_ms: 250,
             pdf_compact_reading: true,
+            use_proxy: false,
             embedding_model: "embed-test".to_string(),
             vision_model: "vision-test".to_string(),
             remote_content_confirmed: true,
@@ -4361,6 +4416,7 @@ mod tests {
         assert!(!row.value_json.contains("chat_generation"));
         assert!(!row.value_json.contains("auto_run_background_jobs"));
         assert!(!row.value_json.contains("pdf_compact_reading"));
+        assert!(!row.value_json.contains("use_proxy"));
         assert!(!row.value_json.contains("endpoint_routing"));
         let generation_row = db::settings::get(
             &db::open_conn(services.database_path()).unwrap(),
@@ -4398,6 +4454,16 @@ mod tests {
             PersistedPdfReaderSettings {
                 compact_reading: true
             }
+        );
+        let network_row = db::settings::get(
+            &db::open_conn(services.database_path()).unwrap(),
+            NETWORK_SETTINGS_KEY,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<PersistedNetworkSettings>(&network_row.value_json).unwrap(),
+            PersistedNetworkSettings { use_proxy: false }
         );
         drop(services);
 
