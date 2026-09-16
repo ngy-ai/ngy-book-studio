@@ -30,6 +30,10 @@ fn imports_reads_and_restores_a_real_epub() {
 
     assert_eq!(imported.title, "山海小记");
     assert_eq!(imported.author, "测试作者");
+    // The OPF's `dc:language` must survive the import: it is what stops the
+    // translation scheduler from queueing a book that is already in the target
+    // language (this fixture declares `zh-CN`, the default target is `zh-Hans`).
+    assert_eq!(imported.language.as_deref(), Some("zh-CN"));
     // SQLite stores only metadata; source and cover bytes live in the managed
     // content-addressed object directory.
     assert!(!library_dir.join("books").exists());

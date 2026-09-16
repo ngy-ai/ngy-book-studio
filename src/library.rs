@@ -348,6 +348,9 @@ impl LibraryStore {
         let blob_publication = BlobPublicationLock::for_store(&blob_store)?;
         let startup_publication_guard = io.block_on(blob_publication.acquire());
         run_startup_blob_gc(&opened.connection, &blob_store, &io)?;
+        // Must run before the in-memory projection is loaded below so a repaired
+        // language is already part of the records every caller sees.
+        run_startup_language_backfill(&opened.connection, &blob_store, &io)?;
         drop(startup_publication_guard);
         let books = db::books::list(&opened.connection)?;
         let groups = db::groups::list(&opened.connection)?;
@@ -1903,6 +1906,114 @@ fn run_startup_blob_gc(
     Ok(())
 }
 
+/// Durable one-shot marker for the language backfill. A per-book condition is
+/// not enough: a container that declares no language stays blank forever, so
+/// re-reading its blob on every startup would be real I/O for no result.
+const LANGUAGE_BACKFILL_SETTING: &str = "library.language_backfill.v1";
+
+/// One-shot repair for a book whose declared language an import dropped. EPUB
+/// was the offender: its importer ignored the OPF's `dc:language`, so every EPUB
+/// looked like an unknown-language book and the translation scheduler queued
+/// even a Chinese book for Chinese translation.
+///
+/// Only container metadata is read — never the content — and a language is only
+/// ever filled in, never replaced, so a book a newer importer or the reader
+/// already described is left alone. `revision` and `updated_at` stay untouched,
+/// which keeps derived indexes, translations, annotations and library ordering
+/// exactly as they were.
+fn run_startup_language_backfill(
+    conn: &rusqlite::Connection,
+    store: &LocalBlobStore,
+    io: &IoRuntime,
+) -> Result<()> {
+    if db::settings::get(conn, LANGUAGE_BACKFILL_SETTING)?.is_some() {
+        return Ok(());
+    }
+    // A blob that cannot be read or parsed keeps the marker unwritten so the
+    // next startup retries, instead of silently giving up on that book. An empty
+    // library likewise leaves it unwritten: there was nothing to examine, so a
+    // book appearing later must still get its chance.
+    let mut incomplete = false;
+    let books = db::books::list(conn)?;
+    for book in books.iter() {
+        if book
+            .language
+            .as_deref()
+            .is_some_and(|language| !language.trim().is_empty())
+        {
+            continue;
+        }
+        // Checked before any read: a format that cannot declare a language would
+        // otherwise cost a whole original-file read for a guaranteed `None`.
+        if !crate::formats::declares_language(&book.format) {
+            continue;
+        }
+        // A malformed key is a repair failure, not a reason to refuse to open the
+        // library: warn, keep the marker unwritten, and let the next start retry.
+        let key = match BlobKey::parse(&book.source_object_key) {
+            Ok(key) => key,
+            Err(error) => {
+                incomplete = true;
+                tracing::warn!(
+                    book_id = %book.id,
+                    %error,
+                    "启动语言回填：原件对象键无法解析，保留待下次重试"
+                );
+                continue;
+            }
+        };
+        let language = match io.block_on(store.get(&key)) {
+            Ok(bytes) => match crate::formats::declared_language(&book.format, &bytes) {
+                Ok(Some(language)) => language,
+                // The container declares nothing; there is nothing to repair.
+                Ok(None) => continue,
+                Err(error) => {
+                    incomplete = true;
+                    tracing::warn!(
+                        book_id = %book.id,
+                        format = %book.format,
+                        %error,
+                        "启动语言回填：无法读出声明语言，保留待下次重试"
+                    );
+                    continue;
+                }
+            },
+            Err(error) => {
+                incomplete = true;
+                tracing::warn!(
+                    book_id = %book.id,
+                    %error,
+                    "启动语言回填：无法读取原件，保留待下次重试"
+                );
+                continue;
+            }
+        };
+        match db::books::backfill_language(conn, &book.id, &language) {
+            Ok(1) => tracing::info!(
+                book_id = %book.id,
+                %language,
+                "启动语言回填：补上导入器漏掉的声明语言"
+            ),
+            Ok(_) => {}
+            Err(error) => {
+                incomplete = true;
+                tracing::warn!(book_id = %book.id, %error, "启动语言回填：写入失败");
+            }
+        }
+    }
+    if !incomplete && !books.is_empty() {
+        db::settings::upsert(
+            conn,
+            &db::settings::Setting {
+                key: LANGUAGE_BACKFILL_SETTING.to_string(),
+                value_json: "true".to_string(),
+                updated_at: now_secs(),
+            },
+        )?;
+    }
+    Ok(())
+}
+
 struct PersistedGraph {
     book: db::books::BookRecord,
     source_blob: db::blobs::BlobRecord,
@@ -2821,6 +2932,79 @@ mod tests {
     /// this side hands over is released before the wait. 30s matches the
     /// fixture budgets in `tests/translation_flow.rs`.
     const BACKGROUND_PUBLICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// A book row can lose the language its own original declares: an earlier
+    /// EPUB importer ignored the OPF, and `create_book` never records one at all.
+    /// The startup repair reads the tag back, must never replace a language
+    /// somebody else already set, and must not run a second time.
+    #[test]
+    fn startup_backfill_fills_a_missing_language_once_and_never_replaces_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("library");
+
+        // An empty library leaves the one-shot marker unwritten, so the books
+        // created below still get their chance on the next open.
+        let mut library = LibraryStore::load_from(dir.clone()).unwrap();
+        let blank = library.create_book("待回填", "作者").unwrap();
+        let spoken_for = library.create_book("已有语言", "作者").unwrap();
+        drop(library);
+
+        let conn = db::open_conn(&dir.join(db::DATABASE_FILE)).unwrap();
+        conn.execute(
+            "UPDATE books SET language = 'en' WHERE id = ?1",
+            [spoken_for.id.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+
+        // `create_book` stores no language while its generated original declares
+        // `zh-CN` — exactly the shape the repair exists to fix.
+        let reopened = LibraryStore::load_from(dir.clone()).unwrap();
+        let language_of = |id: &str| {
+            reopened
+                .books()
+                .iter()
+                .find(|book| book.id == id)
+                .expect("图书应仍然存在")
+                .language
+                .clone()
+        };
+        assert_eq!(language_of(&blank.id).as_deref(), Some("zh-CN"));
+        assert_eq!(
+            language_of(&spoken_for.id).as_deref(),
+            Some("en"),
+            "回填不得覆盖已记录的语言"
+        );
+        drop(reopened);
+
+        // The marker makes the repair one-shot: blanking the language by hand
+        // must not bring it back on the next start.
+        let conn = db::open_conn(&dir.join(db::DATABASE_FILE)).unwrap();
+        assert!(
+            db::settings::get(&conn, LANGUAGE_BACKFILL_SETTING)
+                .unwrap()
+                .is_some(),
+            "一次回填之后必须写下一次性标记"
+        );
+        conn.execute(
+            "UPDATE books SET language = NULL WHERE id = ?1",
+            [blank.id.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let reopened = LibraryStore::load_from(dir).unwrap();
+        assert!(
+            reopened
+                .books()
+                .iter()
+                .find(|book| book.id == blank.id)
+                .unwrap()
+                .language
+                .is_none(),
+            "标记存在时不得再次回填"
+        );
+    }
 
     fn initial_note_draft(
         library: &LibraryStore,

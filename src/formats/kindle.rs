@@ -252,6 +252,23 @@ impl DocumentImporter for KindleImporter {
 /// both cases: the resource records keep their positions and `first_image_index`
 /// in record 0 stays valid, so image extraction and `recindex=` rewriting are
 /// unaffected.
+/// Reads only the declared language from the container, normalizing no chapter.
+/// It runs the same HUFF/CDIC rewrite as a real import so the startup backfill
+/// sees exactly what `KindleImporter::import` would have recorded. A container
+/// whose metadata table is empty reports `None`, and a file `ebook-rs` rejects
+/// (encrypted or malformed) surfaces as an error the caller logs and skips.
+pub(crate) fn declared_language(bytes: &[u8]) -> Result<Option<String>> {
+    let prepared = prepare_kindle_source(bytes)?;
+    let parsed = ebook_rs::MobiBook::parse(prepared.as_ref())
+        .map_err(|error| anyhow::anyhow!(error).context("ebook-rs rejected the Kindle file"))?;
+    Ok(parsed
+        .metadata()
+        .languages
+        .first()
+        .map(|language| language.trim().to_string())
+        .filter(|language| !language.is_empty()))
+}
+
 fn prepare_kindle_source(bytes: &[u8]) -> Result<Cow<'_, [u8]>> {
     let Some(palm) = PalmDb::parse(bytes)? else {
         return Ok(Cow::Borrowed(bytes));

@@ -221,6 +221,10 @@ impl DocumentImporter for EpubImporter {
             ),
         );
         document.authors = authors;
+        // The declared `dc:language` is what lets the translation scheduler skip
+        // a book that is already in the target language; without it every EPUB
+        // looks like an unknown-language book and is queued for translation.
+        document.language = declared_language_of(&epub);
         document.units = units;
         document.toc = toc;
         document.cover_asset_id = cover_asset_id;
@@ -233,6 +237,24 @@ impl DocumentImporter for EpubImporter {
             assets: imported_assets,
         })
     }
+}
+
+/// The OPF's declared language, trimmed, dropped when empty. Shared by the
+/// importer and the startup backfill so both agree on what "declared" means.
+fn declared_language_of(epub: &Epub) -> Option<String> {
+    epub.metadata()
+        .language()
+        .map(|language| language.value().trim().to_string())
+        .filter(|language| !language.is_empty())
+}
+
+/// Reads only the declared language and parses no content. The startup backfill
+/// uses it for books imported before this importer recorded the language, so a
+/// book that is already in the target language stops being queued for
+/// translation.
+pub(crate) fn declared_language(bytes: &[u8]) -> Result<Option<String>> {
+    let epub = Epub::read(Cursor::new(bytes.to_vec())).context("source is not a valid EPUB")?;
+    Ok(declared_language_of(&epub))
 }
 
 fn zip_contains(bytes: &[u8], name: &str) -> bool {

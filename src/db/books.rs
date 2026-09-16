@@ -147,6 +147,20 @@ pub(crate) fn update_catalog(
     .context("无法保存图书元数据")
 }
 
+/// Fills in a language an earlier import dropped, for the startup backfill.
+/// It never touches `revision` or `updated_at`: a repair must not invalidate
+/// derived indexes, translations or annotations, and must not reshuffle
+/// "recently updated" ordering. Guarded on a blank language so it can never
+/// overwrite a value a newer importer, the reader or a future UI already set.
+pub(crate) fn backfill_language(conn: &Connection, book_id: &str, language: &str) -> Result<usize> {
+    conn.execute(
+        "UPDATE books SET language = ?2
+         WHERE id = ?1 AND (language IS NULL OR trim(language) = '')",
+        params![book_id, language],
+    )
+    .context("无法回填图书语言")
+}
+
 pub(crate) fn set_current_source(
     conn: &Connection,
     book_id: &str,

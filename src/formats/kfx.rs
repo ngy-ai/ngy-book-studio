@@ -283,6 +283,20 @@ fn is_unreadable_kfx_character(character: char) -> bool {
         )
 }
 
+/// Reads only the declared language, extracting no text. Used by the startup
+/// backfill for books imported before the language was recorded; a container
+/// without a language tag reports `None`.
+pub(crate) fn declared_language(bytes: &[u8]) -> Result<Option<String>> {
+    let parsed = KfxBook::from_bytes(bytes)
+        .map_err(|error| anyhow::anyhow!(error).context("KFX 容器解析失败"))?;
+    Ok(parsed
+        .metadata
+        .languages
+        .first()
+        .map(|language| language.trim().to_string())
+        .filter(|language| !language.is_empty()))
+}
+
 fn validate_kfx_text(sections: &[ebook_rs::Section]) -> Result<()> {
     let quality = kfx_text_quality(sections);
     ensure!(
