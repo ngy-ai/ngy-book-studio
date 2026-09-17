@@ -17,8 +17,7 @@ use ngy_book_studio::{
 use std::{
     path::{Path, PathBuf},
     sync::{
-        Arc,
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -264,6 +263,10 @@ fn report_startup_failure(cx: &mut App, setup: Option<SetupHandles>, failure: St
 /// 进程环境变量；命令行参数的覆盖优先级最高。目录创建、按日滚动、保留最近
 /// [`logging::LOG_MAX_FILES`] 个文件与过期清理也由该库在 `init` 时完成（并在后台定期执行），
 /// 本项目不再自行实现。
+///
+/// 0.6.0 起该库读取的环境变量一律带 [`logging::ENV_PREFIX`] 前缀（`RUST_LOG` 除外），
+/// 所以模式变量是 `MOYE_APP_MODE` 而不是无前缀的 `APP_MODE`；时间戳偏移也必须显式传
+/// [`logging::LOG_TIME_OFFSET`]，因为库的默认值不是 UTC。
 fn install_logging(selection: &DataDirSelection) {
     if LOGGING_INSTALLED.swap(true, Ordering::AcqRel) {
         return;
@@ -277,18 +280,19 @@ fn install_logging(selection: &DataDirSelection) {
         }
     }
 
-    // 文件日志落到 `<数据目录>/logs/`（`log_dir` 直接传入，优先级高于 `LOG_DIR`），
+    // 文件日志落到 `<数据目录>/logs/`（`log_dir` 直接传入，优先级高于带前缀的 `MOYE_LOG_DIR`），
     // 前缀 `ngy-book-studio`，保留最近 `LOG_MAX_FILES` 个日滚动文件。
     let log_dir = logging::log_directory(&selection.data_dir);
     let crates = vec!["ngy-book-studio".to_string()];
-    let options = ngy_utils_tracing::InitOptions::default()
+    let options = ngy_utils_tracing::InitOptions::new(logging::ENV_PREFIX)
         // 第一个命令行参数作为模式覆盖（development/test/production），优先级高于 `MOYE_APP_MODE`。
         .mode_override(std::env::args().nth(1))
         .crates(crates.clone())
         .log_dir(Some(log_dir.to_string_lossy().into_owned()))
         .log_prefix(Some(logging::LOG_PREFIX.to_string()))
         .max_log_files(Some(logging::LOG_MAX_FILES))
-        .mode_env_var(Some("MOYE_APP_MODE".to_string()));
+        // 时间戳偏移必须显式给出：0.6.0 的默认值是 `+08:00`，而本项目按 UTC 记录。
+        .time_offset(Some(logging::LOG_TIME_OFFSET.to_string()));
     match ngy_utils_tracing::init(options) {
         Ok(result) => {
             *LOG_GUARD.lock().expect("log guard lock poisoned") = Some(result);
@@ -301,7 +305,7 @@ fn install_logging(selection: &DataDirSelection) {
         Err(error) => {
             eprintln!("[ngy-book-studio] 日志初始化失败，仅输出到控制台：{error:#}");
             // 全局 subscriber 尚未安装时退回控制台日志；已经装过则忽略。
-            if ngy_utils_tracing::console_tracing(crates).is_err() {
+            if ngy_utils_tracing::console_tracing(logging::ENV_PREFIX, crates).is_err() {
                 eprintln!("[ngy-book-studio] 控制台日志也未能安装，本次运行的日志可能全部丢失");
             }
         }

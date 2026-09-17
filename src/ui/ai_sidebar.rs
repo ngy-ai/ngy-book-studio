@@ -2108,9 +2108,17 @@ impl AiSidebar {
     fn render_endpoint_status(&self, theme: Palette) -> gpui::AnyElement {
         let warning = self.endpoint_status.is_warning();
         let (background, foreground, icon) = if warning {
-            (rgb(theme.danger_soft), rgb(theme.danger), IconName::TriangleAlert)
+            (
+                rgb(theme.danger_soft),
+                rgb(theme.danger),
+                IconName::TriangleAlert,
+            )
         } else {
-            (rgb(theme.success_soft), rgb(theme.success), IconName::CircleCheck)
+            (
+                rgb(theme.success_soft),
+                rgb(theme.success),
+                IconName::CircleCheck,
+            )
         };
         div()
             .v_flex()
@@ -2363,10 +2371,13 @@ impl AiSidebar {
                                 .child("可选引用"),
                         )
                         .child(
-                            div().text_xs().text_color(rgb(palette(cx).muted)).child(format!(
-                                "已选 {selected_count}/{}",
-                                MAX_SELECTED_REFERENCES
-                            )),
+                            div()
+                                .text_xs()
+                                .text_color(rgb(palette(cx).muted))
+                                .child(format!(
+                                    "已选 {selected_count}/{}",
+                                    MAX_SELECTED_REFERENCES
+                                )),
                         ),
                 )
                 .child(
@@ -2473,7 +2484,12 @@ impl AiSidebar {
                     )
                 })
                 .when_some(self.sessions.error.clone(), |this, error| {
-                    this.child(div().text_xs().text_color(rgb(palette(cx).danger)).child(error))
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(palette(cx).danger))
+                            .child(error),
+                    )
                 })
                 .when(self.sessions.open, |this| {
                     this.when_some(pending_delete, |this, pending| {
@@ -2537,9 +2553,14 @@ impl AiSidebar {
                                 .overflow_y_scrollbar()
                                 .when(rows.is_empty(), |this| {
                                     this.child(
-                                        div().px_2().py_3().text_xs().text_color(rgb(palette(cx).muted)).child(
-                                            "还没有历史会话。发送第一条消息后会保存在这里。",
-                                        ),
+                                        div()
+                                            .px_2()
+                                            .py_3()
+                                            .text_xs()
+                                            .text_color(rgb(palette(cx).muted))
+                                            .child(
+                                                "还没有历史会话。发送第一条消息后会保存在这里。",
+                                            ),
                                     )
                                 })
                                 .children(rows),
@@ -2559,11 +2580,26 @@ impl AiSidebar {
         let view = cx.entity().clone();
         let user = message.role == AiMessageRole::User;
         let show_no_source_warning = should_show_no_knowledge_base_source_warning(message);
+        // 回答卡片必须是皮肤色：写死的 `white()` 背景配 `ink` 文字，在深色皮肤里
+        // 就是"浅底浅字"（回答几乎看不见），浅色皮肤里也只是看不出卡片层次。
+        // 用户气泡用 `paper` 而不是白色文字，理由与 `theme.primary_foreground`
+        // 相同：两套皮肤下它离 `accent` 都比白色更远。
         let (background, foreground): (gpui::Hsla, gpui::Hsla) = match message.role {
-            AiMessageRole::User => (rgb(palette(cx).accent).into(), white()),
-            AiMessageRole::Assistant => (white(), rgb(palette(cx).ink).into()),
-            AiMessageRole::Status => (rgb(palette(cx).neutral_soft).into(), rgb(palette(cx).muted).into()),
-            AiMessageRole::Error => (rgb(palette(cx).danger_soft).into(), rgb(palette(cx).danger).into()),
+            AiMessageRole::User => (
+                rgb(palette(cx).accent).into(),
+                rgb(palette(cx).paper).into(),
+            ),
+            AiMessageRole::Assistant => {
+                (rgb(palette(cx).surface).into(), rgb(palette(cx).ink).into())
+            }
+            AiMessageRole::Status => (
+                rgb(palette(cx).neutral_soft).into(),
+                rgb(palette(cx).muted).into(),
+            ),
+            AiMessageRole::Error => (
+                rgb(palette(cx).danger_soft).into(),
+                rgb(palette(cx).danger).into(),
+            ),
         };
         let sources = message
             .sources
@@ -2622,7 +2658,11 @@ impl AiSidebar {
                     .py_2()
                     .rounded(px(10.))
                     .border_1()
-                    .border_color(if user { rgb(palette(cx).accent) } else { rgb(palette(cx).border) })
+                    .border_color(if user {
+                        rgb(palette(cx).accent)
+                    } else {
+                        rgb(palette(cx).border)
+                    })
                     .bg(background)
                     .text_sm()
                     .text_color(foreground)
@@ -2763,7 +2803,11 @@ impl Render for AiSidebar {
                             .min_w(px(0.))
                             .gap_2()
                             .text_color(rgb(palette(cx).ink))
-                            .child(Icon::new(IconName::Bot).small().text_color(rgb(palette(cx).accent)))
+                            .child(
+                                Icon::new(IconName::Bot)
+                                    .small()
+                                    .text_color(rgb(palette(cx).accent)),
+                            )
                             .child(
                                 div()
                                     .v_flex()
@@ -2876,13 +2920,15 @@ impl Render for AiSidebar {
                             .h_flex()
                             .justify_between()
                             .gap_2()
-                            .child(div().text_xs().text_color(rgb(palette(cx).muted)).child(if sending {
-                                "正在生成，可随时取消"
-                            } else if session_busy {
-                                "正在切换会话"
-                            } else {
-                                "Ctrl+Enter 发送"
-                            }))
+                            .child(div().text_xs().text_color(rgb(palette(cx).muted)).child(
+                                if sending {
+                                    "正在生成，可随时取消"
+                                } else if session_busy {
+                                    "正在切换会话"
+                                } else {
+                                    "Ctrl+Enter 发送"
+                                },
+                            ))
                             .when(!sending, |this| {
                                 this.child(
                                     Button::new("ai-send")

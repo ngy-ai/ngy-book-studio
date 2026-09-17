@@ -87,6 +87,10 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   未设置时默认 Production。该库先加载 `.env` 再读取模式，所以 `.env` 里的
   `MOYE_APP_MODE` 也生效，并且因用 `dotenv_override`，其值会覆盖进程环境变量；命令行
   参数的覆盖优先级最高。
+  该库（0.6.0 起）读取的环境变量一律带 `logging::ENV_PREFIX`（`MOYE_`）前缀，只有
+  `RUST_LOG` 保持无前缀；`init` 还装一层 `log` 兼容桥，依赖里走 `log` 的记录此后也会
+  进日志。时间戳偏移必须显式传 `logging::LOG_TIME_OFFSET`（`UTC`）—— 库的默认值不是
+  UTC，不传就会与按 UTC 日期滚动的文件名不一致。
   日志目录不是独立选项：它固定是 `<数据目录>/logs/`。`main.rs` 持有 init 返回的
   `InitResult`（含文件 guard 与后台清理句柄）并在进程退出前 drop，以免丢掉非阻塞写入的
   尾日志、或让清理线程悬空；init 失败退回 `console_tracing`，两条路都装不上只报 stderr，
@@ -100,7 +104,11 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   「深色叠深色」。取色点拿不到 `cx`（自由函数、`'static` 闭包）时先
   `let theme = palette(cx);` 取值再传：闭包里直接写 `palette(cx)` 会把 `&App` 借用带出
   方法体，`move` 闭包还会把 `cx` 移动走。半透明色用 `Palette::tint(基色, alpha)`，
-  不要写 `rgba(0x...)`。WebView 拿不到 Rust 常量，三个面（阅读器章节、富文本编辑器、
+  不要写 `rgba(0x...)`；文本选中底色是 `Palette::selection()`（半透明强调色），不要退回
+  不透明的 `accent_soft` —— 它在深色皮肤里和 `surface`（AI 回答卡片、输入框）只差一档
+  明度，选中范围看不出来。会承载文字的卡片一律用皮肤色（回答卡片 `surface` + `ink`，
+  用户气泡 `accent` + `paper`），写死的 `white()` 配 `ink` 在深色皮肤里是浅底浅字。
+  WebView 拿不到 Rust 常量，三个面（阅读器章节、富文本编辑器、
   PDF.js viewer）靠 `Palette::css_variables` / `css_variable_setters` 下发的 `--ngy-*`
   自定义属性取色；编辑器还要额外注入一层覆盖规则（`editor_appearance_script`），因为它
   的颜色写死在随包发布的 `assets/editor/prosemirror.js` 里。各 WebView 窗口用
@@ -121,6 +129,18 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   委托包装；新增页面来源时必须走同一入口，不要复制门闩或摘要校验。
   `ensure_visual_render_job` 只用于本地可安全自动运行的渲染（DjVu），Office COM 增强
   必须继续走显式信任对话框与 `set_office_enhancement_enabled`。
+  `AppServices::configure_providers` 是 AI 设置保存的唯一入口，它串行地拿两把门闩：
+  `ai_configuration`（整个保存期间持有，保证一次设置切换不被交叉）与索引协调器的
+  `transitions`。**等门闩必须有上限**（`AI_SETTINGS_GATE_TIMEOUT`，30 秒）：门闩持有者
+  可能正被后台任务堵住（现场 2026-09-17：设置窗口停在「正在安全保存 Provider 设置…」，
+  而 `settings` 表根本没被改写），无限等待会把之后的每一次保存也拖成永久挂起；超时发生在
+  进入写入之前，本次没有提交任何东西，所以报「另一个设置保存仍在进行中」并让用户重试。
+  门闩**里面**的重配置与回滚不能包超时——「要么提交、要么回滚」的保证要求那次工作跑完。
+  界面侧另有一条等待上限（`src/ui/ai_settings/mod.rs` 的 `SAVE_WAIT_LIMIT`，60 秒）：超时只是
+  放弃等待，写入仍留在运行中的任务里，所以提示必须写成「设置可能已经保存，也可能仍被阻塞」，
+  不能写成失败；用户主动关窗不因为保存中而被拦（`on_window_close` 只在
+  `application_is_exiting` 且 `Saving` 时等结果），否则一次被堵住的保存会变成关不掉的
+  死窗口，用户除了杀进程没有别的出路。
 - `src/learning.rs`、`src/learning_records.rs`、`src/learning_catalog.rs`、
   `src/ui/learning.rs`：学习中心异步服务、逐章目录、
   独立 JSON 学习档案和原生 GPUI 训练窗口。记录不进入图书数据库；运行前保存不可变
@@ -231,7 +251,7 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
 - `src/search.rs`、`src/indexing.rs`：作用域内 FTS5/`sqlite-vec` 精确 KNN、RRF 混合
   召回，以及可恢复的 embedding/vision 后台任务。执行器固定启动
   `MAX_BACKGROUND_JOB_CONCURRENCY` 个 worker，只有序号小于当前并发的 worker 扫描队列，
-  每个任务提交后按配置间隔休眠；两者由 AI 设置“后台任务”经
+  每个任务提交后按配置间隔休眠；两者由 AI 设置的「后台任务」窗口经
   `IndexingCoordinator::configure_scheduling` 实时发布，写坏的值按范围钳制。
   同一个「任务并发」既是任务上限，也是**单个整本翻译的块窗口上限**：一轮里最多同时开
   `concurrency` 个文本块请求（`walk_translation_blocks` 的窗口，每轮重读设置，所以运行中
@@ -362,7 +382,14 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   答案重复标记），流结束时把同一组形状计数写进 `translation_stream`，失败时另存
   `translation_response_salvaged`。这些计数只说明“模型没写出答案 / 思考没结束 / 答案重复
   输出 / 容器被打断”，不含任何正文；`NGY_DUMP_TRANSLATION_RAW` 仍是唯一会打印响应与
-  冻结输入的开关，并且现在也覆盖流失败。流没有正常结束（含 `ProviderTimeout` 静默超时）
+  冻结输入的开关，并且现在也覆盖流失败。收流还有一条自己的**静默**上限
+  （`TRANSLATION_STREAM_SILENCE_LIMIT`，与 `PROVIDER_STEP_TIMEOUT` 同值）：provider 层的
+  静默计时兜不住「流不再产生任何事件」——现场 2026-09-17 的整本翻译在开出 8 个块请求后
+  彻底静默（job-logs 无写入、进程没有任何 TCP 连接、`await_translation_step` 的 180 秒
+  也没触发），于是整本书永久停在同一块上，并占住 `transitions` 门闩把 AI 设置保存一起
+  卡住。兜底按 `ProviderTimeout::stream` 报错（分类仍是 `http_timeout`，不新增类别），
+  让任务走出来而不是无限等待；**总时长仍然不设上限**，持续产出数据的慢模型继续能翻完。
+  流没有正常结束（含 `ProviderTimeout` 静默超时）
   但已收到的字节能通过完整分段校验（只有一个完整容器、id 不多不少）时采用该答案并记警告；
   两个答案、缺片段、容器被截断或校验失败一律不猜、按原样失败，此时 provider 失败仍让
   整个任务失败。
@@ -458,9 +485,28 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   工作者、只读临时导出和持久视觉渲染器；原件禁用宏和外链更新，派生页按当前
   renderer/revision/profile 发布，失败时回退结构化预览。
 - `src/reader.rs`、`src/epub_limits.rs`：EPUB 投影、资源授权、导航 URL 和归档安全上限。
+- `src/ui/ai_settings/`：AI 设置的**五个独立窗口**（`Endpoint`、`对话模型`、`联网搜索`、
+  `后台任务`、`系统配置`）；工具栏“AI 设置”是选择窗口的菜单，五个窗口可同时打开。
+  `mod.rs` 放五窗口共用的身份（`AiSettingsSection`）、应用级单例登记
+  （`SettingsWindowTrackers`，一条登记只服务一个窗口）、状态与提示、统一外框
+  （`settings_frame`）与统一提交（`commit_settings`）；`endpoint.rs`、`models.rs`、
+  `web_search.rs`、`background_jobs.rs`、`system.rs` 各自持有草稿、校验与面板；
+  `endpoint_draft.rs` 是 Endpoint 与对话模型两个窗口共用的 Endpoint 草稿与模型检测。
+  **每个窗口只保存自己那一块**：各窗口的 `entered_settings` 一律以
+  `services.provider_settings()` 的当前值为底、只覆盖本窗口字段，然后交给
+  `AppServices::configure_providers`（唯一的提交入口），因此任何窗口的保存都不会把别的
+  窗口里还没提交的输入写进数据库（改动前是一个窗口、五个标签、一次统一保存全部配置）。
+  新增设置项时必须同时决定它归哪个窗口，并保持「只覆盖本窗口字段」这条约定；跨窗口共享
+  的草稿只读展示，不要在窗口之间互相写入。模型检测在 Endpoint 与对话模型两个窗口都可用，
+  结果按 Endpoint 标识、`discovery_generation` 与规范化地址三重校验，换地址即作废；
+  删除仍被模型绑定的 Endpoint 会被拒绝（以已保存设置的绑定为准，窗口快照兜底）。保存流程
+  的两条上限（`SAVE_WAIT_LIMIT` 与 `AI_SETTINGS_GATE_TIMEOUT`）对五个窗口同样适用。
+  窗口内的调试选择器统一由 `AiSettingsSection::selector` 生成：`ai-<窗口短名>-<name>`，
+  例如 `ai-models-save-settings`、`ai-background-job-scheduling`；GUI 冒烟与 GPUI 测试
+  按它定位元素，不要再写死旧窗口的选择器。
 - `src/ui/`：按窗口/职责拆分的 GPUI 界面。`library.rs`、`reader.rs`、`pdf_reader.rs`、
   `editor.rs`、`page_image.rs` 分别管理对应窗口；`ai_sidebar.rs`、
-  `ai_controller.rs`、`ai_settings.rs` 管理 AI 交互；`background_jobs.rs` 管理当前图书范围
+  `ai_controller.rs`、`ai_settings/` 管理 AI 交互；`background_jobs.rs` 管理当前图书范围
   的派生任务；后台任务窗口全应用只有一个，重复打开时激活现有窗口并按新的库范围刷新，
   不打开第二个；`mod.rs` 只保留跨窗口主题、窗口打开与安全关闭基础设施，其中包含按
   图书登记的窗口表：删除图书后关闭该书已打开的阅读、PDF/Office 预览、DjVu 页面和编辑窗口。
@@ -1223,8 +1269,8 @@ EPUB/PDF/原件导出、重新打开及原件字节一致性。
   同一 key 还保存后台任务调度（`concurrency` 1–1024 默认 1、`interval_ms` 0–60000 默认 10），
   读取时钳制而不是报错，坏行不得让图书库无法打开；两者不属于 Provider JSON，保存后经
   `configure_scheduling` 立即作用于后续任务，正在运行的任务不被打断。
-- PDF 紧凑阅读使用独立 settings key（`pdf.reader.preferences.v1`，默认关闭，AI 设置
-  “系统配置”中的“PDF 紧凑阅读”默认不勾选），同样不得扩展 Provider JSON；新 key 必须
+- PDF 紧凑阅读使用独立 settings key（`pdf.reader.preferences.v1`，默认关闭，AI 设置的
+  「系统配置」窗口中的“PDF 紧凑阅读”默认不勾选），同样不得扩展 Provider JSON；新 key 必须
   加入 `AI_SETTINGS_KEYS`，否则 `snapshot_ai_settings`/`restore_ai_settings` 的失败回滚
   会不对称（`restore_ai_settings` 校验备份行数）。页间距只有一份契约：宿主用
   `ngypdf://viewer/viewer.html?...&compact=1` 让新窗口在首帧前设置
@@ -1238,8 +1284,8 @@ EPUB/PDF/原件导出、重新打开及原件字节一致性。
   仍存在的差额（<0.5px 不动手），并用 `takeRecords()` 丢弃自己的两条记录；
   锚点页必须取“视口中心覆盖的那一页”（草稿钉住的页优先），不能用 `currentPage`——
   它只跟踪已绘制的页，刚滚到、仍在占位状态的页会让它滞后一页，补偿就会少算一个页间距。
-- 默认显示语言使用独立 settings key（`translation.preferences.v1`，AI 设置
-  “系统配置”中的下拉默认选“中文（简体）”，预设中/英/日/韩/法/德/西/俄等，也提供“不翻译
+- 默认显示语言使用独立 settings key（`translation.preferences.v1`，AI 设置的
+  「系统配置」窗口中的下拉默认选“中文（简体）”，预设中/英/日/韩/法/德/西/俄等，也提供“不翻译
   （仅原文）”），同样
   不得扩展 Provider JSON，且必须加入 `AI_SETTINGS_KEYS`。`ProviderSettings::validate`
   只接受 `TRANSLATION_LANGUAGES` 中的标签，UI 与校验共用这份常量。目标语言变化或对话
@@ -1310,7 +1356,8 @@ EPUB/PDF/原件导出、重新打开及原件字节一致性。
 5. 图书库主窗口关闭先询问“退出软件 / 继续运行”；取消前不得最小化、取消 AI 或
    改变窗口关闭状态。确认后通过 `on_window_close` 注册的原关闭回调逐个关闭子窗口，
    编辑取消、快照/保存/阅读进度/学习持久化失败须调用 `cancel_application_exit` 撤销
-   本次退出。AI 设置已经开始保存时等待结果。子窗全部移除后，主窗口再等待已接受的
+   本次退出。五个 AI 设置窗口各自在已经开始保存时等待结果（按 `PendingOperation::Saving` 判断，上界是界面的
+   `SAVE_WAIT_LIMIT`：保存被后台任务堵住时最多等这么久，之后窗口按已结束处理）。子窗全部移除后，主窗口再等待已接受的
    导入、创建、分组、移动或删除 mutation 完成，最后安全移除并让 GPUI 自然退出。
    不调用 `App::quit()`/`cx.quit()` 绕过 close veto；`on_window_closed` 订阅保存在全局
    协调器中并 defer 推进。实际开窗前检查退出状态，防止迟到的异步打开留下孤立窗口。

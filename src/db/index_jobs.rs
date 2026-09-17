@@ -319,6 +319,34 @@ pub(crate) fn bind_queued_canonical_execution(
     .map(|changed| changed == 1)
 }
 
+/// Binds an unclaimed queued translation row to the canonical cursor encoding
+/// the executor writes.
+///
+/// Translation cursors come from two writers: the executor, which serializes
+/// the whole block-level cursor, and the reconfiguration path, which persists
+/// the smaller [`PersistedIndexCursor`] shape. Every executor comparison is
+/// JSON string equality, so a job configured by the latter has to be re-encoded
+/// before its first claim — otherwise that execution abandons itself and the
+/// row stays `running` with no worker. The exact old cursor keeps a stale queue
+/// scan from rewriting a newer generation; status and control flags are
+/// preserved so a pause/cancel requested before the claim still wins.
+pub(crate) fn bind_queued_translation_cursor(
+    conn: &Connection,
+    job_id: &str,
+    expected_cursor_json: &str,
+    cursor_json: &str,
+    updated_at: u64,
+) -> Result<bool> {
+    conn.execute(
+        "UPDATE index_jobs SET cursor_json = ?3, updated_at = ?4
+         WHERE id = ?1 AND status = 'queued' AND kind = 'translation'
+           AND cursor_json = ?2",
+        params![job_id, expected_cursor_json, cursor_json, updated_at as i64],
+    )
+    .context("无法绑定翻译任务游标")
+    .map(|changed| changed == 1)
+}
+
 /// Cancels exactly the queued execution generation observed by the worker.
 /// This prevents a stale post-vision row from remaining at the head of the
 /// queue after its embedding or vision input contract has changed.

@@ -5681,14 +5681,24 @@ impl EditorApp {
                             div()
                                 .v_flex()
                                 .gap_2()
-                                .child(div().text_sm().text_color(rgb(palette(cx).ink)).child("标题（可选）"))
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(rgb(palette(cx).ink))
+                                        .child("标题（可选）"),
+                                )
                                 .child(Input::new(&modal.title_input)),
                         )
                         .child(
                             div()
                                 .v_flex()
                                 .gap_2()
-                                .child(div().text_sm().text_color(rgb(palette(cx).ink)).child("说明（可选）"))
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(rgb(palette(cx).ink))
+                                        .child("说明（可选）"),
+                                )
                                 .child(
                                     div()
                                         .h(px(120.))
@@ -5982,44 +5992,83 @@ impl Render for EditorApp {
         let view = cx.entity().clone();
         let write_busy = self.active_write.is_some() || self.export_dialog_open;
         let media_modal_open = self.media_modal.is_some();
-        let (status_icon, status_text, status_color) = if self.closing
-            || self.webview_build_gate.close_requested
-        {
-            (IconName::BookOpen, "正在安全关闭编辑器…", palette(cx).accent)
-        } else if let Some(operation) = self.active_write.as_ref() {
-            match operation.intent {
-                EditorWriteIntent::Save => (IconName::BookOpen, "正在后台保存…", palette(cx).accent),
-                EditorWriteIntent::Export => (IconName::BookOpen, "正在后台保存并导出…", palette(cx).accent),
-                EditorWriteIntent::Close => (IconName::BookOpen, "正在后台保存并关闭…", palette(cx).accent),
-            }
-        } else if self.export_dialog_open {
-            (IconName::ExternalLink, "正在选择导出位置…", palette(cx).accent)
-        } else if self.cover_loading {
-            (IconName::BookOpen, "正在读取封面图片…", palette(cx).accent)
-        } else if self.media_loading {
-            (IconName::BookOpen, "正在读取媒体文件…", palette(cx).accent)
-        } else if media_modal_open {
-            (IconName::Settings2, "正在编辑媒体信息…", palette(cx).accent)
-        } else if let Some(pending) = self.pending_snapshot.as_ref() {
-            match pending.action {
-                PendingEditorAction::Save => (IconName::BookOpen, "正在同步并保存…", palette(cx).accent),
-                PendingEditorAction::Export => (IconName::BookOpen, "正在同步并导出…", palette(cx).accent),
-                PendingEditorAction::Close => (IconName::BookOpen, "正在保存并关闭…", palette(cx).accent),
-                _ => (IconName::BookOpen, "正在同步富文本…", palette(cx).accent),
-            }
-        } else if self.pending_ready_action.is_some() {
-            (IconName::BookOpen, "等待富文本视图就绪…", palette(cx).accent)
-        } else if self.webview_build_gate.building {
-            (IconName::BookOpen, "正在初始化预览组件…", palette(cx).accent)
-        } else if self.tab.uses_webview() && self.editor_webview.is_none() {
-            (IconName::TriangleAlert, "预览组件不可用", palette(cx).danger)
-        } else if self.tab == EditorTab::RichText
-            && !self.active_web_page.as_ref().is_some_and(|page| page.ready)
-        {
-            (IconName::BookOpen, "富文本视图正在加载…", palette(cx).accent)
-        } else {
-            (IconName::CircleCheck, "编辑器已就绪", 0x376441)
-        };
+        let (status_icon, status_text, status_color) =
+            if self.closing || self.webview_build_gate.close_requested {
+                (
+                    IconName::BookOpen,
+                    "正在安全关闭编辑器…",
+                    palette(cx).accent,
+                )
+            } else if let Some(operation) = self.active_write.as_ref() {
+                match operation.intent {
+                    EditorWriteIntent::Save => {
+                        (IconName::BookOpen, "正在后台保存…", palette(cx).accent)
+                    }
+                    EditorWriteIntent::Export => (
+                        IconName::BookOpen,
+                        "正在后台保存并导出…",
+                        palette(cx).accent,
+                    ),
+                    EditorWriteIntent::Close => (
+                        IconName::BookOpen,
+                        "正在后台保存并关闭…",
+                        palette(cx).accent,
+                    ),
+                }
+            } else if self.export_dialog_open {
+                (
+                    IconName::ExternalLink,
+                    "正在选择导出位置…",
+                    palette(cx).accent,
+                )
+            } else if self.cover_loading {
+                (IconName::BookOpen, "正在读取封面图片…", palette(cx).accent)
+            } else if self.media_loading {
+                (IconName::BookOpen, "正在读取媒体文件…", palette(cx).accent)
+            } else if media_modal_open {
+                (IconName::Settings2, "正在编辑媒体信息…", palette(cx).accent)
+            } else if let Some(pending) = self.pending_snapshot.as_ref() {
+                match pending.action {
+                    PendingEditorAction::Save => {
+                        (IconName::BookOpen, "正在同步并保存…", palette(cx).accent)
+                    }
+                    PendingEditorAction::Export => {
+                        (IconName::BookOpen, "正在同步并导出…", palette(cx).accent)
+                    }
+                    PendingEditorAction::Close => {
+                        (IconName::BookOpen, "正在保存并关闭…", palette(cx).accent)
+                    }
+                    _ => (IconName::BookOpen, "正在同步富文本…", palette(cx).accent),
+                }
+            } else if self.pending_ready_action.is_some() {
+                (
+                    IconName::BookOpen,
+                    "等待富文本视图就绪…",
+                    palette(cx).accent,
+                )
+            } else if self.webview_build_gate.building {
+                (
+                    IconName::BookOpen,
+                    "正在初始化预览组件…",
+                    palette(cx).accent,
+                )
+            } else if self.tab.uses_webview() && self.editor_webview.is_none() {
+                (
+                    IconName::TriangleAlert,
+                    "预览组件不可用",
+                    palette(cx).danger,
+                )
+            } else if self.tab == EditorTab::RichText
+                && !self.active_web_page.as_ref().is_some_and(|page| page.ready)
+            {
+                (
+                    IconName::BookOpen,
+                    "富文本视图正在加载…",
+                    palette(cx).accent,
+                )
+            } else {
+                (IconName::CircleCheck, "编辑器已就绪", 0x376441)
+            };
         let chapter_title = self.chapter_title_input.read(cx).value().trim().to_string();
         let editor_summary = if self.chapters.get(self.selected).is_some() {
             format!(
@@ -6097,7 +6146,11 @@ impl Render for EditorApp {
                                 .text_left()
                                 .text_sm()
                                 .line_clamp(2)
-                                .text_color(if selected { rgb(palette(cx).accent) } else { rgb(palette(cx).ink) })
+                                .text_color(if selected {
+                                    rgb(palette(cx).accent)
+                                } else {
+                                    rgb(palette(cx).ink)
+                                })
                                 .child(row.label.clone()),
                         )
                         .into_any_element()
@@ -6374,9 +6427,17 @@ impl Render for EditorApp {
                 .border_color(rgb(palette(cx).border))
                 .when_some(self.notice.as_ref(), |toolbar, notice| {
                     let (background, foreground, icon) = if notice.error {
-                        (rgb(palette(cx).danger_soft), rgb(palette(cx).danger), IconName::TriangleAlert)
+                        (
+                            rgb(palette(cx).danger_soft),
+                            rgb(palette(cx).danger),
+                            IconName::TriangleAlert,
+                        )
                     } else {
-                        (rgb(palette(cx).success_soft), rgb(palette(cx).success), IconName::CircleCheck)
+                        (
+                            rgb(palette(cx).success_soft),
+                            rgb(palette(cx).success),
+                            IconName::CircleCheck,
+                        )
                     };
                     toolbar.child(
                         div()
@@ -6747,7 +6808,12 @@ impl Render for EditorApp {
                 // inner flex-row style. That makes this fixed-height toolbar
                 // consume the whole editor and stacks its controls vertically.
                 .overflow_x_scroll()
-                .child(div().text_xs().text_color(rgb(palette(cx).muted)).child("媒体"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(palette(cx).muted))
+                        .child("媒体"),
+                )
                 .child(
                     Button::new("editor-insert-image")
                         .xsmall()
@@ -6836,7 +6902,9 @@ impl Render for EditorApp {
                             .rounded(px(10.))
                             .border_1()
                             .border_color(rgb(palette(cx).border))
-                            .bg(white())
+                            // 容器底色是 WebView 建好前的第一帧，必须已经是当前皮肤
+                            // 的颜色：写死白色会在深色皮肤里闪一帧白底。
+                            .bg(rgb(palette(cx).paper))
                             .child(webview.clone()),
                     )
                     .into_any_element(),

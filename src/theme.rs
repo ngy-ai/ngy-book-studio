@@ -198,6 +198,18 @@ impl Palette {
         Self::tint(self.scrim, alpha)
     }
 
+    /// 文本选中的底色。
+    ///
+    /// 不能用不透明的皮肤色：`accent_soft` 在深色皮肤里和 `surface`（回答卡片、
+    /// 输入框）只差一档明度，选中区域几乎看不出来；浅色皮肤里它又太浅，被选中
+    /// 的文字仍像没选中。叠了 alpha 的强调色落在 `paper` / `surface` / `sidebar`
+    /// 三种底色上都读得出来，而且选中不改文字颜色，所以文字仍与其自己的底色
+    /// 保持原来的对比度。GPUI 在绘制文字之前先填这个矩形，透明度会与卡片底色
+    /// 正常合成。
+    pub fn selection(self) -> gpui::Rgba {
+        Self::tint(self.accent, 0.4)
+    }
+
     /// 皮肤色的 `(CSS 自定义属性名, 取值)` 列表。
     ///
     /// WebView 的下发有两条路径（阅读器注入样式表、编辑器与 PDF 阅读器的运行时
@@ -357,7 +369,9 @@ fn sync_component_theme(appearance: Appearance, cx: &mut App) {
     theme.info_foreground = to_hsla(palette.surface);
     theme.link = to_hsla(palette.accent_strong);
     theme.link_hover = to_hsla(palette.accent);
-    theme.selection = to_hsla(palette.accent_soft);
+    // 选中底色是半透明的强调色，不是 `accent_soft`：不透明色在深色卡片上
+    // （AI 回答、输入框）看不出选中范围，理由见 `Palette::selection`。
+    theme.selection = palette.selection().into();
     theme.sidebar = to_hsla(palette.sidebar);
     theme.sidebar_foreground = to_hsla(palette.ink);
     theme.sidebar_border = to_hsla(palette.border);
@@ -452,6 +466,36 @@ mod tests {
         }
     }
 
+    /// 选中底色要同时成立两件事：在不透明的卡片底上看得出来，且被选中的文字仍然
+    /// 读得出来。不透明的皮肤色做不到前者 —— 深色皮肤里 `accent_soft` 与 `surface`
+    /// （AI 回答卡片、输入框）只差一档明度，选中范围几乎看不出来 —— 所以它是叠了
+    /// alpha 的强调色，这里按 alpha 合成成实际显示的颜色再断言。
+    #[test]
+    fn the_selection_tint_is_visible_and_keeps_the_selected_text_readable() {
+        for palette in [Palette::LIGHT, Palette::DARK] {
+            let selection = palette.selection();
+            assert!(
+                selection.a > 0. && selection.a < 1.,
+                "选中底色必须是半透明的强调色"
+            );
+            for backdrop in [palette.paper, palette.surface, palette.sidebar] {
+                let selected = composited(selection, backdrop);
+                assert!(
+                    contrast_ratio(relative_luminance(selected), relative_luminance(backdrop))
+                        >= 1.5,
+                    "选中范围在 {backdrop:#08x} 上看不出来"
+                );
+                assert!(
+                    contrast_ratio(
+                        relative_luminance(palette.ink),
+                        relative_luminance(selected)
+                    ) >= 4.5,
+                    "选中后的文字在 {backdrop:#08x} 上读不出来"
+                );
+            }
+        }
+    }
+
     /// 强调色同时是链接色、图标色与实心按钮底色，三个位置都得可读。
     #[test]
     fn the_accent_color_is_readable_as_text_and_as_a_button_backdrop() {
@@ -492,8 +536,10 @@ mod tests {
                 (palette.info, palette.info_soft, "信息"),
             ] {
                 assert!(
-                    contrast_ratio(relative_luminance(foreground), relative_luminance(background))
-                        >= 4.5,
+                    contrast_ratio(
+                        relative_luminance(foreground),
+                        relative_luminance(background)
+                    ) >= 4.5,
                     "{label} 色在柔和底上的对比度不足"
                 );
             }
@@ -557,5 +603,18 @@ mod tests {
     fn contrast_ratio(a: f32, b: f32) -> f32 {
         let (lighter, darker) = if a > b { (a, b) } else { (b, a) };
         (lighter + 0.05) / (darker + 0.05)
+    }
+
+    /// 半透明色按 alpha 合成到不透明底色上，得到实际显示的颜色 —— 也就是 GPU 上
+    /// 选中矩形压在卡片底色之后，用户真正看到的那一版。
+    fn composited(foreground: gpui::Rgba, backdrop: u32) -> u32 {
+        let channel = |shift: u32, value: f32| {
+            let base = ((backdrop >> shift) & 0xff) as f32 / 255.0;
+            value * foreground.a + base * (1.0 - foreground.a)
+        };
+        let to_byte = |value: f32| (value.clamp(0., 1.) * 255.0).round() as u32;
+        (to_byte(channel(16, foreground.r)) << 16)
+            | (to_byte(channel(8, foreground.g)) << 8)
+            | to_byte(channel(0, foreground.b))
     }
 }

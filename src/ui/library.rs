@@ -949,9 +949,13 @@ impl EpubReaderApp {
         .detach();
     }
 
-    fn open_ai_settings(&mut self, cx: &mut Context<Self>) {
-        if let Err(error) = open_ai_settings_window(Arc::clone(&self.services), cx) {
-            self.set_error(format!("无法打开 AI Provider 设置：{error:#}"), cx);
+    /// 打开五个 AI 设置窗口里的一个；每个窗口各自保存自己那一块配置。
+    fn open_ai_settings(&mut self, section: AiSettingsSection, cx: &mut Context<Self>) {
+        if let Err(error) = open_ai_settings_window(Arc::clone(&self.services), section, cx) {
+            self.set_error(
+                format!("无法打开「{}」设置：{error:#}", section.label()),
+                cx,
+            );
         }
     }
 
@@ -2885,7 +2889,9 @@ impl EpubReaderApp {
             .custom(
                 ButtonCustomVariant::new(cx)
                     .color(rgb(palette(cx).accent).into())
-                    .foreground(white())
+                    // 与 `theme.primary_foreground` 一致：写死的白色文字压在深色
+                    // 皮肤的 `accent`（偏亮的砖红）上只有 3.2:1，读不出来。
+                    .foreground(rgb(palette(cx).paper).into())
                     .border(rgb(palette(cx).accent).into())
                     .hover(rgb(palette(cx).accent_strong).into())
                     .active(rgb(palette(cx).accent_strong).into()),
@@ -2975,10 +2981,23 @@ impl EpubReaderApp {
                             .ghost()
                             .icon(IconName::Settings2)
                             .label("AI 设置")
-                            .on_click({
+                            .dropdown_menu({
                                 let view = view.clone();
-                                move |_, _, cx| {
-                                    view.update(cx, |this, cx| this.open_ai_settings(cx));
+                                move |menu, _, _| {
+                                    let mut menu = menu;
+                                    for section in AiSettingsSection::ALL {
+                                        let view = view.clone();
+                                        menu = menu.item(
+                                            PopupMenuItem::new(section.label()).on_click(
+                                                move |_, _, cx| {
+                                                    view.update(cx, |this, cx| {
+                                                        this.open_ai_settings(section, cx)
+                                                    });
+                                                },
+                                            ),
+                                        );
+                                    }
+                                    menu
                                 }
                             }),
                     )
@@ -3067,7 +3086,12 @@ impl EpubReaderApp {
                             .text_color(rgb(palette(cx).ink))
                             .child(heading),
                     )
-                    .child(div().text_sm().text_color(rgb(palette(cx).muted)).child(subtitle)),
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(palette(cx).muted))
+                            .child(subtitle),
+                    ),
             )
             .when(!searching, |this| {
                 this.when_some(self.group_filter.group_id(), |this, group_id| {
@@ -3829,7 +3853,9 @@ impl EpubReaderApp {
                                     .text_xs()
                                     .text_color(rgb(palette(cx).accent))
                                     .child(
-                                        Icon::new(IconName::Folder).small().text_color(rgb(palette(cx).accent)),
+                                        Icon::new(IconName::Folder)
+                                            .small()
+                                            .text_color(rgb(palette(cx).accent)),
                                     )
                                     .child(
                                         div().min_w(px(0.)).truncate().child(group.name.clone()),
@@ -4078,7 +4104,11 @@ impl EpubReaderApp {
                     .text_left()
                     .truncate()
                     .text_sm()
-                    .text_color(if selected { rgb(palette(cx).accent) } else { rgb(palette(cx).ink) })
+                    .text_color(if selected {
+                        rgb(palette(cx).accent)
+                    } else {
+                        rgb(palette(cx).ink)
+                    })
                     .when(selected, |this| this.font_medium())
                     .child(label),
             )
@@ -5089,7 +5119,9 @@ impl EpubReaderApp {
             .px_2()
             .rounded(px(8.))
             .cursor_pointer()
-            .when(ungrouped_selected, |this| this.bg(rgb(palette(cx).accent_soft)))
+            .when(ungrouped_selected, |this| {
+                this.bg(rgb(palette(cx).accent_soft))
+            })
             .when(!ungrouped_selected, |this| {
                 this.hover(|style| style.bg(Palette::tint(palette(cx).ink, 0.04)))
             })
@@ -5116,7 +5148,11 @@ impl EpubReaderApp {
                     .child("未分组"),
             )
             .when(ungrouped_selected, |this| {
-                this.child(Icon::new(IconName::Check).small().text_color(rgb(palette(cx).accent)))
+                this.child(
+                    Icon::new(IconName::Check)
+                        .small()
+                        .text_color(rgb(palette(cx).accent)),
+                )
             })
             .on_click(move |_, _, cx| {
                 ungrouped_view.update(cx, |this, cx| this.select_picker_group(None, cx));
@@ -5316,7 +5352,11 @@ impl EpubReaderApp {
                     IconName::Folder
                 })
                 .small()
-                .text_color(if is_selected { rgb(palette(cx).accent) } else { rgb(palette(cx).muted) }),
+                .text_color(if is_selected {
+                    rgb(palette(cx).accent)
+                } else {
+                    rgb(palette(cx).muted)
+                }),
             )
             .child(
                 div()
@@ -5332,7 +5372,11 @@ impl EpubReaderApp {
                     .child(group.name.clone()),
             )
             .when(is_selected, |this| {
-                this.child(Icon::new(IconName::Check).small().text_color(rgb(palette(cx).accent)))
+                this.child(
+                    Icon::new(IconName::Check)
+                        .small()
+                        .text_color(rgb(palette(cx).accent)),
+                )
             })
             .on_click(move |_, _, cx| {
                 row_view.update(cx, |this, cx| {
@@ -5378,7 +5422,12 @@ impl EpubReaderApp {
                     .gap_2()
                     .child(Input::new(&input).disabled(pending))
                     .when_some(error, |body, error| {
-                        body.child(div().text_sm().text_color(rgb(palette(cx).danger)).child(error))
+                        body.child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(palette(cx).danger))
+                                .child(error),
+                        )
                     })
                     .into_any_element();
                 let cancel_view = view.clone();
@@ -5550,9 +5599,17 @@ impl EpubReaderApp {
 
     fn render_notice(&self, notice: &Notice, theme: Palette) -> gpui::AnyElement {
         let (background, foreground, icon) = if notice.error {
-            (rgb(theme.danger_soft), rgb(theme.danger), IconName::TriangleAlert)
+            (
+                rgb(theme.danger_soft),
+                rgb(theme.danger),
+                IconName::TriangleAlert,
+            )
         } else {
-            (rgb(theme.success_soft), rgb(theme.success), IconName::CircleCheck)
+            (
+                rgb(theme.success_soft),
+                rgb(theme.success),
+                IconName::CircleCheck,
+            )
         };
         div()
             .absolute()

@@ -69,6 +69,14 @@ const TRANSLATION_SETTINGS_KEY: &str = "translation.preferences.v1";
 const NETWORK_SETTINGS_KEY: &str = "ai.network.preferences.v1";
 const WEB_SEARCH_CREDENTIAL_TARGET: &str = "ai.openai_compatible.web_search.v1";
 const MAX_MODEL_NAME_CHARS: usize = 256;
+/// 等待 `ai_configuration` 门闩的上限。
+///
+/// 这把门闩只用来把设置保存串行成一次「事务」：拿不到就说明另一次保存还没结束。
+/// 另一次保存可能正被后台索引任务堵在自己的门闩上（现场 2026-09-17：设置窗口停在
+/// 「正在安全保存 Provider 设置…」，而 `settings` 表根本没被改写），所以这里必须
+/// 有上限：无限等待会让每一次后续保存也永远没有结果，界面上再点「保存设置」只会
+/// 叠加等待。超时发生在进入写入之前，本次没有提交任何东西，重试是安全的。
+const AI_SETTINGS_GATE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Upper bounds for one published visual page set (Office enhanced preview or
 /// DjVu scan) loaded into a reading window.
 const MAX_LOADED_VISUAL_PAGES: usize = 20_000;
@@ -1672,7 +1680,23 @@ impl AppServices {
         let auto_run = Arc::clone(&self.auto_run_background_jobs);
         self.runtime
             .spawn(async move {
-                let _transition = configuration.lock().await;
+                // 这一层超时只包住「等门闩」，不包住后面的写入：门闩里的重配置与
+                // 回滚必须完整跑完（那是「要么提交、要么回滚」的保证），所以不能
+                // 用超时把工作 future 整个丢掉。
+                let _transition = match tokio::time::timeout(
+                    AI_SETTINGS_GATE_TIMEOUT,
+                    configuration.lock(),
+                )
+                .await
+                {
+                    Ok(transition) => transition,
+                    Err(_) => {
+                        anyhow::bail!(
+                            "另一个设置保存仍在进行中（已等待 {} 秒）：它可能正被后台任务阻塞，稍后重试",
+                            AI_SETTINGS_GATE_TIMEOUT.as_secs()
+                        )
+                    }
+                };
                 let previous_settings = ai
                     .read()
                     .map_err(|_| anyhow::anyhow!("AI service lock is poisoned"))?
@@ -2304,7 +2328,11 @@ impl AppServices {
             .await
             .context("后台任务明细查询线程异常退出")??;
         self.runtime
-            .spawn(async move { indexing.probe_translation_block_response(&job_id, ordinal).await })
+            .spawn(async move {
+                indexing
+                    .probe_translation_block_response(&job_id, ordinal)
+                    .await
+            })
             .await
             .context("后台任务明细查询线程异常退出")?
     }

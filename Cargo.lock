@@ -4842,15 +4842,16 @@ dependencies = [
 
 [[package]]
 name = "ngy-utils-tracing"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f113c9c367694e60bdea69d918f2f572f6dbd52d81928ae75bd3bac826eec101"
+checksum = "d76ed71060de8705d752c717a1b47c80666cea0b3847eae527fb3c730ccc2c04"
 dependencies = [
  "anyhow",
  "dotenvy",
  "time",
  "tracing",
  "tracing-appender",
+ "tracing-log",
  "tracing-subscriber",
 ]
 

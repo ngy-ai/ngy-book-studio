@@ -46,6 +46,16 @@ const QUEUE_SCAN_LIMIT: usize = 64;
 const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(400);
 const PROVIDER_STEP_TIMEOUT: Duration = Duration::from_secs(180);
+/// 流式翻译响应允许的最长静默。**静默，不是总时长**：持续产出数据的慢模型照旧
+/// 可以慢慢翻完（`max_tokens`、响应字节上限与输出上限截断仍然只管输出规模）。
+///
+/// 「静默由 provider 层的空闲超时负责」（`ProviderTimeout::stream`）在正常路径上成立，
+/// 但它并不兜住「流本身再也不产生任何事件」：现场 2026-09-17 的整本翻译在开出 8 个
+/// 块请求后彻底静默——job-logs 自 14:50:45 起再无写入、进程没有任何 TCP 连接、
+/// `await_translation_step` 的 180 秒上限也没有触发——于是整个文本块、进而整本书
+/// 永久停在同一块上，并占住索引协调器的 `transitions` 门闩，把设置保存一起卡住。
+/// 静默上限与 provider 步上限同值，避免出现两套“多久算死”的读数。
+const TRANSLATION_STREAM_SILENCE_LIMIT: Duration = PROVIDER_STEP_TIMEOUT;
 const EMBEDDING_BATCH_SIZE: usize = 16;
 const MAX_EMBEDDING_INPUT_BYTES: usize = 24 * 1024;
 const MAX_EMBEDDING_BATCH_BYTES: usize = 256 * 1024;
@@ -1361,6 +1371,46 @@ async fn run_queued_job(
             let now = unix_timestamp()?;
             if !run_db(db_path, move |conn| {
                 db::index_jobs::bind_queued_canonical_execution(
+                    &conn,
+                    &job_id,
+                    &expected_cursor_json,
+                    &next_cursor_json,
+                    now,
+                )
+            })
+            .await?
+            {
+                return Ok(());
+            }
+            job.cursor_json = cursor_json;
+        }
+    }
+    // 翻译任务的持久游标由两个写入者产出：执行器写完整的块级游标，重配置路径写
+    // 「较小的持久化形状」（没有 `retry_ordinals`/`inflight`/`blocks_version`）。
+    // 而这里的一切比较都是 JSON 字符串相等，所以必须在领取前重写成规范编码 ——
+    // 否则重配置刚建好的任务第一次运行就会判成 `Abandoned`：行留在 `running`、
+    // `attempts` 已经加一、没有任何执行者，任务窗口于是显示「运行中」而「处理中」
+    // 恒为 0，点「恢复」也不会有任何进展（现场 2026-09-17）。
+    //
+    // 未配置对话模型时不绑定：那次运行会以「翻译模型尚未配置」失败并正常发布终态，
+    // 而不是在这里悄悄不动。
+    if job.kind == TRANSLATION_JOB_KIND
+        && let Some(translation) = models.translation.as_ref()
+    {
+        let bound = JobCursor::from_job(
+            &job,
+            &translation.model,
+            Some(&translation.execution_identity),
+        )?;
+        let cursor_json = bound.encode()?;
+        if cursor_json != job.cursor_json {
+            let job_id = job.id.clone();
+            let expected_cursor_json = job.cursor_json.clone();
+            let next_cursor_json = cursor_json.clone();
+            let db_path = inner.db_path.clone();
+            let now = unix_timestamp()?;
+            if !run_db(db_path, move |conn| {
+                db::index_jobs::bind_queued_translation_cursor(
                     &conn,
                     &job_id,
                     &expected_cursor_json,
@@ -4494,14 +4544,25 @@ async fn collect_probe_response(mut stream: crate::ai::ChatEventStream) -> Resul
     })
 }
 
+/// 收流时的静默判定：到达 [`TRANSLATION_STREAM_SILENCE_LIMIT`] 即算超时。
+///
+/// 单独成函数是为了把边界钉在测试里——这是「任务还能不能自己走出来」的那条线，
+/// 差一毫秒就该继续等，到达就该报错并让出 `transitions` 门闩。
+fn stream_silence_exceeded(since_last_event_ms: u64) -> bool {
+    since_last_event_ms >= TRANSLATION_STREAM_SILENCE_LIMIT.as_millis() as u64
+}
+
 /// Collects one streaming translation answer.
 ///
 /// There is deliberately no total-duration deadline: a slow local model may need
 /// minutes for one block, and the observed failure (2026-09-11, block 1269) was a
 /// *healthy* 120-second stream — 1579 content chunks, 7024 bytes, no `[DONE]` —
 /// that the old whole-request timeout cut in half. Silence is bounded by the
-/// provider layer, and the reply itself by `MAX_TRANSLATION_RESPONSE_BYTES`.
-/// Progress lines and the end-of-stream shape keep such a run diagnosable.
+/// provider layer **and** by [`TRANSLATION_STREAM_SILENCE_LIMIT`] here, because a
+/// stream that stops producing events altogether (no TCP connection, no error) is
+/// exactly what the provider layer cannot see; the reply itself stays bounded by
+/// `MAX_TRANSLATION_RESPONSE_BYTES`. Progress lines and the end-of-stream shape
+/// keep such a run diagnosable.
 async fn collect_translation_response(
     inner: &Arc<IndexingInner>,
     job: &db::index_jobs::IndexJob,
@@ -4600,6 +4661,30 @@ async fn collect_translation_response(
                 }
                 // 只记录进度，不设总时长上限：继续产出数据的流必须能翻完这一块。
                 // 静默由 provider 层的空闲超时负责，输出规模由 max_tokens 与响应字节上限约束。
+                //
+                // 但静默必须有自己的上限：provider 层兜不住「流不再产生任何事件」
+                // （见 [`TRANSLATION_STREAM_SILENCE_LIMIT`]），没有这条检查时整本书会
+                // 永久停在这一块，并连带占住 `transitions` 门闩让设置保存一起卡死。
+                if stream_silence_exceeded(stats.since_last_event_ms()) {
+                    stats.end = "stream_silent";
+                    tracing::warn!(
+                        target: "ngy_ai",
+                        parent: &span,
+                        stage = "translation_stream_silent",
+                        block_ordinal = scope.ordinal,
+                        request_attempt,
+                        since_last_event_ms = stats.since_last_event_ms(),
+                        events = stats.events,
+                        response_bytes = response.len(),
+                        "Translation response stream went silent"
+                    );
+                    // 用 provider 层同一个超时类型报错，分类仍是 `http_timeout`：
+                    // 后台任务日志与 UI 不因为「静默改由收流这一层兜底」多出一个类别。
+                    break Err(anyhow::Error::new(crate::ai::ProviderTimeout::stream(
+                        TRANSLATION_STREAM_SILENCE_LIMIT.as_secs(),
+                    ))
+                    .context("翻译模型流式响应静默超时"));
+                }
                 if Instant::now() >= next_progress_at {
                     next_progress_at = Instant::now() + TRANSLATION_STREAM_PROGRESS_INTERVAL;
                     let shape = translation_response_shape(&response);
@@ -8791,6 +8876,25 @@ mod tests {
         assert!(!quoted.open_container);
     }
 
+    /// 静默上限是「任务还能不能自己走出来」的那条线：差一点继续等，到达即按
+    /// provider 静默超时收尾，不再无限期占着 `transitions` 门闩——现场 2026-09-17
+    /// 的整本翻译与 AI 设置保存就是这样一起停住的。
+    #[test]
+    fn stream_silence_is_reported_exactly_at_the_limit() {
+        let limit = TRANSLATION_STREAM_SILENCE_LIMIT.as_millis() as u64;
+        assert!(!stream_silence_exceeded(0));
+        assert!(!stream_silence_exceeded(limit - 1));
+        assert!(stream_silence_exceeded(limit));
+
+        // 兜底错误必须沿用 provider 超时的固定分类，否则后台任务日志与 UI 会因为
+        // 「静默改由收流这一层负责」多出一个类别。
+        let timeout =
+            crate::ai::ProviderTimeout::stream(TRANSLATION_STREAM_SILENCE_LIMIT.as_secs());
+        let error = anyhow::Error::new(timeout).context("翻译模型流式响应静默超时");
+        assert_eq!(crate::ai_diagnostics::error_kind(&error), "http_timeout");
+        assert_eq!(classify_error(&error), JobLogErrorKind::Timeout);
+    }
+
     #[test]
     fn an_unfinished_stream_is_only_salvaged_by_one_complete_valid_answer() {
         let source = TranslationSource {
@@ -9582,12 +9686,10 @@ mod tests {
         assert!(
             fixture
                 .runtime
-                .block_on(
-                    coordinator.probe_translation_block_response(
-                        &format!("embedding:{}", fixture.source_id),
-                        0
-                    )
-                )
+                .block_on(coordinator.probe_translation_block_response(
+                    &format!("embedding:{}", fixture.source_id),
+                    0
+                ))
                 .is_err()
         );
         assert!(
@@ -10806,6 +10908,88 @@ mod tests {
         assert!(
             windows.iter().all(|(_, open)| open.len() == 1),
             "并发 1 时窗口只能有一个块：{windows:?}"
+        );
+    }
+
+    /// 重配置路径写出的持久游标是「较小的形状」，而领取后的每次比较都是 JSON 字符串
+    /// 相等。领取时必须先把它重写成规范编码，否则任务第一次运行立刻判成 `Abandoned`：
+    /// 行留在 `running`、`attempts` 已加一、没有任何执行者 —— 现场 2026-09-17，新导入
+    /// 的图书点「恢复」后一直显示运行中，已处理 0、处理中 0，刷新也不动。
+    #[test]
+    fn a_reconfigured_translation_job_runs_instead_of_abandoning_its_first_execution() {
+        let provider = Arc::new(MockMergeProvider::default());
+        let fixture = Fixture::new();
+        let inner = fixture.indexing_inner();
+        let coordinator = IndexingCoordinator {
+            inner: Arc::clone(&inner),
+            workers: Mutex::new(Vec::new()),
+        };
+        let job_id = format!("translation:{}:zh-Hans", fixture.source_id);
+        fixture
+            .runtime
+            .block_on(coordinator.configure_translation(
+                provider,
+                "chat-test".to_string(),
+                "translation-v2:chat-test".to_string(),
+                Some("zh-Hans".to_string()),
+                false,
+            ))
+            .unwrap();
+
+        let conn = db::open_conn(&fixture.db_path).unwrap();
+        let row = db::index_jobs::get(&conn, &job_id).unwrap().unwrap();
+        assert_eq!(row.status, db::index_jobs::IndexJobStatus::Paused);
+        let persisted: serde_json::Value = serde_json::from_str(&row.cursor_json).unwrap();
+        assert!(
+            persisted.get("inflight").is_none() && persisted.get("blocks_version").is_none(),
+            "重配置路径写的持久游标没有块级字段：{}",
+            row.cursor_json
+        );
+        let blocks = translation_blocks(&conn, &fixture.book_id, &fixture.source_id).unwrap();
+        let translatable = blocks
+            .iter()
+            .filter(|block| !block.source.segments.is_empty())
+            .count();
+        assert!(translatable > 0, "这条用例需要至少一个可翻译的文本块");
+        drop(conn);
+
+        // 用户点「恢复」：任务回到队列，worker 领取后必须真的开始翻。
+        assert!(
+            fixture
+                .runtime
+                .block_on(coordinator.resume(&job_id))
+                .unwrap()
+        );
+        let conn = db::open_conn(&fixture.db_path).unwrap();
+        let queued = db::index_jobs::list_queued(&conn, 8)
+            .unwrap()
+            .into_iter()
+            .find(|job| job.id == job_id)
+            .expect("恢复后的翻译任务必须回到队列");
+        drop(conn);
+
+        fixture
+            .runtime
+            .block_on(run_queued_job(&inner, queued))
+            .unwrap();
+
+        let conn = db::open_conn(&fixture.db_path).unwrap();
+        let row = db::index_jobs::get(&conn, &job_id).unwrap().unwrap();
+        assert_eq!(
+            row.status,
+            db::index_jobs::IndexJobStatus::Succeeded,
+            "领取时重写成规范游标之后第一次执行必须翻完，而不是被判成已被替换：{:?}",
+            row.error
+        );
+        let finished: serde_json::Value = serde_json::from_str(&row.cursor_json).unwrap();
+        assert_eq!(finished["next_ordinal"], serde_json::json!(blocks.len()));
+        assert_eq!(finished["inflight"], serde_json::json!([]));
+        assert_eq!(
+            db::translations::list_for_source(&conn, &fixture.book_id, "zh-Hans", fixture.revision)
+                .unwrap()
+                .len(),
+            translatable,
+            "每个可翻译的文本块都要留下一行译文"
         );
     }
 

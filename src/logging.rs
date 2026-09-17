@@ -9,6 +9,15 @@
 
 use std::path::{Path, PathBuf};
 
+/// `ngy_utils_tracing` 读取日志环境变量时使用的**必需**前缀（该库按字面拼接，故这里自带
+/// 分隔符）：模式因此来自 `MOYE_APP_MODE`，不是无前缀的 `APP_MODE`，别的程序占用
+/// `LOG_DIR`、`APP_MODE` 这类通用名也不会影响本项目的日志行为。`RUST_LOG` 是唯一例外，
+/// 它保持无前缀。
+pub const ENV_PREFIX: &str = "MOYE_";
+/// 日志时间戳使用的 UTC 偏移，控制台层与文件层共用。显式写 `UTC` 而不依赖
+/// `ngy_utils_tracing` 的默认值（0.6.0 起该默认值是 `+08:00`），因为本项目按 UTC 约定
+/// 记录时间戳，与按 UTC 日期滚动的文件名一致。
+pub const LOG_TIME_OFFSET: &str = "UTC";
 /// 数据目录下的日志子目录名。
 pub const LOG_DIRECTORY: &str = "logs";
 /// 日志文件前缀；`ngy_utils_tracing` 在 Production/Test 模式下按日滚动为

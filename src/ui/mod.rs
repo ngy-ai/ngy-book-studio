@@ -18,7 +18,7 @@ pub(crate) use data_dir_setup::{DataDirSetupWindow, open_data_dir_setup_window};
 pub(crate) use library::{EpubReaderApp, wrap_root};
 
 use ai_controller::AiSidebarController;
-use ai_settings::open_ai_settings_window;
+use ai_settings::{AiSettingsSection, open_ai_settings_window};
 use ai_sidebar::{
     AI_SIDEBAR_COLLAPSED_WIDTH, AI_SIDEBAR_MAX_WIDTH, AI_SIDEBAR_MIN_WIDTH, AI_SIDEBAR_WIDTH,
     AiBookOption, AiReferenceHint, AiSidebar, AiSidebarEvent, AiSidebarScope, AiSourceLink,

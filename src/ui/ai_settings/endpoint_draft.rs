@@ -1,0 +1,483 @@
+//! 一个 Endpoint 在设置窗口里的草稿，以及围绕它的连接检测。
+//!
+//! Endpoint 与对话模型两个窗口都要列出 Endpoint、都要能检测某个 Endpoint 的模型，所以
+//! 草稿与检测放在这里共用：两个窗口各持有一份自己的草稿（同步在窗口里编辑的字段彼此
+//! 独立），保存时才各自提交。
+
+use super::*;
+
+use ngy_book_studio::{
+    ai::{
+        DEFAULT_AI_REQUEST_TIMEOUT_SECS, DEFAULT_OLLAMA_OPENAI_BASE_URL,
+        MAX_AI_REQUEST_TIMEOUT_SECS, MIN_AI_REQUEST_TIMEOUT_SECS, ModelInfo,
+        normalize_provider_base_url,
+    },
+    services::{ApiKeyUpdate, EndpointSettings, ModelRole},
+};
+
+/// 一个 Endpoint 的可编辑草稿。密钥只以掩码输入框的形式存在，明文不回填。
+pub(super) struct EndpointDraft {
+    pub(super) id: String,
+    pub(super) name_input: Entity<InputState>,
+    pub(super) base_url_input: Entity<InputState>,
+    pub(super) request_timeout_input: Entity<InputState>,
+    pub(super) api_key_input: Entity<InputState>,
+    pub(super) remote_content_confirmed: bool,
+    pub(super) allow_insecure_remote_http: bool,
+    pub(super) confirmed_remote_endpoint: String,
+    pub(super) delete_api_key: bool,
+    /// 检测结果对应的规范化地址：地址一变，旧结果立刻作废。
+    pub(super) observed_url: String,
+    /// 最近一次检测返回的模型名；`None` 表示还没检测过。
+    pub(super) detected_models: Option<Vec<String>>,
+    pub(super) discovery_generation: u64,
+    api_key_subscription: Subscription,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl EndpointDraft {
+    fn invalidate_models(&mut self) {
+        self.detected_models = None;
+        self.discovery_generation = self.discovery_generation.wrapping_add(1);
+    }
+
+    pub(super) fn entered(&self, cx: &App) -> Result<EndpointSettings> {
+        Ok(EndpointSettings {
+            id: self.id.clone(),
+            name: self.name_input.read(cx).value().trim().to_string(),
+            base_url: self.base_url_input.read(cx).value().trim().to_string(),
+            request_timeout_secs: parse_request_timeout_secs(
+                self.request_timeout_input.read(cx).value().as_ref(),
+            )?,
+            remote_content_confirmed: self.remote_content_confirmed,
+            allow_insecure_remote_http: self.allow_insecure_remote_http,
+            confirmed_remote_endpoint: self.confirmed_remote_endpoint.clone(),
+        })
+    }
+
+    pub(super) fn api_key_update(&self, cx: &App) -> ApiKeyUpdate {
+        api_key_update_for_input(
+            self.api_key_input.read(cx).value().as_ref(),
+            self.delete_api_key,
+        )
+    }
+}
+
+pub(super) fn new_endpoint_draft<V: EndpointBackedWindow>(
+    endpoint: EndpointSettings,
+    window: &mut Window,
+    cx: &mut Context<V>,
+) -> EndpointDraft {
+    let observed_url = endpoint_draft_identity(&endpoint.base_url);
+    let name_input = cx.new(|cx| InputState::new(window, cx).default_value(endpoint.name.clone()));
+    let base_url_input = cx.new(|cx| {
+        InputState::new(window, cx)
+            .default_value(endpoint.base_url.clone())
+            .placeholder(DEFAULT_OLLAMA_OPENAI_BASE_URL)
+    });
+    let request_timeout_input = cx.new(|cx| {
+        InputState::new(window, cx)
+            .default_value(endpoint.request_timeout_secs.to_string())
+            .placeholder(DEFAULT_AI_REQUEST_TIMEOUT_SECS.to_string())
+            .validate(|value, _| value.chars().all(|character| character.is_ascii_digit()))
+    });
+    let endpoint_id = endpoint.id.clone();
+    let url_subscription = cx.subscribe_in(
+        &base_url_input,
+        window,
+        move |this: &mut V, input, event, window, cx| {
+            if !matches!(event, InputEvent::Change) {
+                return;
+            }
+            let canonical = endpoint_draft_identity(input.read(cx).value().as_ref());
+            if let Some(endpoint) = this
+                .endpoints_mut()
+                .iter_mut()
+                .find(|endpoint| endpoint.id == endpoint_id)
+                && canonical != endpoint.observed_url
+            {
+                endpoint.observed_url = canonical;
+                endpoint.remote_content_confirmed = false;
+                endpoint.allow_insecure_remote_http = false;
+                endpoint.confirmed_remote_endpoint.clear();
+                endpoint.delete_api_key = false;
+                // A different server must never inherit a key through input undo history.
+                reset_endpoint_key(endpoint, window, cx);
+                endpoint.invalidate_models();
+                this.state_mut().notice = None;
+                cx.notify();
+            }
+        },
+    );
+    let name_subscription = cx.subscribe(&name_input, |_, _, event, cx| {
+        if matches!(event, InputEvent::Change) {
+            cx.notify();
+        }
+    });
+    let api_key_input = new_api_key_input(window, cx);
+    let api_key_subscription = subscribe_endpoint_key(&api_key_input, &endpoint.id, cx);
+    EndpointDraft {
+        id: endpoint.id,
+        name_input,
+        base_url_input,
+        request_timeout_input,
+        api_key_input,
+        remote_content_confirmed: endpoint.remote_content_confirmed,
+        allow_insecure_remote_http: endpoint.allow_insecure_remote_http,
+        confirmed_remote_endpoint: endpoint.confirmed_remote_endpoint,
+        delete_api_key: false,
+        observed_url,
+        detected_models: None,
+        discovery_generation: 0,
+        api_key_subscription,
+        _subscriptions: vec![url_subscription, name_subscription],
+    }
+}
+
+fn new_api_key_input<V>(window: &mut Window, cx: &mut Context<V>) -> Entity<InputState> {
+    cx.new(|cx| {
+        InputState::new(window, cx)
+            .masked(true)
+            .placeholder("留空则保持当前 Endpoint 的现有密钥")
+    })
+}
+
+fn subscribe_endpoint_key<V: EndpointBackedWindow>(
+    input: &Entity<InputState>,
+    endpoint_id: &str,
+    cx: &mut Context<V>,
+) -> Subscription {
+    let endpoint_id = endpoint_id.to_string();
+    cx.subscribe(input, move |this, _, event, cx| {
+        if matches!(event, InputEvent::Change)
+            && let Some(endpoint) = this
+                .endpoints_mut()
+                .iter_mut()
+                .find(|endpoint| endpoint.id == endpoint_id)
+        {
+            endpoint.invalidate_models();
+            this.state_mut().notice = None;
+            cx.notify();
+        }
+    })
+}
+
+/// 换一个地址就换一套密钥：清空输入框并重建订阅，撤销历史不会把旧密钥带回来。
+fn reset_endpoint_key<V: EndpointBackedWindow>(
+    endpoint: &mut EndpointDraft,
+    window: &mut Window,
+    cx: &mut Context<V>,
+) {
+    endpoint.api_key_input = new_api_key_input(window, cx);
+    endpoint.api_key_subscription =
+        subscribe_endpoint_key(&endpoint.api_key_input, &endpoint.id, cx);
+}
+
+/// 勾选/取消「删除已保存的密钥」。勾选时同时清空输入框，避免撤销把旧值带回来。
+pub(super) fn set_delete_endpoint_key<V: EndpointBackedWindow>(
+    this: &mut V,
+    endpoint_id: &str,
+    delete: bool,
+    window: &mut Window,
+    cx: &mut Context<V>,
+) {
+    if let Some(endpoint) = this
+        .endpoints_mut()
+        .iter_mut()
+        .find(|endpoint| endpoint.id == endpoint_id)
+    {
+        endpoint.delete_api_key = delete;
+        endpoint.invalidate_models();
+        if delete {
+            reset_endpoint_key(endpoint, window, cx);
+        }
+        this.state_mut().notice = None;
+        cx.notify();
+    }
+}
+
+/// 读取某个 Endpoint 的模型列表。凭据与网络 I/O 都由 `AppServices` 派发到它自己的
+/// Tokio runtime 上，这个 GPUI 任务只负责等待与应用结果。
+pub(super) fn detect_models<V: EndpointBackedWindow>(
+    this: &mut V,
+    endpoint_id: &str,
+    window: &mut Window,
+    cx: &mut Context<V>,
+) {
+    if this.state().busy() {
+        return;
+    }
+    let Some(index) = this
+        .endpoints()
+        .iter()
+        .position(|endpoint| endpoint.id == endpoint_id)
+    else {
+        return;
+    };
+    this.endpoints_mut()[index].invalidate_models();
+    let generation = this.endpoints()[index].discovery_generation;
+    let endpoint = match this.endpoints()[index].entered(cx).and_then(|endpoint| {
+        endpoint.validate()?;
+        Ok(endpoint)
+    }) {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            this.state_mut()
+                .report(format!("AI Provider 设置无效：{error:#}"), true);
+            cx.notify();
+            return;
+        }
+    };
+    let key_update = this.endpoints()[index].api_key_update(cx);
+    this.state_mut()
+        .begin_detection(format!("正在读取 {} 的模型…", endpoint.name));
+
+    let services = Arc::clone(this.services());
+    cx.spawn_in(window, async move |view, cx| {
+        let outcome = services
+            .probe_endpoint_models(endpoint.clone(), key_update)
+            .await;
+        let _ = view.update(cx, |this, cx| {
+            this.state_mut().operation = PendingOperation::Idle;
+            if !detection_matches(this, &endpoint, generation, cx) {
+                this.state_mut().notice = None;
+                cx.notify();
+                return;
+            }
+            match outcome {
+                Ok(models) => {
+                    // Endpoint 窗口没有模型输入，检测结果只列出来；对话模型窗口可以直接点选。
+                    let picks_models = this.role_model(ModelRole::Chat, cx).is_some();
+                    apply_detected_models(this, &endpoint, models, picks_models);
+                }
+                Err(error) => this.state_mut().report(
+                    format!(
+                        "无法读取 {} 的模型：{error:#}。若使用本地 Ollama，请确认服务已运行。",
+                        endpoint.name
+                    ),
+                    true,
+                ),
+            }
+            cx.notify();
+        });
+    })
+    .detach();
+    cx.notify();
+}
+
+/// 检测结果回到界面时，草稿是否还是发起检测的那一份（同一个 Endpoint、同一代、同一地址）。
+pub(super) fn detection_matches<V: EndpointBackedWindow>(
+    this: &V,
+    endpoint: &EndpointSettings,
+    generation: u64,
+    cx: &App,
+) -> bool {
+    this.endpoints().iter().any(|draft| {
+        draft.id == endpoint.id
+            && draft.discovery_generation == generation
+            && canonical_endpoint(draft.base_url_input.read(cx).value().as_ref())
+                == canonical_endpoint(&endpoint.base_url)
+    })
+}
+
+pub(super) fn apply_detected_models<V: EndpointBackedWindow>(
+    this: &mut V,
+    endpoint: &EndpointSettings,
+    models: Vec<ModelInfo>,
+    picks_models: bool,
+) {
+    let detected_models: Vec<_> = models.into_iter().map(|model| model.id).collect();
+    let count = detected_models.len();
+    if let Some(draft) = this
+        .endpoints_mut()
+        .iter_mut()
+        .find(|draft| draft.id == endpoint.id)
+    {
+        draft.detected_models = Some(detected_models);
+    }
+    let hint = if picks_models {
+        "可在各模型区域查看或选择。"
+    } else {
+        "可在下方列表查看，回到「对话模型」窗口即可选用。"
+    };
+    this.state_mut().report(
+        format!("{} 连接成功，返回 {count} 个模型；{hint}", endpoint.name),
+        false,
+    );
+}
+
+/// 检测结果的卡片：返回的模型列表、与当前模型不匹配的名字、以及本地 Ollama 的拉取提示。
+pub(super) fn render_model_detection<V: EndpointBackedWindow>(
+    view: &V,
+    endpoint: &EndpointDraft,
+    role: Option<ModelRole>,
+    cx: &mut Context<V>,
+) -> Option<gpui::AnyElement> {
+    let models = endpoint.detected_models.as_ref()?;
+    let missing_models = role
+        .and_then(|role| view.role_model(role, cx))
+        .filter(|model| !models.contains(model))
+        .into_iter()
+        .collect::<Vec<_>>();
+    let commands = ollama_pull_commands(
+        endpoint.base_url_input.read(cx).value().as_ref(),
+        &missing_models,
+    );
+    let busy = view.state().busy();
+    Some(
+        div()
+            .v_flex()
+            .gap_2()
+            .p_3()
+            .rounded(px(8.))
+            .border_1()
+            .border_color(rgb(palette(cx).border))
+            .bg(rgb(palette(cx).paper))
+            .child(
+                div()
+                    .text_xs()
+                    .font_semibold()
+                    .text_color(rgb(palette(cx).ink))
+                    .child(format!(
+                        "{} 返回的模型（{}）",
+                        endpoint.name_input.read(cx).value(),
+                        models.len()
+                    )),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .line_height(gpui::relative(1.5))
+                    .text_color(rgb(palette(cx).muted))
+                    .child(if models.is_empty() {
+                        "未返回模型".to_string()
+                    } else {
+                        "模型列表不标注能力，请选择支持当前用途的模型。".to_string()
+                    }),
+            )
+            .when(!missing_models.is_empty(), |this| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(palette(cx).danger))
+                        .child(format!(
+                            "当前模型未在此 Endpoint 的列表中：{}",
+                            missing_models.join("、")
+                        )),
+                )
+            })
+            .child(
+                div()
+                    .h_flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .children(models.iter().enumerate().map(|(index, model)| {
+                        let model = model.clone();
+                        let selected_role = role;
+                        Button::new(("ai-detected-model", index))
+                            .small()
+                            .label(model.clone())
+                            .disabled(busy || role.is_none())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if let Some(role) = selected_role {
+                                    this.adopt_detected_model(role, &model, window, cx);
+                                }
+                            }))
+                    })),
+            )
+            .children(commands.into_iter().map(|command| {
+                div()
+                    .px_2()
+                    .py_1()
+                    .rounded(px(5.))
+                    .bg(rgb(palette(cx).sidebar))
+                    .text_xs()
+                    .text_color(rgb(palette(cx).ink))
+                    .child(command)
+            }))
+            .into_any_element(),
+    )
+}
+
+pub(super) fn parse_request_timeout_secs(value: &str) -> Result<u64> {
+    let value = value.trim();
+    let timeout = value.parse::<u64>().map_err(|_| {
+        anyhow::anyhow!(
+            "请求超时必须是 {MIN_AI_REQUEST_TIMEOUT_SECS} 到 {MAX_AI_REQUEST_TIMEOUT_SECS} 之间的整数秒数"
+        )
+    })?;
+    anyhow::ensure!(
+        (MIN_AI_REQUEST_TIMEOUT_SECS..=MAX_AI_REQUEST_TIMEOUT_SECS).contains(&timeout),
+        "请求超时必须是 {MIN_AI_REQUEST_TIMEOUT_SECS} 到 {MAX_AI_REQUEST_TIMEOUT_SECS} 之间的整数秒数"
+    );
+    Ok(timeout)
+}
+
+pub(super) fn canonical_endpoint(endpoint: &str) -> Option<String> {
+    normalize_provider_base_url(endpoint.trim())
+        .ok()
+        .map(|url| url.to_string())
+}
+
+pub(super) fn endpoint_draft_identity(endpoint: &str) -> String {
+    canonical_endpoint(endpoint).unwrap_or_else(|| endpoint.trim().to_string())
+}
+
+fn ollama_pull_commands(endpoint: &str, missing_models: &[String]) -> Vec<String> {
+    if !looks_like_local_ollama(endpoint) {
+        return Vec::new();
+    }
+    missing_models
+        .iter()
+        .map(|model| format!("ollama pull {model}"))
+        .collect()
+}
+
+fn looks_like_local_ollama(endpoint: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(endpoint.trim()) else {
+        return false;
+    };
+    let local_host = url.host_str().is_some_and(|host| {
+        let host = host.trim_matches(['[', ']']);
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    });
+    local_host && url.port_or_known_default() == Some(11_434)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pull_guidance_is_only_generated_for_local_ollama() {
+        let missing = vec!["chat-model".to_string(), "embed-model".to_string()];
+        assert_eq!(
+            ollama_pull_commands(DEFAULT_OLLAMA_OPENAI_BASE_URL, &missing),
+            vec![
+                "ollama pull chat-model".to_string(),
+                "ollama pull embed-model".to_string()
+            ]
+        );
+        assert!(ollama_pull_commands("https://models.example.test/v1/", &missing).is_empty());
+        assert_eq!(
+            ollama_pull_commands("http://localhost:11434", &missing).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn request_timeout_is_an_integer_within_the_provider_range() {
+        assert_eq!(parse_request_timeout_secs("1").unwrap(), 1);
+        assert_eq!(parse_request_timeout_secs(" 120 ").unwrap(), 120);
+        assert_eq!(parse_request_timeout_secs("600").unwrap(), 600);
+        for invalid in ["", "0", "601", "1.5", "-1", "ten", "18446744073709551616"] {
+            assert!(
+                parse_request_timeout_secs(invalid).is_err(),
+                "{invalid:?} should be rejected"
+            );
+        }
+    }
+}
