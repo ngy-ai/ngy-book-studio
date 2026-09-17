@@ -283,6 +283,12 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   链接、span 或列表文字叶节点。其它格式使用规范化 HTML；解析在后台执行。
   `src/ai/translation.rs` 定义只含文字的分段协议：每次提供整段上下文与整数 ID，模型必须
   返回完整、唯一的 ID 集合；按原文顺序回排并恢复片段边界空白，不能用模型 HTML 替换正文。
+  每个请求的用户 JSON 还带 `book`（书名）与 `chapter`（章节标题）两个语境字段，供模型消歧：
+  它们从冻结的文本块取（`TranslationBlock.book_title` / `unit_title`，经
+  `TranslationContext`；`validate_translation_source` 按含上下文的那一份算请求上限），与正文
+  走同一条不可信数据通道，空标题整段省略、超长标题按 `MAX_CONTEXT_LABEL_CHARS` 截断，绝不出现在
+  片段列表或译文里。工作线程与任务窗口都必须从文本块取上下文，两边请求体才逐字节一致；
+  上下文只进用户消息，不写进系统提示。
   响应允许完整的前置 `<think>`、Markdown 围栏和说明文字包裹一个完整答案；规范外壳是
   `{"translations":[{"id":0,"text":"译文"}]}`。只有小模型丢掉该外壳时才把顶层片段对象本身或
   片段对象数组折进同一外壳（现场：`qwen3.5:0.8b` 逐块返回 `[{"id":0,"text":"…"}]`，整本书
@@ -906,6 +912,47 @@ cargo test --test openai_compatible_flow --locked
 
 `src/ui/` 的单元测试属于产品二进制目标，不包含在 `cargo test --lib` 中。完成 Rust
 改动前仍应执行全目标检查和测试；不要只用快速命令作最终验收。
+
+### 可选测试执行器（cargo-nextest）
+
+`cargo-nextest` 已在本机可用（0.9.145），配置在仓库根 `.config/nextest.toml`，但它
+不是门禁的替代品：`cargo fmt` / `cargo check` / `cargo clippy` 仍由 cargo 执行，上面的
+`cargo test` 命令仍是最终验收基线。切换某条命令前先做一次全量对账并把项数差异写进
+`ROADMAP.md`，不要凭「nextest 默认更全」直接替换。
+
+命令映射 —— `--` 之后的 libtest 参数在 nextest 里不存在，必须换成 nextest 自己的选项：
+
+| `cargo test` | `cargo nextest run` |
+| --- | --- |
+| `--all-targets` | 不需要，nextest 默认跑全部测试目标 |
+| `--no-fail-fast` | 不需要，nextest 默认不 fail-fast |
+| `... -- --ignored` | `... --run-ignored ignored-only` |
+| `... -- --nocapture` | `... --no-capture` |
+| `... -- --test-threads=1` | `... --test-threads=1`（语义已变，见下） |
+| `... <名称>` | `... -E 'test(<名称>)'` |
+
+例：`cargo nextest run --lib --locked -E 'test(learning::)' --run-ignored
+ignored-only --test-threads=1` 对应 `cargo test --lib --locked learning:: -- --ignored
+--test-threads=1`。
+
+差异与注意：
+
+- nextest 不跑 doctests，需要时另跑 `cargo test --doc`；本仓库当前没有 doctest。
+- 每个测试跑在独立进程里，测试之间不再共享进程状态，泄漏的线程与全局状态不会跨测试
+  传播；代价是大二进制（gpui + test-support）被反复加载，`--test-threads` 现在控制
+  并发**进程**数，CPU 与内存峰值比单进程 `cargo test` 更高。
+- 因此 `--test-threads=1` 从「单进程单线程」变成「同时只跑一个测试进程」。learning
+  的真实窗口 / 键盘注入专项切换前必须实测通过，不能假设等价；`.config/nextest.toml`
+  用 `learning-desktop` test-group 把 `supervisor_control_flow` 与 `desktop_*` 限制为
+  独占运行，用 `background-gated` 把 `services::tests::` 限到 2 并发。
+- 2026-09-17 全量对账：975 项运行 / 8 项 skip、约 51 秒。默认并发下 `services::tests::`
+  有 4 项因紧截止预算耗尽假失败（同批在低并发与 `cargo test --lib services::tests::`
+  下全通过、单项连跑 3 次全通过），按上面的 test-group 限流后复跑消失；当时仍失败的
+  7 项都在集成测试 `translation_flow`，且 `cargo test --test translation_flow` 同样
+  失败，属工作区未提交改动的既有状态，与本迁移无关。
+- 那批紧截止夹具（`ai::indexing`、`translation_flow`）在更高并发下更容易偶发失败，
+  这是测试自身的预算问题而非产品回归；配置里 `retries = 0` 是刻意的，先修预算，不要
+  用重试掩盖。
 
 ### 可选 DOM 门禁（Node + 已安装 Playwright）
 

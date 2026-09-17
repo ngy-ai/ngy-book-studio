@@ -32,7 +32,7 @@ use crate::{
     ai::job_diagnostics::{
         JobLogErrorKind, JobLogEvent, JobLogMetrics, classify_error, record_for_database,
     },
-    ai::translation::{StoredTranslation, TranslationSource},
+    ai::translation::{StoredTranslation, TranslationContext, TranslationSource},
     ai::{
         ChatMessage, ChatRequest, ChatRole, ContentPart, EmbeddingRequest, ImageUrl,
         MessageContent, OpenAiCompatibleProvider, ReasoningEffort,
@@ -466,12 +466,14 @@ impl IndexingCoordinator {
             &block.source,
             None,
         );
-        let user_content = block.source.request_input();
+        let block_context = block.translation_context();
+        let user_content = block.source.request_input(&block_context);
         let request = translation_request(
             &model,
             &context.target_language,
             context.source_language.as_deref(),
             &block.source,
+            &block_context,
             None,
         );
         let body = serde_json::to_string(&request)
@@ -557,6 +559,7 @@ impl IndexingCoordinator {
             &context.target_language,
             context.source_language.as_deref(),
             &block.source,
+            &block.translation_context(),
             None,
         );
         let model = translation.model.clone();
@@ -2100,6 +2103,9 @@ async fn run_vision(
 /// `ordinal` is the flattened index used both as the durable job cursor and as
 /// the persisted block ordering within its unit.
 struct TranslationBlock {
+    /// 书名是每个文本块都要带给模型的语境，因此和块一起冻结下来：工作线程与
+    /// 任务窗口都从这里取上下文，两者发出的请求体才逐字节相同。
+    book_title: String,
     unit_id: String,
     unit_revision: u64,
     unit_title: String,
@@ -2107,6 +2113,12 @@ struct TranslationBlock {
     block_id: String,
     ordinal: usize,
     source: TranslationSource,
+}
+
+impl TranslationBlock {
+    fn translation_context(&self) -> TranslationContext<'_> {
+        TranslationContext::new(&self.book_title, &self.unit_title)
+    }
 }
 
 /// One block of a whole-book translation task as inspected from the task
@@ -2407,7 +2419,11 @@ enum BlockPlan<'a> {
     /// Publish the translation already stored for this block text.
     Cached(Box<StoredTranslation>),
     /// Send this block to the provider.
-    Request { source: &'a TranslationSource },
+    Request {
+        source: &'a TranslationSource,
+        /// 书名与章节标题，随请求一起发给模型。
+        context: TranslationContext<'a>,
+    },
 }
 
 /// The durable progress of one translation run: the cursor this execution owns
@@ -2829,7 +2845,7 @@ async fn walk_translation_blocks(
                     BlockPlan::Cached(stored) => {
                         resolved.insert(ordinal, BlockSlot::Cached(*stored));
                     }
-                    BlockPlan::Request { source } => {
+                    BlockPlan::Request { source, context } => {
                         // The window is part of the durable cursor: the task window
                         // reads it as 「处理中」, so it is published before the request
                         // goes out.
@@ -2848,6 +2864,7 @@ async fn walk_translation_blocks(
                                     target_language,
                                     source_language,
                                     source,
+                                    context,
                                 )
                                 .await;
                                 (ordinal, walk)
@@ -3138,7 +3155,7 @@ async fn plan_translation_block<'a>(
         multi_segment = block.source.segments.len() > 1,
         segment_chars = %translation_segment_chars(&block.source.segments),
         source_chars = block.source.text.chars().count(),
-        request_bytes = block.source.request_input().len(),
+        request_bytes = block.source.request_input(&block.translation_context()).len(),
         "Translation block started"
     );
     if block.source.segments.is_empty() {
@@ -3194,6 +3211,7 @@ async fn plan_translation_block<'a>(
     }
     Ok(BlockPlan::Request {
         source: &block.source,
+        context: block.translation_context(),
     })
 }
 
@@ -3282,6 +3300,11 @@ fn translation_blocks_with_epub(
 ) -> Result<Vec<TranslationBlock>> {
     let units = db::content_units::list_for_source(conn, source_id)?;
     let unit_count = units.len();
+    // 书名随每个文本块的请求一起发给模型，所以在这里读一次；读不到说明来源与图书
+    // 已经不一致，宁可让任务失败，也不发一个没有书名的请求。
+    let book_title = db::books::get(conn, book_id)?
+        .context("翻译图书不存在")?
+        .title;
     let spine_count = epub.map(|(opened, _)| opened.spine.len());
     if let Some((opened, _)) = epub {
         ensure!(
@@ -3352,16 +3375,20 @@ fn translation_blocks_with_epub(
             .iter()
             .map(|source| source.text.chars().count())
             .sum::<usize>();
+        let unit_title = unit.title.clone().unwrap_or_default();
         for (index, source) in sources.into_iter().enumerate() {
-            validate_translation_source(&source)?;
+            // 请求体大小包含上下文，所以校验必须按模型实际收到的那一份来算。
+            let context = TranslationContext::new(&book_title, &unit_title);
+            validate_translation_source(&source, &context)?;
             ensure!(
                 blocks.len() < MAX_TRANSLATION_BLOCKS,
                 "图书文本块数量超过翻译上限"
             );
             blocks.push(TranslationBlock {
+                book_title: book_title.clone(),
                 unit_id: unit.id.clone(),
                 unit_revision: unit.revision,
-                unit_title: unit.title.clone().unwrap_or_default(),
+                unit_title: unit_title.clone(),
                 unit_ordinal: unit.ordinal,
                 block_id: format!("{}::h{index}", unit.id),
                 ordinal,
@@ -3400,7 +3427,10 @@ fn translation_blocks_with_epub(
     Ok(blocks)
 }
 
-fn validate_translation_source(source: &TranslationSource) -> Result<()> {
+fn validate_translation_source(
+    source: &TranslationSource,
+    context: &TranslationContext<'_>,
+) -> Result<()> {
     let raw_chars = source.segments.iter().try_fold(0usize, |total, segment| {
         let next = total.saturating_add(segment.chars().count());
         ensure!(
@@ -3414,7 +3444,7 @@ fn validate_translation_source(source: &TranslationSource) -> Result<()> {
         "段落超过翻译长度上限或没有可翻译文字，请先拆分长段落后重试"
     );
     ensure!(
-        source.request_input().len() <= MAX_TRANSLATION_REQUEST_BYTES,
+        source.request_input(context).len() <= MAX_TRANSLATION_REQUEST_BYTES,
         "段落格式片段超过翻译请求大小上限，请先拆分长段落后重试"
     );
     Ok(())
@@ -3436,10 +3466,13 @@ fn translation_block_preview(text: &str) -> String {
     preview
 }
 
-/// Identity of one translatable block decision. The model sees exactly the
-/// block text and its leaf split, so a stored row may be reused for any block
-/// with the same key — even when an edit (or the normalized EPUB projection,
-/// which adds the chapter title heading) moved the block to another position.
+/// Identity of one translatable block decision. Besides the block text and its
+/// leaf split the model also sees the book and chapter context, but that context
+/// is constant for every block of one unit — and a stored row is only ever
+/// looked up inside its own unit — so the key stays text + leaf split: a stored
+/// row may be reused for any block with the same key, even when an edit (or the
+/// normalized EPUB projection, which adds the chapter title heading) moved the
+/// block to another position.
 fn translation_cache_key<'a>(source_text: &str, segments: impl Iterator<Item = &'a str>) -> String {
     let mut key = String::from(source_text);
     for segment in segments {
@@ -3526,6 +3559,7 @@ fn translation_request(
     target_language: &str,
     source_language: Option<&str>,
     source: &TranslationSource,
+    context: &TranslationContext<'_>,
     correction: Option<&str>,
 ) -> ChatRequest {
     ChatRequest {
@@ -3535,7 +3569,7 @@ fn translation_request(
                 ChatRole::System,
                 translation_prompt(target_language, source_language, source, correction),
             ),
-            ChatMessage::text(ChatRole::User, source.request_input()),
+            ChatMessage::text(ChatRole::User, source.request_input(context)),
         ],
         tools: Vec::new(),
         temperature: Some(TRANSLATION_TEMPERATURE),
@@ -3603,6 +3637,7 @@ async fn translate_block(
     target_language: &str,
     source_language: Option<&str>,
     source: &TranslationSource,
+    context: TranslationContext<'_>,
 ) -> Result<BlockWalk> {
     let started = Instant::now();
     // The walk counts its own work: a parallel window cannot share one mutable
@@ -3656,6 +3691,7 @@ async fn translate_block(
             target_language,
             source_language,
             source,
+            context,
             &mut rejected_kinds,
             carried_kind,
             round == rounds,
@@ -3719,6 +3755,7 @@ async fn translate_block_round(
     target_language: &str,
     source_language: Option<&str>,
     source: &TranslationSource,
+    context: TranslationContext<'_>,
     rejected_kinds: &mut Vec<&'static str>,
     initial_correction: Option<&'static str>,
     allow_fragment_fallback: bool,
@@ -3777,6 +3814,7 @@ async fn translate_block_round(
             target_language,
             source_language,
             source,
+            &context,
             correction_kind,
         );
         tracing::debug!(
@@ -3798,7 +3836,7 @@ async fn translate_block_round(
                     MessageContent::Parts(_) => None,
                 })
                 .unwrap_or(0),
-            user_bytes = source.request_input().len(),
+            user_bytes = source.request_input(&context).len(),
             message_count = request.messages.len(),
             max_tokens = TRANSLATION_MAX_OUTPUT_TOKENS,
             "Translation attempt started"
@@ -3821,6 +3859,7 @@ async fn translate_block_round(
                 scope,
                 attempt,
                 source,
+                &context,
                 &translation.execution_identity,
                 stream,
             )
@@ -3985,6 +4024,7 @@ async fn translate_block_round(
                     attempt,
                     &response,
                     source,
+                    &context,
                     "protocol_rejected",
                 );
                 if !retry {
@@ -4026,6 +4066,7 @@ async fn translate_block_round(
                             target_language,
                             source_language,
                             source,
+                            context,
                         )
                         .await?;
                         // The block's duration covers both the strict attempts and
@@ -4095,6 +4136,7 @@ async fn translate_block_by_fragment(
     target_language: &str,
     source_language: Option<&str>,
     source: &TranslationSource,
+    context: TranslationContext<'_>,
 ) -> Result<BlockWalk> {
     let fragments = source.segments.len();
     let started = Instant::now();
@@ -4148,6 +4190,7 @@ async fn translate_block_by_fragment(
             target_language,
             source_language,
             &fragment,
+            &context,
             None,
         );
         tracing::debug!(
@@ -4155,7 +4198,7 @@ async fn translate_block_by_fragment(
             parent: &span,
             stage = "translation_fragment_start",
             fragment_chars = fragment_text.chars().count(),
-            request_bytes = fragment.request_input().len(),
+            request_bytes = fragment.request_input(&context).len(),
             "Translation fragment started"
         );
         let stream = match await_translation_step(
@@ -4175,6 +4218,7 @@ async fn translate_block_by_fragment(
             scope,
             index + 1,
             &fragment,
+            &context,
             &translation.execution_identity,
             stream,
         )
@@ -4219,6 +4263,7 @@ async fn translate_block_by_fragment(
                     index + 1,
                     &response,
                     &fragment,
+                    &context,
                     "fragment_rejected",
                 );
                 return Err(error.context(format!(
@@ -4460,6 +4505,7 @@ fn dump_raw_translation_response(
     attempt: usize,
     response: &str,
     source: &TranslationSource,
+    context: &TranslationContext<'_>,
     reason: &'static str,
 ) {
     if std::env::var_os("NGY_DUMP_TRANSLATION_RAW").is_none() {
@@ -4484,8 +4530,8 @@ fn dump_raw_translation_response(
         attempt,
         reason,
         source_chars = source.text.chars().count(),
-        request_bytes = source.request_input().len(),
-        input = %source.request_input(),
+        request_bytes = source.request_input(context).len(),
+        input = %source.request_input(context),
         "Frozen translation request input (NGY_DUMP_TRANSLATION_RAW)"
     );
 }
@@ -4579,6 +4625,7 @@ async fn collect_translation_response(
     scope: &TranslationBlockScope,
     request_attempt: usize,
     source: &TranslationSource,
+    context: &TranslationContext<'_>,
     identity: &str,
     mut stream: crate::ai::ChatEventStream,
 ) -> Result<BlockStep<String>> {
@@ -4811,6 +4858,7 @@ async fn collect_translation_response(
                 request_attempt,
                 &response,
                 source,
+                context,
                 stats.end,
             );
             // 流没有正常结束，但已经收到的字节可能包含一个完整、能通过全部片段校验的
@@ -8818,7 +8866,14 @@ mod tests {
             text: "第一章 起点".to_string(),
             segments: vec!["起点".to_string()],
         };
-        let request = translation_request("model:test", "zh-Hans", None, &source, None);
+        let request = translation_request(
+            "model:test",
+            "zh-Hans",
+            None,
+            &source,
+            &TranslationContext::default(),
+            None,
+        );
         assert_eq!(request.reasoning_effort, Some(ReasoningEffort::None));
         assert_eq!(
             serde_json::to_value(&request).unwrap()["reasoning_effort"],
@@ -8834,6 +8889,7 @@ mod tests {
             "zh-Hans",
             None,
             &source,
+            &TranslationContext::default(),
             Some("invalid_schema"),
         );
         assert_eq!(correction.reasoning_effort, Some(ReasoningEffort::None));
@@ -8971,21 +9027,28 @@ mod tests {
 
     #[test]
     fn translation_source_limits_count_raw_whitespace_and_encoded_slot_overhead() {
+        let no_context = TranslationContext::default();
         let exact = "a".repeat(MAX_TRANSLATION_SOURCE_CHARS);
         assert!(
-            validate_translation_source(&TranslationSource {
-                text: exact.clone(),
-                segments: vec![exact],
-            })
+            validate_translation_source(
+                &TranslationSource {
+                    text: exact.clone(),
+                    segments: vec![exact],
+                },
+                &no_context,
+            )
             .is_ok()
         );
 
         let too_long = "a".repeat(MAX_TRANSLATION_SOURCE_CHARS + 1);
         assert!(
-            validate_translation_source(&TranslationSource {
-                text: too_long.clone(),
-                segments: vec![too_long],
-            })
+            validate_translation_source(
+                &TranslationSource {
+                    text: too_long.clone(),
+                    segments: vec![too_long],
+                },
+                &no_context,
+            )
             .is_err()
         );
 
@@ -8993,10 +9056,13 @@ mod tests {
         // but the request must not retain an unlimited amount of source spacing.
         let whitespace = format!("a{}b", " ".repeat(MAX_TRANSLATION_SOURCE_CHARS));
         assert!(
-            validate_translation_source(&TranslationSource {
-                text: "a b".into(),
-                segments: vec![whitespace],
-            })
+            validate_translation_source(
+                &TranslationSource {
+                    text: "a b".into(),
+                    segments: vec![whitespace],
+                },
+                &no_context,
+            )
             .is_err()
         );
 
@@ -9006,16 +9072,33 @@ mod tests {
             text: "a".repeat(MAX_TRANSLATION_SOURCE_CHARS),
             segments: vec!["a".to_string(); MAX_TRANSLATION_SOURCE_CHARS],
         };
-        assert!(fragmented.request_input().len() > MAX_TRANSLATION_REQUEST_BYTES);
-        assert!(validate_translation_source(&fragmented).is_err());
+        assert!(fragmented.request_input(&no_context).len() > MAX_TRANSLATION_REQUEST_BYTES);
+        assert!(validate_translation_source(&fragmented, &no_context).is_err());
 
         // Code is not in the translated leaves but still counts as model context.
         assert!(
-            validate_translation_source(&TranslationSource {
-                text: "x".repeat(MAX_TRANSLATION_SOURCE_CHARS + 1),
-                segments: vec!["caption".into()],
-            })
+            validate_translation_source(
+                &TranslationSource {
+                    text: "x".repeat(MAX_TRANSLATION_SOURCE_CHARS + 1),
+                    segments: vec!["caption".into()],
+                },
+                &no_context,
+            )
             .is_err()
+        );
+
+        // 上下文计入请求上限：书名与章节标题再长也不会把请求体撑过上限，
+        // 因为它们在进入请求体之前就被截断到固定长度。
+        let huge_title = "标".repeat(MAX_TRANSLATION_SOURCE_CHARS * 2);
+        assert!(
+            validate_translation_source(
+                &TranslationSource {
+                    text: "a".repeat(MAX_TRANSLATION_SOURCE_CHARS),
+                    segments: vec!["a".repeat(MAX_TRANSLATION_SOURCE_CHARS)],
+                },
+                &TranslationContext::new(&huge_title, &huge_title),
+            )
+            .is_ok()
         );
     }
 
@@ -9055,7 +9138,9 @@ mod tests {
             text: "Hello world".to_string(),
             segments: vec!["Hello".to_string(), "world".to_string()],
         };
-        let request = translation_request("chat-test", "zh-Hans", Some("en"), &source, None);
+        let context = TranslationContext::new("A Book", "Chapter One");
+        let request =
+            translation_request("chat-test", "zh-Hans", Some("en"), &source, &context, None);
         let ChatMessage { content, .. } = &request.messages[0];
         let system = match content.as_ref().unwrap() {
             MessageContent::Text(text) => text.as_str(),
@@ -9074,13 +9159,16 @@ mod tests {
             MessageContent::Text(text) => text.clone(),
             MessageContent::Parts(_) => panic!("the user message is plain text"),
         };
-        assert_eq!(user, source.request_input());
+        assert_eq!(user, source.request_input(&context));
         let parsed = serde_json::from_str::<serde_json::Value>(&user).unwrap();
         assert_eq!(parsed["source"], "Hello world");
         assert_eq!(parsed["segments"][1]["text"], "world");
+        // 书名与章节随正文一起进入同一条用户消息：模型看到语境，而系统提示保持不变。
+        assert_eq!(parsed["book"], "A Book");
+        assert_eq!(parsed["chapter"], "Chapter One");
 
         // A request without a source-language hint must not mention one.
-        let request = translation_request("chat-test", "zh-Hans", None, &source, None);
+        let request = translation_request("chat-test", "zh-Hans", None, &source, &context, None);
         let system = match request.messages[0].content.as_ref().unwrap() {
             MessageContent::Text(text) => text.clone(),
             MessageContent::Parts(_) => panic!("the system prompt is plain text"),
@@ -9094,7 +9182,14 @@ mod tests {
             text: "Body".to_string(),
             segments: vec!["Body".to_string()],
         };
-        let request = translation_request("chat-test", "zh-Hans", Some("en"), &source, None);
+        let request = translation_request(
+            "chat-test",
+            "zh-Hans",
+            Some("en"),
+            &source,
+            &TranslationContext::default(),
+            None,
+        );
         let body = serde_json::to_string(&request).unwrap();
         let parsed = serde_json::from_str::<serde_json::Value>(&body).unwrap();
         assert_eq!(parsed["model"], "chat-test");
@@ -9174,6 +9269,16 @@ mod tests {
         );
         assert!(blocks.iter().all(|block| block.unit_title == "第一章"));
         assert!(blocks.iter().all(|block| block.unit_ordinal == 0));
+        // 每个文本块都冻结了书名；它与章节标题一起进入模型请求的用户消息。
+        assert!(blocks.iter().all(|block| block.book_title == "Book"));
+        let input: serde_json::Value = serde_json::from_str(
+            &blocks[0]
+                .source
+                .request_input(&blocks[0].translation_context()),
+        )
+        .unwrap();
+        assert_eq!(input["book"], "Book");
+        assert_eq!(input["chapter"], "第一章");
         assert_eq!(
             blocks.iter().map(|block| block.ordinal).collect::<Vec<_>>(),
             vec![0, 1, 2, 3, 4, 5],
@@ -9566,6 +9671,12 @@ mod tests {
         // The worker's prompt carries the format contract; a body without it
         // would not be the request the task actually sends.
         assert!(detail.request.system_prompt.contains("translations"));
+
+        // 书名与章节标题随正文一起进入用户消息：上下文只帮助模型消歧，不出现在
+        // 片段列表里，因此窗口展示的正文就是工作线程会发出的那一份。
+        let user: serde_json::Value = serde_json::from_str(&detail.request.user_content).unwrap();
+        assert_eq!(user["book"], "Index test");
+        assert_eq!(user["chapter"], detail.unit_title);
 
         // Reading one block never claims, advances, or publishes the task.
         let after = {
@@ -10441,6 +10552,8 @@ mod tests {
     ) -> Result<BlockWalk> {
         let run = TranslationRun::new(cursor.clone())?;
         let scope = run.scope(0);
+        // 这些用例关心的是协议与重试行为，语境不影响它们；带语境的请求体由
+        // 文本块明细与请求构造的用例单独固定。
         fixture.runtime.block_on(translate_block(
             &fixture.indexing_inner(),
             job,
@@ -10449,6 +10562,7 @@ mod tests {
             "zh-Hans",
             None,
             source,
+            TranslationContext::default(),
         ))
     }
 

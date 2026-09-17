@@ -1,0 +1,38 @@
+# cargo-nextest 执行器配置（可选执行器，用法见 AGENTS.md「可选测试执行器」）。
+#
+# 安装：cargo install cargo-nextest --locked
+#
+# 这里只做两件事：给「卡住」的测试一个上限，以及把真实窗口/宿主的 learning
+# 专项串行化。刻意不配置 retries：本仓库已知的偶发失败是测试自身的紧截止预算
+# 问题（见 ROADMAP.md 的 5 秒 / 30 秒等待记录），用重试掩盖只会把真实回归留到
+# 以后，预算该修就修。
+
+[profile.default]
+# `cargo test` 要显式写 --no-fail-fast，nextest 默认就不 fail-fast；写出来是为了
+# 明确意图，避免有人按 cargo test 的习惯以为它会提前停。
+fail-fast = false
+# 不重试，理由见文件头。
+retries = 0
+# 单个测试跑满 60 秒标记为慢；连续 4 个观察周期（240 秒）仍未结束才判定挂死并终止。
+# 阈值取得宽，是因为 translation/indexing 的夹具按「30 秒无进展」计预算，learning
+# 的宿主测试也偏慢（全文件并行下 lib 整块约 40—47 秒）。
+slow-timeout = { period = "60s", terminate-after = 4 }
+
+[test-groups]
+# 真实窗口 + 键盘注入的 learning 桌面专项必须独占运行：AGENTS.md 要求它们用
+# --test-threads=1 显式执行，进程隔离之后仍要保证彼此不重叠。
+learning-desktop = { max-threads = 1 }
+# 后台任务 / 视觉渲染 / 数据库并发敏感的一组。2026-09-17 实测：全量默认并发
+# （num-cpus）下 services::tests 有 4 项因紧截止预算耗尽失败，同一批在
+# `cargo test --lib services::tests::` 与低并发 nextest 下全部通过、单项连跑 3 次
+# 也全部通过 —— 是并发压力不是产品回归。限到 2 并发。
+background-gated = { max-threads = 2 }
+
+[[profile.default.overrides]]
+# 对应 learning 的 #[ignore] 专项：supervisor_control_flow 三项与 desktop_* 两项。
+filter = 'test(/supervisor_control_flow/) | test(/desktop_/)'
+test-group = 'learning-desktop'
+
+[[profile.default.overrides]]
+filter = 'test(/services::tests::/)'
+test-group = 'background-gated'
