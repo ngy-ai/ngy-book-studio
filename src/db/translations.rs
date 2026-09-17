@@ -7,7 +7,7 @@ use rusqlite::{Connection, params};
 /// block in place when the document revision or model changes.
 ///
 /// `manual_text` carries the reader's own edit of the same block in the same
-/// [`StoredTranslation`](crate::translation::StoredTranslation) shape. It lives
+/// [`StoredTranslation`](crate::ai::translation::StoredTranslation) shape. It lives
 /// beside the machine text instead of replacing it, so the job never has to
 /// know about it and "恢复机器译文" is a plain `NULL` write.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -217,15 +217,15 @@ pub(crate) fn adopt_execution_identity(
         .context("无法解析译文身份记录")?;
     drop(stmt);
 
-    let protocol = crate::translation::execution_identity_protocol(execution_identity);
+    let protocol = crate::ai::translation::execution_identity_protocol(execution_identity);
     let mut stored = Vec::with_capacity(rows.len());
     for (id, translated_text) in rows {
         let Ok(mut translation) =
-            serde_json::from_str::<crate::translation::StoredTranslation>(&translated_text)
+            serde_json::from_str::<crate::ai::translation::StoredTranslation>(&translated_text)
         else {
             return Ok(false);
         };
-        if crate::translation::execution_identity_protocol(&translation.execution_identity)
+        if crate::ai::translation::execution_identity_protocol(&translation.execution_identity)
             != protocol
         {
             return Ok(false);
@@ -516,9 +516,9 @@ mod tests {
     #[test]
     fn adopting_a_new_engine_keeps_text_and_rejects_another_protocol() {
         let (_temp, conn) = fixture();
-        let stored = crate::translation::StoredTranslation {
+        let stored = crate::ai::translation::StoredTranslation {
             execution_identity: "translation-v2:old".into(),
-            segments: vec![crate::translation::TranslationSegment {
+            segments: vec![crate::ai::translation::TranslationSegment {
                 source: "block-a".into(),
                 translated: "甲".into(),
             }],
@@ -536,7 +536,7 @@ mod tests {
         let rows = list_for_unit(&conn, "unit", "zh-Hans").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].model, "new-model");
-        let adopted: crate::translation::StoredTranslation =
+        let adopted: crate::ai::translation::StoredTranslation =
             serde_json::from_str(&rows[0].translated_text).unwrap();
         assert_eq!(adopted.execution_identity, "translation-v2:new");
         assert_eq!(adopted.segments[0].translated, "甲");
@@ -547,7 +547,7 @@ mod tests {
             !adopt_execution_identity(&conn, "book", "zh-Hans", "new-model", "translation-v3:new")
                 .unwrap()
         );
-        let untouched: crate::translation::StoredTranslation = serde_json::from_str(
+        let untouched: crate::ai::translation::StoredTranslation = serde_json::from_str(
             &list_for_unit(&conn, "unit", "zh-Hans").unwrap()[0].translated_text,
         )
         .unwrap();

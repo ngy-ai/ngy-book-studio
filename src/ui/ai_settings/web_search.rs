@@ -9,11 +9,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use gpui_component::checkbox::Checkbox;
-use ngy_book_studio::services::{ApiKeyUpdate, ProviderSettings};
-use ngy_book_studio::web_search::{
+use ngy_book_studio::ai::web_search::{
     DEFAULT_WEB_SEARCH_TIMEOUT_SECS, MAX_WEB_SEARCH_RESULTS, MAX_WEB_SEARCH_TIMEOUT_SECS,
     MIN_WEB_SEARCH_TIMEOUT_SECS, normalize_web_endpoint,
 };
+use ngy_book_studio::services::{ApiKeyUpdate, ProviderSettings};
 
 pub(super) struct WebSearchSettingsWindow {
     services: Arc<AppServices>,

@@ -4,8 +4,8 @@
 //! logs: providers may echo prompts or credentials in those values.
 
 use crate::{
-    agent::AgentError,
-    agent_runtime::AgentRequestCancelled,
+    ai::agent::AgentError,
+    ai::agent_runtime::AgentRequestCancelled,
     ai::{ContextWindowExceeded, IncompleteToolArguments},
 };
 
@@ -64,7 +64,7 @@ pub fn error_kind(error: &anyhow::Error) -> &'static str {
     if error.is::<crate::ai::ProviderTimeout>() {
         return "http_timeout";
     }
-    if let Some(error) = error.downcast_ref::<crate::translation::ResponseError>() {
+    if let Some(error) = error.downcast_ref::<crate::ai::translation::ResponseError>() {
         return error.kind();
     }
     if let Some(error) = error.downcast_ref::<AgentError>() {
@@ -196,8 +196,8 @@ mod tests {
             let wrapped = anyhow::Error::new(timeout).context("failed to read AI chat stream");
             assert_eq!(error_kind(&wrapped), "http_timeout", "{scope}");
             assert_eq!(
-                crate::job_diagnostics::classify_error(&wrapped),
-                crate::job_diagnostics::JobLogErrorKind::Timeout,
+                crate::ai::job_diagnostics::classify_error(&wrapped),
+                crate::ai::job_diagnostics::JobLogErrorKind::Timeout,
                 "{scope}"
             );
         }

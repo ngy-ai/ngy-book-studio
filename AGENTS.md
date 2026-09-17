@@ -248,7 +248,11 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   `translations.rs` 和
   `office_enhancements.rs`；跨表原子操作只放 `transactions.rs`，FTS 查询放
   `book_search.rs`，建表与完整性契约放 `schema.rs`。
-- `src/search.rs`、`src/indexing.rs`：作用域内 FTS5/`sqlite-vec` 精确 KNN、RRF 混合
+- `src/ai/`：AI 后端包。`mod.rs` 是 OpenAI-compatible 模型访问，`agent.rs`/`agent_runtime.rs`/
+  `agent_chat.rs`/`chat.rs` 是只读问答 Agent 与会话持久化，`search.rs`/`indexing.rs` 是检索与
+  索引/翻译后台任务，`translation.rs`/`credentials.rs`/`web_search.rs`/`ai_diagnostics.rs`/
+  `job_diagnostics.rs` 是分段协议、端点密钥、联网补充与诊断。
+- `src/ai/search.rs`、`src/ai/indexing.rs`：作用域内 FTS5/`sqlite-vec` 精确 KNN、RRF 混合
   召回，以及可恢复的 embedding/vision 后台任务。执行器固定启动
   `MAX_BACKGROUND_JOB_CONCURRENCY` 个 worker，只有序号小于当前并发的 worker 扫描队列，
   每个任务提交后按配置间隔休眠；两者由 AI 设置的「后台任务」窗口经
@@ -256,7 +260,7 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   同一个「任务并发」既是任务上限，也是**单个整本翻译的块窗口上限**：一轮里最多同时开
   `concurrency` 个文本块请求（`walk_translation_blocks` 的窗口，每轮重读设置，所以运行中
   调大只让 walk 走得更前、不打断任何在飞请求），因此一本翻译自己也会出现多个「处理中」。
-  `indexing.rs` 另实现整本图书翻译任务
+  `ai/indexing.rs` 另实现整本图书翻译任务
   `kind="translation"`：任务标识为 `translation:<source_id>:<target_language>`，游标用
   `next_ordinal` 记录「第一块尚未提交的文本块」，并按序调用对话模型 `chat_stream` 写入
   `translations` 表，可暂停/恢复/重试/取消；文本块按 `content_units.block_json` 的 `BlockDocument` 确定性
@@ -277,7 +281,7 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   原生 EPUB 必须从当前 source blob 用 `OpenedBook`/`load_resource` 提取实际阅读章节的
   body；校验 spine 数量、单元顺序与归属。不能用导入后的 AST 代替原生章节，它可能合并
   链接、span 或列表文字叶节点。其它格式使用规范化 HTML；解析在后台执行。
-  `src/translation.rs` 定义只含文字的分段协议：每次提供整段上下文与整数 ID，模型必须
+  `src/ai/translation.rs` 定义只含文字的分段协议：每次提供整段上下文与整数 ID，模型必须
   返回完整、唯一的 ID 集合；按原文顺序回排并恢复片段边界空白，不能用模型 HTML 替换正文。
   响应允许完整的前置 `<think>`、Markdown 围栏和说明文字包裹一个完整答案；规范外壳是
   `{"translations":[{"id":0,"text":"译文"}]}`。只有小模型丢掉该外壳时才把顶层片段对象本身或
@@ -413,7 +417,7 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   永远不算信号**：散文把引用写成 `He said "hello" to me.`，只看引号会把每段带引文的正文都
   留在原文；关键字同样必须与同一行的代码形状一起出现（英文句子也会以 `let`/`use` 开头）。
   代价是含代码字段名的散文段会被一起跳过（实测这本书 2961 个散文块里 3 个），保留原文
-  比送进模型更安全。**改动这套规则必须把 `indexing::TRANSLATION_BLOCKS_VERSION` 加一**：
+  比送进模型更安全。**改动这套规则必须把 `ai::indexing::TRANSLATION_BLOCKS_VERSION` 加一**：
   块数会变，旧游标的序号不再指向同一块，`JobCursor::from_job` 见到版本不符就把翻译任务
   退回书首重扫（已存译文仍按缓存键命中，重扫不花请求）。
   文本叶节点必须去掉 ECMAScript `\s`
@@ -462,14 +466,14 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   创建的 `visual-render:{source_id}` 任务会退回结构化 SVG 渲染。
   渲染器选择失败/未注册会在恢复期报「找不到当前来源所需的 renderer」，不要用
   `ngy-structural-png` 兜底掩盖 DjVu 页面缺失。
-- `src/ai.rs`、`src/credentials.rs`：OpenAI-compatible models/chat streaming/embeddings
+- `src/ai/mod.rs`、`src/ai/credentials.rs`：OpenAI-compatible models/chat streaming/embeddings
   接口、端点策略和 Windows Credential Manager 密钥存储。
   端点配置的“请求超时”不再作为 reqwest 的整段请求超时：`Client` 只保留 10 秒连接超时，
   非流式调用（models/embeddings）由 `within_request_timeout` 按总时长约束，流式回答由
   `ProviderTimeout::stream` 约束“两个数据块之间的静默”，因此持续输出数据的慢模型不会被
   中途掐断（2026-09-11：120 秒整段超时切掉了一条仍有 1579 个正文块、7024 字节正文、
   没有 `[DONE]` 的流，整本图书被判失败）。流的总规模仍由 `max_tokens`、32 MiB 字节上限和
-  65536 事件上限约束。`ProviderTimeout` 在 `ai_diagnostics` 中映射为固定分类
+  65536 事件上限约束。`ProviderTimeout` 在 `ai::ai_diagnostics` 中映射为固定分类
   `http_timeout`，后台任务日志与 UI 不因超时改在块间生效而出现新类别。
   `SseDiagnostics` 每 10 秒输出一条与内容无关的传输进度行（`sse_progress`：字节数、事件数、
   正文块数、空块数、距上次事件的时间、最大间隔），结束时不再只给分类计数。
@@ -479,7 +483,7 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   `HttpWebSearch::new_with_proxy` 的 `.no_proxy()` 客户端。代理是系统级偏好，因此**不进
   `ProviderConfig`**（endpoint 级结构，且被大量测试字面量构造）；两处客户端都只在保存设置
   时重建，开关对已发出的请求无效。
-- `src/agent.rs`、`src/agent_runtime.rs`、`src/agent_chat.rs`、`src/chat.rs`：只读 Agent
+- `src/ai/agent.rs`、`src/ai/agent_runtime.rs`、`src/ai/agent_chat.rs`、`src/ai/chat.rs`：只读 Agent
   工具、SSE/tool-call 循环、窗口授权范围、会话/消息/引用持久化与对话编排。
 - `src/office_com.rs`、`src/office_preview.rs`、`src/office_visual.rs`：可选 Office STA
   工作者、只读临时导出和持久视觉渲染器；原件禁用宏和外链更新，派生页按当前
@@ -522,7 +526,7 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   宽度（钳制在可读最小宽度与详情面板最小宽度之间，窗口缩小也不会挤压详情）；
   每页 12 项，按创建时间与 ID 稳定
   排序，2 秒轮询不改变搜索和筛选。切换库范围须立即清空旧数据并使迟到查询失效，日志
-  查询独立门控，不得串到其他任务。`src/job_diagnostics.rs` 将闭合事件枚举和数值指标
+  查询独立门控，不得串到其他任务。`src/ai/job_diagnostics.rs` 将闭合事件枚举和数值指标
   写到数据目录 `job-logs/` 的独立 SQLite，不改图书数据库结构；按规范库路径和任务 ID
   隔离，每任务 500 行、全库 50000 行、文件页数限制约 64 MiB。记录不依赖窗口打开，
   日志失败不得改变任务结果；不接受任意正文、URL 或错误字符串，不逐 token 记录。
@@ -538,7 +542,7 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   `error_kind`，否则头部失败行只剩位置。  `JobLogErrorKind::label()` 是闭合表的固定中文说明，
   只能用于呈现，不得改写成错误正文。
   文本块明细每行的“查看”按钮打开只读调试面板（`TranslationBlockDetail`）：它**不读**任何
-  持久化的请求副本——请求 body、系统提示与用户消息从不入库（见 `job_diagnostics.rs` 的闭合
+  持久化的请求副本——请求 body、系统提示与用户消息从不入库（见 `ai/job_diagnostics.rs` 的闭合
   事件约定），面板按被钉住的修订**重新解析文本块并按需重建** `translation_request`。
   因此 worker（`translate_block`）与检查器必须共用同一个 `translation_prompt()`，不得各写
   一份；`translation_request` 的温度固定为 `TRANSLATION_TEMPERATURE = 0.0`，两边一起生效。
@@ -689,8 +693,8 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   `a_second_writer_reports_the_lock_conflict_the_poller_retries` 钉住重试依赖的错误形状。
   加固后 42 次 6 进程并发运行全部通过（加固前同一实验 6 个进程里 2 个失败）。该套件当前为
   17 项运行 + 1 项需真实模型的忽略用例。同一轮加压后另观察到 `cargo test --lib` 的
-  `indexing::tests::vision_endpoint_switch_uses_new_provider_and_preserves_embedding_route`
-  等同类紧截止失败（`src/indexing.rs` 里 5 秒的「旧 vision 请求未开始」与 `wait_for_state`
+  `ai::indexing::tests::vision_endpoint_switch_uses_new_provider_and_preserves_embedding_route`
+  等同类紧截止失败（`src/ai/indexing.rs` 里 5 秒的「旧 vision 请求未开始」与 `wait_for_state`
   截止，3 次重跑里 1 次）：这是该模块测试自己的预算问题——整块测试并行，有些夹具还故意给
   提供方 5 秒延迟，5 秒预算等于和它要等的工作赛跑。已把这些进展等待统一为模块内的
   `TEST_PROGRESS_WAIT`（30 秒），`wait_for_state` 的失败信息补上任务 ID 与预算；6 个 flow
@@ -964,7 +968,7 @@ cargo run --locked --bin ngy-book-studio 2>&1 | Tee-Object -FilePath $aiLog
   分类/行/列。未知工具名和 provider 标识归一化；不记录提问、书名、正文、选区、
   回答、完整参数、引用 ID、密钥、HTTP headers 或端点路径/查询串。
 - 不逐 token 打日志。新增日志必须使用同一 target、继承异步 span，并经
-  `src/ai_diagnostics.rs` 的分类/摘要函数处理不可信值；不能直接格式化任意错误链。
+  `src/ai/ai_diagnostics.rs` 的分类/摘要函数处理不可信值；不能直接格式化任意错误链。
   HTTP/SSE 故障与日志脱敏回归位于 `tests/openai_compatible_flow.rs`。
 
 ### 导入诊断日志

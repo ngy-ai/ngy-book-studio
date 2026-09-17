@@ -5,7 +5,7 @@ use gpui_component::{
     text::{TextView, TextViewStyle},
 };
 use ngy_book_studio::{
-    agent::AgentAnswerSourceStatus,
+    ai::agent::AgentAnswerSourceStatus,
     ai::normalize_provider_base_url,
     document::{BookDocument, ContentUnit, DocumentLocator, Revision, SourceLocator},
     services::{ModelRole, ProviderSettings},

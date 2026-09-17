@@ -194,7 +194,7 @@ impl JobLogErrorKind {
 /// persist `Display`, a context message, an HTTP body or a URL.
 pub fn classify_error(error: &anyhow::Error) -> JobLogErrorKind {
     use JobLogErrorKind::*;
-    match crate::ai_diagnostics::error_kind(error) {
+    match crate::ai::ai_diagnostics::error_kind(error) {
         "database" => Database,
         "io" | "json_io" => Io,
         "http_timeout" | "tool_timeout" => Timeout,
@@ -377,7 +377,7 @@ pub fn record_for_database(
     {
         tracing::warn!(
             target: "ngy_ai",
-            error_kind = crate::ai_diagnostics::error_kind(&error),
+            error_kind = crate::ai::ai_diagnostics::error_kind(&error),
             "background job diagnostic could not be persisted"
         );
     }

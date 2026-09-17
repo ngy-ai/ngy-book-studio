@@ -3714,9 +3714,9 @@ mod tests {
                     model: "chat-model".to_string(),
                     source_text: "原文".to_string(),
                     translated_text: serde_json::to_string(
-                        &crate::translation::StoredTranslation {
+                        &crate::ai::translation::StoredTranslation {
                             execution_identity: "translation-v2:test".to_string(),
-                            segments: vec![crate::translation::TranslationSegment {
+                            segments: vec![crate::ai::translation::TranslationSegment {
                                 source: "原文".to_string(),
                                 translated: "译文".to_string(),
                             }],

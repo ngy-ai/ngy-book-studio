@@ -11,8 +11,8 @@
 //! chapter being read when new blocks land, so a finished chapter appears
 //! without switching away and back.
 use super::*;
+use ngy_book_studio::ai::translation::TranslationSegment;
 use ngy_book_studio::services::{BackgroundJobStatus, TranslatedBlock, TranslationDisplayMode};
-use ngy_book_studio::translation::TranslationSegment;
 
 /// Task kind of a whole-book translation job, as persisted in `index_jobs`.
 const TRANSLATION_JOB_KIND: &str = "translation";

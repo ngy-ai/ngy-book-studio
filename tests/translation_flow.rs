@@ -13,14 +13,14 @@ use std::{
 };
 
 use ngy_book_studio::{
-    credentials::MemoryCredentialStore,
-    job_diagnostics::JobLogErrorKind,
+    ai::credentials::MemoryCredentialStore,
+    ai::job_diagnostics::JobLogErrorKind,
+    ai::translation::TranslationSegment,
     library::ImportOutcome,
     services::{
         AppServices, BackgroundJobAction, BackgroundJobSnapshot, BackgroundJobStatus,
         ProviderSettings, TranslatedBlock,
     },
-    translation::TranslationSegment,
 };
 use serde_json::{Value, json};
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
@@ -1646,7 +1646,7 @@ fn one_untranslatable_block_is_skipped_and_the_run_continues() {
         assert_eq!(skipped[0].metrics.ordinal, Some(1));
         assert_eq!(
             skipped[0].level,
-            ngy_book_studio::job_diagnostics::JobLogLevel::Warning
+            ngy_book_studio::ai::job_diagnostics::JobLogLevel::Warning
         );
         for entry in &logs.entries {
             assert!(

@@ -9,9 +9,9 @@ use std::{
 use anyhow::{Context as _, Result, bail, ensure};
 use futures_util::{FutureExt as _, future::BoxFuture};
 
-pub use crate::agent::{SearchMode, SearchRequest};
+pub use crate::ai::agent::{SearchMode, SearchRequest};
 use crate::{
-    agent::{PassageRecord, SearchBackend},
+    ai::agent::{PassageRecord, SearchBackend},
     ai::{EmbeddingRequest, OpenAiCompatibleProvider},
     db::{connection, embeddings, search_chunks},
     document::{DocumentLocator, Revision, SourceLocator},

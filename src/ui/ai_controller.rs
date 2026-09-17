@@ -12,12 +12,12 @@ use std::{
 use anyhow::{Context as _, Result, bail};
 use gpui::{Context, Entity, Task};
 use ngy_book_studio::{
-    agent::{AgentAnswerSourceStatus, AgentCitation, SelectionSnapshot},
-    agent_chat::{AgentConversation, ConversationQuestion},
-    agent_runtime::{AgentCancellation, AgentRequestCancelled, AgentRunEvent},
     ai::ChatRole,
-    ai_diagnostics::error_kind,
-    chat::{ChatCitation, ChatSession, ChatThread, ChatWindowKind},
+    ai::agent::{AgentAnswerSourceStatus, AgentCitation, SelectionSnapshot},
+    ai::agent_chat::{AgentConversation, ConversationQuestion},
+    ai::agent_runtime::{AgentCancellation, AgentRequestCancelled, AgentRunEvent},
+    ai::ai_diagnostics::error_kind,
+    ai::chat::{ChatCitation, ChatSession, ChatThread, ChatWindowKind},
     document::{BookDocument, Revision, SourceLocator},
     services::AppServices,
 };
@@ -42,7 +42,7 @@ enum UiAgentMessage {
 }
 
 struct UiConversationAnswer {
-    answer: ngy_book_studio::agent_chat::ConversationAnswer,
+    answer: ngy_book_studio::ai::agent_chat::ConversationAnswer,
     sources: Vec<AiSourceLink>,
     source_status: AgentAnswerSourceStatus,
 }
@@ -1160,8 +1160,8 @@ mod tests {
         Block, BlockDocument, BookDocument, ContentUnit, ContentUnitKind, DocumentLocator, Revision,
     };
     use ngy_book_studio::{
-        agent::AgentCitationSourceKind,
-        chat::{ChatScope, ChatThread, NewChatMessage, NewChatThread, StoredChatMessage},
+        ai::agent::AgentCitationSourceKind,
+        ai::chat::{ChatScope, ChatThread, NewChatMessage, NewChatThread, StoredChatMessage},
         library::LibraryStore,
     };
     use std::{cell::RefCell, rc::Rc, time::Duration};

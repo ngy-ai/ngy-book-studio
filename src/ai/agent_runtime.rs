@@ -1,7 +1,7 @@
 //! OpenAI-compatible read-only agent execution.
 //!
 //! This module is the orchestration layer between the streaming provider and
-//! the three host-authorized tools from [`crate::agent`].  It never accepts a
+//! the three host-authorized tools from [`crate::ai::agent`].  It never accepts a
 //! database handle or a wider scope from the model.
 
 use std::{
@@ -20,20 +20,20 @@ use tokio::sync::{Notify, mpsc};
 use tracing::Instrument as _;
 
 use crate::{
-    agent::{
+    ai::agent::{
         AgentAnswer, AgentAnswerSourceStatus, AgentCitation, AgentLimits, AgentStreamAccumulator,
         AllowedBookScope, BookBackend, BookOutlineRecord, CitationRegistry, NO_SOURCE_MARKER,
         OutlineNodeRecord, OutlineRequest, PassageRecord, ReadOnlyAgent, ReadPassagesRequest,
         SearchBackend, SelectionSnapshot, WebSearchBackend, WebSearchRequest,
         agent_tool_definitions,
     },
+    ai::ai_diagnostics::{
+        ToolArgumentsSummary, error_kind, finish_reason_label, safe_label, tool_label,
+    },
     ai::{
         ChatEventStream, ChatGenerationSettings, ChatMessage, ChatRequest, ChatRole,
         ContextWindowExceeded, IncompleteToolArguments, MessageContent, OpenAiCompatibleProvider,
         ReasoningEffort,
-    },
-    ai_diagnostics::{
-        ToolArgumentsSummary, error_kind, finish_reason_label, safe_label, tool_label,
     },
     db,
     document::{DocumentLocator, Revision, SourceLocator},
@@ -1387,7 +1387,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        agent::{AgentAnswerSourceStatus, OutlineRequest, SearchRequest, WebSearchResult},
+        ai::agent::{AgentAnswerSourceStatus, OutlineRequest, SearchRequest, WebSearchResult},
         ai::{
             ChatEventStream, ChatStreamEvent, EmbeddingBatch, EmbeddingRequest, ModelInfo,
             ToolCallDelta,

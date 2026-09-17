@@ -7,8 +7,8 @@ use gpui::{
     Modifiers, Pixels, ScrollDelta, ScrollWheelEvent, TestAppContext, VisualTestContext, point,
 };
 use ngy_book_studio::{
-    credentials::MemoryCredentialStore,
-    job_diagnostics::{BackgroundJobLogEntry, JobLogLevel, JobLogMetrics},
+    ai::credentials::MemoryCredentialStore,
+    ai::job_diagnostics::{BackgroundJobLogEntry, JobLogLevel, JobLogMetrics},
     services::{BackgroundJobProgress, TranslationBlockRequest},
 };
 

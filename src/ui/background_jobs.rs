@@ -4,7 +4,9 @@ use gpui::{ClipboardItem, DragMoveEvent, EmptyView, Pixels, ScrollHandle};
 
 #[cfg(test)]
 mod layout_tests;
-use ngy_book_studio::job_diagnostics::{BackgroundJobLogSnapshot, JobLogErrorKind, JobLogEvent};
+use ngy_book_studio::ai::job_diagnostics::{
+    BackgroundJobLogSnapshot, JobLogErrorKind, JobLogEvent,
+};
 // Only the debug-panel test names the request payload type directly; the
 // production code reaches it through `TranslationBlockDetail::request`.
 #[cfg(test)]

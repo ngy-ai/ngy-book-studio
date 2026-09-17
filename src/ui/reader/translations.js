@@ -87,7 +87,7 @@
   // Unicode `Cf` format characters that ECMAScript `\s` does not cover. A leaf
   // made only of these (or of whitespace) has nothing to translate: the model
   // answers it with blanks and the whole block would be rejected. This list
-  // must stay identical to `translation::has_visible_text` in Rust, otherwise
+  // must stay identical to `ai::translation::has_visible_text` in Rust, otherwise
   // the two segment lists drift apart and the whole block keeps the original.
   const INVISIBLE = /[\u00ad\u0600-\u0605\u061c\u06dd\u070f\u0890-\u0891\u08e2\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u206f\ufff9-\ufffb\u{110bd}\u{110cd}\u{13430}-\u{1343f}\u{1bca0}-\u{1bca3}\u{1d173}-\u{1d17a}\u{e0001}\u{e0020}-\u{e007f}]/gu;
   const translatable = (value) =>

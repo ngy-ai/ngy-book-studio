@@ -14,11 +14,11 @@ use html5ever::{
 };
 use markup5ever_rcdom::{Handle, NodeData, RcDom, SerializableHandle};
 
+use crate::ai::translation::{TranslationSource, has_visible_text, normalize_source_text};
 use crate::document::{
     Block, BlockDocument, Inline, ListItem, MAX_DOCUMENT_DEPTH, TableCell, TableRow,
     deterministic_id, raw_html_plain_text,
 };
-use crate::translation::{TranslationSource, has_visible_text, normalize_source_text};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParsedSource {

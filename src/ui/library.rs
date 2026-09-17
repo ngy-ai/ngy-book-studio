@@ -3,12 +3,12 @@ use anyhow::ensure;
 use std::collections::HashMap;
 
 use ngy_book_studio::{
-    agent::PassageRecord,
+    ai::agent::PassageRecord,
+    ai::search::{SearchMode, SearchRequest},
     annotations::Annotation,
     document::{BookDocument, BookFormat, BookSource as CanonicalBookSource, DocumentLocator},
     office_com::OfficeCancellation,
     preview::VisualJobState,
-    search::{SearchMode, SearchRequest},
     services::{PublishedVisualPage, VisualPageSourceKind},
 };
 

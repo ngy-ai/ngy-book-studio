@@ -67,7 +67,7 @@ use gpui_component::{
 };
 use native_dialog::DialogBuilder;
 use ngy_book_studio::{
-    chat::ChatWindowKind,
+    ai::chat::ChatWindowKind,
     document::{BookDocument, BookFormat, BookSource as CanonicalBookSource, SourceLocator},
     export::ExportFormat,
     library::{BookGroup, BookRecord, CoverDraft, ImportOutcome, LibraryStore, SearchHit},

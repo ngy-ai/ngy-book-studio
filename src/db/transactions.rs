@@ -2892,9 +2892,9 @@ mod tests {
             source_language: Some("zh".to_string()),
             model: "chat-1".to_string(),
             source_text: "searchable document body".to_string(),
-            translated_text: serde_json::to_string(&crate::translation::StoredTranslation {
+            translated_text: serde_json::to_string(&crate::ai::translation::StoredTranslation {
                 execution_identity: execution_identity.to_string(),
-                segments: vec![crate::translation::TranslationSegment {
+                segments: vec![crate::ai::translation::TranslationSegment {
                     source: "searchable document body".to_string(),
                     translated: "译".to_string(),
                 }],
@@ -2973,7 +2973,7 @@ mod tests {
         let rows = translations::list_for_unit(&conn, "unit-1", "en").unwrap();
         assert_eq!(rows.len(), 1, "already translated blocks are kept");
         assert_eq!(rows[0].model, "chat-2");
-        let stored: crate::translation::StoredTranslation =
+        let stored: crate::ai::translation::StoredTranslation =
             serde_json::from_str(&rows[0].translated_text).unwrap();
         assert_eq!(stored.execution_identity, "translation-v2:new");
         assert_eq!(stored.segments[0].translated, "译");

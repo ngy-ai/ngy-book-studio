@@ -24,12 +24,12 @@ use serde::{Deserialize, Serialize};
 use tokio::{runtime::Handle, task::JoinHandle};
 
 use crate::{
+    ai::job_diagnostics::{JobLogEvent, JobLogMetrics, classify_error, record_for_database},
     db,
     document::{
         Block, BookDocument, ContentUnit, ContentUnitKind, DocumentLocator, Inline, Revision,
         SourceLocator, TableRow, deterministic_id,
     },
-    job_diagnostics::{JobLogEvent, JobLogMetrics, classify_error, record_for_database},
 };
 
 pub const PDFJS_VERSION: &str = "5.7.284";

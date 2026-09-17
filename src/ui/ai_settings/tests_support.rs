@@ -6,7 +6,7 @@
 use super::*;
 
 use gpui::{Focusable as _, Modifiers, TestAppContext, VisualTestContext};
-use ngy_book_studio::credentials::MemoryCredentialStore;
+use ngy_book_studio::ai::credentials::MemoryCredentialStore;
 
 pub(super) fn open_settings_view<V: SettingsWindowView>(
     cx: &mut TestAppContext,

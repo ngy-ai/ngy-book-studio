@@ -8,7 +8,7 @@ use super::{
 use anyhow::ensure;
 use gpui::{DragMoveEvent, EmptyView, Pixels};
 use ngy_book_studio::{
-    chat::ChatWindowKind,
+    ai::chat::ChatWindowKind,
     document::{BookDocument, DocumentLocator, SourceLocator},
     media::MediaService,
     reader::{

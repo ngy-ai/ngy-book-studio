@@ -17,16 +17,16 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tracing::Instrument as _;
 
 use crate::{
-    agent::{AgentAnswer, SearchBackend, SelectionSnapshot},
-    agent_runtime::{
+    ai::agent::{AgentAnswer, SearchBackend, SelectionSnapshot},
+    ai::agent_runtime::{
         AgentCancellation, AgentQuestion, AgentRequestCancelled, AgentRunEvent, AgentRuntime,
     },
-    ai::{ChatMessage, ChatRole},
-    ai_diagnostics::error_kind,
-    chat::{
+    ai::ai_diagnostics::error_kind,
+    ai::chat::{
         ChatRepository, ChatScope, ChatSession, ChatThread, ChatWindowKind, NewChatCitation,
         NewChatMessage, NewChatThread, StoredChatMessage,
     },
+    ai::{ChatMessage, ChatRole},
     document::{DocumentLocator, SourceLocator},
     library::LibraryStore,
     services::{AiRequestSnapshot, AppServices},

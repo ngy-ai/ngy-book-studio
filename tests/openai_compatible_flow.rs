@@ -9,18 +9,18 @@ use std::{
 use anyhow::Result;
 use futures_util::{FutureExt as _, StreamExt as _, future::BoxFuture};
 use ngy_book_studio::{
-    agent::{
+    ai::agent::{
         AgentAnswerSourceStatus, AgentLimits, BookBackend, BookOutlineRecord, OutlineRequest,
         PassageRecord, ReadPassagesRequest, SearchBackend, SearchMode, SearchRequest,
     },
-    agent_chat::{AgentConversation, ConversationQuestion},
-    agent_runtime::{AgentCancellation, AgentQuestion, AgentRunEvent, AgentRuntime},
+    ai::agent_chat::{AgentConversation, ConversationQuestion},
+    ai::agent_runtime::{AgentCancellation, AgentQuestion, AgentRunEvent, AgentRuntime},
+    ai::chat::ChatWindowKind,
+    ai::credentials::MemoryCredentialStore,
     ai::{
         ChatGenerationSettings, ChatMessage, ChatRequest, ChatRole, EmbeddingRequest,
         OpenAiCompatibleProvider, OpenAiHttpProvider, ProviderConfig,
     },
-    chat::ChatWindowKind,
-    credentials::MemoryCredentialStore,
     document::{DocumentLocator, Revision},
     services::{ApiKeyUpdate, AppServices, ProviderSettings},
 };

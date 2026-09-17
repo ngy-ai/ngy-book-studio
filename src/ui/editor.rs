@@ -8,7 +8,7 @@ use super::{
 };
 use gpui::{Pixels, PromptButton, PromptLevel};
 use ngy_book_studio::{
-    chat::ChatWindowKind,
+    ai::chat::ChatWindowKind,
     document::{
         AssetRef, AssetRole, Block, BookDocument, BookFormat, BookSource, ContentUnitKind, Inline,
         Revision, TocNode, deterministic_id,

@@ -11,10 +11,10 @@ use std::{
 };
 
 use ngy_book_studio::{
-    agent::{AgentAnswerSourceStatus, SearchMode, SearchRequest},
-    agent_chat::{AgentConversation, ConversationQuestion},
-    chat::ChatWindowKind,
-    credentials::MemoryCredentialStore,
+    ai::agent::{AgentAnswerSourceStatus, SearchMode, SearchRequest},
+    ai::agent_chat::{AgentConversation, ConversationQuestion},
+    ai::chat::ChatWindowKind,
+    ai::credentials::MemoryCredentialStore,
     services::{
         ApiKeyUpdate, AppServices, BackgroundJobStatus, EndpointSettings, ModelRole,
         ProviderSettings,

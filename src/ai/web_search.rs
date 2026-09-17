@@ -17,7 +17,7 @@ use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::{Client, Method, Url};
 use serde::Deserialize;
 
-use crate::agent::{WebSearchBackend, WebSearchRequest, WebSearchResult};
+use crate::ai::agent::{WebSearchBackend, WebSearchRequest, WebSearchResult};
 
 pub const DEFAULT_WEB_SEARCH_TIMEOUT_SECS: u64 = 20;
 pub const MIN_WEB_SEARCH_TIMEOUT_SECS: u64 = 1;

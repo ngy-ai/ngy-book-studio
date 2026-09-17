@@ -1679,7 +1679,7 @@ impl ToolCallDeltaAccumulator {
             };
             let parsed: Value = serde_json::from_str(&arguments).map_err(|error| {
                 tracing::warn!(target: "ngy_ai", stage = "tool_arguments_json",
-                    tool = crate::ai_diagnostics::tool_label(&call.name),
+                    tool = crate::ai::ai_diagnostics::tool_label(&call.name),
                     argument_bytes = arguments.len(), json_category = ?error.classify(),
                     json_line = error.line(), json_column = error.column(),
                     "AI streamed tool arguments are invalid JSON");
@@ -1687,8 +1687,8 @@ impl ToolCallDeltaAccumulator {
             })?;
             if !parsed.is_object() {
                 tracing::warn!(target: "ngy_ai", stage = "tool_arguments_shape",
-                    tool = crate::ai_diagnostics::tool_label(&call.name),
-                    arguments = ?crate::ai_diagnostics::ToolArgumentsSummary::new(&arguments),
+                    tool = crate::ai::ai_diagnostics::tool_label(&call.name),
+                    arguments = ?crate::ai::ai_diagnostics::ToolArgumentsSummary::new(&arguments),
                     "AI streamed tool arguments are not an object");
                 return Err(AgentError::StreamProtocol(
                     "tool arguments must be a JSON object".to_string(),

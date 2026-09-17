@@ -1,8 +1,21 @@
-//! OpenAI-compatible model access.
+//! AI backend: OpenAI-compatible model access plus the read-only Q&A agent,
+//! its conversation store, retrieval/grounding and the durable AI workers.
 //!
 //! The domain and UI only depend on [`OpenAiCompatibleProvider`].  In
 //! particular, nothing in this module assumes that the endpoint is Ollama;
 //! Ollama is merely the safe, loopback default.
+
+pub mod agent;
+pub mod agent_chat;
+pub mod agent_runtime;
+pub mod ai_diagnostics;
+pub mod chat;
+pub mod credentials;
+pub mod indexing;
+pub mod job_diagnostics;
+pub mod search;
+pub mod translation;
+pub mod web_search;
 
 use std::{
     fmt,
@@ -18,7 +31,7 @@ use reqwest::{Client, Response, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use tracing::Instrument as _;
 
-use crate::ai_diagnostics::{error_kind, finish_reason_label, safe_label, tool_label};
+use crate::ai::ai_diagnostics::{error_kind, finish_reason_label, safe_label, tool_label};
 
 pub const DEFAULT_OLLAMA_OPENAI_BASE_URL: &str = "http://127.0.0.1:11434/v1/";
 pub const DEFAULT_AI_REQUEST_TIMEOUT_SECS: u64 = 120;
@@ -1694,12 +1707,15 @@ mod tests {
             )
         );
         let error = anyhow::Error::new(error).context("failed to start AI response stream");
-        assert_eq!(crate::ai_diagnostics::error_kind(&error), "http_rejected");
-        let metrics = crate::job_diagnostics::JobLogMetrics::for_error(&error);
+        assert_eq!(
+            crate::ai::ai_diagnostics::error_kind(&error),
+            "http_rejected"
+        );
+        let metrics = crate::ai::job_diagnostics::JobLogMetrics::for_error(&error);
         assert_eq!(metrics.http_status, Some(503));
         assert_eq!(
             metrics.error_kind,
-            Some(crate::job_diagnostics::JobLogErrorKind::Provider)
+            Some(crate::ai::job_diagnostics::JobLogErrorKind::Provider)
         );
         let serialized = serde_json::to_string(&metrics).unwrap();
         assert!(!serialized.contains(private_detail));

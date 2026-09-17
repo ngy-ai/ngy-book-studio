@@ -18,8 +18,8 @@ use anyhow::{Context as _, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    agent::AgentCitationSourceKind,
     ai::ChatRole,
+    ai::agent::AgentCitationSourceKind,
     db,
     document::{DocumentLocator, Revision, SourceLocator, deterministic_id},
     runtime::IoRuntime,

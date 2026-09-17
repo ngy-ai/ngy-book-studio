@@ -18,11 +18,11 @@ use std::{
 use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 
-pub use crate::indexing::{
+pub use crate::ai::indexing::{
     TranslationBlockDetail, TranslationBlockInfo, TranslationBlockList, TranslationBlockProbe,
     TranslationBlockRequest,
 };
-pub use crate::job_diagnostics::{
+pub use crate::ai::job_diagnostics::{
     BACKGROUND_JOB_LOG_LIMIT, BackgroundJobLogEntry, BackgroundJobLogSnapshot, JobLogLevel,
 };
 
@@ -32,17 +32,19 @@ use crate::office_visual::{OFFICE_ENHANCED_RENDERER_NAME, OfficeEnhancedRenderer
 #[cfg(target_os = "windows")]
 use crate::windows_pdf_renderer::WindowsPdfRenderer;
 use crate::{
-    agent::WebSearchBackend,
+    ai::agent::WebSearchBackend,
+    ai::chat::ChatRepository,
+    ai::credentials::{CredentialStore, SystemCredentialStore},
+    ai::indexing::{IndexingCoordinator, IndexingJobStatus, IndexingModelConfig},
+    ai::search::SearchService,
+    ai::web_search::{HttpWebSearch, WebSearchConfig, normalize_web_endpoint},
     ai::{
         ChatGenerationSettings, DEFAULT_AI_REQUEST_TIMEOUT_SECS, DEFAULT_AI_USE_PROXY,
         DEFAULT_OLLAMA_OPENAI_BASE_URL, ModelInfo, OpenAiCompatibleProvider, OpenAiHttpProvider,
         ProviderConfig, normalize_provider_base_url,
     },
-    chat::ChatRepository,
-    credentials::{CredentialStore, SystemCredentialStore},
     db,
     formats::FormatRegistry,
-    indexing::{IndexingCoordinator, IndexingJobStatus, IndexingModelConfig},
     library::{LibraryStore, reclaim_unreferenced_blobs},
     office_com::{OfficeComWorker, OfficeEnhancer},
     preview::{
@@ -52,10 +54,8 @@ use crate::{
         office_preview_unit_id,
     },
     runtime::IoRuntime,
-    search::SearchService,
     storage::{BlobKey, BlobPublicationLock, BlobStore, LocalBlobStore},
     theme::Appearance,
-    web_search::{HttpWebSearch, WebSearchConfig, normalize_web_endpoint},
 };
 
 const OBJECT_DIRECTORY: &str = "objects";
@@ -528,11 +528,11 @@ fn default_web_search_method() -> String {
 }
 
 fn default_web_search_timeout_secs() -> u64 {
-    crate::web_search::DEFAULT_WEB_SEARCH_TIMEOUT_SECS
+    crate::ai::web_search::DEFAULT_WEB_SEARCH_TIMEOUT_SECS
 }
 
 fn default_web_search_max_results() -> usize {
-    crate::web_search::MAX_WEB_SEARCH_RESULTS
+    crate::ai::web_search::MAX_WEB_SEARCH_RESULTS
 }
 
 impl Default for ProviderSettings {
@@ -565,8 +565,8 @@ impl Default for ProviderSettings {
             web_search_remote_confirmed: false,
             web_search_allow_insecure_http: false,
             web_search_confirmed_remote_endpoint: String::new(),
-            web_search_timeout_secs: crate::web_search::DEFAULT_WEB_SEARCH_TIMEOUT_SECS,
-            web_search_max_results: crate::web_search::MAX_WEB_SEARCH_RESULTS,
+            web_search_timeout_secs: crate::ai::web_search::DEFAULT_WEB_SEARCH_TIMEOUT_SECS,
+            web_search_max_results: crate::ai::web_search::MAX_WEB_SEARCH_RESULTS,
         }
     }
 }
@@ -755,7 +755,7 @@ pub struct BackgroundJobSnapshot {
 pub struct TranslatedBlock {
     pub key: String,
     pub source: String,
-    pub segments: Vec<crate::translation::TranslationSegment>,
+    pub segments: Vec<crate::ai::translation::TranslationSegment>,
     pub manual: bool,
 }
 
@@ -1221,8 +1221,10 @@ impl AppServices {
                         // endpoint produced the machine text behind it: the reader
                         // wrote it, and a model change must not hide it.
                         let manual = row.manual_text.as_deref().and_then(|manual| {
-                            serde_json::from_str::<crate::translation::StoredTranslation>(manual)
-                                .ok()
+                            serde_json::from_str::<crate::ai::translation::StoredTranslation>(
+                                manual,
+                            )
+                            .ok()
                         });
                         if let Some(translation) = manual {
                             return Some(TranslatedBlock {
@@ -1236,7 +1238,7 @@ impl AppServices {
                             return None;
                         }
                         let translation = serde_json::from_str::<
-                            crate::translation::StoredTranslation,
+                            crate::ai::translation::StoredTranslation,
                         >(&row.translated_text)
                         .ok()?;
                         if translation.execution_identity != execution_identity {
@@ -1268,7 +1270,7 @@ impl AppServices {
         book_id: String,
         content_unit_id: String,
         block_id: String,
-        segments: Option<Vec<crate::translation::TranslationSegment>>,
+        segments: Option<Vec<crate::ai::translation::TranslationSegment>>,
     ) -> Result<()> {
         ensure!(!book_id.trim().is_empty(), "图书 ID 不能为空");
         ensure!(!content_unit_id.trim().is_empty(), "内容单元 ID 不能为空");
@@ -1304,14 +1306,13 @@ impl AppServices {
                 let manual_text = match segments {
                     None => None,
                     Some(segments) => {
-                        let machine =
-                            serde_json::from_str::<crate::translation::StoredTranslation>(
-                                &row.translated_text,
-                            )
-                            .context("该文本块的机器译文不可用，无法保存手工译文")?;
+                        let machine = serde_json::from_str::<
+                            crate::ai::translation::StoredTranslation,
+                        >(&row.translated_text)
+                        .context("该文本块的机器译文不可用，无法保存手工译文")?;
                         let segments = manual_translation_segments(&machine, &segments)?;
                         Some(
-                            serde_json::to_string(&crate::translation::StoredTranslation {
+                            serde_json::to_string(&crate::ai::translation::StoredTranslation {
                                 execution_identity: machine.execution_identity,
                                 segments,
                             })
@@ -2216,7 +2217,8 @@ impl AppServices {
                     book_ids.iter().any(|book_id| book_id == &job.book_id),
                     "后台任务不在当前图书范围内"
                 );
-                crate::job_diagnostics::JobDiagnosticStore::for_database(&db_path)?.read(&job_id)
+                crate::ai::job_diagnostics::JobDiagnosticStore::for_database(&db_path)?
+                    .read(&job_id)
             })
             .await
             .context("后台任务日志查询线程异常退出")?
@@ -2904,7 +2906,7 @@ fn indexing_model_config(settings: &ProviderSettings) -> Result<IndexingModelCon
 /// Shape check for one manual edit request, applied before any database work so
 /// an oversized or empty payload never reaches a translation row.
 fn validate_manual_translation_segments(
-    segments: &[crate::translation::TranslationSegment],
+    segments: &[crate::ai::translation::TranslationSegment],
 ) -> Result<()> {
     ensure!(!segments.is_empty(), "手工译文不能为空");
     ensure!(
@@ -2937,9 +2939,9 @@ fn validate_manual_translation_segments(
 /// reading window may replace the translation, never the segment shape or the
 /// original text a translation is attached to.
 fn manual_translation_segments(
-    machine: &crate::translation::StoredTranslation,
-    submitted: &[crate::translation::TranslationSegment],
-) -> Result<Vec<crate::translation::TranslationSegment>> {
+    machine: &crate::ai::translation::StoredTranslation,
+    submitted: &[crate::ai::translation::TranslationSegment],
+) -> Result<Vec<crate::ai::translation::TranslationSegment>> {
     ensure!(
         machine.segments.len() == submitted.len(),
         "该文本块的原文结构已改变，无法保存手工译文"
@@ -2955,7 +2957,7 @@ fn manual_translation_segments(
                 "第 {} 段译文的原文已改变，无法保存手工译文",
                 index + 1
             );
-            Ok(crate::translation::TranslationSegment {
+            Ok(crate::ai::translation::TranslationSegment {
                 source: stored.source.clone(),
                 translated: submitted.translated.trim().to_string(),
             })
@@ -2970,7 +2972,7 @@ fn translation_execution_identity(settings: &ProviderSettings) -> Result<String>
     let endpoint = normalize_provider_base_url(&settings.endpoint_for(ModelRole::Chat)?.base_url)?;
     Ok(format!(
         "{}:{}",
-        crate::translation::EXECUTION_IDENTITY_PROTOCOL,
+        crate::ai::translation::EXECUTION_IDENTITY_PROTOCOL,
         blake3::hash(format!("{}\0{}", endpoint.as_str(), settings.chat_model).as_bytes()).to_hex()
     ))
 }
@@ -3531,7 +3533,7 @@ fn visual_page_row(
 mod tests {
     use super::*;
     use crate::{
-        ai::DEFAULT_OLLAMA_OPENAI_BASE_URL, credentials::MemoryCredentialStore,
+        ai::DEFAULT_OLLAMA_OPENAI_BASE_URL, ai::credentials::MemoryCredentialStore,
         library::ImportOutcome, preview::VisualJobState,
     };
     #[cfg(target_os = "windows")]
@@ -3776,9 +3778,9 @@ mod tests {
             .unwrap();
 
         let stored = |identity: &str, block_id: &str, translated: String| {
-            serde_json::to_string(&crate::translation::StoredTranslation {
+            serde_json::to_string(&crate::ai::translation::StoredTranslation {
                 execution_identity: identity.to_string(),
-                segments: vec![crate::translation::TranslationSegment {
+                segments: vec![crate::ai::translation::TranslationSegment {
                     source: format!("source-{block_id}"),
                     translated,
                 }],
@@ -3825,7 +3827,10 @@ mod tests {
                 .unwrap();
             }
         };
-        let stale = format!("{}:stale", crate::translation::EXECUTION_IDENTITY_PROTOCOL);
+        let stale = format!(
+            "{}:stale",
+            crate::ai::translation::EXECUTION_IDENTITY_PROTOCOL
+        );
 
         // 同一模型同一身份：手工与机器各行其是。
         write(
@@ -4855,7 +4860,7 @@ mod tests {
 
     #[test]
     fn background_job_logs_enforce_book_scope_and_job_existence() {
-        use crate::job_diagnostics::{JobLogEvent, JobLogMetrics, record_for_database};
+        use crate::ai::job_diagnostics::{JobLogEvent, JobLogMetrics, record_for_database};
 
         let temp = tempfile::tempdir().unwrap();
         let services = AppServices::open_with_credentials(
