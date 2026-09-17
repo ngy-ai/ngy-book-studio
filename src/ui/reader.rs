@@ -1096,13 +1096,21 @@ impl Render for ReaderApp {
         };
         let (status_icon, status_text, status_color) =
             if self.closing || self.webview_build_gate.close_requested {
-                (IconName::BookOpen, "正在安全关闭阅读器…", palette(cx).accent)
+                (
+                    IconName::BookOpen,
+                    "正在安全关闭阅读器…",
+                    palette(cx).accent,
+                )
             } else if self.webview_build_gate.building {
                 (IconName::BookOpen, "正在创建正文视图…", palette(cx).accent)
             } else if self.webview.is_some() {
                 (IconName::CircleCheck, "正文视图已连接", 0x376441)
             } else {
-                (IconName::TriangleAlert, "正文视图不可用", palette(cx).danger)
+                (
+                    IconName::TriangleAlert,
+                    "正文视图不可用",
+                    palette(cx).danger,
+                )
             };
         let reader_summary = format!("第 {} / {} 章 · {chapter_label}", current + 1, total);
         let reader_context = if self.search_query.is_empty() {
@@ -1176,9 +1184,17 @@ impl Render for ReaderApp {
             .border_color(rgb(palette(cx).border))
             .when_some(self.notice.as_ref(), |toolbar, notice| {
                 let (background, foreground, icon) = if notice.error {
-                    (rgb(palette(cx).danger_soft), rgb(palette(cx).danger), IconName::TriangleAlert)
+                    (
+                        rgb(palette(cx).danger_soft),
+                        rgb(palette(cx).danger),
+                        IconName::TriangleAlert,
+                    )
                 } else {
-                    (rgb(palette(cx).success_soft), rgb(palette(cx).success), IconName::CircleCheck)
+                    (
+                        rgb(palette(cx).success_soft),
+                        rgb(palette(cx).success),
+                        IconName::CircleCheck,
+                    )
                 };
                 toolbar.child(
                     div()
@@ -1255,11 +1271,13 @@ impl Render for ReaderApp {
                                         });
                                     }),
                             )
-                            .child(div().mr_2().text_xs().text_color(rgb(palette(cx).muted)).child(format!(
-                                "{} / {}",
-                                current + 1,
-                                total
-                            )))
+                            .child(
+                                div()
+                                    .mr_2()
+                                    .text_xs()
+                                    .text_color(rgb(palette(cx).muted))
+                                    .child(format!("{} / {}", current + 1, total)),
+                            )
                             .child(
                                 Button::new("previous-chapter")
                                     .ghost()
@@ -1284,11 +1302,12 @@ impl Render for ReaderApp {
                     ),
             )
             .child(
-                div()
-                    .h(px(3.))
-                    .w_full()
-                    .bg(rgb(palette(cx).border))
-                    .child(div().h_full().w(gpui::relative(progress)).bg(rgb(palette(cx).accent))),
+                div().h(px(3.)).w_full().bg(rgb(palette(cx).border)).child(
+                    div()
+                        .h_full()
+                        .w(gpui::relative(progress))
+                        .bg(rgb(palette(cx).accent)),
+                ),
             );
 
         let navigation_items = if self.search_query.is_empty() {
@@ -1322,7 +1341,11 @@ impl Render for ReaderApp {
                                     .text_left()
                                     .text_sm()
                                     .line_clamp(2)
-                                    .text_color(if selected { rgb(palette(cx).accent) } else { rgb(palette(cx).ink) })
+                                    .text_color(if selected {
+                                        rgb(palette(cx).accent)
+                                    } else {
+                                        rgb(palette(cx).ink)
+                                    })
                                     .child(item.label.clone()),
                             )
                             .into_any_element()
@@ -1765,7 +1788,11 @@ impl ReaderApp {
                 div()
                     .h_full()
                     .w(px(if active { 2. } else { 1. }))
-                    .bg(rgb(if active { palette(cx).accent } else { palette(cx).border })),
+                    .bg(rgb(if active {
+                        palette(cx).accent
+                    } else {
+                        palette(cx).border
+                    })),
             )
             .hover(|this| this.bg(rgb(palette(cx).accent_soft)))
             .on_drag_move(cx.listener(

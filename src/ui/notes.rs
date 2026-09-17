@@ -563,7 +563,12 @@ impl NotesWindow {
                     .min_w(px(0.))
                     .gap_1()
                     .child(div().text_lg().font_semibold().child(title))
-                    .child(div().text_sm().text_color(rgb(palette(cx).muted)).child(subtitle)),
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(palette(cx).muted))
+                            .child(subtitle),
+                    ),
             )
             .child(
                 Button::new("notes-refresh")
@@ -619,11 +624,16 @@ impl NotesWindow {
                     .justify_between()
                     .gap_2()
                     .child(filters)
-                    .child(div().text_xs().text_color(rgb(palette(cx).muted)).child(format!(
-                        "{} 条笔记 · {} 本图书",
-                        self.listing.notes.len(),
-                        self.listing.book_count
-                    ))),
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(palette(cx).muted))
+                            .child(format!(
+                                "{} 条笔记 · {} 本图书",
+                                self.listing.notes.len(),
+                                self.listing.book_count
+                            )),
+                    ),
             )
             .into_any_element()
     }
@@ -792,10 +802,15 @@ impl NotesWindow {
             .bg(rgb(palette(cx).surface))
             .border_t_1()
             .border_color(rgb(palette(cx).border))
-            .child(div().text_xs().text_color(rgb(palette(cx).muted)).child(format!(
-                "找到 {} 条 · 最近更新在前",
-                self.listing.filtered.len()
-            )))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(palette(cx).muted))
+                    .child(format!(
+                        "找到 {} 条 · 最近更新在前",
+                        self.listing.filtered.len()
+                    )),
+            )
             .child(
                 div()
                     .h_flex()
@@ -950,7 +965,12 @@ fn render_note_thought(
             }
             ThoughtPart::Table { rows, nested } => {
                 if *nested {
-                    body = body.child(div().text_xs().text_color(rgb(palette(cx).muted)).child("完整表格"));
+                    body = body.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(palette(cx).muted))
+                            .child("完整表格"),
+                    );
                 }
                 body = body.child(render_note_table(&part_id, rows, width, window, cx));
             }
@@ -990,7 +1010,9 @@ fn render_note_table(
             .flex_row()
             .w(table_width)
             .flex_shrink_0()
-            .when(row_index == 0, |line| line.bg(rgb(palette(cx).sidebar)).font_semibold())
+            .when(row_index == 0, |line| {
+                line.bg(rgb(palette(cx).sidebar)).font_semibold()
+            })
             .when(row_index + 1 < rows.len(), |line| {
                 line.border_b_1().border_color(rgb(palette(cx).border))
             });

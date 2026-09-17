@@ -1272,7 +1272,9 @@ impl LearningWindow {
         .justify_start()
         .label(document.title())
         .when(self.study_pane == StudyPane::Document(document), |button| {
-            button.bg(rgb(palette(cx).accent_soft)).text_color(rgb(palette(cx).accent_strong))
+            button
+                .bg(rgb(palette(cx).accent_soft))
+                .text_color(rgb(palette(cx).accent_strong))
         })
         .disabled(self.busy() || (document == CourseDocument::Answers && self.inputs_disabled()))
         .on_click(move |_, _, cx| {
@@ -1432,7 +1434,9 @@ impl LearningWindow {
                     .justify_start()
                     .label(lesson.title.clone())
                     .when(selected, |button| {
-                        button.bg(rgb(palette(cx).accent_soft)).text_color(rgb(palette(cx).accent_strong))
+                        button
+                            .bg(rgb(palette(cx).accent_soft))
+                            .text_color(rgb(palette(cx).accent_strong))
                     })
                     .disabled(self.inputs_disabled())
                     .on_click(move |_, _, cx| {
@@ -1488,13 +1492,18 @@ impl LearningWindow {
                             .into_iter()
                             .map(|chapter| self.render_document_button(chapter, cx)),
                     )
-                    .child(div().px_2().py_3().text_xs().text_color(rgb(palette(cx).muted)).child(
-                        if self.service.chapter() == 1 {
-                            "第1章 · 六步练习".to_string()
-                        } else {
-                            format!("第{}章 · 练习任务", self.service.chapter())
-                        },
-                    ))
+                    .child(
+                        div()
+                            .px_2()
+                            .py_3()
+                            .text_xs()
+                            .text_color(rgb(palette(cx).muted))
+                            .child(if self.service.chapter() == 1 {
+                                "第1章 · 六步练习".to_string()
+                            } else {
+                                format!("第{}章 · 练习任务", self.service.chapter())
+                            }),
+                    )
                     .child(steps)
                     .child(
                         div()
@@ -1541,7 +1550,9 @@ impl LearningWindow {
                     .ghost()
                     .label(label)
                     .when(selected, |button| {
-                        button.bg(rgb(palette(cx).accent_soft)).text_color(rgb(palette(cx).accent_strong))
+                        button
+                            .bg(rgb(palette(cx).accent_soft))
+                            .text_color(rgb(palette(cx).accent_strong))
                     })
                     .on_click(move |_, _, cx| {
                         view.update(cx, |this, cx| {
@@ -1744,12 +1755,17 @@ impl LearningWindow {
                         });
                     }),
             )
-            .child(div().text_xs().text_color(rgb(palette(cx).muted)).child(format!(
-                "第{}章 · 第 {} / {} 节",
-                self.service.chapter(),
-                self.selected_lesson + 1,
-                self.lessons.len(),
-            )))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(palette(cx).muted))
+                    .child(format!(
+                        "第{}章 · 第 {} / {} 节",
+                        self.service.chapter(),
+                        self.selected_lesson + 1,
+                        self.lessons.len(),
+                    )),
+            )
             .child(
                 Button::new("learning-next-lesson")
                     .debug_selector(|| "learning-next-lesson".into())
@@ -2038,7 +2054,9 @@ impl LearningWindow {
                     .small()
                     .label(label)
                     .when(self.implementation == id, |button| {
-                        button.bg(rgb(palette(cx).accent_soft)).text_color(rgb(palette(cx).accent_strong))
+                        button
+                            .bg(rgb(palette(cx).accent_soft))
+                            .text_color(rgb(palette(cx).accent_strong))
                     })
                     .disabled(disabled)
                     .on_click(move |_, _, cx| {
@@ -2128,7 +2146,9 @@ impl LearningWindow {
                     .ghost()
                     .label(label)
                     .when(self.evidence_pane == pane, |button| {
-                        button.bg(rgb(palette(cx).accent_soft)).text_color(rgb(palette(cx).accent_strong))
+                        button
+                            .bg(rgb(palette(cx).accent_soft))
+                            .text_color(rgb(palette(cx).accent_strong))
                     })
                     .on_click(move |_, _, cx| {
                         view.update(cx, |this, cx| {
@@ -2317,12 +2337,17 @@ impl LearningWindow {
             .gap_2()
             .p_3()
             .child(div().text_sm().font_semibold().child("本次作答快照 · 只读"))
-            .child(div().text_xs().text_color(rgb(palette(cx).muted)).child(format!(
-                "{} · {} · {}",
-                implementation_label(self.service.chapter(), &workspace.implementation),
-                scenario_label(self.service.chapter(), &workspace.scenario),
-                help,
-            )))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(palette(cx).muted))
+                    .child(format!(
+                        "{} · {} · {}",
+                        implementation_label(self.service.chapter(), &workspace.implementation),
+                        scenario_label(self.service.chapter(), &workspace.scenario),
+                        help,
+                    )),
+            )
             .child(
                 div()
                     .text_xs()
@@ -2380,7 +2405,9 @@ impl LearningWindow {
                         self.omitted_traces + index + 1,
                         short_text(&event.label, 36)
                     ))
-                    .when(index == selected, |button| button.bg(rgb(palette(cx).accent_soft)))
+                    .when(index == selected, |button| {
+                        button.bg(rgb(palette(cx).accent_soft))
+                    })
                     .on_click(move |_, _, cx| {
                         view.update(cx, |this, cx| {
                             this.trace_selected = Some(index);
@@ -2399,9 +2426,14 @@ impl LearningWindow {
             .gap_2()
             .p_3()
             .when(self.omitted_traces > 0, |panel| {
-                panel.child(div().text_xs().text_color(rgb(palette(cx).muted)).child(format!(
-                    "当前显示最近 {MAX_VISIBLE_TRACES} 条；完整报告保留更早事件。"
-                )))
+                panel.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(palette(cx).muted))
+                        .child(format!(
+                            "当前显示最近 {MAX_VISIBLE_TRACES} 条；完整报告保留更早事件。"
+                        )),
+                )
             })
             .child(events)
             .child(
@@ -2479,7 +2511,11 @@ impl LearningWindow {
                     .gap_1p5()
                     .p_3()
                     .border_1()
-                    .border_color(rgb(if selected { palette(cx).accent } else { palette(cx).border }))
+                    .border_color(rgb(if selected {
+                        palette(cx).accent
+                    } else {
+                        palette(cx).border
+                    }))
                     .rounded(px(8.))
                     .bg(rgb(palette(cx).surface))
                     .child(div().text_sm().font_semibold().child(format!(
@@ -2487,11 +2523,12 @@ impl LearningWindow {
                         implementation_label(self.service.chapter(), &entry.implementation),
                         scenario_label(self.service.chapter(), &entry.scenario)
                     )))
-                    .child(div().text_xs().text_color(rgb(palette(cx).muted)).child(run_label(
-                        &entry.status,
-                        entry.passed,
-                        entry.imported,
-                    )))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(palette(cx).muted))
+                            .child(run_label(&entry.status, entry.passed, entry.imported)),
+                    )
                     .child(
                         div()
                             .text_xs()
@@ -2654,7 +2691,9 @@ impl Render for LearningWindow {
             .text_color(rgb(palette(cx).ink))
             .bg(rgb(palette(cx).paper))
             .child(header)
-            .when_some(self.render_notice(palette(cx)), |root, notice| root.child(notice))
+            .when_some(self.render_notice(palette(cx)), |root, notice| {
+                root.child(notice)
+            })
             .child(
                 div()
                     .h_flex()

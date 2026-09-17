@@ -77,13 +77,13 @@ use ngy_book_studio::{
 };
 use serde::Deserialize;
 
+/// 当前皮肤。窗口在渲染或推送 WebView 时读它；改名成 `current_appearance` 是为了
+/// 不和界面代码里的同名字段/局部变量撞名。
+pub(crate) use ngy_book_studio::theme::appearance as current_appearance;
 /// 皮肤与调色板是本模块所有窗口共用的取色入口：颜色只在 `ngy_book_studio::theme`
 /// 里定义一次，各窗口用 `use super::*;` 拿到 [`palette`] 后按语义名取色。任何一个
 /// 窗口都不应该自己再写死颜色常量，否则它会在切换皮肤时留在旧配色上。
 pub(crate) use ngy_book_studio::theme::{Appearance, Palette, palette, set_appearance};
-/// 当前皮肤。窗口在渲染或推送 WebView 时读它；改名成 `current_appearance` 是为了
-/// 不和界面代码里的同名字段/局部变量撞名。
-pub(crate) use ngy_book_studio::theme::appearance as current_appearance;
 
 const STATUS_BAR_HEIGHT: f32 = 30.;
 const MAX_EDITOR_BODY_BYTES: usize = 8 * 1024 * 1024;
@@ -428,7 +428,13 @@ fn render_status_bar(
                         .child(Icon::new(status_icon).small())
                         .child(status_text),
                 )
-                .child(div().w(px(1.)).h(px(12.)).flex_none().bg(rgb(palette.border)))
+                .child(
+                    div()
+                        .w(px(1.))
+                        .h(px(12.))
+                        .flex_none()
+                        .bg(rgb(palette.border)),
+                )
                 .child(div().min_w(px(0.)).truncate().child(summary)),
         )
         .child(
@@ -439,7 +445,13 @@ fn render_status_bar(
                 .flex_none()
                 .gap_3()
                 .child(div().min_w(px(0.)).truncate().child(context))
-                .child(div().w(px(1.)).h(px(12.)).flex_none().bg(rgb(palette.border)))
+                .child(
+                    div()
+                        .w(px(1.))
+                        .h(px(12.))
+                        .flex_none()
+                        .bg(rgb(palette.border)),
+                )
                 .child(
                     div()
                         .flex_none()

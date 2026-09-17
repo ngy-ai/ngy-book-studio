@@ -957,7 +957,11 @@ impl Render for PageImageApp {
             .map(|notice| {
                 (
                     notice.text.clone(),
-                    if notice.error { palette(cx).danger } else { palette(cx).muted },
+                    if notice.error {
+                        palette(cx).danger
+                    } else {
+                        palette(cx).muted
+                    },
                 )
             })
             .unwrap_or_else(|| (page_subtitle(page, self.kind), palette(cx).muted));

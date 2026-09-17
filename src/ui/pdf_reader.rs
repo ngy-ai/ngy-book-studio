@@ -545,11 +545,10 @@ impl PdfReaderApp {
         });
         // 皮肤是应用级偏好：设置窗口保存后全局状态变一次，已经打开的 viewer 也要
         // 跟着换外壳颜色，否则它会留在旧配色的页面上。
-        let _theme_subscription = cx.observe_global::<ngy_book_studio::theme::AppTheme>(
-            |this, cx| {
+        let _theme_subscription =
+            cx.observe_global::<ngy_book_studio::theme::AppTheme>(|this, cx| {
                 this.push_pdf_appearance(cx);
-            },
-        );
+            });
         let mut ai_controller = match AiSidebarController::new(
             Arc::clone(&services),
             ChatWindowKind::Reader,
@@ -1479,7 +1478,11 @@ impl PdfReaderApp {
                 div()
                     .h_full()
                     .w(px(if active { 2. } else { 1. }))
-                    .bg(rgb(if active { palette(cx).accent } else { palette(cx).border })),
+                    .bg(rgb(if active {
+                        palette(cx).accent
+                    } else {
+                        palette(cx).border
+                    })),
             )
             .hover(|this| this.bg(rgb(palette(cx).accent_soft)))
             .on_drag_move(cx.listener(
@@ -1600,13 +1603,21 @@ impl Render for PdfReaderApp {
             .unwrap_or_else(|| format!("第 {current_page} 页"));
         let (status_icon, status_text, status_color) =
             if self.closing || self.webview_build_gate.close_requested {
-                (IconName::BookOpen, "正在安全关闭 PDF 阅读器…", palette(cx).accent)
+                (
+                    IconName::BookOpen,
+                    "正在安全关闭 PDF 阅读器…",
+                    palette(cx).accent,
+                )
             } else if self.webview_build_gate.building || !self.pdf_ready {
                 (IconName::BookOpen, "正在加载本地 PDF…", palette(cx).accent)
             } else if self.webview.is_some() {
                 (IconName::CircleCheck, "PDF.js 视图已连接", 0x376441)
             } else {
-                (IconName::TriangleAlert, "PDF 视图不可用", palette(cx).danger)
+                (
+                    IconName::TriangleAlert,
+                    "PDF 视图不可用",
+                    palette(cx).danger,
+                )
             };
         let status_bar = render_status_bar(
             status_icon,
@@ -1632,9 +1643,17 @@ impl Render for PdfReaderApp {
             .border_color(rgb(palette(cx).border))
             .when_some(self.notice.as_ref(), |toolbar, notice| {
                 let (background, foreground, icon) = if notice.error {
-                    (rgb(palette(cx).danger_soft), rgb(palette(cx).danger), IconName::TriangleAlert)
+                    (
+                        rgb(palette(cx).danger_soft),
+                        rgb(palette(cx).danger),
+                        IconName::TriangleAlert,
+                    )
                 } else {
-                    (rgb(palette(cx).success_soft), rgb(palette(cx).success), IconName::CircleCheck)
+                    (
+                        rgb(palette(cx).success_soft),
+                        rgb(palette(cx).success),
+                        IconName::CircleCheck,
+                    )
                 };
                 toolbar.child(
                     div()
@@ -1736,11 +1755,12 @@ impl Render for PdfReaderApp {
                     ),
             )
             .child(
-                div()
-                    .h(px(3.))
-                    .w_full()
-                    .bg(rgb(palette(cx).border))
-                    .child(div().h_full().w(gpui::relative(progress)).bg(rgb(palette(cx).accent))),
+                div().h(px(3.)).w_full().bg(rgb(palette(cx).border)).child(
+                    div()
+                        .h_full()
+                        .w(gpui::relative(progress))
+                        .bg(rgb(palette(cx).accent)),
+                ),
             );
 
         // Every page gets a row so the whole document can be navigated from the
@@ -1809,7 +1829,11 @@ impl Render for PdfReaderApp {
                                         .text_left()
                                         .text_sm()
                                         .font_medium()
-                                        .text_color(if selected { rgb(palette(cx).accent) } else { rgb(palette(cx).ink) })
+                                        .text_color(if selected {
+                                            rgb(palette(cx).accent)
+                                        } else {
+                                            rgb(palette(cx).ink)
+                                        })
                                         .child(
                                             hit.chapter_title
                                                 .clone()

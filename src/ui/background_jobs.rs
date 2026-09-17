@@ -1190,8 +1190,16 @@ impl BackgroundJobsWindow {
                     .rounded(px(7.))
                     .cursor_pointer()
                     .text_sm()
-                    .bg(rgb(if selected { palette(cx).accent_soft } else { palette(cx).sidebar }))
-                    .text_color(rgb(if selected { palette(cx).accent_strong } else { palette(cx).ink }))
+                    .bg(rgb(if selected {
+                        palette(cx).accent_soft
+                    } else {
+                        palette(cx).sidebar
+                    }))
+                    .text_color(rgb(if selected {
+                        palette(cx).accent_strong
+                    } else {
+                        palette(cx).ink
+                    }))
                     .child(label)
                     .child(div().text_xs().child(count.to_string()))
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -1279,7 +1287,11 @@ impl BackgroundJobsWindow {
                 div()
                     .h_full()
                     .w(px(if active { 2. } else { 1. }))
-                    .bg(rgb(if active { palette(cx).accent } else { palette(cx).border })),
+                    .bg(rgb(if active {
+                        palette(cx).accent
+                    } else {
+                        palette(cx).border
+                    })),
             )
             .into_any_element()
     }
@@ -1341,19 +1353,23 @@ impl BackgroundJobsWindow {
             .py_2()
             .gap_1();
         if count == 0 {
-            list = list.child(div().p_6().text_sm().text_color(rgb(palette(cx).muted)).child(
-                if self.loading && !self.loaded {
-                    "正在读取任务…"
-                } else if !self.loaded && self.refresh_error.is_some() {
-                    "读取失败，请刷新重试。"
-                } else if self.books.is_empty() {
-                    "当前范围没有图书。"
-                } else if self.jobs.is_empty() {
-                    "当前范围还没有后台任务。"
-                } else {
-                    "没有符合搜索或筛选条件的任务。"
-                },
-            ));
+            list = list.child(
+                div()
+                    .p_6()
+                    .text_sm()
+                    .text_color(rgb(palette(cx).muted))
+                    .child(if self.loading && !self.loaded {
+                        "正在读取任务…"
+                    } else if !self.loaded && self.refresh_error.is_some() {
+                        "读取失败，请刷新重试。"
+                    } else if self.books.is_empty() {
+                        "当前范围没有图书。"
+                    } else if self.jobs.is_empty() {
+                        "当前范围还没有后台任务。"
+                    } else {
+                        "没有符合搜索或筛选条件的任务。"
+                    }),
+            );
         }
         for job in jobs
             .into_iter()
@@ -1369,73 +1385,82 @@ impl BackgroundJobsWindow {
                 .find(|book| book.id == job.book_id)
                 .map(|book| book.title.as_str())
                 .unwrap_or("图书已移除");
-            list =
-                list.child(
-                    div()
-                        .id(SharedString::from(format!("job-row-{}", job.id)))
-                        .flex_none()
-                        .h_flex()
-                        .items_center()
-                        .gap_3()
-                        .px_3()
-                        .py_2()
-                        .rounded(px(7.))
-                        .border_1()
-                        .border_color(rgb(if selected { palette(cx).accent } else { palette(cx).border }))
-                        .bg(rgb(if selected { palette(cx).accent_soft } else { palette(cx).surface }))
-                        .cursor_pointer()
-                        .child(
-                            div()
-                                .v_flex()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_semibold()
-                                        .truncate()
-                                        .child(title.to_string()),
-                                )
-                                .child(
-                                    div().text_xs().text_color(rgb(palette(cx).muted)).truncate().child(
-                                        format!("{} · {}", job_kind_label(&job.kind), job.id),
-                                    ),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .v_flex()
-                                .gap_1()
-                                .items_end()
-                                .flex_none()
-                                .child(
-                                    div()
-                                        .px_2()
-                                        .rounded_full()
-                                        .bg(background)
-                                        .text_xs()
-                                        .text_color(color)
-                                        .child(label),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(palette(cx).muted))
-                                        .child(progress_label(job)),
-                                ),
-                        )
-                        .child(Icon::new(IconName::ChevronRight).small())
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            if this.selected_job_id.as_ref() != Some(&id) {
-                                this.selected_job_id = Some(id.clone());
-                                this.clear_detail_cache();
-                            }
-                            this.refresh_logs(window, cx);
-                            this.refresh_blocks(window, cx);
-                            cx.notify();
-                        })),
-                );
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!("job-row-{}", job.id)))
+                    .flex_none()
+                    .h_flex()
+                    .items_center()
+                    .gap_3()
+                    .px_3()
+                    .py_2()
+                    .rounded(px(7.))
+                    .border_1()
+                    .border_color(rgb(if selected {
+                        palette(cx).accent
+                    } else {
+                        palette(cx).border
+                    }))
+                    .bg(rgb(if selected {
+                        palette(cx).accent_soft
+                    } else {
+                        palette(cx).surface
+                    }))
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .v_flex()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .truncate()
+                                    .child(title.to_string()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(palette(cx).muted))
+                                    .truncate()
+                                    .child(format!("{} · {}", job_kind_label(&job.kind), job.id)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .v_flex()
+                            .gap_1()
+                            .items_end()
+                            .flex_none()
+                            .child(
+                                div()
+                                    .px_2()
+                                    .rounded_full()
+                                    .bg(background)
+                                    .text_xs()
+                                    .text_color(color)
+                                    .child(label),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(palette(cx).muted))
+                                    .child(progress_label(job)),
+                            ),
+                    )
+                    .child(Icon::new(IconName::ChevronRight).small())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if this.selected_job_id.as_ref() != Some(&id) {
+                            this.selected_job_id = Some(id.clone());
+                            this.clear_detail_cache();
+                        }
+                        this.refresh_logs(window, cx);
+                        this.refresh_blocks(window, cx);
+                        cx.notify();
+                    })),
+            );
         }
         let pages = count.div_ceil(JOBS_PER_PAGE).max(1);
         div()
@@ -1698,7 +1723,11 @@ impl BackgroundJobsWindow {
                     .child("最新记录在前 · 时间为 UTC · ordinal 从 0 开始 · 复制按时间正序排列。"),
             );
             if let Some(error) = &self.logs_error {
-                content = content.child(div().text_color(rgb(palette(cx).danger)).child(error.clone()));
+                content = content.child(
+                    div()
+                        .text_color(rgb(palette(cx).danger))
+                        .child(error.clone()),
+                );
             }
             if let Some(logs) = &self.logs {
                 if logs.truncated {
@@ -1757,7 +1786,12 @@ impl BackgroundJobsWindow {
             if let Some(cursor) = &job.cursor_json {
                 content = content
                     .child(div().text_color(rgb(palette(cx).muted)).child("执行游标"))
-                    .child(div().p_2().bg(rgb(palette(cx).sidebar)).child(prettify_cursor(cursor)));
+                    .child(
+                        div()
+                            .p_2()
+                            .bg(rgb(palette(cx).sidebar))
+                            .child(prettify_cursor(cursor)),
+                    );
             }
         }
         div()
@@ -2198,7 +2232,12 @@ impl BackgroundJobsWindow {
             .track_scroll(&scroll_handle)
             .pr_1();
         if let Some(error) = state.error.as_ref() {
-            body = body.child(div().text_xs().text_color(rgb(palette(cx).danger)).child(error.clone()));
+            body = body.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(palette(cx).danger))
+                    .child(error.clone()),
+            );
         } else if state.loading {
             body = body.child(
                 div()
@@ -2376,12 +2415,16 @@ impl BackgroundJobsWindow {
         probe: &BlockProbeState,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let mut panel = div().v_flex().w_full().flex_none().gap_2().child(
-            div().text_xs().text_color(rgb(palette(cx).muted)).child(
+        let mut panel =
+            div()
+                .v_flex()
+                .w_full()
+                .flex_none()
+                .gap_2()
+                .child(div().text_xs().text_color(rgb(palette(cx).muted)).child(
                 "失败块才有这一页：诊断日志只保存固定分类，所以这里按同一份冻结原文重新请求一次，\
                  把模型返回的原文原样显示出来。这次请求不写译文、不推进任务、不改任何记录。",
-            ),
-        );
+            ));
         panel = panel.child(
             div().h_flex().flex_none().items_center().gap_2().child(
                 Button::new("jobs-block-probe-run")
@@ -2411,13 +2454,24 @@ impl BackgroundJobsWindow {
             );
         }
         if let Some(error) = probe.error.as_ref() {
-            panel = panel.child(div().text_xs().text_color(rgb(palette(cx).danger)).child(error.clone()));
+            panel = panel.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(palette(cx).danger))
+                    .child(error.clone()),
+            );
         }
         let Some(result) = probe.result.as_ref() else {
             return panel.into_any_element();
         };
         panel = panel
-            .child(div().flex_none().h(px(1.)).w_full().bg(rgb(palette(cx).border)))
+            .child(
+                div()
+                    .flex_none()
+                    .h(px(1.))
+                    .w_full()
+                    .bg(rgb(palette(cx).border)),
+            )
             .child(
                 div()
                     .text_xs()
@@ -2627,8 +2681,16 @@ impl Render for BackgroundJobsWindow {
                         .px_5()
                         .py_2()
                         .text_xs()
-                        .bg(rgb(if notice.error { 0xf8e2de } else { palette(cx).accent_soft }))
-                        .text_color(rgb(if notice.error { palette(cx).danger } else { palette(cx).accent_strong }))
+                        .bg(rgb(if notice.error {
+                            0xf8e2de
+                        } else {
+                            palette(cx).accent_soft
+                        }))
+                        .text_color(rgb(if notice.error {
+                            palette(cx).danger
+                        } else {
+                            palette(cx).accent_strong
+                        }))
                         .child(notice.text.clone()),
                 )
             })
@@ -3426,7 +3488,10 @@ mod tests {
         let mut state = detail_state(BlockDetailTab::Response);
         state.probe.result = Some(probe_fixture(r#"{"translations":[{"id":0,"text":"甲"}]}"#));
         let pretty = block_detail_text(&state, None).unwrap();
-        assert!(pretty.contains('\n'), "a valid object is indented: {pretty}");
+        assert!(
+            pretty.contains('\n'),
+            "a valid object is indented: {pretty}"
+        );
         assert!(serde_json::from_str::<serde_json::Value>(&pretty).is_ok());
 
         // A fenced answer is the classic weak-model failure; it must be visible
@@ -3464,7 +3529,10 @@ mod tests {
         assert_eq!(probe_end_label(&probe), "响应流在没有收尾标记的情况下关闭");
 
         probe.end = "size_limit";
-        assert_eq!(probe_end_label(&probe), "响应超过大小上限，只显示已收到的部分");
+        assert_eq!(
+            probe_end_label(&probe),
+            "响应超过大小上限，只显示已收到的部分"
+        );
 
         probe.end = "tool_call";
         assert_eq!(probe_end_label(&probe), "模型意外请求了工具");
