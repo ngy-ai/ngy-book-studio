@@ -34,6 +34,11 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
 
 ## 代码地图
 
+各模块按职责拆成目录：`mod.rs`（或 `startup/mod.rs` 这类入口文件）只放模块文档、
+共享导入、模块声明和对外的 `pub use`，实现分散在同目录的子模块里；子模块用
+`use super::*;` 取得父模块声明的项，只在子模块之间共享的类型与函数按 `pub(crate)`
+收口（测试夹具用 `pub(super)`）。新增代码放进对应的子模块，不要再把大文件堆回来。
+
 - `src/main.rs`：WebView2 探测、启动顺序与 GPUI 主窗口。数据目录不再用默认位置后，
   启动分成两段：`startup::plan_launch` 只判断能不能直接用记住的目录，需要用户确认时开
   设置窗口（`src/ui/data_dir_setup.rs`）；窗口确认后才完成待办搬迁、装日志、打开
@@ -45,7 +50,7 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   下次启动继续重试，原因同时写进 stderr（那时文件日志还没装）。日志写不进去只降级为
   控制台并把原因写进 stderr —— 此时文件日志还没装，弹原生对话框会撞上 GPUI 的 `App`
   借用。
-- `src/startup.rs`：数据目录的解析与引导配置。数据目录不再固定用 `ProjectDirs` 的
+- `src/startup/`：数据目录的解析与引导配置。数据目录不再固定用 `ProjectDirs` 的
   默认位置：首次启动（或上次选择已失效）时由用户在设置窗口确认，选择写进**图书库之外**的
   `bootstrap.json`（`%APPDATA%\ngy\ngy_book_studio\config\`），下次启动直接使用。
   `settings` 表在图书库里，所以它不能用来记录图书库的位置。本模块不碰界面：
@@ -114,14 +119,14 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   的颜色写死在随包发布的 `assets/editor/prosemirror.js` 里。各 WebView 窗口用
   `observe_global::<AppTheme>` 跟随切换，不靠中心化的窗口注册表；窗口自己的
   `with_background_color` 要在创建时就是当前皮肤的颜色，否则每次换页会闪一帧旧底色。
-- `src/services.rs`、`src/runtime.rs`：进程级服务组合与独立 Tokio runtime；统一持有
+- `src/services/`、`src/runtime.rs`：进程级服务组合与独立 Tokio runtime；统一持有
   图书库、对象存储、格式注册表、搜索、AI、Office 和后台任务。GPUI 回调跑在自己的
   executor 上，不是 Tokio 上下文：UI 可达的服务方法必须把数据库、对象存储、`tokio::fs`
   和解析工作放到应用 I/O runtime（`IoRuntime::spawn`）上再 await，`runtime.rs` 的
   `block_on` 只用于启动、测试与后台线程。索引协调器内部 `run_db`/`run_db_mut` 解析
   环境句柄，只允许它自己派发的工作使用；公共路径用 `run_db_on` 显式传入句柄，否则会
   在 GPUI future 里 panic，而 GPUI 回调不可 unwind，会直接终止整个进程。
-  `src/services.rs` 测试里的 `block_on_without_tokio` 用非 Tokio 执行器驱动服务方法，
+  `src/services/` 测试里的 `block_on_without_tokio` 用非 Tokio 执行器驱动服务方法，
   用于固定这条约定（后台任务窗口的文本块明细读取曾因此崩溃）。
   `load_published_visual_pages(book_id, kind)` 是 Office 增强预览与 DjVu 共用的页面读取
   入口：它在 `library_mutations` 与 `blob_publication` 门闩内读 `visual_pages`、逐页校验
@@ -141,8 +146,8 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   不能写成失败；用户主动关窗不因为保存中而被拦（`on_window_close` 只在
   `application_is_exiting` 且 `Saving` 时等结果），否则一次被堵住的保存会变成关不掉的
   死窗口，用户除了杀进程没有别的出路。
-- `src/learning.rs`、`src/learning_records.rs`、`src/learning_catalog.rs`、
-  `src/ui/learning.rs`：学习中心异步服务、逐章目录、
+- `src/learning/`、`src/learning_records/`、`src/learning_catalog.rs`、
+  `src/ui/learning/`：学习中心异步服务、逐章目录、
   独立 JSON 学习档案和原生 GPUI 训练窗口。记录不进入图书数据库；运行前保存不可变
   代码、预测与提示级别，运行报告由受信宿主生成；恢复前原样归档当前文件。
   恢复文件对话框使用后台准备的 Shell 路径：Windows 的 `\\?\` 盘符 / UNC 前缀
@@ -163,7 +168,7 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   滚动容器内。0.5.1 的 TextView 内部虚拟列表滚动不会平移选区坐标，不得恢复
   `selectable(true).scrollable(true)` 组合。GPUI `test-support` 仅用于开发测试，
   事件与内存剪贴板回归不能替代真实 Windows 鼠标、字体和系统剪贴板验收。
-- `src/document.rs`：稳定 ID 的格式无关模型，包括 `BookDocument`、`ContentUnit`、
+- `src/document/`：稳定 ID 的格式无关模型，包括 `BookDocument`、`ContentUnit`、
   `BlockDocument`、`TocNode` 和 `DocumentLocator`。
 - `src/formats/`：`DocumentImporter` 注册表及 EPUB、PDF、Office、Kindle、KFX、DjVu
   适配器；`office_oxide`、`ebook-rs`、`djvu-rs` 等第三方类型必须在本目录内转换为统一模型。
@@ -207,7 +212,7 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   不得放宽为“导入成功”。`djvu.rs`：字节所有权要求下先校验上限再克隆一次源字节；
   隐藏文字层经 `reflowable_text` 转页文字，NAVM 书签只有能解析出 `#<页号>` 时映射
   （其余跳过但保留可解析子项）；导入阶段不产出页面图片。
-- `src/markup.rs`、`src/editing.rs`、`src/export.rs`：HTML 解析清洗、事务式
+- `src/markup/`、`src/editing.rs`、`src/export.rs`：HTML 解析清洗、事务式
   模型编辑，以及原件/EPUB/PDF 稳定导出。
   **XHTML 只能出现 XML 能自行解析的字符引用。** 阅读器把章节按
   `application/xhtml+xml` 交给 WebView，除 `&amp;` `&lt;` `&gt;` `&quot;` `&apos;`
@@ -224,7 +229,7 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   走同一层，不要各自再写一份转义。
 - `src/storage.rs`、`src/media.rs`：应用自有 `BlobStore`、基于 `object_store` 的本地
   BLAKE3 内容寻址实现，以及带图书归属校验和 Range 支持的媒体响应。
-- `src/library.rs`：SQLite 与对象存储之上的图书库业务编排、导入/创建/保存/删除、
+- `src/library/`：SQLite 与对象存储之上的图书库业务编排、导入/创建/保存/删除、
   垃圾回收和兼容现有 UI 的投影。
   打开图书库时按顺序做两件一次性修复：先 `run_startup_blob_gc` 回收未引用对象，
   再 `run_startup_language_backfill` 把导入器漏记的声明语言补回 `books.language`。
@@ -249,18 +254,29 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   `office_enhancements.rs`；跨表原子操作只放 `transactions.rs`，FTS 查询放
   `book_search.rs`，建表与完整性契约放 `schema.rs`。
 - `src/ai/`：AI 后端包。`mod.rs` 是 OpenAI-compatible 模型访问，`agent.rs`/`agent_runtime.rs`/
-  `agent_chat.rs`/`chat.rs` 是只读问答 Agent 与会话持久化，`search.rs`/`indexing.rs` 是检索与
+  `agent_chat.rs`/`chat.rs` 是只读问答 Agent 与会话持久化，`search.rs`/`indexing/` 是检索与
   索引/翻译后台任务，`translation.rs`/`credentials.rs`/`web_search.rs`/`ai_diagnostics.rs`/
   `job_diagnostics.rs` 是分段协议、端点密钥、联网补充与诊断。
-- `src/ai/search.rs`、`src/ai/indexing.rs`：作用域内 FTS5/`sqlite-vec` 精确 KNN、RRF 混合
-  召回，以及可恢复的 embedding/vision 后台任务。执行器固定启动
+- `src/ai/search.rs`、`src/ai/indexing/`：作用域内 FTS5/`sqlite-vec` 精确 KNN、RRF 混合
+  召回，以及可恢复的 embedding/vision 后台任务。`indexing/` 按职责分文件，不要把任何一个
+  文件重新堆回大杂烩：`mod.rs` 是协调器、游标、共享类型与常量，`worker.rs` 是任务循环与
+  「一轮派发一个任务」的判定，`embedding.rs`/`vision.rs` 是两个模型通道，`control.rs` 是
+  暂停/取消观察与结果发布，`inspection.rs` 是只读的任务窗口块检查器，`support.rs` 是共用
+  小工具，`translation/` 是整本翻译任务（`mod.rs` 走位与提交、`blocks.rs` 取块、
+  `prompt.rs` 请求体、`response.rs` 应答收集与校验）。`tests/mod.rs` 只放共用夹具与可计数的
+  mock 提供方，用例按主题分文件：`unit`（纯请求/应答形状）、`embedding`、`job_control`、
+  `endpoints`、`vision`、`scheduling`、`translation`、`translation_retry`、
+  `translation_walk`；新增用例放进对应主题的文件，不要再往夹具文件里塞用例。
+  子模块一律用 `use super::*;` 取得上面的共享项，跨模块引用按 `pub(crate)`（测试夹具用
+  `pub(super)`）收口；协调器
+  的 `impl` 块可以分散在 `mod.rs` 与 `inspection.rs`。执行器固定启动
   `MAX_BACKGROUND_JOB_CONCURRENCY` 个 worker，只有序号小于当前并发的 worker 扫描队列，
   每个任务提交后按配置间隔休眠；两者由 AI 设置的「后台任务」窗口经
   `IndexingCoordinator::configure_scheduling` 实时发布，写坏的值按范围钳制。
   同一个「任务并发」既是任务上限，也是**单个整本翻译的块窗口上限**：一轮里最多同时开
   `concurrency` 个文本块请求（`walk_translation_blocks` 的窗口，每轮重读设置，所以运行中
   调大只让 walk 走得更前、不打断任何在飞请求），因此一本翻译自己也会出现多个「处理中」。
-  `ai/indexing.rs` 另实现整本图书翻译任务
+  `ai/indexing/translation/` 另实现整本图书翻译任务
   `kind="translation"`：任务标识为 `translation:<source_id>:<target_language>`，游标用
   `next_ordinal` 记录「第一块尚未提交的文本块」，并按序调用对话模型 `chat_stream` 写入
   `translations` 表，可暂停/恢复/重试/取消；文本块按 `content_units.block_json` 的 `BlockDocument` 确定性
@@ -463,7 +479,7 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   换模型/协议重排走的是同一个函数：后台动作不得删除读者写下的文字。被保留的行仍是有效的
   缓存项，所以重新翻译只重跑其余文本块，手工改写过的块保留原机器译文与身份；版本已经过期
   的手工行和没有手工译文的行一样被删掉，不会留下再也显示不出来的孤儿行。
-- `src/preview.rs`、`src/windows_pdf_renderer.rs`、`src/djvu_renderer.rs`：`VisualRenderer`、
+- `src/preview/`、`src/windows_pdf_renderer.rs`、`src/djvu_renderer.rs`：`VisualRenderer`、
   结构化页面 PNG 光栅化、Windows PDF 原页光栅化与纯 Rust DjVu 逐页光栅化、
   可暂停/恢复/重试/取消的持久任务和本地 PDF.js 资产路由。DjVu 渲染器（`ngy-djvu-png`）
   不加 `cfg(windows)`，页与内容单元严格 1:1（`content_unit_id` + `SourceLocator::DjvuPage`），
@@ -491,7 +507,7 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   时重建，开关对已发出的请求无效。
 - `src/ai/agent.rs`、`src/ai/agent_runtime.rs`、`src/ai/agent_chat.rs`、`src/ai/chat.rs`：只读 Agent
   工具、SSE/tool-call 循环、窗口授权范围、会话/消息/引用持久化与对话编排。
-- `src/office_com.rs`、`src/office_preview.rs`、`src/office_visual.rs`：可选 Office STA
+- `src/office_com.rs`、`src/office_preview/`、`src/office_visual.rs`：可选 Office STA
   工作者、只读临时导出和持久视觉渲染器；原件禁用宏和外链更新，派生页按当前
   renderer/revision/profile 发布，失败时回退结构化预览。
 - `src/reader.rs`、`src/epub_limits.rs`：EPUB 投影、资源授权、导航 URL 和归档安全上限。
@@ -514,7 +530,7 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   窗口内的调试选择器统一由 `AiSettingsSection::selector` 生成：`ai-<窗口短名>-<name>`，
   例如 `ai-models-save-settings`、`ai-background-job-scheduling`；GUI 冒烟与 GPUI 测试
   按它定位元素，不要再写死旧窗口的选择器。
-- `src/ui/`：按窗口/职责拆分的 GPUI 界面。`library.rs`、`reader.rs`、`pdf_reader.rs`、
+- `src/ui/`：按窗口/职责拆分的 GPUI 界面。`library/`、`reader.rs`、`pdf_reader.rs`、
   `editor.rs`、`page_image.rs` 分别管理对应窗口；`ai_sidebar.rs`、
   `ai_controller.rs`、`ai_settings/` 管理 AI 交互；`background_jobs.rs` 管理当前图书范围
   的派生任务；后台任务窗口全应用只有一个，重复打开时激活现有窗口并按新的库范围刷新，
@@ -700,7 +716,7 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   加固后 42 次 6 进程并发运行全部通过（加固前同一实验 6 个进程里 2 个失败）。该套件当前为
   17 项运行 + 1 项需真实模型的忽略用例。同一轮加压后另观察到 `cargo test --lib` 的
   `ai::indexing::tests::vision_endpoint_switch_uses_new_provider_and_preserves_embedding_route`
-  等同类紧截止失败（`src/ai/indexing.rs` 里 5 秒的「旧 vision 请求未开始」与 `wait_for_state`
+  等同类紧截止失败（`src/ai/indexing/` 里 5 秒的「旧 vision 请求未开始」与 `wait_for_state`
   截止，3 次重跑里 1 次）：这是该模块测试自己的预算问题——整块测试并行，有些夹具还故意给
   提供方 5 秒延迟，5 秒预算等于和它要等的工作赛跑。已把这些进展等待统一为模块内的
   `TEST_PROGRESS_WAIT`（30 秒），`wait_for_state` 的失败信息补上任务 ID 与预算；6 个 flow
@@ -862,7 +878,7 @@ cargo build --release --locked --bin ngy-book-studio
 ### 数据目录与日志位置
 
 数据目录在首次启动时由用户确认，不再使用 `ProjectDirs` 的默认位置；选择记录在
-`%APPDATA%\ngy\ngy_book_studio\config\bootstrap.json`（实现见 `src/startup.rs`）。
+`%APPDATA%\ngy\ngy_book_studio\config\bootstrap.json`（实现见 `src/startup/`）。
 设置界面是应用自己的窗口（`src/ui/data_dir_setup.rs`）：输入框里预填推荐路径或上次的
 选择，可以直接改、可以点「浏览…」调系统目录选择器，点「确认并启动」（或回车）后才校验
 并记录；校验在后台执行器上做，失败原因显示在同一个窗口里。关闭设置窗口即放弃启动。

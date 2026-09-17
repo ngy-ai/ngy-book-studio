@@ -1,0 +1,203 @@
+//! Durable job vocabulary: status, projection, cursor and run outcome.
+
+use super::*;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexingJobStatus {
+    Queued,
+    Running,
+    Paused,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexingJobSnapshot {
+    pub id: String,
+    pub book_id: String,
+    pub source_id: Option<String>,
+    pub kind: String,
+    pub status: IndexingJobStatus,
+    pub attempts: u32,
+    pub cursor_json: String,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexingModelConfig {
+    pub(crate) embedding_model: String,
+    pub(crate) embedding_dimensions: usize,
+    pub(crate) embedding_execution_identity: String,
+    pub(crate) vision_model: String,
+    pub(crate) vision_execution_identity: String,
+}
+
+impl IndexingModelConfig {
+    pub fn new(
+        embedding_model: impl Into<String>,
+        embedding_dimensions: usize,
+        embedding_execution_identity: impl Into<String>,
+        vision_model: impl Into<String>,
+        vision_execution_identity: impl Into<String>,
+    ) -> Result<Self> {
+        Ok(Self {
+            embedding_model: validated_model(embedding_model.into(), "embedding")?,
+            embedding_dimensions,
+            embedding_execution_identity: validated_execution_identity(
+                embedding_execution_identity.into(),
+                "embedding",
+            )?,
+            vision_model: validated_model(vision_model.into(), "vision")?,
+            vision_execution_identity: validated_execution_identity(
+                vision_execution_identity.into(),
+                "vision",
+            )?,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ControlRequest {
+    Pause,
+    Cancel,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct JobCursor {
+    pub(crate) schema_version: u32,
+    pub(crate) book_id: String,
+    pub(crate) source_id: String,
+    pub(crate) revision: u64,
+    pub(crate) kind: String,
+    #[serde(default)]
+    pub(crate) model: Option<String>,
+    #[serde(default)]
+    pub(crate) execution_identity: Option<String>,
+    #[serde(default)]
+    pub(crate) input_execution_identity: Option<String>,
+    #[serde(default)]
+    pub(crate) next_ordinal: usize,
+    /// Blocks a per-block retry asked for, as a sorted ordinal list. Empty means
+    /// a normal run: walk the whole book from `next_ordinal`. Non-empty means
+    /// `next_ordinal` sits at the first entry and the run stops after the last
+    /// one, so blocks outside the set are never re-sent to the provider — an
+    /// already translated block in between still hits its cache row and is not
+    /// requested again.
+    #[serde(default)]
+    pub(crate) retry_ordinals: Vec<usize>,
+    /// Ordinals this execution has already sent to the provider and not committed
+    /// yet, sorted. `任务并发` is how many of them one task keeps open at a time,
+    /// and the task window reads the set as 「处理中」.
+    ///
+    /// Only whole-book translation fills this in; every other kind walks one item
+    /// at a time and leaves it empty. `next_ordinal` never moves past a block that
+    /// is still waiting, so an interrupted run only ever redoes work — nothing in
+    /// flight is treated as done, and the set is empty again in every terminal
+    /// state (a paused task must not keep claiming requests that are already
+    /// gone).
+    #[serde(default)]
+    pub(crate) inflight: Vec<usize>,
+    /// Version of the text-block extraction rules this cursor was built with.
+    /// Every cursor is written with the current version; only whole-book
+    /// translation compares it, because only its ordinals are block ordinals.
+    ///
+    /// Changing the rules (a stricter "this block is source code" test, for
+    /// example) changes how many blocks the book has, so every ordinal after the
+    /// first affected block now points at a different piece of text. A cursor
+    /// from another version is therefore reset to the start of the book in
+    /// `from_job`: stored translations still match by cache key, so the rescan
+    /// costs no requests.
+    #[serde(default)]
+    pub(crate) blocks_version: u32,
+}
+
+impl JobCursor {
+    pub(crate) fn from_job(
+        job: &db::index_jobs::IndexJob,
+        model: &str,
+        execution_identity: Option<&str>,
+    ) -> Result<Self> {
+        let mut cursor =
+            serde_json::from_str::<Self>(&job.cursor_json).context("索引任务游标无效")?;
+        let source_id = job.source_id.as_deref().context("索引任务缺少来源")?;
+        ensure!(
+            cursor.schema_version == 1
+                && cursor.book_id == job.book_id
+                && cursor.source_id == source_id
+                && cursor.kind == job.kind,
+            "索引任务游标与任务身份不匹配"
+        );
+        if cursor.model.as_deref() != Some(model)
+            || execution_identity
+                .is_some_and(|identity| cursor.execution_identity.as_deref() != Some(identity))
+        {
+            cursor.model = Some(model.to_string());
+            cursor.execution_identity = execution_identity.map(str::to_string);
+            cursor.input_execution_identity = None;
+            cursor.next_ordinal = 0;
+        }
+        // 提取文本块的规则变了（例如「这一块是源代码」的判定变严），块数随之改变，
+        // 于是受影响之后的每个序号都指向了另一段文字。旧版本的游标因此退回书首重扫：
+        // 已存译文仍按缓存键命中，重扫不花请求。只有整本翻译读这个字段，其它任务
+        // 恒为当前版本，不会因为这条检查被重置。
+        if cursor.kind == TRANSLATION_JOB_KIND
+            && cursor.blocks_version != TRANSLATION_BLOCKS_VERSION
+        {
+            cursor.blocks_version = TRANSLATION_BLOCKS_VERSION;
+            cursor.next_ordinal = 0;
+            cursor.retry_ordinals.clear();
+            cursor.inflight.clear();
+        }
+        Ok(cursor)
+    }
+
+    pub(crate) fn encode(&self) -> Result<String> {
+        serde_json::to_string(self).context("无法序列化索引任务游标")
+    }
+
+    /// Opens one more block in the parallel window. The walk dispatches blocks in
+    /// ordinal order, so appending keeps the list sorted and deduplicated.
+    pub(crate) fn open_inflight(&mut self, ordinal: usize) {
+        debug_assert!(
+            self.inflight.iter().all(|open| *open < ordinal),
+            "翻译窗口必须按序号打开"
+        );
+        self.inflight.push(ordinal);
+    }
+
+    /// Drops every block at or below `committed`. The walk commits in ordinal
+    /// order, so everything at or below it is finished and must not be reported
+    /// as in flight any more.
+    pub(crate) fn close_inflight(&mut self, committed: usize) {
+        self.inflight.retain(|open| *open > committed);
+    }
+}
+
+pub(crate) enum RunOutcome {
+    Succeeded(JobCursor),
+    Paused(JobCursor),
+    Cancelled(JobCursor, Option<String>),
+    /// `None` when the failure has no single fixed category (for example a task
+    /// that never had a model to call). The window shows the message instead.
+    Failed(JobCursor, String, Option<JobLogErrorKind>),
+    WaitingForPages(JobCursor),
+    Abandoned,
+}
+
+/// Why one in-flight block must stop early.
+///
+/// A block request cannot name the position to publish — the run keeps advancing
+/// the cursor while the request waits — so a request only reports the reason and
+/// the run decides which cursor the outcome carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StopRequest {
+    Pause,
+    Cancel,
+    /// The book published a newer revision, so every translation of this run is
+    /// stale and is dropped.
+    SourceChanged,
+    /// The durable row is no longer this execution's: it was replaced by a
+    /// settings reset, reclaimed, or is not running any more.
+    Abandoned,
+}
