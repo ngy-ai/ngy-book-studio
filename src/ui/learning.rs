@@ -1272,7 +1272,7 @@ impl LearningWindow {
         .justify_start()
         .label(document.title())
         .when(self.study_pane == StudyPane::Document(document), |button| {
-            button.bg(rgb(ACCENT_SOFT)).text_color(rgb(ACCENT_DARK))
+            button.bg(rgb(palette(cx).accent_soft)).text_color(rgb(palette(cx).accent_strong))
         })
         .disabled(self.busy() || (document == CourseDocument::Answers && self.inputs_disabled()))
         .on_click(move |_, _, cx| {
@@ -1357,21 +1357,21 @@ impl LearningWindow {
             .gap_4()
             .px_5()
             .py_3()
-            .bg(rgb(SURFACE))
+            .bg(rgb(palette(cx).surface))
             .border_b_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(palette(cx).border))
             .child(
                 div()
                     .h_flex()
                     .gap_3()
                     .min_w(px(0.))
-                    .child(Icon::new(IconName::BookOpen).text_color(rgb(ACCENT)))
+                    .child(Icon::new(IconName::BookOpen).text_color(rgb(palette(cx).accent)))
                     .child(
                         div()
                             .v_flex()
                             .min_w(px(0.))
                             .child(div().text_lg().font_semibold().child("学习 · AI Agent"))
-                            .child(div().text_xs().text_color(rgb(MUTED)).child(
+                            .child(div().text_xs().text_color(rgb(palette(cx).muted)).child(
                                 match self.study_pane {
                                     StudyPane::Document(document) => document.title(),
                                     _ => chapter_title(self.service.chapter()),
@@ -1384,7 +1384,7 @@ impl LearningWindow {
     }
 
     #[inline(never)]
-    fn render_notice(&self) -> Option<gpui::AnyElement> {
+    fn render_notice(&self, theme: Palette) -> Option<gpui::AnyElement> {
         let notice = self.notice.as_ref()?;
         Some(
             div()
@@ -1394,8 +1394,16 @@ impl LearningWindow {
                 .gap_2()
                 .px_5()
                 .py_2()
-                .bg(rgb(if notice.error { 0xf8e2de } else { ACCENT_SOFT }))
-                .text_color(rgb(if notice.error { DANGER } else { ACCENT_DARK }))
+                .bg(rgb(if notice.error {
+                    theme.danger_soft
+                } else {
+                    theme.accent_soft
+                }))
+                .text_color(rgb(if notice.error {
+                    theme.danger
+                } else {
+                    theme.accent_strong
+                }))
                 .text_sm()
                 .child(
                     Icon::new(if notice.error {
@@ -1424,7 +1432,7 @@ impl LearningWindow {
                     .justify_start()
                     .label(lesson.title.clone())
                     .when(selected, |button| {
-                        button.bg(rgb(ACCENT_SOFT)).text_color(rgb(ACCENT_DARK))
+                        button.bg(rgb(palette(cx).accent_soft)).text_color(rgb(palette(cx).accent_strong))
                     })
                     .disabled(self.inputs_disabled())
                     .on_click(move |_, _, cx| {
@@ -1446,16 +1454,16 @@ impl LearningWindow {
             .flex_none()
             .h_full()
             .min_h(px(0.))
-            .bg(rgb(SIDEBAR))
+            .bg(rgb(palette(cx).sidebar))
             .border_r_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(palette(cx).border))
             .child(
                 div()
                     .px_4()
                     .py_4()
                     .text_xs()
                     .font_semibold()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette(cx).muted))
                     .child("课程导航"),
             )
             .child(
@@ -1472,7 +1480,7 @@ impl LearningWindow {
                             .px_2()
                             .py_3()
                             .text_xs()
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(palette(cx).muted))
                             .child("完整教程 · 十章"),
                     )
                     .children(
@@ -1480,7 +1488,7 @@ impl LearningWindow {
                             .into_iter()
                             .map(|chapter| self.render_document_button(chapter, cx)),
                     )
-                    .child(div().px_2().py_3().text_xs().text_color(rgb(MUTED)).child(
+                    .child(div().px_2().py_3().text_xs().text_color(rgb(palette(cx).muted)).child(
                         if self.service.chapter() == 1 {
                             "第1章 · 六步练习".to_string()
                         } else {
@@ -1493,7 +1501,7 @@ impl LearningWindow {
                             .px_2()
                             .py_3()
                             .text_xs()
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(palette(cx).muted))
                             .child("第一章 · 实验资料"),
                     )
                     .children(
@@ -1508,9 +1516,9 @@ impl LearningWindow {
                     .gap_2()
                     .p_4()
                     .border_t_1()
-                    .border_color(rgb(BORDER))
+                    .border_color(rgb(palette(cx).border))
                     .text_xs()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette(cx).muted))
                     .child("手搓 → 框架重建 → 同题比较")
                     .child("先写预测，再看运行。保留第一次判断和使用过的提示。")
                     .child("十章均可进入代码实验；切换实验章节时自动保存当前编辑。各章记录独立。"),
@@ -1533,7 +1541,7 @@ impl LearningWindow {
                     .ghost()
                     .label(label)
                     .when(selected, |button| {
-                        button.bg(rgb(ACCENT_SOFT)).text_color(rgb(ACCENT_DARK))
+                        button.bg(rgb(palette(cx).accent_soft)).text_color(rgb(palette(cx).accent_strong))
                     })
                     .on_click(move |_, _, cx| {
                         view.update(cx, |this, cx| {
@@ -1561,7 +1569,7 @@ impl LearningWindow {
                 }),
         )
         .border_b_1()
-        .border_color(rgb(BORDER))
+        .border_color(rgb(palette(cx).border))
         .into_any_element()
     }
 
@@ -1634,7 +1642,7 @@ impl LearningWindow {
             .px_4()
             .py_3()
             .border_b_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(palette(cx).border))
             .when(document != CourseDocument::Tutorial, |row| {
                 row.child(
                     Button::new("learning-back-to-guide")
@@ -1690,7 +1698,7 @@ impl LearningWindow {
             .min_h(px(0.))
             .min_w(px(0.))
             .child(actions)
-            .child(div().px_4().pt_2().text_xs().text_color(rgb(MUTED)).child(
+            .child(div().px_4().pt_2().text_xs().text_color(rgb(palette(cx).muted)).child(
                 if document.chapter_index().is_some_and(|index| index > 0) {
                     "读完本章后进入“本章代码实验”：先预测，再编写手搓与库版本，查看宿主检查和运行轨迹。"
                 } else {
@@ -1718,7 +1726,7 @@ impl LearningWindow {
             .justify_between()
             .items_center()
             .border_t_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(palette(cx).border))
             .pt_2()
             .child(
                 Button::new("learning-previous-lesson")
@@ -1736,7 +1744,7 @@ impl LearningWindow {
                         });
                     }),
             )
-            .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
+            .child(div().text_xs().text_color(rgb(palette(cx).muted)).child(format!(
                 "第{}章 · 第 {} / {} 节",
                 self.service.chapter(),
                 self.selected_lesson + 1,
@@ -1790,7 +1798,7 @@ impl LearningWindow {
             ),
             None => div()
                 .p_5()
-                .text_color(rgb(MUTED))
+                .text_color(rgb(palette(cx).muted))
                 .child(if self.operation == Some(Operation::Loading) {
                     "正在读取课程与学习记录…"
                 } else {
@@ -1822,7 +1830,7 @@ impl LearningWindow {
             .px_3()
             .py_2()
             .text_xs()
-            .text_color(rgb(MUTED))
+            .text_color(rgb(palette(cx).muted))
             .child(if self.showing_reference {
                 "参考实现 · 只读 · 运行仍使用你的代码"
             } else if self.implementation == "langgraph" {
@@ -1980,7 +1988,7 @@ impl LearningWindow {
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette(cx).muted))
                     .child("记录首次判断、提示和修改理由。每次运行保存当时的代码、预测及帮助级别；评分仍待评阅。"),
             )
             .into_any_element()
@@ -2030,7 +2038,7 @@ impl LearningWindow {
                     .small()
                     .label(label)
                     .when(self.implementation == id, |button| {
-                        button.bg(rgb(ACCENT_SOFT)).text_color(rgb(ACCENT_DARK))
+                        button.bg(rgb(palette(cx).accent_soft)).text_color(rgb(palette(cx).accent_strong))
                     })
                     .disabled(disabled)
                     .on_click(move |_, _, cx| {
@@ -2089,13 +2097,13 @@ impl LearningWindow {
             .px_3()
             .py_3()
             .border_t_1()
-            .border_color(rgb(BORDER))
-            .bg(rgb(SURFACE))
+            .border_color(rgb(palette(cx).border))
+            .bg(rgb(palette(cx).surface))
             .child(row)
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette(cx).muted))
                     .child(if chapter == 1 {
                         "本章使用固定模型响应与模拟只读工具，让两种实现面对相同任务。"
                     } else {
@@ -2120,7 +2128,7 @@ impl LearningWindow {
                     .ghost()
                     .label(label)
                     .when(self.evidence_pane == pane, |button| {
-                        button.bg(rgb(ACCENT_SOFT)).text_color(rgb(ACCENT_DARK))
+                        button.bg(rgb(palette(cx).accent_soft)).text_color(rgb(palette(cx).accent_strong))
                     })
                     .on_click(move |_, _, cx| {
                         view.update(cx, |this, cx| {
@@ -2131,7 +2139,7 @@ impl LearningWindow {
             );
         }
         tabs.border_b_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(palette(cx).border))
             .into_any_element()
     }
 
@@ -2143,7 +2151,7 @@ impl LearningWindow {
                 .gap_3()
                 .p_4()
                 .text_sm()
-                .text_color(rgb(MUTED))
+                .text_color(rgb(palette(cx).muted))
                 .child(if self.running {
                     "正在执行你的代码…"
                 } else {
@@ -2154,11 +2162,11 @@ impl LearningWindow {
                 .into_any_element();
         };
         let color = if report.imported {
-            MUTED
+            palette(cx).muted
         } else if report.passed {
             0x376441
         } else {
-            DANGER
+            palette(cx).danger
         };
         let mut checks = div().v_flex().gap_1p5();
         if let Some(items) = report
@@ -2184,9 +2192,9 @@ impl LearningWindow {
                     div()
                         .text_xs()
                         .text_color(rgb(if report.imported || passed {
-                            MUTED
+                            palette(cx).muted
                         } else {
-                            DANGER
+                            palette(cx).danger
                         }))
                         .child(format!("{prefix} · {detail}")),
                 );
@@ -2218,7 +2226,7 @@ impl LearningWindow {
                     .v_flex()
                     .gap_1()
                     .text_xs()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette(cx).muted))
                     .child(format!("记录 {}", short_text(&report.id, 14)))
                     .child(format!("记录时间：{}", record_time(&report.created_at))),
             )
@@ -2228,7 +2236,7 @@ impl LearningWindow {
                     .gap_1p5()
                     .p_3()
                     .rounded(px(8.))
-                    .bg(rgb(PAPER))
+                    .bg(rgb(palette(cx).paper))
                     .text_sm()
                     .child(format!("{}：{}", if self.service.chapter() == 1 { "模型决策" } else { "练习输入获取" }, report.metrics.model_decisions))
                     .child(format!("实际工具执行：{}", report.metrics.actual_tool_executions))
@@ -2253,9 +2261,9 @@ impl LearningWindow {
                     .gap_1()
                     .p_3()
                     .rounded(px(8.))
-                    .bg(rgb(ACCENT_SOFT))
+                    .bg(rgb(palette(cx).accent_soft))
                     .text_xs()
-                    .text_color(rgb(ACCENT_DARK))
+                    .text_color(rgb(palette(cx).accent_strong))
                     .child("学习证据：待评阅")
                     .child(if report.imported {
                         "这份报告来自导入备份，其历史结果和来源尚未重新核验。"
@@ -2272,7 +2280,7 @@ impl LearningWindow {
             return div()
                 .p_4()
                 .text_sm()
-                .text_color(rgb(MUTED))
+                .text_color(rgb(palette(cx).muted))
                 .child("选择一条历史记录，或运行一次代码后，查看当时保存的代码、预测和学习笔记。")
                 .into_any_element();
         };
@@ -2309,7 +2317,7 @@ impl LearningWindow {
             .gap_2()
             .p_3()
             .child(div().text_sm().font_semibold().child("本次作答快照 · 只读"))
-            .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
+            .child(div().text_xs().text_color(rgb(palette(cx).muted)).child(format!(
                 "{} · {} · {}",
                 implementation_label(self.service.chapter(), &workspace.implementation),
                 scenario_label(self.service.chapter(), &workspace.scenario),
@@ -2318,7 +2326,7 @@ impl LearningWindow {
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette(cx).muted))
                     .child(if report.imported {
                         "导入记录 · 待核验。这里展示备份保存的作答，不能证明当时独立完成。"
                     } else {
@@ -2340,7 +2348,7 @@ impl LearningWindow {
             return div()
                 .p_4()
                 .text_sm()
-                .text_color(rgb(MUTED))
+                .text_color(rgb(palette(cx).muted))
                 .child(if self.running {
                     "正在等待执行器的实际事件…"
                 } else {
@@ -2372,7 +2380,7 @@ impl LearningWindow {
                         self.omitted_traces + index + 1,
                         short_text(&event.label, 36)
                     ))
-                    .when(index == selected, |button| button.bg(rgb(ACCENT_SOFT)))
+                    .when(index == selected, |button| button.bg(rgb(palette(cx).accent_soft)))
                     .on_click(move |_, _, cx| {
                         view.update(cx, |this, cx| {
                             this.trace_selected = Some(index);
@@ -2391,7 +2399,7 @@ impl LearningWindow {
             .gap_2()
             .p_3()
             .when(self.omitted_traces > 0, |panel| {
-                panel.child(div().text_xs().text_color(rgb(MUTED)).child(format!(
+                panel.child(div().text_xs().text_color(rgb(palette(cx).muted)).child(format!(
                     "当前显示最近 {MAX_VISIBLE_TRACES} 条；完整报告保留更早事件。"
                 )))
             })
@@ -2456,7 +2464,7 @@ impl LearningWindow {
             list = list.child(
                 div()
                     .text_sm()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette(cx).muted))
                     .child("尚无运行历史。第一次运行后会保留当时的代码、预测与结果。"),
             );
         }
@@ -2471,15 +2479,15 @@ impl LearningWindow {
                     .gap_1p5()
                     .p_3()
                     .border_1()
-                    .border_color(rgb(if selected { ACCENT } else { BORDER }))
+                    .border_color(rgb(if selected { palette(cx).accent } else { palette(cx).border }))
                     .rounded(px(8.))
-                    .bg(rgb(SURFACE))
+                    .bg(rgb(palette(cx).surface))
                     .child(div().text_sm().font_semibold().child(format!(
                         "{} · {}",
                         implementation_label(self.service.chapter(), &entry.implementation),
                         scenario_label(self.service.chapter(), &entry.scenario)
                     )))
-                    .child(div().text_xs().text_color(rgb(MUTED)).child(run_label(
+                    .child(div().text_xs().text_color(rgb(palette(cx).muted)).child(run_label(
                         &entry.status,
                         entry.passed,
                         entry.imported,
@@ -2487,7 +2495,7 @@ impl LearningWindow {
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(palette(cx).muted))
                             .child(record_time(&entry.created_at)),
                     )
                     .child(
@@ -2521,9 +2529,9 @@ impl LearningWindow {
             .px_4()
             .py_3()
             .border_t_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(palette(cx).border))
             .text_xs()
-            .text_color(rgb(MUTED))
+            .text_color(rgb(palette(cx).muted))
             .child(div().font_semibold().child(if environment.ready {
                 "运行环境"
             } else {
@@ -2569,7 +2577,7 @@ impl LearningWindow {
                 .min_w(px(0.))
                 .min_h(px(0.))
                 .h_full()
-                .bg(rgb(SURFACE))
+                .bg(rgb(palette(cx).surface))
                 .child(self.render_course_document(document, window, cx))
                 .child(self.render_environment(cx))
                 .into_any_element();
@@ -2586,7 +2594,7 @@ impl LearningWindow {
             .min_w(px(0.))
             .min_h(px(0.))
             .h_full()
-            .bg(rgb(SURFACE))
+            .bg(rgb(palette(cx).surface))
             .child(self.render_study_tabs(cx))
             .child(pane)
             .child(self.render_run_controls(cx))
@@ -2607,9 +2615,9 @@ impl LearningWindow {
             .flex_none()
             .h_full()
             .min_h(px(0.))
-            .bg(rgb(PAPER))
+            .bg(rgb(palette(cx).paper))
             .border_l_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(palette(cx).border))
             .child(self.render_evidence_tabs(cx))
             .child(div().v_flex().flex_1().min_h(px(0.)).child(pane))
             .child(self.render_environment(cx))
@@ -2643,10 +2651,10 @@ impl Render for LearningWindow {
             .v_flex()
             .size_full()
             .min_h(px(0.))
-            .text_color(rgb(INK))
-            .bg(rgb(PAPER))
+            .text_color(rgb(palette(cx).ink))
+            .bg(rgb(palette(cx).paper))
             .child(header)
-            .when_some(self.render_notice(), |root, notice| root.child(notice))
+            .when_some(self.render_notice(palette(cx)), |root, notice| root.child(notice))
             .child(
                 div()
                     .h_flex()
@@ -2659,7 +2667,7 @@ impl Render for LearningWindow {
             .child(render_status_bar(
                 IconName::BookOpen,
                 status.to_string(),
-                MUTED,
+                palette(cx).muted,
                 match self.study_pane {
                     StudyPane::Document(document) => document.title().to_string(),
                     _ => format!(
@@ -2671,6 +2679,7 @@ impl Render for LearningWindow {
                     ),
                 },
                 "本章学习证据待评阅".to_string(),
+                palette(cx),
             ))
     }
 }

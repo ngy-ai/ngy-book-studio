@@ -91,6 +91,21 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   `InitResult`（含文件 guard 与后台清理句柄）并在进程退出前 drop，以免丢掉非阻塞写入的
   尾日志、或让清理线程悬空；init 失败退回 `console_tracing`，两条路都装不上只报 stderr，
   不 panic（GPUI 回调不可 unwind），也不拦住启动。
+- `src/theme.rs`：浅色 / 深色两套皮肤的唯一定义。`Appearance` 是**应用级**偏好
+  （存 `appearance.preferences.v1`，由 `ProviderSettings.appearance` 合并进快照），
+  `Palette` 给每个语义色一个取值，`set_appearance` 一次做完三件事：记住皮肤、把同一份
+  颜色写进 `gpui-component` 的 `ThemeColor`（不写的话按钮、输入框、滚动条会留在旧皮肤
+  上，而且必须在 `Theme::change` **之后**写，否则被内置主题覆盖）、刷新全部窗口。
+  界面代码一律 `palette(cx).xxx` 取色，不要再写 `rgb(0x...)`：写死的颜色在深色皮肤里就是
+  「深色叠深色」。取色点拿不到 `cx`（自由函数、`'static` 闭包）时先
+  `let theme = palette(cx);` 取值再传：闭包里直接写 `palette(cx)` 会把 `&App` 借用带出
+  方法体，`move` 闭包还会把 `cx` 移动走。半透明色用 `Palette::tint(基色, alpha)`，
+  不要写 `rgba(0x...)`。WebView 拿不到 Rust 常量，三个面（阅读器章节、富文本编辑器、
+  PDF.js viewer）靠 `Palette::css_variables` / `css_variable_setters` 下发的 `--ngy-*`
+  自定义属性取色；编辑器还要额外注入一层覆盖规则（`editor_appearance_script`），因为它
+  的颜色写死在随包发布的 `assets/editor/prosemirror.js` 里。各 WebView 窗口用
+  `observe_global::<AppTheme>` 跟随切换，不靠中心化的窗口注册表；窗口自己的
+  `with_background_color` 要在创建时就是当前皮肤的颜色，否则每次换页会闪一帧旧底色。
 - `src/services.rs`、`src/runtime.rs`：进程级服务组合与独立 Tokio runtime；统一持有
   图书库、对象存储、格式注册表、搜索、AI、Office 和后台任务。GPUI 回调跑在自己的
   executor 上，不是 Tokio 上下文：UI 可达的服务方法必须把数据库、对象存储、`tokio::fs`

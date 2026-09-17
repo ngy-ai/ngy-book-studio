@@ -620,6 +620,8 @@ fn open_pdf_reader_window(request: PdfReaderWindowRequest, cx: &mut App) {
             tracing::warn!(%error, "cannot read the PDF reading preference");
             false
         });
+    // 皮肤同样只读一次：viewer 的原生底色要立刻是当前皮肤的颜色。
+    let appearance = current_appearance(cx);
     let opened = cx.open_window(options, move |window, cx| {
         let parent = match ParentWindowHandle::capture(window) {
             Ok(parent) => parent,
@@ -716,7 +718,14 @@ fn open_pdf_reader_window(request: PdfReaderWindowRequest, cx: &mut App) {
         );
         window
             .spawn(cx, async move |cx| {
-                match build_pdf_reader_webview(bytes, initial_page, compact_reading, &parent).await
+                match build_pdf_reader_webview(
+                    bytes,
+                    initial_page,
+                    compact_reading,
+                    &parent,
+                    appearance,
+                )
+                .await
                 {
                     Ok((raw_webview, ipc_receiver)) => {
                         let _ = cx.update(|window, cx| {
@@ -2420,6 +2429,9 @@ impl EpubReaderApp {
                             // Build the child WebView against this window's HWND and
                             // attach it once ready.
                             let book = opened.clone();
+                            // 皮肤只在窗口创建时读一次：WebView 的原生底色要立刻是
+                            // 对的那一种。之后换皮肤由阅读器窗口自己重放外观脚本。
+                            let appearance = current_appearance(cx);
                             window
                                 .spawn(cx, async move |cx| {
                                     match build_reader_webview(
@@ -2431,6 +2443,7 @@ impl EpubReaderApp {
                                         &parent,
                                         record.id.clone(),
                                         Arc::clone(&services),
+                                        appearance,
                                     )
                                     .await
                                     {
@@ -2779,10 +2792,16 @@ impl EpubReaderApp {
 
                     // Build the preview/rich-text webview in the background and
                     // attach it once ready. The source tab needs no webview.
+                    let appearance = current_appearance(cx);
                     window
                         .spawn(cx, async move |cx| {
-                            match build_editor_webview(&parent, web_state, Arc::clone(&services))
-                                .await
+                            match build_editor_webview(
+                                &parent,
+                                web_state,
+                                Arc::clone(&services),
+                                appearance,
+                            )
+                            .await
                             {
                                 Ok((raw_webview, page_receiver)) => {
                                     let _ = cx.update(|window, cx| {
@@ -2865,11 +2884,11 @@ impl EpubReaderApp {
         Button::new(id)
             .custom(
                 ButtonCustomVariant::new(cx)
-                    .color(rgb(ACCENT).into())
+                    .color(rgb(palette(cx).accent).into())
                     .foreground(white())
-                    .border(rgb(ACCENT).into())
-                    .hover(rgb(ACCENT_DARK).into())
-                    .active(rgb(ACCENT_DARK).into()),
+                    .border(rgb(palette(cx).accent).into())
+                    .hover(rgb(palette(cx).accent_strong).into())
+                    .active(rgb(palette(cx).accent_strong).into()),
             )
             .rounded(px(9.))
     }
@@ -2898,8 +2917,8 @@ impl EpubReaderApp {
             .px_7()
             .py_3()
             .border_b_1()
-            .border_color(rgb(BORDER))
-            .bg(rgb(SURFACE))
+            .border_color(rgb(palette(cx).border))
+            .bg(rgb(palette(cx).surface))
             .child(
                 div()
                     .h_flex()
@@ -2912,7 +2931,7 @@ impl EpubReaderApp {
                             .justify_center()
                             .size_9()
                             .rounded(px(10.))
-                            .bg(rgb(ACCENT))
+                            .bg(rgb(palette(cx).accent))
                             .text_color(white())
                             .child(Icon::new(IconName::BookOpen)),
                     )
@@ -2924,13 +2943,13 @@ impl EpubReaderApp {
                                 div()
                                     .text_lg()
                                     .font_semibold()
-                                    .text_color(rgb(INK))
+                                    .text_color(rgb(palette(cx).ink))
                                     .child("墨页"),
                             )
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(MUTED))
+                                    .text_color(rgb(palette(cx).muted))
                                     .child("你的私人图书馆"),
                             ),
                     ),
@@ -3035,7 +3054,7 @@ impl EpubReaderApp {
             .min_h(px(54.))
             .pb_4()
             .border_b_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(palette(cx).border))
             .child(
                 div()
                     .v_flex()
@@ -3045,10 +3064,10 @@ impl EpubReaderApp {
                         div()
                             .text_2xl()
                             .font_semibold()
-                            .text_color(rgb(INK))
+                            .text_color(rgb(palette(cx).ink))
                             .child(heading),
                     )
-                    .child(div().text_sm().text_color(rgb(MUTED)).child(subtitle)),
+                    .child(div().text_sm().text_color(rgb(palette(cx).muted)).child(subtitle)),
             )
             .when(!searching, |this| {
                 this.when_some(self.group_filter.group_id(), |this, group_id| {
@@ -3069,7 +3088,7 @@ impl EpubReaderApp {
         div()
             .v_flex()
             .size_full()
-            .bg(rgb(PAPER))
+            .bg(rgb(palette(cx).paper))
             .child(header)
             .child(
                 div()
@@ -3091,29 +3110,30 @@ impl EpubReaderApp {
                             .p_5()
                             .rounded(px(14.))
                             .border_1()
-                            .border_color(rgb(BORDER))
-                            .bg(rgb(SURFACE))
+                            .border_color(rgb(palette(cx).border))
+                            .bg(rgb(palette(cx).surface))
                             .child(title)
                             .child(content),
                     )
                     .child(self.ai_sidebar.clone()),
             )
-            .child(self.render_library_status_bar(visible.len()))
+            .child(self.render_library_status_bar(visible.len(), cx))
             .when_some(self.notice.as_ref(), |this, notice| {
-                this.child(self.render_notice(notice))
+                this.child(self.render_notice(notice, palette(cx)))
             })
             .into_any_element()
     }
 
-    fn render_library_status_bar(&self, visible: usize) -> gpui::AnyElement {
+    fn render_library_status_bar(&self, visible: usize, cx: &App) -> gpui::AnyElement {
+        let theme = palette(cx);
         let (status_icon, status_text, status_color) = if self.search_loading {
-            (IconName::Search, "正在检索…", ACCENT)
+            (IconName::Search, "正在检索…", theme.accent)
         } else if self.search_error.is_some() {
-            (IconName::TriangleAlert, "检索失败", DANGER)
+            (IconName::TriangleAlert, "检索失败", theme.danger)
         } else if self.is_importing {
-            (IconName::BookOpen, "正在导入图书…", ACCENT)
+            (IconName::BookOpen, "正在导入图书…", theme.accent)
         } else {
-            (IconName::CircleCheck, "书库已就绪", 0x376441)
+            (IconName::CircleCheck, "书库已就绪", theme.success)
         };
         let scope = if !self.search_query.is_empty() {
             format!(
@@ -3153,6 +3173,7 @@ impl EpubReaderApp {
                 self.library.groups().len()
             ),
             scope,
+            palette(cx),
         )
     }
 
@@ -3229,8 +3250,8 @@ impl EpubReaderApp {
                     .gap_3()
                     .rounded(px(14.))
                     .border_1()
-                    .border_color(rgb(BORDER))
-                    .bg(rgb(PAPER))
+                    .border_color(rgb(palette(cx).border))
+                    .bg(rgb(palette(cx).paper))
                     .child(
                         div()
                             .flex()
@@ -3238,15 +3259,15 @@ impl EpubReaderApp {
                             .justify_center()
                             .size(px(56.))
                             .rounded_full()
-                            .bg(rgb(ACCENT_SOFT))
-                            .text_color(rgb(ACCENT))
+                            .bg(rgb(palette(cx).accent_soft))
+                            .text_color(rgb(palette(cx).accent))
                             .child(Icon::new(IconName::BookOpen).large()),
                     )
                     .child(
                         div()
                             .text_xl()
                             .font_semibold()
-                            .text_color(rgb(INK))
+                            .text_color(rgb(palette(cx).ink))
                             .child("你的书架还是空的"),
                     )
                     .child(
@@ -3255,7 +3276,7 @@ impl EpubReaderApp {
                             .text_center()
                             .text_sm()
                             .line_height(gpui::relative(1.6))
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(palette(cx).muted))
                             .child("导入 EPUB、PDF、Office 或 DRM-free Kindle 图书，原件会完整保存在本地。"),
                     )
                     .child(
@@ -3292,8 +3313,8 @@ impl EpubReaderApp {
                         .gap_3()
                         .rounded(px(14.))
                         .border_1()
-                        .border_color(rgb(BORDER))
-                        .bg(rgb(PAPER))
+                        .border_color(rgb(palette(cx).border))
+                        .bg(rgb(palette(cx).paper))
                         .child(
                             div()
                                 .flex()
@@ -3301,15 +3322,15 @@ impl EpubReaderApp {
                                 .justify_center()
                                 .size(px(56.))
                                 .rounded_full()
-                                .bg(rgb(ACCENT_SOFT))
-                                .text_color(rgb(ACCENT))
+                                .bg(rgb(palette(cx).accent_soft))
+                                .text_color(rgb(palette(cx).accent))
                                 .child(Icon::new(IconName::Search).large()),
                         )
                         .child(
                             div()
                                 .text_xl()
                                 .font_semibold()
-                                .text_color(rgb(INK))
+                                .text_color(rgb(palette(cx).ink))
                                 .child(format!(
                                     "正在进行{}检索…",
                                     search_mode_label(self.search_mode)
@@ -3321,7 +3342,7 @@ impl EpubReaderApp {
                                 .text_center()
                                 .text_sm()
                                 .line_height(gpui::relative(1.6))
-                                .text_color(rgb(MUTED))
+                                .text_color(rgb(palette(cx).muted))
                                 .child("搜索范围只包含当前分组及其子分组中的图书。"),
                         ),
                 )
@@ -3344,18 +3365,18 @@ impl EpubReaderApp {
                         .gap_3()
                         .rounded(px(14.))
                         .border_1()
-                        .border_color(rgba(0x9f302c2e))
-                        .bg(rgb(0xf7e1df))
+                        .border_color(Palette::tint(palette(cx).danger, 0.18))
+                        .bg(rgb(palette(cx).danger_soft))
                         .child(
                             div()
-                                .text_color(rgb(DANGER))
+                                .text_color(rgb(palette(cx).danger))
                                 .child(Icon::new(IconName::TriangleAlert).large()),
                         )
                         .child(
                             div()
                                 .text_xl()
                                 .font_semibold()
-                                .text_color(rgb(INK))
+                                .text_color(rgb(palette(cx).ink))
                                 .child("无法完成搜索"),
                         )
                         .child(
@@ -3364,7 +3385,7 @@ impl EpubReaderApp {
                                 .text_center()
                                 .text_sm()
                                 .line_height(gpui::relative(1.6))
-                                .text_color(rgb(MUTED))
+                                .text_color(rgb(palette(cx).muted))
                                 .child(error.clone()),
                         ),
                 )
@@ -3387,8 +3408,8 @@ impl EpubReaderApp {
                         .gap_3()
                         .rounded(px(14.))
                         .border_1()
-                        .border_color(rgb(BORDER))
-                        .bg(rgb(PAPER))
+                        .border_color(rgb(palette(cx).border))
+                        .bg(rgb(palette(cx).paper))
                         .child(
                             div()
                                 .flex()
@@ -3396,15 +3417,15 @@ impl EpubReaderApp {
                                 .justify_center()
                                 .size(px(56.))
                                 .rounded_full()
-                                .bg(rgb(ACCENT_SOFT))
-                                .text_color(rgb(ACCENT))
+                                .bg(rgb(palette(cx).accent_soft))
+                                .text_color(rgb(palette(cx).accent))
                                 .child(Icon::new(IconName::Search).large()),
                         )
                         .child(
                             div()
                                 .text_xl()
                                 .font_semibold()
-                                .text_color(rgb(INK))
+                                .text_color(rgb(palette(cx).ink))
                                 .child("没有找到相关内容"),
                         )
                         .child(
@@ -3413,7 +3434,7 @@ impl EpubReaderApp {
                                 .text_center()
                                 .text_sm()
                                 .line_height(gpui::relative(1.6))
-                                .text_color(rgb(MUTED))
+                                .text_color(rgb(palette(cx).muted))
                                 .child(match self.search_mode {
                                     SearchMode::Keyword => "试试更短的关键词，或检查正文中的拼写。",
                                     SearchMode::Semantic | SearchMode::Hybrid => {
@@ -3447,8 +3468,8 @@ impl EpubReaderApp {
                     .p_4()
                     .rounded(px(10.))
                     .border_1()
-                    .border_color(rgb(BORDER))
-                    .bg(rgb(SURFACE))
+                    .border_color(rgb(palette(cx).border))
+                    .bg(rgb(palette(cx).surface))
                     // Same rule as the book grid: a hit is opened on double
                     // click, so a stray click while reading snippets cannot
                     // jump into a book. `Button` has no `on_double_click`, so
@@ -3477,21 +3498,21 @@ impl EpubReaderApp {
                                         div()
                                             .truncate()
                                             .font_semibold()
-                                            .text_color(rgb(INK))
+                                            .text_color(rgb(palette(cx).ink))
                                             .child(hit.book_title.clone()),
                                     )
                                     .child(
                                         div()
                                             .flex_none()
                                             .text_xs()
-                                            .text_color(rgb(ACCENT))
+                                            .text_color(rgb(palette(cx).accent))
                                             .child(location),
                                     ),
                             )
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(MUTED))
+                                    .text_color(rgb(palette(cx).muted))
                                     .child(hit.author.clone()),
                             )
                             .child(
@@ -3499,7 +3520,7 @@ impl EpubReaderApp {
                                     .line_clamp(2)
                                     .text_left()
                                     .text_sm()
-                                    .text_color(rgb(MUTED))
+                                    .text_color(rgb(palette(cx).muted))
                                     .child(hit.snippet.clone()),
                             ),
                     )
@@ -3541,6 +3562,9 @@ impl EpubReaderApp {
     }
 
     fn render_book_card(&self, book: &BookRecord, cx: &mut Context<Self>) -> gpui::AnyElement {
+        // 悬停/按下样式是 `'static` 闭包，借用 `cx` 会逃逸，`move` 闭包又会夺走它；
+        // 取一次值（`Palette` 是 `Copy`）供整张卡片共用。
+        let theme = palette(cx);
         let view = cx.entity().clone();
         let book_id = book.id.clone();
         let cover_bytes = self.library.cover_bytes_cached(&book.id);
@@ -3566,8 +3590,8 @@ impl EpubReaderApp {
                 .items_center()
                 .justify_center()
                 .gap_2()
-                .bg(rgb(SIDEBAR))
-                .text_color(rgb(ACCENT))
+                .bg(rgb(palette(cx).sidebar))
+                .text_color(rgb(palette(cx).accent))
                 .child(Icon::new(IconName::BookOpen).large())
                 .child(
                     div()
@@ -3607,8 +3631,8 @@ impl EpubReaderApp {
             .border_1()
             .border_color(rgba(0x00000000))
             .cursor_pointer()
-            .hover(|style| style.bg(rgb(PAPER)).border_color(rgb(BORDER)))
-            .active(|style| style.bg(rgb(SIDEBAR)))
+            .hover(|style| style.bg(rgb(theme.paper)).border_color(rgb(theme.border)))
+            .active(|style| style.bg(rgb(theme.sidebar)))
             // Books open on double click, matching the shell's file list: a
             // single click only focuses the card, so browsing the grid or
             // reaching for the card's own buttons cannot open a reader.
@@ -3730,7 +3754,7 @@ impl EpubReaderApp {
                     menu.separator()
                         .item(
                             PopupMenuItem::new("删除图书")
-                                .icon(Icon::new(IconName::Delete).text_color(rgb(DANGER)))
+                                .icon(Icon::new(IconName::Delete).text_color(rgb(theme.danger)))
                                 .on_click(move |_, window, cx| {
                                     delete_view.update(cx, |this, cx| {
                                         this.open_delete_book_dialog(
@@ -3753,8 +3777,8 @@ impl EpubReaderApp {
                     .overflow_hidden()
                     .rounded(px(10.))
                     .border_1()
-                    .border_color(rgb(BORDER))
-                    .bg(rgb(SURFACE))
+                    .border_color(rgb(theme.border))
+                    .bg(rgb(theme.surface))
                     .child(cover),
             )
             .child(
@@ -3769,7 +3793,7 @@ impl EpubReaderApp {
                             .text_sm()
                             .font_semibold()
                             .line_clamp(2)
-                            .text_color(rgb(INK))
+                            .text_color(rgb(palette(cx).ink))
                             .child(book.title.clone()),
                     )
                     .child(
@@ -3777,7 +3801,7 @@ impl EpubReaderApp {
                             .w_full()
                             .text_xs()
                             .line_clamp(1)
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(palette(cx).muted))
                             .child(book.author.clone()),
                     )
                     .child(
@@ -3786,10 +3810,10 @@ impl EpubReaderApp {
                             .px_1p5()
                             .py_0p5()
                             .rounded(px(4.))
-                            .bg(rgb(ACCENT_SOFT))
+                            .bg(rgb(palette(cx).accent_soft))
                             .text_xs()
                             .font_medium()
-                            .text_color(rgb(ACCENT_DARK))
+                            .text_color(rgb(palette(cx).accent_strong))
                             .child(book.format.to_ascii_uppercase()),
                     )
                     .when_some(
@@ -3803,9 +3827,9 @@ impl EpubReaderApp {
                                     .w_full()
                                     .gap_1()
                                     .text_xs()
-                                    .text_color(rgb(ACCENT))
+                                    .text_color(rgb(palette(cx).accent))
                                     .child(
-                                        Icon::new(IconName::Folder).small().text_color(rgb(ACCENT)),
+                                        Icon::new(IconName::Folder).small().text_color(rgb(palette(cx).accent)),
                                     )
                                     .child(
                                         div().min_w(px(0.)).truncate().child(group.name.clone()),
@@ -3861,9 +3885,9 @@ impl EpubReaderApp {
             .ghost()
             .xsmall()
             .icon(IconName::Folder)
-            .bg(rgba(0xfffefae6))
+            .bg(Palette::tint(palette(cx).surface, 0.9))
             .border_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(palette(cx).border))
             .rounded(px(7.))
             .tooltip("设置分组")
             .on_click(move |_, _, cx| {
@@ -3907,7 +3931,7 @@ impl EpubReaderApp {
                 .h(px(1.))
                 .my_2()
                 .mx_2()
-                .bg(rgb(BORDER))
+                .bg(rgb(palette(cx).border))
                 .into_any_element(),
             div()
                 .h_flex()
@@ -3915,7 +3939,7 @@ impl EpubReaderApp {
                 .px_2()
                 .text_xs()
                 .font_semibold()
-                .text_color(rgb(MUTED))
+                .text_color(rgb(palette(cx).muted))
                 .child("书架")
                 .into_any_element(),
         ];
@@ -3942,7 +3966,7 @@ impl EpubReaderApp {
                 .h(px(1.))
                 .my_1()
                 .mx_2()
-                .bg(rgb(BORDER))
+                .bg(rgb(palette(cx).border))
                 .into_any_element(),
         );
 
@@ -3960,7 +3984,7 @@ impl EpubReaderApp {
                         .gap_2()
                         .text_xs()
                         .font_semibold()
-                        .text_color(rgb(MUTED))
+                        .text_color(rgb(palette(cx).muted))
                         .child(Icon::new(IconName::Folder).small())
                         .child("分组"),
                 )
@@ -3987,7 +4011,7 @@ impl EpubReaderApp {
                     .py_3()
                     .text_xs()
                     .line_height(gpui::relative(1.6))
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette(cx).muted))
                     .child("还没有分组，点击右上角 + 新建一个。")
                     .into_any_element(),
             );
@@ -4005,8 +4029,8 @@ impl EpubReaderApp {
             .p_2()
             .rounded(px(14.))
             .border_1()
-            .border_color(rgb(BORDER))
-            .bg(rgb(SIDEBAR))
+            .border_color(rgb(palette(cx).border))
+            .bg(rgb(palette(cx).sidebar))
             .child(
                 div()
                     .id("group-scroll")
@@ -4038,14 +4062,14 @@ impl EpubReaderApp {
             .gap_2()
             .rounded(px(8.))
             .when(selected, |this| {
-                this.bg(rgb(ACCENT_SOFT))
+                this.bg(rgb(palette(cx).accent_soft))
                     .border_l_2()
-                    .border_color(rgb(ACCENT))
+                    .border_color(rgb(palette(cx).accent))
             })
             .child(Icon::new(icon).small().text_color(if selected {
-                rgb(ACCENT)
+                rgb(palette(cx).accent)
             } else {
-                rgb(MUTED)
+                rgb(palette(cx).muted)
             }))
             .child(
                 div()
@@ -4054,7 +4078,7 @@ impl EpubReaderApp {
                     .text_left()
                     .truncate()
                     .text_sm()
-                    .text_color(if selected { rgb(ACCENT) } else { rgb(INK) })
+                    .text_color(if selected { rgb(palette(cx).accent) } else { rgb(palette(cx).ink) })
                     .when(selected, |this| this.font_medium())
                     .child(label),
             )
@@ -4066,9 +4090,9 @@ impl EpubReaderApp {
                     .justify_center()
                     .px(px(6.))
                     .rounded_full()
-                    .bg(rgba(0xffffff99))
+                    .bg(Palette::tint(palette(cx).surface, 0.6))
                     .text_xs()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette(cx).muted))
                     .child(count.to_string()),
             )
             .on_click(move |_, _, cx| {
@@ -4106,7 +4130,7 @@ impl EpubReaderApp {
         let selected = self.group_filter.group_id() == Some(group.id.as_str());
         let count = self.library.group_subtree_book_count(&group.id);
         let row_id = SharedString::from(format!("group-row-{}", group.id));
-        let accent = selected.then_some(rgb(ACCENT));
+        let accent = selected.then_some(rgb(palette(cx).accent));
 
         let toggle = if has_children {
             let toggle_view = view.clone();
@@ -4144,14 +4168,14 @@ impl EpubReaderApp {
                     IconName::Folder
                 })
                 .small()
-                .text_color(accent.unwrap_or(rgb(MUTED))),
+                .text_color(accent.unwrap_or(rgb(palette(cx).muted))),
             )
             .child(
                 div()
                     .min_w(px(0.))
                     .truncate()
                     .text_sm()
-                    .text_color(accent.unwrap_or(rgb(INK)))
+                    .text_color(accent.unwrap_or(rgb(palette(cx).ink)))
                     .when(selected, |this| this.font_medium())
                     .child(group.name.clone()),
             )
@@ -4167,7 +4191,7 @@ impl EpubReaderApp {
             .ghost()
             .xsmall()
             .icon(IconName::Ellipsis)
-            .text_color(rgb(MUTED))
+            .text_color(rgb(palette(cx).muted))
             .dropdown_menu(move |menu, _, _| {
                 let view = menu_view.clone();
                 let group_id = menu_id.clone();
@@ -4219,12 +4243,12 @@ impl EpubReaderApp {
             .pr_1()
             .rounded(px(8.))
             .when(selected, |this| {
-                this.bg(rgb(ACCENT_SOFT))
+                this.bg(rgb(palette(cx).accent_soft))
                     .border_l_2()
-                    .border_color(rgb(ACCENT))
+                    .border_color(rgb(palette(cx).accent))
             })
             .when(!selected, |this| {
-                this.hover(|style| style.bg(rgba(0x2926210a)))
+                this.hover(|style| style.bg(Palette::tint(palette(cx).ink, 0.04)))
             })
             .child(toggle)
             .child(label)
@@ -4236,9 +4260,9 @@ impl EpubReaderApp {
                     .justify_center()
                     .px(px(6.))
                     .rounded_full()
-                    .bg(rgba(0xffffff99))
+                    .bg(Palette::tint(palette(cx).surface, 0.6))
                     .text_xs()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette(cx).muted))
                     .child(count.to_string()),
             )
             .child(actions)
@@ -4246,6 +4270,8 @@ impl EpubReaderApp {
     }
 
     fn render_group_actions(&self, group_id: &str, cx: &mut Context<Self>) -> gpui::AnyElement {
+        // 分组菜单在 `move` 闭包里构造，捕获 `cx` 会把借用带走；取一次值即可。
+        let theme = palette(cx);
         let view = cx.entity().clone();
         let new_child_id = group_id.to_string();
         let new_child_view = view.clone();
@@ -4294,7 +4320,7 @@ impl EpubReaderApp {
                         .separator()
                         .item(
                             PopupMenuItem::new("删除分组")
-                                .icon(Icon::new(IconName::Delete).text_color(rgb(DANGER)))
+                                .icon(Icon::new(IconName::Delete).text_color(rgb(theme.danger)))
                                 .on_click(move |_, window, cx| {
                                     delete_view.update(cx, |this, cx| {
                                         this.open_delete_group_dialog(
@@ -4327,8 +4353,8 @@ impl EpubReaderApp {
                     .gap_3()
                     .rounded(px(14.))
                     .border_1()
-                    .border_color(rgb(BORDER))
-                    .bg(rgb(PAPER))
+                    .border_color(rgb(palette(cx).border))
+                    .bg(rgb(palette(cx).paper))
                     .child(
                         div()
                             .flex()
@@ -4336,15 +4362,15 @@ impl EpubReaderApp {
                             .justify_center()
                             .size(px(56.))
                             .rounded_full()
-                            .bg(rgb(ACCENT_SOFT))
-                            .text_color(rgb(ACCENT))
+                            .bg(rgb(palette(cx).accent_soft))
+                            .text_color(rgb(palette(cx).accent))
                             .child(Icon::new(IconName::FolderOpen).large()),
                     )
                     .child(
                         div()
                             .text_xl()
                             .font_semibold()
-                            .text_color(rgb(INK))
+                            .text_color(rgb(palette(cx).ink))
                             .child("这个分组还是空的"),
                     )
                     .child(
@@ -4353,7 +4379,7 @@ impl EpubReaderApp {
                             .text_center()
                             .text_sm()
                             .line_height(gpui::relative(1.6))
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(palette(cx).muted))
                             .child("可在图书卡片右上角的文件夹菜单中，将图书移动到这里。"),
                     )
                     .child(
@@ -5063,17 +5089,17 @@ impl EpubReaderApp {
             .px_2()
             .rounded(px(8.))
             .cursor_pointer()
-            .when(ungrouped_selected, |this| this.bg(rgb(ACCENT_SOFT)))
+            .when(ungrouped_selected, |this| this.bg(rgb(palette(cx).accent_soft)))
             .when(!ungrouped_selected, |this| {
-                this.hover(|style| style.bg(rgba(0x2926210a)))
+                this.hover(|style| style.bg(Palette::tint(palette(cx).ink, 0.04)))
             })
             .child(
                 Icon::new(IconName::Inbox)
                     .small()
                     .text_color(if ungrouped_selected {
-                        rgb(ACCENT)
+                        rgb(palette(cx).accent)
                     } else {
-                        rgb(MUTED)
+                        rgb(palette(cx).muted)
                     }),
             )
             .child(
@@ -5083,14 +5109,14 @@ impl EpubReaderApp {
                     .truncate()
                     .text_sm()
                     .text_color(if ungrouped_selected {
-                        rgb(ACCENT_DARK)
+                        rgb(palette(cx).accent_strong)
                     } else {
-                        rgb(INK)
+                        rgb(palette(cx).ink)
                     })
                     .child("未分组"),
             )
             .when(ungrouped_selected, |this| {
-                this.child(Icon::new(IconName::Check).small().text_color(rgb(ACCENT)))
+                this.child(Icon::new(IconName::Check).small().text_color(rgb(palette(cx).accent)))
             })
             .on_click(move |_, _, cx| {
                 ungrouped_view.update(cx, |this, cx| this.select_picker_group(None, cx));
@@ -5103,7 +5129,7 @@ impl EpubReaderApp {
             div()
                 .p_3()
                 .text_sm()
-                .text_color(rgb(MUTED))
+                .text_color(rgb(palette(cx).muted))
                 .child("还没有分组，可用下方「新建分组」创建一个。")
                 .into_any_element()
         } else {
@@ -5136,7 +5162,7 @@ impl EpubReaderApp {
             .child(
                 div()
                     .text_sm()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette(cx).muted))
                     .child(format!("为《{book_title}》选择分组")),
             )
             .child(
@@ -5146,9 +5172,9 @@ impl EpubReaderApp {
                     .max_h(px(320.))
                     .overflow_y_scrollbar()
                     .border_1()
-                    .border_color(rgb(BORDER))
+                    .border_color(rgb(palette(cx).border))
                     .rounded(px(10.))
-                    .bg(rgb(SURFACE))
+                    .bg(rgb(palette(cx).surface))
                     .child(
                         div()
                             .v_flex()
@@ -5278,9 +5304,9 @@ impl EpubReaderApp {
             .pl(px(4. + depth as f32 * 16.))
             .rounded(px(8.))
             .cursor_pointer()
-            .when(is_selected, |this| this.bg(rgb(ACCENT_SOFT)))
+            .when(is_selected, |this| this.bg(rgb(palette(cx).accent_soft)))
             .when(!is_selected, |this| {
-                this.hover(|style| style.bg(rgba(0x2926210a)))
+                this.hover(|style| style.bg(Palette::tint(palette(cx).ink, 0.04)))
             })
             .child(toggle)
             .child(
@@ -5290,7 +5316,7 @@ impl EpubReaderApp {
                     IconName::Folder
                 })
                 .small()
-                .text_color(if is_selected { rgb(ACCENT) } else { rgb(MUTED) }),
+                .text_color(if is_selected { rgb(palette(cx).accent) } else { rgb(palette(cx).muted) }),
             )
             .child(
                 div()
@@ -5299,14 +5325,14 @@ impl EpubReaderApp {
                     .truncate()
                     .text_sm()
                     .text_color(if is_selected {
-                        rgb(ACCENT_DARK)
+                        rgb(palette(cx).accent_strong)
                     } else {
-                        rgb(INK)
+                        rgb(palette(cx).ink)
                     })
                     .child(group.name.clone()),
             )
             .when(is_selected, |this| {
-                this.child(Icon::new(IconName::Check).small().text_color(rgb(ACCENT)))
+                this.child(Icon::new(IconName::Check).small().text_color(rgb(palette(cx).accent)))
             })
             .on_click(move |_, _, cx| {
                 row_view.update(cx, |this, cx| {
@@ -5352,7 +5378,7 @@ impl EpubReaderApp {
                     .gap_2()
                     .child(Input::new(&input).disabled(pending))
                     .when_some(error, |body, error| {
-                        body.child(div().text_sm().text_color(rgb(DANGER)).child(error))
+                        body.child(div().text_sm().text_color(rgb(palette(cx).danger)).child(error))
                     })
                     .into_any_element();
                 let cancel_view = view.clone();
@@ -5397,7 +5423,7 @@ impl EpubReaderApp {
                 let description = description.clone();
                 (
                     title,
-                    render_delete_confirm_body(description, &view).into_any_element(),
+                    render_delete_confirm_body(description, &view, palette(cx)).into_any_element(),
                 )
             }
             GroupModal::DeleteBook {
@@ -5407,7 +5433,7 @@ impl EpubReaderApp {
                 let description = description.clone();
                 (
                     title,
-                    render_delete_confirm_body(description, &view).into_any_element(),
+                    render_delete_confirm_body(description, &view, palette(cx)).into_any_element(),
                 )
             }
             GroupModal::OfficeTrust {
@@ -5426,7 +5452,7 @@ impl EpubReaderApp {
                     .child(
                         div()
                             .text_sm()
-                            .text_color(rgb(INK))
+                            .text_color(rgb(palette(cx).ink))
                             .line_height(gpui::relative(1.6))
                             .child(description),
                     )
@@ -5485,7 +5511,7 @@ impl EpubReaderApp {
                 // library below it. Make the modal a real mouse barrier so a
                 // dismissal can never continue into a book card.
                 .occlude()
-                .bg(rgba(0x1f1d1a80))
+                .bg(palette(cx).scrim_with_alpha(0.5))
                 .v_flex()
                 .items_center()
                 .justify_center()
@@ -5506,14 +5532,14 @@ impl EpubReaderApp {
                         .gap_4()
                         .rounded(px(12.))
                         .border_1()
-                        .border_color(rgb(BORDER))
-                        .bg(rgb(SURFACE))
+                        .border_color(rgb(palette(cx).border))
+                        .bg(rgb(palette(cx).surface))
                         .shadow_lg()
                         .child(
                             div()
                                 .text_lg()
                                 .font_semibold()
-                                .text_color(rgb(INK))
+                                .text_color(rgb(palette(cx).ink))
                                 .child(title),
                         )
                         .child(body),
@@ -5522,11 +5548,11 @@ impl EpubReaderApp {
         )
     }
 
-    fn render_notice(&self, notice: &Notice) -> gpui::AnyElement {
+    fn render_notice(&self, notice: &Notice, theme: Palette) -> gpui::AnyElement {
         let (background, foreground, icon) = if notice.error {
-            (rgb(0xf7e1df), rgb(0x9f302c), IconName::TriangleAlert)
+            (rgb(theme.danger_soft), rgb(theme.danger), IconName::TriangleAlert)
         } else {
-            (rgb(0xe3efe5), rgb(0x376441), IconName::CircleCheck)
+            (rgb(theme.success_soft), rgb(theme.success), IconName::CircleCheck)
         };
         div()
             .absolute()
@@ -5540,9 +5566,9 @@ impl EpubReaderApp {
             .rounded(px(10.))
             .border_1()
             .border_color(if notice.error {
-                rgba(0x9f302c2e)
+                Palette::tint(theme.danger, 0.18)
             } else {
-                rgba(0x3764412e)
+                Palette::tint(theme.success, 0.18)
             })
             .bg(background)
             .text_sm()
@@ -5562,13 +5588,13 @@ impl Render for EpubReaderApp {
                 .items_center()
                 .justify_center()
                 .gap_2()
-                .bg(rgb(PAPER))
-                .text_color(rgb(INK))
+                .bg(rgb(palette(cx).paper))
+                .text_color(rgb(palette(cx).ink))
                 .child(div().font_semibold().child("正在关闭墨页…"))
                 .child(
                     div()
                         .text_sm()
-                        .text_color(rgb(MUTED))
+                        .text_color(rgb(palette(cx).muted))
                         .child("正在完成已提交的书库操作，完成后将自动关闭。"),
                 )
                 .into_any_element();
@@ -5587,6 +5613,7 @@ impl Render for EpubReaderApp {
 fn render_delete_confirm_body(
     description: String,
     view: &Entity<EpubReaderApp>,
+    theme: Palette,
 ) -> gpui::AnyElement {
     let cancel_view = view.clone();
     let confirm_view = view.clone();
@@ -5596,7 +5623,7 @@ fn render_delete_confirm_body(
         .child(
             div()
                 .text_sm()
-                .text_color(rgb(INK))
+                .text_color(rgb(theme.ink))
                 .line_height(gpui::relative(1.6))
                 .child(description),
         )

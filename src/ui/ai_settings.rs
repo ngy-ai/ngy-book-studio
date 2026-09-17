@@ -261,6 +261,8 @@ pub(super) struct AiSettingsWindow {
     background_job_interval_input: Entity<InputState>,
     /// Global PDF reading preference: no gap between pages when enabled.
     pdf_compact_reading: bool,
+    /// 界面皮肤。保存后才生效，与上面的阅读偏好同一套语义。
+    appearance: Appearance,
     /// Target language for reading-time book translation. `None` disables it.
     default_language: Option<String>,
     /// How reading-time translations are displayed relative to the original text.
@@ -408,6 +410,7 @@ impl AiSettingsWindow {
             background_job_concurrency_input,
             background_job_interval_input,
             pdf_compact_reading: settings.pdf_compact_reading,
+            appearance: settings.appearance,
             default_language: settings.default_language.clone(),
             translation_display_mode: settings.translation_display_mode,
             use_proxy: settings.use_proxy,
@@ -515,6 +518,7 @@ impl AiSettingsWindow {
                 self.background_job_interval_input.read(cx).value().as_ref(),
             )?,
             pdf_compact_reading: self.pdf_compact_reading,
+            appearance: self.appearance,
             default_language: self.default_language.clone(),
             translation_display_mode: self.translation_display_mode,
             use_proxy: self.use_proxy,
@@ -940,6 +944,8 @@ impl AiSettingsWindow {
         // The reading preference applies to open readers as soon as the save
         // commits, so it is captured before the settings move into the future.
         let pdf_compact_reading = settings.pdf_compact_reading;
+        // 皮肤同理：提交成功后立刻套用到全部窗口（含已打开的 WebView 面）。
+        let appearance = settings.appearance;
         let services = Arc::clone(&self.services);
         let window_handle = self.window_handle;
         cx.spawn_in(window, async move |view, cx| {
@@ -978,6 +984,7 @@ impl AiSettingsWindow {
                         // open; the write above is the source of truth.
                         apply_pdf_compact_reading(pdf_compact_reading, cx);
                         apply_translation_display_mode(cx);
+                        set_appearance(appearance, cx);
                         cx.spawn(async move |_entity, cx| {
                             let _ = window_handle.update(cx, |_, window, cx| {
                                 remove_window_after_current_frame(window, cx, None);
@@ -1002,6 +1009,7 @@ impl AiSettingsWindow {
 
     fn render_input_field(
         &self,
+        theme: Palette,
         label: &'static str,
         description: &'static str,
         input: &Entity<InputState>,
@@ -1013,20 +1021,20 @@ impl AiSettingsWindow {
                 div()
                     .text_sm()
                     .font_semibold()
-                    .text_color(rgb(INK))
+                    .text_color(rgb(theme.ink))
                     .child(label),
             )
             .child(Input::new(input).disabled(self.operation.busy()))
-            .child(div().text_xs().text_color(rgb(MUTED)).child(description))
+            .child(div().text_xs().text_color(rgb(theme.muted)).child(description))
             .into_any_element()
     }
 
-    fn render_notice(&self) -> Option<gpui::AnyElement> {
+    fn render_notice(&self, theme: Palette) -> Option<gpui::AnyElement> {
         self.notice.as_ref().map(|notice| {
             let (background, foreground, icon) = if notice.error {
-                (rgb(0xf7e1df), rgb(0x9f302c), IconName::TriangleAlert)
+                (rgb(theme.danger_soft), rgb(theme.danger), IconName::TriangleAlert)
             } else {
-                (rgb(0xe3efe5), rgb(0x376441), IconName::CircleCheck)
+                (rgb(theme.success_soft), rgb(theme.success), IconName::CircleCheck)
             };
             div()
                 .h_flex()
@@ -1077,13 +1085,13 @@ impl AiSettingsWindow {
                 .p_3()
                 .rounded(px(8.))
                 .border_1()
-                .border_color(rgb(BORDER))
-                .bg(rgb(PAPER))
+                .border_color(rgb(palette(cx).border))
+                .bg(rgb(palette(cx).paper))
                 .child(
                     div()
                         .text_xs()
                         .font_semibold()
-                        .text_color(rgb(INK))
+                        .text_color(rgb(palette(cx).ink))
                         .child(format!(
                             "{} 返回的模型（{}）",
                             endpoint.name_input.read(cx).value(),
@@ -1094,7 +1102,7 @@ impl AiSettingsWindow {
                     div()
                         .text_xs()
                         .line_height(gpui::relative(1.5))
-                        .text_color(rgb(MUTED))
+                        .text_color(rgb(palette(cx).muted))
                         .child(if models.is_empty() {
                             "未返回模型".to_string()
                         } else {
@@ -1102,7 +1110,7 @@ impl AiSettingsWindow {
                         }),
                 )
                 .when(!missing_models.is_empty(), |this| {
-                    this.child(div().text_xs().text_color(rgb(0x9f302c)).child(format!(
+                    this.child(div().text_xs().text_color(rgb(palette(cx).danger)).child(format!(
                         "当前模型未在此 Endpoint 的列表中：{}",
                         missing_models.join("、")
                     )))
@@ -1134,9 +1142,9 @@ impl AiSettingsWindow {
                         .px_2()
                         .py_1()
                         .rounded(px(5.))
-                        .bg(rgb(SIDEBAR))
+                        .bg(rgb(palette(cx).sidebar))
                         .text_xs()
-                        .text_color(rgb(INK))
+                        .text_color(rgb(palette(cx).ink))
                         .child(command)
                 }))
                 .into_any_element(),
@@ -1169,15 +1177,15 @@ impl AiSettingsWindow {
             .p_4()
             .rounded(px(12.))
             .border_1()
-            .border_color(rgb(BORDER))
-            .bg(rgb(SURFACE))
+            .border_color(rgb(palette(cx).border))
+            .bg(rgb(palette(cx).surface))
             .child(self.render_endpoint_list(cx))
-            .child(self.render_input_field(
+            .child(self.render_input_field(palette(cx), 
                 "Endpoint 名称",
                 "用于区分连接；各模型按此名称选择 Endpoint。",
                 &endpoint.name_input,
             ))
-            .child(self.render_input_field(
+            .child(self.render_input_field(palette(cx), 
                 "Endpoint",
                 "默认使用本机 Ollama 的 http://127.0.0.1:11434/v1/；不会静默切换到云端。",
                 &endpoint.base_url_input,
@@ -1241,7 +1249,7 @@ impl AiSettingsWindow {
                         });
                     }),
             )
-            .child(self.render_input_field(
+            .child(self.render_input_field(palette(cx), 
                 "请求超时（秒）",
                 "可设置 1–600 秒，默认 120 秒。非流式请求按整段调用计时；流式回答按“多久没有新数据”计时，只要模型持续输出就不会被中途中断。",
                 &endpoint.request_timeout_input,
@@ -1276,7 +1284,7 @@ impl AiSettingsWindow {
                     .disabled(self.operation.busy() || self.selected_endpoint_id == "default")
                     .debug_selector(|| "ai-delete-endpoint".into())
                     .on_click(cx.listener(|this, _, window, cx| this.delete_selected_endpoint(window, cx)))))
-            .child(div().text_xs().text_color(rgb(MUTED)).child(
+            .child(div().text_xs().text_color(rgb(palette(cx).muted)).child(
                 "每个 Endpoint 独立保存连接、密钥和远程授权。模型使用中的 Endpoint 需先重新分配才能删除。"))
             .into_any_element()
     }
@@ -1289,8 +1297,8 @@ impl AiSettingsWindow {
             .p_4()
             .rounded(px(12.))
             .border_1()
-            .border_color(rgb(BORDER))
-            .bg(rgb(SURFACE))
+            .border_color(rgb(palette(cx).border))
+            .bg(rgb(palette(cx).surface))
             .child(self.render_role_panel(ModelRole::Chat, cx))
             .child(self.render_role_panel(ModelRole::Embedding, cx))
             .child(self.render_role_panel(ModelRole::Vision, cx))
@@ -1342,13 +1350,13 @@ impl AiSettingsWindow {
                 this.child(
                     div()
                         .text_xs()
-                        .text_color(rgb(MUTED))
+                        .text_color(rgb(palette(cx).muted))
                         .child(endpoint.base_url_input.read(cx).value()),
                 )
             })
-            .child(self.render_input_field(label, description, self.model_input_for(role)))
+            .child(self.render_input_field(palette(cx), label, description, self.model_input_for(role)))
             .when(role == ModelRole::Embedding, |this| {
-                this.child(self.render_input_field(
+                this.child(self.render_input_field(palette(cx), 
                     "向量维度（Dimensions）",
                     "正整数，默认 1024。修改后所有已索引的向量将失效并需要重新生成。",
                     &self.embedding_dimensions_input,
@@ -1410,7 +1418,7 @@ impl AiSettingsWindow {
             .gap_4()
             .p_4()
             .rounded(px(10.))
-            .bg(rgb(PAPER))
+            .bg(rgb(palette(cx).paper))
             .child(
                 div()
                     .h_flex()
@@ -1427,35 +1435,35 @@ impl AiSettingsWindow {
                             })),
                     ),
             )
-            .child(div().text_xs().text_color(rgb(MUTED)).child(
+            .child(div().text_xs().text_color(rgb(palette(cx).muted)).child(
                 "保存后用于新的对话请求。除最大输出外，其余参数可留空，使用服务端默认值；具体支持以所选模型为准。",
             ))
-            .child(self.render_input_field(
+            .child(self.render_input_field(palette(cx), 
                 "温度（Temperature）",
                 "0–2；默认 0.1。越低越集中，越高越随机。通常与 Top P 选择一项调整。",
                 &self.temperature_input,
             ))
-            .child(self.render_input_field(
+            .child(self.render_input_field(palette(cx), 
                 "核采样（Top P）",
                 "0–1；控制候选词的累计概率范围，越小越集中。",
                 &self.top_p_input,
             ))
-            .child(self.render_input_field(
+            .child(self.render_input_field(palette(cx), 
                 "最大输出 token 数",
                 "正整数，默认 4096；请按所选模型设置，墨页不设固定上限。上下文不足时可能进一步降低。",
                 &self.max_output_tokens_input,
             ))
-            .child(self.render_input_field(
+            .child(self.render_input_field(palette(cx), 
                 "出现惩罚（Presence Penalty）",
                 "−2–2；正值降低已出现词的再次使用倾向，负值提高。",
                 &self.presence_penalty_input,
             ))
-            .child(self.render_input_field(
+            .child(self.render_input_field(palette(cx), 
                 "频率惩罚（Frequency Penalty）",
                 "−2–2；正值按出现次数抑制重复，负值鼓励重复。",
                 &self.frequency_penalty_input,
             ))
-            .child(div().text_xs().text_color(rgb(MUTED)).child(
+            .child(div().text_xs().text_color(rgb(palette(cx).muted)).child(
                 "最大输出 token 数不改变模型的上下文窗口；Ollama 上下文长度需在服务端设置。",
             ))
             .into_any_element()
@@ -1474,13 +1482,13 @@ impl AiSettingsWindow {
             .p_4()
             .rounded(px(12.))
             .border_1()
-            .border_color(rgb(BORDER))
-            .bg(rgb(SURFACE))
+            .border_color(rgb(palette(cx).border))
+            .bg(rgb(palette(cx).surface))
             .child(
                 div()
                     .text_sm()
                     .font_semibold()
-                    .text_color(rgb(INK))
+                    .text_color(rgb(palette(cx).ink))
                     .child("API key"),
             )
             .child(
@@ -1492,7 +1500,7 @@ impl AiSettingsWindow {
                 div()
                     .text_xs()
                     .line_height(gpui::relative(1.5))
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette(cx).muted))
                     .child("现有密钥不会回填明文。留空表示保持；输入新值表示替换。密钥只存入 Windows Credential Manager。"),
             )
             .child(
@@ -1525,8 +1533,8 @@ impl AiSettingsWindow {
             .p_4()
             .rounded(px(12.))
             .border_1()
-            .border_color(rgb(BORDER))
-            .bg(rgb(SURFACE))
+            .border_color(rgb(palette(cx).border))
+            .bg(rgb(palette(cx).surface))
             .child(
                 div()
                     .h_flex()
@@ -1539,10 +1547,10 @@ impl AiSettingsWindow {
                                 div()
                                     .text_sm()
                                     .font_semibold()
-                                    .text_color(rgb(INK))
+                                    .text_color(rgb(palette(cx).ink))
                                     .child("联网搜索（可选）"),
                             )
-                            .child(div().text_xs().text_color(rgb(MUTED)).child(
+                            .child(div().text_xs().text_color(rgb(palette(cx).muted)).child(
                                 "书中检索不到时，宿主补充一次联网搜索作为回答依据；关闭则不联网。",
                             )),
                     )
@@ -1560,22 +1568,22 @@ impl AiSettingsWindow {
                             }),
                     ),
             )
-            .child(self.render_input_field(
+            .child(self.render_input_field(palette(cx), 
                 "请求模板（URL）",
                 "必须包含 {query}；可配置 SearxNG、Brave、Tavily 等端点。",
                 &self.web_search_url_input,
             ))
-            .child(self.render_input_field(
+            .child(self.render_input_field(palette(cx), 
                 "方法",
                 "GET 或 POST；POST 端点需填写下方的请求体模板。",
                 &self.web_search_method_input,
             ))
-            .child(self.render_input_field(
+            .child(self.render_input_field(palette(cx), 
                 "请求体模板（可选）",
                 "POST 时使用，需包含 {query}；留空则用 GET。",
                 &self.web_search_body_input,
             ))
-            .child(self.render_input_field(
+            .child(self.render_input_field(palette(cx), 
                 "API key 头（可选）",
                 "自定义携带密钥的请求头名；留空则用 Authorization: Bearer。",
                 &self.web_search_key_header_input,
@@ -1586,7 +1594,7 @@ impl AiSettingsWindow {
                     .disabled(busy || self.delete_web_search_api_key || !self.web_search_enabled),
             )
             .child(
-                div().text_xs().text_color(rgb(MUTED)).child(
+                div().text_xs().text_color(rgb(palette(cx).muted)).child(
                     "联网搜索 API key 只存入 Windows Credential Manager；留空保持、输入替换。",
                 ),
             )
@@ -1638,12 +1646,12 @@ impl AiSettingsWindow {
                         });
                     }),
             )
-            .child(self.render_input_field(
+            .child(self.render_input_field(palette(cx), 
                 "超时（秒）",
                 "单次联网搜索请求的总超时。",
                 &self.web_search_timeout_input,
             ))
-            .child(self.render_input_field(
+            .child(self.render_input_field(palette(cx), 
                 "结果条数",
                 "返回给模型的最大搜索结果数量。",
                 &self.web_search_max_results_input,
@@ -1681,20 +1689,20 @@ impl AiSettingsWindow {
                     .p_4()
                     .rounded(px(12.))
                     .border_1()
-                    .border_color(rgb(BORDER))
-                    .bg(rgb(SURFACE))
+                    .border_color(rgb(palette(cx).border))
+                    .bg(rgb(palette(cx).surface))
                     .child(
                         div()
                             .text_sm()
                             .font_semibold()
-                            .text_color(rgb(INK))
+                            .text_color(rgb(palette(cx).ink))
                             .child("新任务运行方式"),
                     )
                     .child(
                         div()
                             .text_xs()
                             .line_height(gpui::relative(1.5))
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(palette(cx).muted))
                             .child(
                                 "导入或编辑图书后，墨页会创建逻辑页面渲染、视觉理解和向量索引任务。",
                             ),
@@ -1717,7 +1725,7 @@ impl AiSettingsWindow {
                         div()
                             .text_xs()
                             .line_height(gpui::relative(1.5))
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(palette(cx).muted))
                             .child(
                                 "关闭后，新导入、创建或编辑图书产生的三类任务会以暂停状态创建，可在“后台任务”窗口逐项恢复。更改此设置不会暂停、恢复或取消已经排队或运行的任务。",
                             ),
@@ -1731,21 +1739,21 @@ impl AiSettingsWindow {
                     .p_4()
                     .rounded(px(12.))
                     .border_1()
-                    .border_color(rgb(BORDER))
-                    .bg(rgb(SURFACE))
+                    .border_color(rgb(palette(cx).border))
+                    .bg(rgb(palette(cx).surface))
                     .child(
                         div()
                             .text_sm()
                             .font_semibold()
-                            .text_color(rgb(INK))
+                            .text_color(rgb(palette(cx).ink))
                             .child("后台任务调度"),
                     )
-                    .child(self.render_input_field(
+                    .child(self.render_input_field(palette(cx), 
                         "任务并发",
                         "同时运行的模型任务数量，1–1024，默认 1。并发越高占用的内存与网络越多；配置较低的机器建议保持 1。",
                         &self.background_job_concurrency_input,
                     ))
-                    .child(self.render_input_field(
+                    .child(self.render_input_field(palette(cx), 
                         "任务间隔（毫秒）",
                         "一个任务完成后，休眠多久再开始下一个任务，0–60000 毫秒，默认 10。机器配置较差时增大该值可降低持续满载的风险。",
                         &self.background_job_interval_input,
@@ -1754,7 +1762,7 @@ impl AiSettingsWindow {
                         div()
                             .text_xs()
                             .line_height(gpui::relative(1.5))
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(palette(cx).muted))
                             .child(
                                 "保存后对后续任务立即生效，不需要重启；正在运行的任务不会被打断。",
                             ),
@@ -2045,6 +2053,24 @@ impl AiSettingsWindow {
                 menu
             });
 
+        // 外观是唯一会影响全部窗口（含已经打开的书）的偏好，所以排在系统面板最前面。
+        let appearance_switch = TabBar::new("ai-appearance")
+            .segmented()
+            .selected_index(match self.appearance {
+                Appearance::Light => 0,
+                Appearance::Dark => 1,
+            })
+            .on_click(cx.listener(|this, index: &usize, _, cx| {
+                let index = (*index).min(Appearance::ALL.len() - 1);
+                this.appearance = Appearance::ALL[index];
+                cx.notify();
+            }))
+            .children(
+                Appearance::ALL
+                    .into_iter()
+                    .map(|appearance| Tab::new().label(appearance.label())),
+            );
+
         div()
             .v_flex()
             .gap_5()
@@ -2055,13 +2081,42 @@ impl AiSettingsWindow {
                     .p_4()
                     .rounded(px(12.))
                     .border_1()
-                    .border_color(rgb(BORDER))
-                    .bg(rgb(SURFACE))
+                    .border_color(rgb(palette(cx).border))
+                    .bg(rgb(palette(cx).surface))
                     .child(
                         div()
                             .text_sm()
                             .font_semibold()
-                            .text_color(rgb(INK))
+                            .text_color(rgb(palette(cx).ink))
+                            .child("界面外观"),
+                    )
+                    .child(appearance_switch)
+                    .child(
+                        div()
+                            .text_xs()
+                            .line_height(gpui::relative(1.5))
+                            .text_color(rgb(palette(cx).muted))
+                            .child(
+                                "浅色与深色两套皮肤覆盖全部窗口：图书库、阅读器、编辑器与 AI 侧栏。\
+                                 正文、逐章翻译、富文本编辑和 PDF 阅读一起换色，阅读进度、标注与笔记不受影响。\
+                                 保存后立即应用到已经打开的窗口。",
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .v_flex()
+                    .gap_3()
+                    .p_4()
+                    .rounded(px(12.))
+                    .border_1()
+                    .border_color(rgb(palette(cx).border))
+                    .bg(rgb(palette(cx).surface))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .text_color(rgb(palette(cx).ink))
                             .child("PDF 阅读"),
                     )
                     .child(
@@ -2082,7 +2137,7 @@ impl AiSettingsWindow {
                         div()
                             .text_xs()
                             .line_height(gpui::relative(1.5))
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(palette(cx).muted))
                             .child(
                                 "开启后 PDF 阅读窗口的页面上下贴合，不再保留页间留白；关闭时恢复默认间距。\
                                  页面投影、左右留白与阅读位置不变，标注与笔记仍按页面文字位置保存。",
@@ -2096,13 +2151,13 @@ impl AiSettingsWindow {
                     .p_4()
                     .rounded(px(12.))
                     .border_1()
-                    .border_color(rgb(BORDER))
-                    .bg(rgb(SURFACE))
+                    .border_color(rgb(palette(cx).border))
+                    .bg(rgb(palette(cx).surface))
                     .child(
                         div()
                             .text_sm()
                             .font_semibold()
-                            .text_color(rgb(INK))
+                            .text_color(rgb(palette(cx).ink))
                             .child("网络"),
                     )
                     .child(
@@ -2123,7 +2178,7 @@ impl AiSettingsWindow {
                         div()
                             .text_xs()
                             .line_height(gpui::relative(1.5))
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(palette(cx).muted))
                             .child(
                                 "开启后 AI 问答、联网搜索与后台翻译请求会走系统代理（环境变量 \
                                  HTTP_PROXY / HTTPS_PROXY，NO_PROXY 里的地址仍然直连）。关闭后一律\
@@ -2139,13 +2194,13 @@ impl AiSettingsWindow {
                     .p_4()
                     .rounded(px(12.))
                     .border_1()
-                    .border_color(rgb(BORDER))
-                    .bg(rgb(SURFACE))
+                    .border_color(rgb(palette(cx).border))
+                    .bg(rgb(palette(cx).surface))
                     .child(
                         div()
                             .text_sm()
                             .font_semibold()
-                            .text_color(rgb(INK))
+                            .text_color(rgb(palette(cx).ink))
                             .child("图书翻译"),
                     )
                     .child(language_button)
@@ -2154,7 +2209,7 @@ impl AiSettingsWindow {
                         div()
                             .text_xs()
                             .line_height(gpui::relative(1.5))
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(palette(cx).muted))
                             .child(
                                 "选择语言后，导入或重新翻译的 EPUB、MOBI、AZW、AZW3、Word 图书会按文本块\
                                 翻译为目标语言。“译文”只显示译文、隐藏原文，点击段落可在译文与双语之间\
@@ -2171,17 +2226,17 @@ impl AiSettingsWindow {
                     .p_4()
                     .rounded(px(12.))
                     .border_1()
-                    .border_color(rgb(BORDER))
-                    .bg(rgb(SURFACE))
+                    .border_color(rgb(palette(cx).border))
+                    .bg(rgb(palette(cx).surface))
                     .child(
                         div()
                             .text_sm()
                             .font_semibold()
-                            .text_color(rgb(INK))
+                            .text_color(rgb(palette(cx).ink))
                             .child("存储位置"),
                     )
-                    .child(storage_path_row("数据目录", &data_dir))
-                    .child(storage_path_row("日志目录", &log_dir))
+                    .child(storage_path_row("数据目录", &data_dir, palette(cx)))
+                    .child(storage_path_row("日志目录", &log_dir, palette(cx)))
                     .children(self.render_confirm_overwrite(cx))
                     .child(
                         div()
@@ -2222,7 +2277,7 @@ impl AiSettingsWindow {
                         div()
                             .text_xs()
                             .line_height(gpui::relative(1.5))
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(palette(cx).muted))
                             .child(
                                 "图书库、笔记、索引、对象存储和日志都放在数据目录里；首次启动时由你选择，\
                                  记录保存在用户配置目录下的 bootstrap.json。更换位置时整个数据目录会被搬到\
@@ -2244,12 +2299,12 @@ impl AiSettingsWindow {
                 .gap_2()
                 .p_3()
                 .rounded(px(8.))
-                .bg(rgb(0xf7e1df))
+                .bg(rgb(palette(cx).danger_soft))
                 .child(
                     div()
                         .text_sm()
                         .line_height(gpui::relative(1.5))
-                        .text_color(rgb(0x9f302c))
+                        .text_color(rgb(palette(cx).danger))
                         .child(format!(
                             "{} 已经是一个图书库。继续会先删掉它的内容，再把当前数据目录的内容\
                              整体搬过去 —— 这一步不可撤销。",
@@ -2289,16 +2344,16 @@ impl AiSettingsWindow {
 }
 
 /// 存储位置的只读路径行：标签在上、路径在下，长路径换行显示。
-fn storage_path_row(label: &'static str, path: &Path) -> impl IntoElement {
+fn storage_path_row(label: &'static str, path: &Path, theme: Palette) -> impl IntoElement {
     div()
         .v_flex()
         .gap_0p5()
-        .child(div().text_xs().text_color(rgb(MUTED)).child(label))
+        .child(div().text_xs().text_color(rgb(theme.muted)).child(label))
         .child(
             div()
                 .text_sm()
                 .line_height(gpui::relative(1.4))
-                .text_color(rgb(INK))
+                .text_color(rgb(theme.ink))
                 .child(path.display().to_string()),
         )
 }
@@ -2326,7 +2381,7 @@ impl Render for AiSettingsWindow {
         div()
             .v_flex()
             .size_full()
-            .bg(rgb(PAPER))
+            .bg(rgb(palette(cx).paper))
             .child(
                 div()
                     .h_flex()
@@ -2336,8 +2391,8 @@ impl Render for AiSettingsWindow {
                     .px_6()
                     .py_4()
                     .border_b_1()
-                    .border_color(rgb(BORDER))
-                    .bg(rgb(SURFACE))
+                    .border_color(rgb(palette(cx).border))
+                    .bg(rgb(palette(cx).surface))
                     .child(
                         div()
                             .h_flex()
@@ -2349,8 +2404,8 @@ impl Render for AiSettingsWindow {
                                     .justify_center()
                                     .size_9()
                                     .rounded(px(10.))
-                                    .bg(rgb(ACCENT_SOFT))
-                                    .text_color(rgb(ACCENT))
+                                    .bg(rgb(palette(cx).accent_soft))
+                                    .text_color(rgb(palette(cx).accent))
                                     .child(Icon::new(IconName::Bot)),
                             )
                             .child(
@@ -2361,10 +2416,10 @@ impl Render for AiSettingsWindow {
                                         div()
                                             .text_lg()
                                             .font_semibold()
-                                            .text_color(rgb(INK))
+                                            .text_color(rgb(palette(cx).ink))
                                             .child("AI Provider"),
                                     )
-                                    .child(div().text_xs().text_color(rgb(MUTED)).child(
+                                    .child(div().text_xs().text_color(rgb(palette(cx).muted)).child(
                                         "OpenAI-compatible · 本地 Ollama 或显式配置的远程端点",
                                     )),
                             ),
@@ -2372,7 +2427,7 @@ impl Render for AiSettingsWindow {
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(palette(cx).muted))
                             .child("墨页不会启动、停止或下载 Ollama 模型"),
                     ),
             )
@@ -2382,8 +2437,8 @@ impl Render for AiSettingsWindow {
                     .px_6()
                     .pt_3()
                     .border_b_1()
-                    .border_color(rgb(BORDER))
-                    .bg(rgb(SURFACE))
+                    .border_color(rgb(palette(cx).border))
+                    .bg(rgb(palette(cx).surface))
                     .child(tabs),
             )
             .child(
@@ -2395,7 +2450,7 @@ impl Render for AiSettingsWindow {
                     .track_scroll(&self.scroll_handles[self.active_tab as usize])
                     .child(div().p_6().child(panel)),
             )
-            .when_some(self.render_notice(), |this, notice| {
+            .when_some(self.render_notice(palette(cx)), |this, notice| {
                 this.child(div().flex_none().px_6().py_2().child(notice))
             })
             .child(
@@ -2407,14 +2462,14 @@ impl Render for AiSettingsWindow {
                     .px_6()
                     .py_4()
                     .border_t_1()
-                    .border_color(rgb(BORDER))
-                    .bg(rgb(SURFACE))
+                    .border_color(rgb(palette(cx).border))
+                    .bg(rgb(palette(cx).surface))
                     .child(
                         div()
                             .max_w(px(440.))
                             .text_xs()
                             .line_height(gpui::relative(1.5))
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(palette(cx).muted))
                             .child("切换标签保留输入；保存设置会应用全部标签中的配置。"),
                     )
                     .child(

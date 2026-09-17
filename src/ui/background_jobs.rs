@@ -83,12 +83,12 @@ impl BlockState {
         }
     }
 
-    fn colors(self) -> (gpui::Rgba, gpui::Rgba) {
+    fn colors(self, theme: Palette) -> (gpui::Rgba, gpui::Rgba) {
         match self {
-            Self::Done => (rgb(0x376441), rgb(0xe3efe5)),
-            Self::Processing => (rgb(ACCENT_DARK), rgb(ACCENT_SOFT)),
-            Self::Failed => (rgb(DANGER), rgb(0xf8e2de)),
-            Self::Pending => (rgb(0x5e6572), rgb(0xe7e9ed)),
+            Self::Done => (rgb(theme.success), rgb(theme.success_soft)),
+            Self::Processing => (rgb(theme.accent_strong), rgb(theme.accent_soft)),
+            Self::Failed => (rgb(theme.danger), rgb(theme.danger_soft)),
+            Self::Pending => (rgb(theme.neutral), rgb(theme.neutral_soft)),
         }
     }
 
@@ -1082,8 +1082,8 @@ impl BackgroundJobsWindow {
             .px_5()
             .py_3()
             .border_b_1()
-            .border_color(rgb(BORDER))
-            .bg(rgb(SURFACE))
+            .border_color(rgb(palette(cx).border))
+            .bg(rgb(palette(cx).surface))
             .child(
                 div()
                     .v_flex()
@@ -1093,7 +1093,7 @@ impl BackgroundJobsWindow {
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(palette(cx).muted))
                             .truncate()
                             .child(format!(
                                 "{} · {} 本图书 · {} 个任务",
@@ -1159,13 +1159,13 @@ impl BackgroundJobsWindow {
             .px_4()
             .py_2()
             .border_b_1()
-            .border_color(rgb(BORDER))
-            .bg(rgb(SURFACE))
+            .border_color(rgb(palette(cx).border))
+            .bg(rgb(palette(cx).surface))
             .child(
                 div()
                     .mr_1()
                     .text_xs()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette(cx).muted))
                     .child("任务分类"),
             );
         for &(kind, label) in JOB_KINDS {
@@ -1190,8 +1190,8 @@ impl BackgroundJobsWindow {
                     .rounded(px(7.))
                     .cursor_pointer()
                     .text_sm()
-                    .bg(rgb(if selected { ACCENT_SOFT } else { SIDEBAR }))
-                    .text_color(rgb(if selected { ACCENT_DARK } else { INK }))
+                    .bg(rgb(if selected { palette(cx).accent_soft } else { palette(cx).sidebar }))
+                    .text_color(rgb(if selected { palette(cx).accent_strong } else { palette(cx).ink }))
                     .child(label)
                     .child(div().text_xs().child(count.to_string()))
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -1238,8 +1238,8 @@ impl BackgroundJobsWindow {
             .items_center()
             .justify_center()
             .cursor_col_resize()
-            .bg(rgb(SURFACE))
-            .hover(|this| this.bg(rgb(ACCENT_SOFT)))
+            .bg(rgb(palette(cx).surface))
+            .hover(|this| this.bg(rgb(palette(cx).accent_soft)))
             .on_drag(JobsListResizeDrag, move |_, _, _, cx| {
                 cx.stop_propagation();
                 handle_view.update(cx, |this, cx| {
@@ -1279,7 +1279,7 @@ impl BackgroundJobsWindow {
                 div()
                     .h_full()
                     .w(px(if active { 2. } else { 1. }))
-                    .bg(rgb(if active { ACCENT } else { BORDER })),
+                    .bg(rgb(if active { palette(cx).accent } else { palette(cx).border })),
             )
             .into_any_element()
     }
@@ -1298,8 +1298,8 @@ impl BackgroundJobsWindow {
                     .when(self.status == status, |button| {
                         button.custom(
                             ButtonCustomVariant::new(cx)
-                                .color(rgb(ACCENT_SOFT).into())
-                                .foreground(rgb(ACCENT_DARK).into()),
+                                .color(rgb(palette(cx).accent_soft).into())
+                                .foreground(rgb(palette(cx).accent_strong).into()),
                         )
                     })
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -1316,7 +1316,7 @@ impl BackgroundJobsWindow {
             .px_4()
             .py_3()
             .border_b_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(palette(cx).border))
             .child(
                 div()
                     .w_full()
@@ -1341,7 +1341,7 @@ impl BackgroundJobsWindow {
             .py_2()
             .gap_1();
         if count == 0 {
-            list = list.child(div().p_6().text_sm().text_color(rgb(MUTED)).child(
+            list = list.child(div().p_6().text_sm().text_color(rgb(palette(cx).muted)).child(
                 if self.loading && !self.loaded {
                     "正在读取任务…"
                 } else if !self.loaded && self.refresh_error.is_some() {
@@ -1362,7 +1362,7 @@ impl BackgroundJobsWindow {
         {
             let id = job.id.clone();
             let selected = self.selected_job_id.as_deref() == Some(&job.id);
-            let (label, color, background) = status_presentation(job);
+            let (label, color, background) = status_presentation(job, palette(cx));
             let title = self
                 .books
                 .iter()
@@ -1381,8 +1381,8 @@ impl BackgroundJobsWindow {
                         .py_2()
                         .rounded(px(7.))
                         .border_1()
-                        .border_color(rgb(if selected { ACCENT } else { BORDER }))
-                        .bg(rgb(if selected { ACCENT_SOFT } else { SURFACE }))
+                        .border_color(rgb(if selected { palette(cx).accent } else { palette(cx).border }))
+                        .bg(rgb(if selected { palette(cx).accent_soft } else { palette(cx).surface }))
                         .cursor_pointer()
                         .child(
                             div()
@@ -1398,7 +1398,7 @@ impl BackgroundJobsWindow {
                                         .child(title.to_string()),
                                 )
                                 .child(
-                                    div().text_xs().text_color(rgb(MUTED)).truncate().child(
+                                    div().text_xs().text_color(rgb(palette(cx).muted)).truncate().child(
                                         format!("{} · {}", job_kind_label(&job.kind), job.id),
                                     ),
                                 ),
@@ -1421,7 +1421,7 @@ impl BackgroundJobsWindow {
                                 .child(
                                     div()
                                         .text_xs()
-                                        .text_color(rgb(MUTED))
+                                        .text_color(rgb(palette(cx).muted))
                                         .child(progress_label(job)),
                                 ),
                         )
@@ -1462,9 +1462,9 @@ impl BackgroundJobsWindow {
                     .px_4()
                     .py_2()
                     .border_t_1()
-                    .border_color(rgb(BORDER))
+                    .border_color(rgb(palette(cx).border))
                     .text_xs()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette(cx).muted))
                     .child(format!(
                         "共 {count} 个任务 · 第 {} / {pages} 页",
                         self.page + 1
@@ -1524,7 +1524,7 @@ impl BackgroundJobsWindow {
                 .justify_center()
                 .p_5()
                 .text_sm()
-                .text_color(rgb(MUTED))
+                .text_color(rgb(palette(cx).muted))
                 .child("选择任务查看运行情况。")
                 .into_any_element();
         };
@@ -1603,8 +1603,8 @@ impl BackgroundJobsWindow {
                     .when(self.tab == tab, |button| {
                         button.custom(
                             ButtonCustomVariant::new(cx)
-                                .color(rgb(ACCENT_SOFT).into())
-                                .foreground(rgb(ACCENT_DARK).into()),
+                                .color(rgb(palette(cx).accent_soft).into())
+                                .foreground(rgb(palette(cx).accent_strong).into()),
                         )
                     })
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -1645,7 +1645,7 @@ impl BackgroundJobsWindow {
             .px_4()
             .py_2()
             .border_b_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(palette(cx).border))
             .child(tabs)
             .child(actions)
             .child(
@@ -1694,22 +1694,22 @@ impl BackgroundJobsWindow {
         } else if self.tab == DetailTab::Logs {
             content = content.child(
                 div()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette(cx).muted))
                     .child("最新记录在前 · 时间为 UTC · ordinal 从 0 开始 · 复制按时间正序排列。"),
             );
             if let Some(error) = &self.logs_error {
-                content = content.child(div().text_color(rgb(DANGER)).child(error.clone()));
+                content = content.child(div().text_color(rgb(palette(cx).danger)).child(error.clone()));
             }
             if let Some(logs) = &self.logs {
                 if logs.truncated {
                     content = content.child(
                         div()
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(palette(cx).muted))
                             .child("较早的记录已按保留上限清理，以下为最近的运行日志。"),
                     );
                 }
                 if logs.entries.is_empty() {
-                    content = content.child(div().py_3().text_color(rgb(MUTED)).child(
+                    content = content.child(div().py_3().text_color(rgb(palette(cx).muted)).child(
                         "暂无保留的运行日志。任务可能尚未开始、在升级前执行，或记录已清理；后续运行会自动记录。",
                     ));
                 }
@@ -1719,7 +1719,7 @@ impl BackgroundJobsWindow {
                             .flex_none()
                             .line_height(gpui::relative(1.5))
                             .border_b_1()
-                            .border_color(rgb(BORDER))
+                            .border_color(rgb(palette(cx).border))
                             .py_1()
                             .child(entry.format_line()),
                     );
@@ -1738,7 +1738,7 @@ impl BackgroundJobsWindow {
                             div()
                                 .w(px(96.))
                                 .flex_none()
-                                .text_color(rgb(MUTED))
+                                .text_color(rgb(palette(cx).muted))
                                 .child(label),
                         )
                         .child(div().flex_1().min_w(px(0.)).child(value)),
@@ -1749,15 +1749,15 @@ impl BackgroundJobsWindow {
                     div()
                         .p_2()
                         .rounded(px(6.))
-                        .bg(rgb(0xf8e2de))
-                        .text_color(rgb(DANGER))
+                        .bg(rgb(palette(cx).danger_soft))
+                        .text_color(rgb(palette(cx).danger))
                         .child(error.clone()),
                 );
             }
             if let Some(cursor) = &job.cursor_json {
                 content = content
-                    .child(div().text_color(rgb(MUTED)).child("执行游标"))
-                    .child(div().p_2().bg(rgb(SIDEBAR)).child(prettify_cursor(cursor)));
+                    .child(div().text_color(rgb(palette(cx).muted)).child("执行游标"))
+                    .child(div().p_2().bg(rgb(palette(cx).sidebar)).child(prettify_cursor(cursor)));
             }
         }
         div()
@@ -1767,7 +1767,7 @@ impl BackgroundJobsWindow {
             .min_w(px(0.))
             .min_h(px(0.))
             .overflow_hidden()
-            .bg(rgb(SURFACE))
+            .bg(rgb(palette(cx).surface))
             .child(header)
             .child(
                 div()
@@ -1793,7 +1793,7 @@ impl BackgroundJobsWindow {
         let mut rows: Vec<gpui::AnyElement> = Vec::new();
         rows.push(
             div()
-                .text_color(rgb(MUTED))
+                .text_color(rgb(palette(cx).muted))
                 .child(
                     "文本块按任务游标顺序排列，序号从 0 开始，与运行日志的 ordinal 一致；预览为原文开头。状态随任务进度实时更新。",
                 )
@@ -1802,7 +1802,7 @@ impl BackgroundJobsWindow {
         if let Some(error) = &self.blocks_error {
             rows.push(
                 div()
-                    .text_color(rgb(DANGER))
+                    .text_color(rgb(palette(cx).danger))
                     .child(error.clone())
                     .into_any_element(),
             );
@@ -1825,7 +1825,7 @@ impl BackgroundJobsWindow {
         let Some((blocks, inspector)) = self.blocks.as_ref().zip(inspector) else {
             rows.push(
                 div()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette(cx).muted))
                     .child(if self.blocks_loading {
                         "正在读取文本块明细…"
                     } else {
@@ -1836,7 +1836,7 @@ impl BackgroundJobsWindow {
             return rows;
         };
         let progress = &inspector.progress;
-        if let Some(banner) = failure_banner(job, inspector) {
+        if let Some(banner) = failure_banner(job, inspector, palette(cx)) {
             rows.push(banner);
         }
         rows.push(
@@ -1844,7 +1844,7 @@ impl BackgroundJobsWindow {
                 .h_flex()
                 .flex_wrap()
                 .gap_2()
-                .text_color(rgb(INK))
+                .text_color(rgb(palette(cx).ink))
                 .child(format!(
                     "共 {} 个文本块 · 已处理 {} · 处理中 {} · 失败 {} · 待处理 {}",
                     progress.total,
@@ -1857,7 +1857,7 @@ impl BackgroundJobsWindow {
         );
         rows.push(
             div()
-                .text_color(rgb(MUTED))
+                .text_color(rgb(palette(cx).muted))
                 .child(format!(
                     "目标语言：{}",
                     translation_language_label(&blocks.target_language)
@@ -1892,8 +1892,8 @@ impl BackgroundJobsWindow {
                     .when(self.blocks_state == state, |button| {
                         button.custom(
                             ButtonCustomVariant::new(cx)
-                                .color(rgb(ACCENT_SOFT).into())
-                                .foreground(rgb(ACCENT_DARK).into()),
+                                .color(rgb(palette(cx).accent_soft).into())
+                                .foreground(rgb(palette(cx).accent_strong).into()),
                         )
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -1913,7 +1913,7 @@ impl BackgroundJobsWindow {
         if progress.failed > 0 {
             rows.push(
                 div()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette(cx).muted))
                     .child(
                         "更换更擅长指令的对话模型后，可用右上方「重试失败块」重跑全部未翻译的块；\
                          行内「重试」只重跑这一块。",
@@ -1933,7 +1933,7 @@ impl BackgroundJobsWindow {
             div()
                 .h_flex()
                 .gap_2()
-                .text_color(rgb(MUTED))
+                .text_color(rgb(palette(cx).muted))
                 .child(match (indices.first(), indices.last()) {
                     (Some(first), Some(last)) => format!(
                         "显示 #{first}–#{last}（筛选后 {filtered} 块 · 第 {}/{} 页）",
@@ -1948,7 +1948,7 @@ impl BackgroundJobsWindow {
             rows.push(
                 div()
                     .py_2()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette(cx).muted))
                     .child("当前筛选下没有文本块。")
                     .into_any_element(),
             );
@@ -1958,7 +1958,7 @@ impl BackgroundJobsWindow {
                 continue;
             };
             let state = inspector.state(index);
-            let (foreground, background) = state.colors();
+            let (foreground, background) = state.colors(palette(cx));
             // Resolved before the row is built: the click handler must not
             // borrow the block list, which lives only for this frame.
             let ordinal = block.ordinal;
@@ -1968,7 +1968,7 @@ impl BackgroundJobsWindow {
                     .gap_1()
                     .py_1()
                     .border_b_1()
-                    .border_color(rgb(BORDER))
+                    .border_color(rgb(palette(cx).border))
                     .child(
                         div()
                             .h_flex()
@@ -1978,7 +1978,7 @@ impl BackgroundJobsWindow {
                                 div()
                                     .w(px(52.))
                                     .flex_none()
-                                    .text_color(rgb(MUTED))
+                                    .text_color(rgb(palette(cx).muted))
                                     .child(format!("#{}", block.ordinal)),
                             )
                             .child(
@@ -1995,7 +1995,7 @@ impl BackgroundJobsWindow {
                                     .w(px(128.))
                                     .flex_none()
                                     .truncate()
-                                    .text_color(rgb(INK))
+                                    .text_color(rgb(palette(cx).ink))
                                     .child(block_chapter_label(block)),
                             )
                             .child(
@@ -2003,7 +2003,7 @@ impl BackgroundJobsWindow {
                                     .flex_1()
                                     .min_w(px(0.))
                                     .truncate()
-                                    .text_color(rgb(MUTED))
+                                    .text_color(rgb(palette(cx).muted))
                                     .child(if block.source_preview.is_empty() {
                                         "（无文字内容）".to_string()
                                     } else {
@@ -2071,7 +2071,7 @@ impl BackgroundJobsWindow {
                             row.child(
                                 div()
                                     .pl(px(60.))
-                                    .text_color(rgb(DANGER))
+                                    .text_color(rgb(palette(cx).danger))
                                     .child(format!("失败原因：{reason}")),
                             )
                         },
@@ -2152,8 +2152,8 @@ impl BackgroundJobsWindow {
                 .when(state.tab == tab, |button| {
                     button.custom(
                         ButtonCustomVariant::new(cx)
-                            .color(rgb(ACCENT_SOFT).into())
-                            .foreground(rgb(ACCENT_DARK).into()),
+                            .color(rgb(palette(cx).accent_soft).into())
+                            .foreground(rgb(palette(cx).accent_strong).into()),
                     )
                 })
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -2198,12 +2198,12 @@ impl BackgroundJobsWindow {
             .track_scroll(&scroll_handle)
             .pr_1();
         if let Some(error) = state.error.as_ref() {
-            body = body.child(div().text_xs().text_color(rgb(DANGER)).child(error.clone()));
+            body = body.child(div().text_xs().text_color(rgb(palette(cx).danger)).child(error.clone()));
         } else if state.loading {
             body = body.child(
                 div()
                     .text_xs()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette(cx).muted))
                     .child("正在读取文本块详情…"),
             );
         } else if state.tab == BlockDetailTab::Response {
@@ -2219,7 +2219,7 @@ impl BackgroundJobsWindow {
                     .flex_none()
                     .text_xs()
                     .line_height(gpui::relative(1.5))
-                    .text_color(rgb(INK))
+                    .text_color(rgb(palette(cx).ink))
                     // `whitespace_normal` keeps the JSON indentation while still
                     // breaking long lines, so a body never runs off the panel.
                     .whitespace_normal()
@@ -2245,7 +2245,7 @@ impl BackgroundJobsWindow {
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette(cx).muted))
                     .children(hint.map(str::to_string)),
             )
             .child(
@@ -2293,7 +2293,7 @@ impl BackgroundJobsWindow {
                 // make the panel a real mouse barrier so a dismissal cannot also
                 // activate a block row behind it.
                 .occlude()
-                .bg(rgba(0x1f1d1a80))
+                .bg(palette(cx).scrim_with_alpha(0.5))
                 .v_flex()
                 .items_center()
                 .justify_center()
@@ -2316,8 +2316,8 @@ impl BackgroundJobsWindow {
                         .gap_3()
                         .rounded(px(12.))
                         .border_1()
-                        .border_color(rgb(BORDER))
-                        .bg(rgb(SURFACE))
+                        .border_color(rgb(palette(cx).border))
+                        .bg(rgb(palette(cx).surface))
                         .shadow_lg()
                         .child(
                             div()
@@ -2328,12 +2328,12 @@ impl BackgroundJobsWindow {
                                     div()
                                         .text_sm()
                                         .font_semibold()
-                                        .text_color(rgb(INK))
+                                        .text_color(rgb(palette(cx).ink))
                                         .truncate()
                                         .child(title),
                                 )
                                 .child(
-                                    div().text_xs().text_color(rgb(MUTED)).truncate().child(
+                                    div().text_xs().text_color(rgb(palette(cx).muted)).truncate().child(
                                         detail
                                             .map(|detail| {
                                                 // A task that never ran records no
@@ -2357,7 +2357,7 @@ impl BackgroundJobsWindow {
                                 ),
                         )
                         .child(tabs)
-                        .child(div().flex_none().h(px(1.)).w_full().bg(rgb(BORDER)))
+                        .child(div().flex_none().h(px(1.)).w_full().bg(rgb(palette(cx).border)))
                         .child(body)
                         .child(footer),
                 )
@@ -2377,7 +2377,7 @@ impl BackgroundJobsWindow {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let mut panel = div().v_flex().w_full().flex_none().gap_2().child(
-            div().text_xs().text_color(rgb(MUTED)).child(
+            div().text_xs().text_color(rgb(palette(cx).muted)).child(
                 "失败块才有这一页：诊断日志只保存固定分类，所以这里按同一份冻结原文重新请求一次，\
                  把模型返回的原文原样显示出来。这次请求不写译文、不推进任务、不改任何记录。",
             ),
@@ -2406,22 +2406,22 @@ impl BackgroundJobsWindow {
             panel = panel.child(
                 div()
                     .text_xs()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette(cx).muted))
                     .child("已发出请求，正在等待模型返回；响应会先在这里显示，不会写进书库。"),
             );
         }
         if let Some(error) = probe.error.as_ref() {
-            panel = panel.child(div().text_xs().text_color(rgb(DANGER)).child(error.clone()));
+            panel = panel.child(div().text_xs().text_color(rgb(palette(cx).danger)).child(error.clone()));
         }
         let Some(result) = probe.result.as_ref() else {
             return panel.into_any_element();
         };
         panel = panel
-            .child(div().flex_none().h(px(1.)).w_full().bg(rgb(BORDER)))
+            .child(div().flex_none().h(px(1.)).w_full().bg(rgb(palette(cx).border)))
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette(cx).muted))
                     .child(format!(
                         "调用模型 {} · 耗时 {:.1} 秒 · 收到 {} 字节 · {}",
                         result.model,
@@ -2434,16 +2434,16 @@ impl BackgroundJobsWindow {
                 div()
                     .text_xs()
                     .text_color(if result.decode_error_kind.is_some() {
-                        rgb(DANGER)
+                        rgb(palette(cx).danger)
                     } else {
-                        rgb(0x376441)
+                        rgb(palette(cx).success)
                     })
                     .child(probe_decode_label(result)),
             );
         let body = if result.response_text.is_empty() {
             div()
                 .text_xs()
-                .text_color(rgb(MUTED))
+                .text_color(rgb(palette(cx).muted))
                 .child("（模型没有返回任何内容）")
                 .into_any_element()
         } else {
@@ -2454,7 +2454,7 @@ impl BackgroundJobsWindow {
                 .flex_none()
                 .text_xs()
                 .line_height(gpui::relative(1.5))
-                .text_color(rgb(INK))
+                .text_color(rgb(palette(cx).ink))
                 .whitespace_normal()
                 .child(prettify_json(&result.response_text))
                 .into_any_element()
@@ -2607,8 +2607,8 @@ impl Render for BackgroundJobsWindow {
             .v_flex()
             .size_full()
             .overflow_hidden()
-            .bg(rgb(PAPER))
-            .text_color(rgb(INK))
+            .bg(rgb(palette(cx).paper))
+            .text_color(rgb(palette(cx).ink))
             .child(self.render_header(cx))
             .when_some(self.refresh_error.as_ref(), |this, error| {
                 this.child(
@@ -2616,8 +2616,8 @@ impl Render for BackgroundJobsWindow {
                         .px_5()
                         .py_2()
                         .text_xs()
-                        .bg(rgb(0xf8e2de))
-                        .text_color(rgb(DANGER))
+                        .bg(rgb(palette(cx).danger_soft))
+                        .text_color(rgb(palette(cx).danger))
                         .child(error.clone()),
                 )
             })
@@ -2627,8 +2627,8 @@ impl Render for BackgroundJobsWindow {
                         .px_5()
                         .py_2()
                         .text_xs()
-                        .bg(rgb(if notice.error { 0xf8e2de } else { ACCENT_SOFT }))
-                        .text_color(rgb(if notice.error { DANGER } else { ACCENT_DARK }))
+                        .bg(rgb(if notice.error { 0xf8e2de } else { palette(cx).accent_soft }))
+                        .text_color(rgb(if notice.error { palette(cx).danger } else { palette(cx).accent_strong }))
                         .child(notice.text.clone()),
                 )
             })
@@ -2681,6 +2681,7 @@ fn job_matches(
 fn failure_banner(
     job: &BackgroundJobSnapshot,
     inspector: &BlockInspector,
+    theme: Palette,
 ) -> Option<gpui::AnyElement> {
     let failed = inspector.progress.failed;
     let failed_task = job.status == BackgroundJobStatus::Failed;
@@ -2705,9 +2706,9 @@ fn failure_banner(
         content = content.child("诊断记录已按保留上限清理，上面的清单可能不完整。");
     }
     let (foreground, background) = if failed_task {
-        (rgb(DANGER), rgb(0xf8e2de))
+        (rgb(theme.danger), rgb(theme.danger_soft))
     } else {
-        (rgb(ACCENT_DARK), rgb(ACCENT_SOFT))
+        (rgb(theme.accent_strong), rgb(theme.accent_soft))
     };
     Some(
         div()
@@ -3009,20 +3010,25 @@ fn job_kind_label(kind: &str) -> &'static str {
     }
 }
 
-fn status_presentation(job: &BackgroundJobSnapshot) -> (&'static str, gpui::Rgba, gpui::Rgba) {
+fn status_presentation(
+    job: &BackgroundJobSnapshot,
+    theme: Palette,
+) -> (&'static str, gpui::Rgba, gpui::Rgba) {
     if job.cancel_requested {
-        return ("正在取消", rgb(0x8a5a20), rgb(0xf4e8d5));
+        return ("正在取消", rgb(theme.warning), rgb(theme.warning_soft));
     }
     if job.pause_requested {
-        return ("正在暂停", rgb(0x8a5a20), rgb(0xf4e8d5));
+        return ("正在暂停", rgb(theme.warning), rgb(theme.warning_soft));
     }
     match job.status {
-        BackgroundJobStatus::Queued => ("排队中", rgb(0x5e6572), rgb(0xe7e9ed)),
-        BackgroundJobStatus::Running => ("运行中", rgb(ACCENT_DARK), rgb(ACCENT_SOFT)),
-        BackgroundJobStatus::Paused => ("已暂停", rgb(0x8a5a20), rgb(0xf4e8d5)),
-        BackgroundJobStatus::Succeeded => ("已完成", rgb(0x376441), rgb(0xe3efe5)),
-        BackgroundJobStatus::Failed => ("失败", rgb(DANGER), rgb(0xf8e2de)),
-        BackgroundJobStatus::Cancelled => ("已取消", rgb(0x5e6572), rgb(0xe7e9ed)),
+        BackgroundJobStatus::Queued => ("排队中", rgb(theme.neutral), rgb(theme.neutral_soft)),
+        BackgroundJobStatus::Running => {
+            ("运行中", rgb(theme.accent_strong), rgb(theme.accent_soft))
+        }
+        BackgroundJobStatus::Paused => ("已暂停", rgb(theme.warning), rgb(theme.warning_soft)),
+        BackgroundJobStatus::Succeeded => ("已完成", rgb(theme.success), rgb(theme.success_soft)),
+        BackgroundJobStatus::Failed => ("失败", rgb(theme.danger), rgb(theme.danger_soft)),
+        BackgroundJobStatus::Cancelled => ("已取消", rgb(theme.neutral), rgb(theme.neutral_soft)),
     }
 }
 
@@ -3273,12 +3279,12 @@ mod tests {
         let mut pending = job(BackgroundJobStatus::Running);
         pending.pause_requested = true;
         assert!(available_actions(&pending).is_empty());
-        assert_eq!(status_presentation(&pending).0, "正在暂停");
+        assert_eq!(status_presentation(&pending, Palette::LIGHT).0, "正在暂停");
 
         pending.pause_requested = false;
         pending.cancel_requested = true;
         assert!(available_actions(&pending).is_empty());
-        assert_eq!(status_presentation(&pending).0, "正在取消");
+        assert_eq!(status_presentation(&pending, Palette::LIGHT).0, "正在取消");
     }
 
     #[test]

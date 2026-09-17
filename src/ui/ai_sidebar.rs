@@ -2105,12 +2105,12 @@ impl AiSidebar {
         }
     }
 
-    fn render_endpoint_status(&self) -> gpui::AnyElement {
+    fn render_endpoint_status(&self, theme: Palette) -> gpui::AnyElement {
         let warning = self.endpoint_status.is_warning();
         let (background, foreground, icon) = if warning {
-            (rgb(0xf8e2de), rgb(DANGER), IconName::TriangleAlert)
+            (rgb(theme.danger_soft), rgb(theme.danger), IconName::TriangleAlert)
         } else {
-            (rgb(0xe3efe5), rgb(0x376441), IconName::CircleCheck)
+            (rgb(theme.success_soft), rgb(theme.success), IconName::CircleCheck)
         };
         div()
             .v_flex()
@@ -2122,7 +2122,7 @@ impl AiSidebar {
             .px_3()
             .py_1p5()
             .border_b_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(theme.border))
             .bg(background)
             .text_xs()
             .text_color(foreground)
@@ -2147,7 +2147,7 @@ impl AiSidebar {
         let view = cx.entity().clone();
         let warning = self.endpoint_status.is_warning();
         let (status_color, status_text) = if warning {
-            (DANGER, "远")
+            (palette(cx).danger, "远")
         } else {
             (0x376441, "本")
         };
@@ -2158,8 +2158,8 @@ impl AiSidebar {
             .flex_none()
             .items_center()
             .border_l_1()
-            .border_color(rgb(BORDER))
-            .bg(rgb(SIDEBAR))
+            .border_color(rgb(palette(cx).border))
+            .bg(rgb(palette(cx).sidebar))
             .py_3()
             .child(
                 Button::new("ai-sidebar-expand")
@@ -2173,7 +2173,7 @@ impl AiSidebar {
             .child(
                 div()
                     .mt_3()
-                    .text_color(rgb(ACCENT))
+                    .text_color(rgb(palette(cx).accent))
                     .child(Icon::new(IconName::Bot).small()),
             )
             .child(
@@ -2250,13 +2250,13 @@ impl AiSidebar {
             .px_3()
             .py_3()
             .border_b_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(palette(cx).border))
             .child(
                 div()
                     .h_flex()
                     .justify_between()
                     .text_xs()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette(cx).muted))
                     .child("图书范围")
                     .child(format!("{} 本", self.conversation.scope.book_ids().len())),
             )
@@ -2265,7 +2265,7 @@ impl AiSidebar {
                 this.child(
                     div()
                         .text_xs()
-                        .text_color(rgb(MUTED))
+                        .text_color(rgb(palette(cx).muted))
                         .child(format!("另有 {hidden} 本图书")),
                 )
             })
@@ -2306,7 +2306,7 @@ impl AiSidebar {
                             .min_w(px(0.))
                             .truncate()
                             .text_sm()
-                            .text_color(rgb(INK))
+                            .text_color(rgb(palette(cx).ink))
                             .child(reference.label.clone()),
                     )
                     .child(
@@ -2341,8 +2341,8 @@ impl AiSidebar {
                 .gap_2()
                 .py_2()
                 .border_b_1()
-                .border_color(rgb(BORDER))
-                .bg(rgb(0xfaf8f4))
+                .border_color(rgb(palette(cx).border))
+                .bg(rgb(palette(cx).surface))
                 .child(
                     div()
                         .h_flex()
@@ -2354,16 +2354,16 @@ impl AiSidebar {
                                 .h_flex()
                                 .gap_2()
                                 .text_xs()
-                                .text_color(rgb(MUTED))
+                                .text_color(rgb(palette(cx).muted))
                                 .child(
                                     Icon::new(IconName::BookOpen)
                                         .small()
-                                        .text_color(rgb(ACCENT)),
+                                        .text_color(rgb(palette(cx).accent)),
                                 )
                                 .child("可选引用"),
                         )
                         .child(
-                            div().text_xs().text_color(rgb(MUTED)).child(format!(
+                            div().text_xs().text_color(rgb(palette(cx).muted)).child(format!(
                                 "已选 {selected_count}/{}",
                                 MAX_SELECTED_REFERENCES
                             )),
@@ -2459,21 +2459,21 @@ impl AiSidebar {
                 .px_3()
                 .py_2()
                 .border_b_1()
-                .border_color(rgb(BORDER))
-                .bg(rgb(SURFACE))
+                .border_color(rgb(palette(cx).border))
+                .bg(rgb(palette(cx).surface))
                 .when(self.sessions.busy, |this| {
                     this.child(
                         div()
                             .h_flex()
                             .gap_2()
                             .text_xs()
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(palette(cx).muted))
                             .child(Icon::new(IconName::LoaderCircle).xsmall())
                             .child("正在处理会话…"),
                     )
                 })
                 .when_some(self.sessions.error.clone(), |this, error| {
-                    this.child(div().text_xs().text_color(rgb(DANGER)).child(error))
+                    this.child(div().text_xs().text_color(rgb(palette(cx).danger)).child(error))
                 })
                 .when(self.sessions.open, |this| {
                     this.when_some(pending_delete, |this, pending| {
@@ -2488,14 +2488,14 @@ impl AiSidebar {
                                 .p_3()
                                 .rounded_md()
                                 .border_1()
-                                .border_color(rgb(DANGER))
-                                .bg(rgb(0xfff3f0))
+                                .border_color(rgb(palette(cx).danger))
+                                .bg(rgb(palette(cx).danger_soft))
                                 .child(div().font_semibold().child("删除 AI 会话？"))
                                 .child(div().text_sm().child(format!("会话：“{}”", pending.title)))
                                 .child(
                                     div()
                                         .text_xs()
-                                        .text_color(rgb(MUTED))
+                                        .text_color(rgb(palette(cx).muted))
                                         .child("问题、回答和引用都会被永久删除，且无法恢复。"),
                                 )
                                 .child(
@@ -2537,7 +2537,7 @@ impl AiSidebar {
                                 .overflow_y_scrollbar()
                                 .when(rows.is_empty(), |this| {
                                     this.child(
-                                        div().px_2().py_3().text_xs().text_color(rgb(MUTED)).child(
+                                        div().px_2().py_3().text_xs().text_color(rgb(palette(cx).muted)).child(
                                             "还没有历史会话。发送第一条消息后会保存在这里。",
                                         ),
                                     )
@@ -2560,10 +2560,10 @@ impl AiSidebar {
         let user = message.role == AiMessageRole::User;
         let show_no_source_warning = should_show_no_knowledge_base_source_warning(message);
         let (background, foreground): (gpui::Hsla, gpui::Hsla) = match message.role {
-            AiMessageRole::User => (rgb(ACCENT).into(), white()),
-            AiMessageRole::Assistant => (white(), rgb(INK).into()),
-            AiMessageRole::Status => (rgb(0xe9e5de).into(), rgb(MUTED).into()),
-            AiMessageRole::Error => (rgb(0xf7e1df).into(), rgb(0x9f302c).into()),
+            AiMessageRole::User => (rgb(palette(cx).accent).into(), white()),
+            AiMessageRole::Assistant => (white(), rgb(palette(cx).ink).into()),
+            AiMessageRole::Status => (rgb(palette(cx).neutral_soft).into(), rgb(palette(cx).muted).into()),
+            AiMessageRole::Error => (rgb(palette(cx).danger_soft).into(), rgb(palette(cx).danger).into()),
         };
         let sources = message
             .sources
@@ -2622,7 +2622,7 @@ impl AiSidebar {
                     .py_2()
                     .rounded(px(10.))
                     .border_1()
-                    .border_color(if user { rgb(ACCENT) } else { rgb(BORDER) })
+                    .border_color(if user { rgb(palette(cx).accent) } else { rgb(palette(cx).border) })
                     .bg(background)
                     .text_sm()
                     .text_color(foreground)
@@ -2636,9 +2636,9 @@ impl AiSidebar {
                                 .py_2()
                                 .rounded(px(8.))
                                 .border_1()
-                                .border_color(rgb(0xe3c26f))
-                                .bg(rgb(0xfff4d6))
-                                .text_color(rgb(0x6f5314))
+                                .border_color(rgb(palette(cx).warning))
+                                .bg(rgb(palette(cx).warning_soft))
+                                .text_color(rgb(palette(cx).warning))
                                 .child(
                                     div()
                                         .h_flex()
@@ -2665,9 +2665,9 @@ impl AiSidebar {
                                 .py_2()
                                 .rounded(px(8.))
                                 .border_1()
-                                .border_color(rgb(0xb9cfe6))
-                                .bg(rgb(0xe9f1fa))
-                                .text_color(rgb(0x2c5c86))
+                                .border_color(rgb(palette(cx).info))
+                                .bg(rgb(palette(cx).info_soft))
+                                .text_color(rgb(palette(cx).info))
                                 .child(
                                     div()
                                         .h_flex()
@@ -2745,8 +2745,8 @@ impl Render for AiSidebar {
             .min_h(px(0.))
             .flex_none()
             .border_l_1()
-            .border_color(rgb(BORDER))
-            .bg(rgb(SIDEBAR))
+            .border_color(rgb(palette(cx).border))
+            .bg(rgb(palette(cx).sidebar))
             .child(
                 div()
                     .h_flex()
@@ -2756,14 +2756,14 @@ impl Render for AiSidebar {
                     .gap_2()
                     .px_3()
                     .border_b_1()
-                    .border_color(rgb(BORDER))
+                    .border_color(rgb(palette(cx).border))
                     .child(
                         div()
                             .h_flex()
                             .min_w(px(0.))
                             .gap_2()
-                            .text_color(rgb(INK))
-                            .child(Icon::new(IconName::Bot).small().text_color(rgb(ACCENT)))
+                            .text_color(rgb(palette(cx).ink))
+                            .child(Icon::new(IconName::Bot).small().text_color(rgb(palette(cx).accent)))
                             .child(
                                 div()
                                     .v_flex()
@@ -2774,7 +2774,7 @@ impl Render for AiSidebar {
                                             .max_w(px(250.))
                                             .truncate()
                                             .text_xs()
-                                            .text_color(rgb(MUTED))
+                                            .text_color(rgb(palette(cx).muted))
                                             .child(active_session_title),
                                     ),
                             ),
@@ -2823,7 +2823,7 @@ impl Render for AiSidebar {
             .when_some(self.render_session_picker(cx), |this, picker| {
                 this.child(picker)
             })
-            .child(self.render_endpoint_status())
+            .child(self.render_endpoint_status(palette(cx)))
             .child(self.render_scope(cx))
             .when_some(self.render_references(cx), |this, references| {
                 this.child(references)
@@ -2844,7 +2844,7 @@ impl Render for AiSidebar {
                                 .gap_2()
                                 .py_8()
                                 .text_center()
-                                .text_color(rgb(MUTED))
+                                .text_color(rgb(palette(cx).muted))
                                 .child(Icon::new(IconName::Bot).large())
                                 .child(div().text_sm().child("围绕当前图书范围提问"))
                                 .child(div().text_xs().line_height(gpui::relative(1.5)).child(
@@ -2868,15 +2868,15 @@ impl Render for AiSidebar {
                     .gap_2()
                     .p_3()
                     .border_t_1()
-                    .border_color(rgb(BORDER))
-                    .bg(rgb(SURFACE))
+                    .border_color(rgb(palette(cx).border))
+                    .bg(rgb(palette(cx).surface))
                     .child(Input::new(&self.input).disabled(sending || session_busy))
                     .child(
                         div()
                             .h_flex()
                             .justify_between()
                             .gap_2()
-                            .child(div().text_xs().text_color(rgb(MUTED)).child(if sending {
+                            .child(div().text_xs().text_color(rgb(palette(cx).muted)).child(if sending {
                                 "正在生成，可随时取消"
                             } else if session_busy {
                                 "正在切换会话"

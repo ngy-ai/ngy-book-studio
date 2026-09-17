@@ -436,7 +436,7 @@ fn translation_block_inspector_names_the_blocks_that_failed() {
         Some("本次执行未翻译的文本块：#58、#61")
     );
     // A failed task must explain itself in the inspector, not only in the log.
-    assert!(failure_banner(&job, &inspector).is_some());
+    assert!(failure_banner(&job, &inspector, Palette::LIGHT).is_some());
 }
 
 #[test]
@@ -493,7 +493,7 @@ fn translation_block_inspector_scopes_failures_to_the_newest_execution() {
     let inspector = BlockInspector::new(&job, blocks.total, Some(&logs));
     assert_eq!(inspector.progress.failed, 0);
     assert_eq!(inspector.state(3), BlockState::Done);
-    assert!(failure_banner(&job, &inspector).is_none());
+    assert!(failure_banner(&job, &inspector, Palette::LIGHT).is_none());
 
     // Without any log at all the inspector still renders from the cursor: 已处理与待处理
     // 由游标决定，处理中由游标里的窗口集合决定（单块在飞时就是游标那一块）。

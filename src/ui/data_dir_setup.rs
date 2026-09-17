@@ -188,7 +188,7 @@ impl DataDirSetupWindow {
         self.launching
     }
 
-    fn render_error(&self) -> Option<gpui::AnyElement> {
+    fn render_error(&self, theme: Palette) -> Option<gpui::AnyElement> {
         let error = self.error.as_ref()?;
         Some(
             div()
@@ -197,9 +197,9 @@ impl DataDirSetupWindow {
                 .gap_2()
                 .p_3()
                 .rounded(px(8.))
-                .bg(rgb(0xf7e1df))
+                .bg(rgb(theme.danger_soft))
                 .text_sm()
-                .text_color(rgb(0x9f302c))
+                .text_color(rgb(theme.danger))
                 .child(Icon::new(IconName::TriangleAlert).small())
                 .child(
                     div()
@@ -218,7 +218,7 @@ impl Render for DataDirSetupWindow {
         let launching = self.launching;
         div()
             .size_full()
-            .bg(rgb(PAPER))
+            .bg(rgb(palette(cx).paper))
             .v_flex()
             .items_center()
             .justify_center()
@@ -232,8 +232,8 @@ impl Render for DataDirSetupWindow {
                     .p_6()
                     .rounded(px(14.))
                     .border_1()
-                    .border_color(rgb(BORDER))
-                    .bg(rgb(SURFACE))
+                    .border_color(rgb(palette(cx).border))
+                    .bg(rgb(palette(cx).surface))
                     .child(
                         div()
                             .v_flex()
@@ -242,14 +242,14 @@ impl Render for DataDirSetupWindow {
                                 div()
                                     .text_lg()
                                     .font_semibold()
-                                    .text_color(rgb(INK))
+                                    .text_color(rgb(palette(cx).ink))
                                     .child(self.heading()),
                             )
                             .child(
                                 div()
                                     .text_sm()
                                     .line_height(gpui::relative(1.5))
-                                    .text_color(rgb(MUTED))
+                                    .text_color(rgb(palette(cx).muted))
                                     .child(self.explanation()),
                             ),
                     )
@@ -261,7 +261,7 @@ impl Render for DataDirSetupWindow {
                                 div()
                                     .text_sm()
                                     .font_semibold()
-                                    .text_color(rgb(INK))
+                                    .text_color(rgb(palette(cx).ink))
                                     .child("数据目录"),
                             )
                             .child(
@@ -291,14 +291,14 @@ impl Render for DataDirSetupWindow {
                         div()
                             .text_xs()
                             .line_height(gpui::relative(1.5))
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(palette(cx).muted))
                             .child(
                                 "图书、笔记、索引和日志都放在这里，建议放在非系统盘；日志写在它的 \
                                  logs/ 子目录下，按 UTC 日期分文件、保留最近 7 天。确认后立即使用，\
                                  下次启动不再询问，之后可以在「系统配置」里查看或更改。",
                             ),
                     )
-                    .children(self.render_error())
+                    .children(self.render_error(palette(cx)))
                     .child(
                         div()
                             .h_flex()

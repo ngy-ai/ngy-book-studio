@@ -54,6 +54,7 @@ use crate::{
     runtime::IoRuntime,
     search::SearchService,
     storage::{BlobKey, BlobPublicationLock, BlobStore, LocalBlobStore},
+    theme::Appearance,
     web_search::{HttpWebSearch, WebSearchConfig, normalize_web_endpoint},
 };
 
@@ -63,6 +64,7 @@ const CHAT_GENERATION_SETTINGS_KEY: &str = "ai.openai_compatible.chat_generation
 const ENDPOINT_ROUTING_SETTINGS_KEY: &str = "ai.openai_compatible.endpoint_routing.v1";
 const BACKGROUND_JOB_SETTINGS_KEY: &str = "background_jobs.preferences.v1";
 const PDF_READER_SETTINGS_KEY: &str = "pdf.reader.preferences.v1";
+const APPEARANCE_SETTINGS_KEY: &str = "appearance.preferences.v1";
 const TRANSLATION_SETTINGS_KEY: &str = "translation.preferences.v1";
 const NETWORK_SETTINGS_KEY: &str = "ai.network.preferences.v1";
 const WEB_SEARCH_CREDENTIAL_TARGET: &str = "ai.openai_compatible.web_search.v1";
@@ -276,6 +278,26 @@ impl Default for PersistedPdfReaderSettings {
     }
 }
 
+/// 界面皮肤偏好。与上面的阅读偏好一样存进自己的 settings key，provider JSON 的
+/// 既有契约不变。
+///
+/// 皮肤是**应用级**偏好而不是窗口级：它决定所有窗口（含已打开的阅读器与编辑器）
+/// 的颜色，所以只有一份，切换时广播。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedAppearanceSettings {
+    #[serde(default)]
+    theme: Appearance,
+}
+
+impl Default for PersistedAppearanceSettings {
+    fn default() -> Self {
+        Self {
+            theme: Appearance::default(),
+        }
+    }
+}
+
 /// Whether AI and web-search requests use the system proxy. Kept in its own
 /// settings key, exactly like the preferences above.
 fn default_ai_use_proxy() -> bool {
@@ -432,6 +454,10 @@ pub struct ProviderSettings {
     /// like the background-job preference above.
     #[serde(skip, default = "default_pdf_compact_reading")]
     pub pdf_compact_reading: bool,
+    /// 界面皮肤（浅色 / 深色）。存进自己的 settings key，与上面的偏好同理；
+    /// 它是应用级设置，切换时所有窗口与 WebView 一起跟随。
+    #[serde(skip, default)]
+    pub appearance: Appearance,
     /// Target language for the reading-time book translation. `None` keeps the
     /// original text. Stored under its own settings key so the established
     /// provider JSON contract remains unchanged, like the preferences above.
@@ -512,6 +538,7 @@ impl Default for ProviderSettings {
             background_job_concurrency: default_background_job_concurrency(),
             background_job_interval_ms: default_background_job_interval_ms(),
             pdf_compact_reading: default_pdf_compact_reading(),
+            appearance: Appearance::default(),
             default_language: default_translation_language(),
             translation_display_mode: default_translation_display_mode(),
             use_proxy: default_ai_use_proxy(),
@@ -2796,12 +2823,13 @@ fn restore_endpoint_keys(
     }
 }
 
-const AI_SETTINGS_KEYS: [&str; 7] = [
+const AI_SETTINGS_KEYS: [&str; 8] = [
     PROVIDER_SETTINGS_KEY,
     CHAT_GENERATION_SETTINGS_KEY,
     ENDPOINT_ROUTING_SETTINGS_KEY,
     BACKGROUND_JOB_SETTINGS_KEY,
     PDF_READER_SETTINGS_KEY,
+    APPEARANCE_SETTINGS_KEY,
     TRANSLATION_SETTINGS_KEY,
     NETWORK_SETTINGS_KEY,
 ];
@@ -2990,6 +3018,14 @@ fn load_provider_settings(db_path: &Path) -> Result<ProviderSettings> {
         }
         None => default_pdf_compact_reading(),
     };
+    settings.appearance = match db::settings::get(&tx, APPEARANCE_SETTINGS_KEY)? {
+        Some(row) => {
+            serde_json::from_str::<PersistedAppearanceSettings>(&row.value_json)
+                .context("保存的外观设置无效")?
+                .theme
+        }
+        None => Appearance::default(),
+    };
     let translation_settings = match db::settings::get(&tx, TRANSLATION_SETTINGS_KEY)? {
         Some(row) => serde_json::from_str::<PersistedTranslationSettings>(&row.value_json)
             .context("保存的翻译设置无效")?,
@@ -3054,6 +3090,14 @@ fn save_provider_settings(db_path: &Path, settings: &ProviderSettings) -> Result
         .context("无法序列化 PDF 阅读设置")?,
         updated_at,
     };
+    let appearance = db::settings::Setting {
+        key: APPEARANCE_SETTINGS_KEY.to_string(),
+        value_json: serde_json::to_string(&PersistedAppearanceSettings {
+            theme: settings.appearance,
+        })
+        .context("无法序列化外观设置")?,
+        updated_at,
+    };
     let translation = db::settings::Setting {
         key: TRANSLATION_SETTINGS_KEY.to_string(),
         value_json: serde_json::to_string(&PersistedTranslationSettings {
@@ -3094,6 +3138,10 @@ fn save_provider_settings(db_path: &Path, settings: &ProviderSettings) -> Result
     ensure!(
         db::settings::upsert(&tx, &pdf_reader)? == 1,
         "PDF 阅读设置未能保存"
+    );
+    ensure!(
+        db::settings::upsert(&tx, &appearance)? == 1,
+        "外观设置未能保存"
     );
     ensure!(
         db::settings::upsert(&tx, &translation)? == 1,

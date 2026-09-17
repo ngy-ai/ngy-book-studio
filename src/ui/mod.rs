@@ -77,16 +77,14 @@ use ngy_book_studio::{
 };
 use serde::Deserialize;
 
-const PAPER: u32 = 0xf7f5f0;
-const SURFACE: u32 = 0xfffefa;
-const SIDEBAR: u32 = 0xf1eee8;
-const INK: u32 = 0x292621;
-const MUTED: u32 = 0x777067;
-const BORDER: u32 = 0xe1ddd5;
-const ACCENT: u32 = 0xb95f42;
-const ACCENT_DARK: u32 = 0x9f4d34;
-const ACCENT_SOFT: u32 = 0xf1ddd5;
-const DANGER: u32 = 0xb33a2b;
+/// 皮肤与调色板是本模块所有窗口共用的取色入口：颜色只在 `ngy_book_studio::theme`
+/// 里定义一次，各窗口用 `use super::*;` 拿到 [`palette`] 后按语义名取色。任何一个
+/// 窗口都不应该自己再写死颜色常量，否则它会在切换皮肤时留在旧配色上。
+pub(crate) use ngy_book_studio::theme::{Appearance, Palette, palette, set_appearance};
+/// 当前皮肤。窗口在渲染或推送 WebView 时读它；改名成 `current_appearance` 是为了
+/// 不和界面代码里的同名字段/局部变量撞名。
+pub(crate) use ngy_book_studio::theme::appearance as current_appearance;
+
 const STATUS_BAR_HEIGHT: f32 = 30.;
 const MAX_EDITOR_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_EDITOR_IPC_BYTES: usize = 20 * 1024 * 1024;
@@ -399,6 +397,7 @@ fn render_status_bar(
     status_color: u32,
     summary: String,
     context: String,
+    palette: Palette,
 ) -> gpui::AnyElement {
     div()
         .h_flex()
@@ -409,10 +408,10 @@ fn render_status_bar(
         .gap_4()
         .px_5()
         .border_t_1()
-        .border_color(rgb(BORDER))
-        .bg(rgb(SURFACE))
+        .border_color(rgb(palette.border))
+        .bg(rgb(palette.surface))
         .text_xs()
-        .text_color(rgb(MUTED))
+        .text_color(rgb(palette.muted))
         .child(
             div()
                 .h_flex()
@@ -429,7 +428,7 @@ fn render_status_bar(
                         .child(Icon::new(status_icon).small())
                         .child(status_text),
                 )
-                .child(div().w(px(1.)).h(px(12.)).flex_none().bg(rgb(BORDER)))
+                .child(div().w(px(1.)).h(px(12.)).flex_none().bg(rgb(palette.border)))
                 .child(div().min_w(px(0.)).truncate().child(summary)),
         )
         .child(
@@ -440,7 +439,7 @@ fn render_status_bar(
                 .flex_none()
                 .gap_3()
                 .child(div().min_w(px(0.)).truncate().child(context))
-                .child(div().w(px(1.)).h(px(12.)).flex_none().bg(rgb(BORDER)))
+                .child(div().w(px(1.)).h(px(12.)).flex_none().bg(rgb(palette.border)))
                 .child(
                     div()
                         .flex_none()

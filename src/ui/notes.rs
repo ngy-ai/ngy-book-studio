@@ -554,16 +554,16 @@ impl NotesWindow {
             .gap_4()
             .px_6()
             .py_4()
-            .bg(rgb(SURFACE))
+            .bg(rgb(palette(cx).surface))
             .border_b_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(palette(cx).border))
             .child(
                 div()
                     .v_flex()
                     .min_w(px(0.))
                     .gap_1()
                     .child(div().text_lg().font_semibold().child(title))
-                    .child(div().text_sm().text_color(rgb(MUTED)).child(subtitle)),
+                    .child(div().text_sm().text_color(rgb(palette(cx).muted)).child(subtitle)),
             )
             .child(
                 Button::new("notes-refresh")
@@ -610,7 +610,7 @@ impl NotesWindow {
             .px_6()
             .py_3()
             .border_b_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(palette(cx).border))
             .child(Input::new(&self.search).w_full())
             .child(
                 div()
@@ -619,7 +619,7 @@ impl NotesWindow {
                     .justify_between()
                     .gap_2()
                     .child(filters)
-                    .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
+                    .child(div().text_xs().text_color(rgb(palette(cx).muted)).child(format!(
                         "{} 条笔记 · {} 本图书",
                         self.listing.notes.len(),
                         self.listing.book_count
@@ -646,9 +646,9 @@ impl NotesWindow {
         let mut content = div().v_flex().gap_3().child(
             div()
                 .border_l_2()
-                .border_color(rgb(ACCENT_SOFT))
+                .border_color(rgb(palette(cx).accent_soft))
                 .pl_3()
-                .text_color(rgb(MUTED))
+                .text_color(rgb(palette(cx).muted))
                 .child(selectable_note_text(
                     format!("note-{id}-quote"),
                     card.quote_html.clone(),
@@ -674,8 +674,8 @@ impl NotesWindow {
             .p_4()
             .rounded(px(10.))
             .border_1()
-            .border_color(rgb(BORDER))
-            .bg(rgb(SURFACE))
+            .border_color(rgb(palette(cx).border))
+            .bg(rgb(palette(cx).surface))
             .child(
                 div()
                     .h_flex()
@@ -696,7 +696,7 @@ impl NotesWindow {
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(MUTED))
+                                    .text_color(rgb(palette(cx).muted))
                                     .child(chapter_label(note)),
                             ),
                     )
@@ -707,8 +707,8 @@ impl NotesWindow {
                             .px_2()
                             .py_1()
                             .rounded(px(5.))
-                            .bg(rgb(ACCENT_SOFT))
-                            .text_color(rgb(ACCENT_DARK))
+                            .bg(rgb(palette(cx).accent_soft))
+                            .text_color(rgb(palette(cx).accent_strong))
                             .child(kind_label(annotation.kind)),
                     ),
             )
@@ -717,7 +717,7 @@ impl NotesWindow {
                 this.child(
                     div()
                         .text_xs()
-                        .text_color(rgb(MUTED))
+                        .text_color(rgb(palette(cx).muted))
                         .child("笔记位置已失效，保留的引文和想法仍可查看、复制。"),
                 )
             })
@@ -789,10 +789,10 @@ impl NotesWindow {
             .gap_4()
             .px_6()
             .py_3()
-            .bg(rgb(SURFACE))
+            .bg(rgb(palette(cx).surface))
             .border_t_1()
-            .border_color(rgb(BORDER))
-            .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
+            .border_color(rgb(palette(cx).border))
+            .child(div().text_xs().text_color(rgb(palette(cx).muted)).child(format!(
                 "找到 {} 条 · 最近更新在前",
                 self.listing.filtered.len()
             )))
@@ -870,7 +870,7 @@ impl NotesWindow {
                     .items_center()
                     .justify_center()
                     .gap_3()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette(cx).muted))
                     .child(Icon::new(IconName::Inbox))
                     .child(message),
             );
@@ -950,7 +950,7 @@ fn render_note_thought(
             }
             ThoughtPart::Table { rows, nested } => {
                 if *nested {
-                    body = body.child(div().text_xs().text_color(rgb(MUTED)).child("完整表格"));
+                    body = body.child(div().text_xs().text_color(rgb(palette(cx).muted)).child("完整表格"));
                 }
                 body = body.child(render_note_table(&part_id, rows, width, window, cx));
             }
@@ -983,16 +983,16 @@ fn render_note_table(
         .w(table_width + px(2.))
         .flex_shrink_0()
         .border_1()
-        .border_color(rgb(BORDER));
+        .border_color(rgb(palette(cx).border));
     for (row_index, row) in rows.iter().enumerate() {
         let mut line = div()
             .flex()
             .flex_row()
             .w(table_width)
             .flex_shrink_0()
-            .when(row_index == 0, |line| line.bg(rgb(SIDEBAR)).font_semibold())
+            .when(row_index == 0, |line| line.bg(rgb(palette(cx).sidebar)).font_semibold())
             .when(row_index + 1 < rows.len(), |line| {
-                line.border_b_1().border_color(rgb(BORDER))
+                line.border_b_1().border_color(rgb(palette(cx).border))
             });
         for column in 0..columns {
             let cell_id = format!("{id}-cell-{row_index}-{column}");
@@ -1008,7 +1008,7 @@ fn render_note_table(
                 .flex_shrink_0()
                 .p_3()
                 .when(column + 1 < columns, |cell| {
-                    cell.border_r_1().border_color(rgb(BORDER))
+                    cell.border_r_1().border_color(rgb(palette(cx).border))
                 })
                 .child(selectable_note_thought(
                     format!("{cell_id}-text"),
@@ -1045,9 +1045,9 @@ impl Render for NotesWindow {
         div()
             .v_flex()
             .size_full()
-            .text_color(rgb(INK))
+            .text_color(rgb(palette(cx).ink))
             .text_sm()
-            .bg(rgb(PAPER))
+            .bg(rgb(palette(cx).paper))
             .child(self.render_header(cx))
             .child(self.render_filters(cx))
             .when_some(self.error.clone(), |this, error| {
@@ -1057,7 +1057,7 @@ impl Render for NotesWindow {
                         .px_6()
                         .py_2()
                         .text_sm()
-                        .text_color(rgb(DANGER))
+                        .text_color(rgb(palette(cx).danger))
                         .child(error),
                 )
             })

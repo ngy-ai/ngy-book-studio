@@ -95,6 +95,50 @@ fn editor_pane_width_from_pointer(
 // checked-in artifact so normal Rust builds never require Node.js.
 const EDITOR_INITIALIZATION_SCRIPT: &str = include_str!("../../assets/editor/prosemirror.js");
 
+/// 编辑器 WebView 的外观覆盖规则。
+///
+/// 编辑器 bundle（`assets/editor/prosemirror.js`）随包发布，里面的工具栏、按钮、
+/// 表格线与代码块底色都是写死的浅色，改不了它的源码就不能靠它换皮肤。宿主因此
+/// 再注入一层覆盖：规则本身只写一次，颜色全部取自 `--ngy-*` 调色板变量，两套皮肤
+/// 自动各取各的值。
+///
+/// 选择器统一加 `html[data-ngy-appearance]` 前缀，特异性从 bundle 的 (0,1,0) 提到
+/// (0,2,1)：不用 `!important` 也能稳定覆盖，且不会连累 bundle 里其它规则。
+const EDITOR_APPEARANCE_RULES: &str = r#"
+html[data-ngy-appearance] body[data-ngy-rich-editor="true"] { background: var(--ngy-paper); color: var(--ngy-text); caret-color: var(--ngy-accent); }
+html[data-ngy-appearance] [data-ngy-editor-ui="toolbar"] { border-color: var(--ngy-border); background: var(--ngy-surface); color: var(--ngy-text); }
+html[data-ngy-appearance] [data-ngy-editor-ui="toolbar"] button { border-color: var(--ngy-border); background: var(--ngy-surface); color: var(--ngy-text); }
+html[data-ngy-appearance] [data-ngy-editor-ui="toolbar"] button:hover { background: var(--ngy-accent-soft); border-color: var(--ngy-accent); }
+html[data-ngy-appearance] [data-ngy-editor-ui="surface"] .ProseMirror-selectednode { outline-color: var(--ngy-accent); }
+html[data-ngy-appearance] [data-ngy-editor-ui="surface"] th,
+html[data-ngy-appearance] [data-ngy-editor-ui="surface"] td { border-color: var(--ngy-border); }
+html[data-ngy-appearance] [data-ngy-editor-ui="surface"] .column-resize-handle { background: var(--ngy-accent); }
+html[data-ngy-appearance] [data-ngy-editor-ui="surface"] pre[data-ngy-raw-html] { background: var(--ngy-sidebar); border-left-color: var(--ngy-accent); }
+"#;
+
+/// 把当前皮肤写进编辑器文档的脚本。
+///
+/// 与阅读器同理，但编辑器多一层：bundle 的样式表要覆盖，所以还要注入一个
+/// `<style id="ngy-editor-appearance">`。样式表内容用 JSON 序列化后塞进 JS 字符串，
+/// 免得 CSS 里的引号和换行把脚本写坏。
+pub(super) fn editor_appearance_script(appearance: Appearance) -> String {
+    let palette = Palette::for_appearance(appearance);
+    let setters = palette.css_variable_setters();
+    let rules = serde_json::to_string(EDITOR_APPEARANCE_RULES).unwrap_or_else(|_| "\"\"".into());
+    let scheme = appearance.color_scheme();
+    format!(
+        "(() => {{ const root = document.documentElement; \
+         root.setAttribute('data-ngy-appearance', '{scheme}'); \
+         root.style.colorScheme = '{scheme}'; \
+         {setters}\
+         let style = document.getElementById('ngy-editor-appearance'); \
+         if (!style) {{ style = document.createElement('style'); \
+         style.id = 'ngy-editor-appearance'; \
+         (document.head || document.documentElement).appendChild(style); }} \
+         style.textContent = {rules}; }})()"
+    )
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct EditorSearchHit {
     chapter_index: usize,
@@ -2446,6 +2490,7 @@ pub(super) async fn build_editor_webview(
     parent: &ParentWindowHandle,
     state: EditorWebState,
     services: Arc<AppServices>,
+    appearance: Appearance,
 ) -> Result<(
     gpui_component::wry::WebView,
     async_channel::Receiver<EditorWebEvent>,
@@ -2577,7 +2622,8 @@ pub(super) async fn build_editor_webview(
         })
         .with_new_window_req_handler(|_, _| gpui_component::wry::NewWindowResponse::Deny)
         .with_download_started_handler(|_, _| false)
-        .with_background_color((251, 250, 247, 255))
+        // 章节 XHTML 到达之前显示的就是这个底色，所以它必须已经是当前皮肤的颜色。
+        .with_background_color(Palette::bytes(Palette::for_appearance(appearance).paper))
         .with_hotkeys_zoom(false)
         .with_incognito(true)
         .with_url(initial_url)
@@ -2614,6 +2660,8 @@ pub struct EditorApp {
     search_query: String,
     search_results: Vec<EditorSearchHit>,
     _search_subscriptions: Vec<Subscription>,
+    /// 皮肤变化时把新配色重新注入编辑器文档。
+    _theme_subscription: Subscription,
     title_input: Entity<InputState>,
     author_input: Entity<InputState>,
     chapter_title_input: Entity<InputState>,
@@ -2695,6 +2743,12 @@ impl EditorApp {
             ),
             cx.subscribe_in(&body_input, window, Self::on_body_input_event),
         ];
+        // 皮肤是应用级偏好：设置窗口保存后全局状态变一次，已经打开的编辑器（含
+        // 富文本工具栏）要立刻换成新配色。
+        let _theme_subscription =
+            cx.observe_global::<ngy_book_studio::theme::AppTheme>(|this, cx| {
+                this.apply_webview_appearance(cx);
+            });
         let cover_preview = cover.as_ref().and_then(|cover| {
             image_format_from_mime(cover.mime())
                 .map(|format| Arc::new(Image::from_bytes(format, (**cover.bytes()).clone())))
@@ -2794,6 +2848,7 @@ impl EditorApp {
             search_query: String::new(),
             search_results: Vec::new(),
             _search_subscriptions,
+            _theme_subscription,
             title_input,
             author_input,
             chapter_title_input,
@@ -3200,6 +3255,7 @@ impl EditorApp {
         // native child WebView actually becomes ready.
         if self.tab.uses_webview() {
             self.load_webview(self.tab, window, cx);
+            self.apply_webview_appearance(cx);
         } else if let Some(webview) = &self.editor_webview {
             webview.update(cx, |webview, _| webview.hide());
         }
@@ -3208,6 +3264,24 @@ impl EditorApp {
         }
         cx.notify();
         true
+    }
+
+    /// 把当前皮肤写进编辑器的 WebView。
+    ///
+    /// 每次页面加载后都要重放：切换章节与标签都会换一份文档，而自定义属性与注入的
+    /// 样式表只存在于上一份文档上。
+    fn apply_webview_appearance(&mut self, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
+        let Some(webview) = self.editor_webview.as_ref() else {
+            return;
+        };
+        let script = editor_appearance_script(current_appearance(cx));
+        if let Err(error) = webview.read(cx).raw().evaluate_script(&script) {
+            // Presentation only: a missed injection must not become an editor error.
+            tracing::warn!(%error, "cannot apply the editor appearance");
+        }
     }
 
     /// Resumes a close that was vetoed while the child WebView was building.
@@ -3245,7 +3319,10 @@ impl EditorApp {
     ) {
         match event {
             EditorWebEvent::Ipc(message) => self.apply_ipc_message(message, window, cx),
-            EditorWebEvent::PageLoaded(url) => self.run_pending_citation_navigation(&url, cx),
+            EditorWebEvent::PageLoaded(url) => {
+                self.apply_webview_appearance(cx);
+                self.run_pending_citation_navigation(&url, cx);
+            }
             EditorWebEvent::CitationNavigationResult {
                 session_id,
                 chapter_id,
@@ -5576,7 +5653,7 @@ impl EditorApp {
                 .absolute()
                 .inset_0()
                 .occlude()
-                .bg(rgba(0x1f1d1a80))
+                .bg(palette(cx).scrim_with_alpha(0.5))
                 .v_flex()
                 .items_center()
                 .justify_center()
@@ -5590,34 +5667,34 @@ impl EditorApp {
                         .gap_4()
                         .rounded(px(12.))
                         .border_1()
-                        .border_color(rgb(BORDER))
-                        .bg(rgb(SURFACE))
+                        .border_color(rgb(palette(cx).border))
+                        .bg(rgb(palette(cx).surface))
                         .shadow_lg()
                         .child(
                             div()
                                 .text_lg()
                                 .font_semibold()
-                                .text_color(rgb(INK))
+                                .text_color(rgb(palette(cx).ink))
                                 .child(heading),
                         )
                         .child(
                             div()
                                 .v_flex()
                                 .gap_2()
-                                .child(div().text_sm().text_color(rgb(INK)).child("标题（可选）"))
+                                .child(div().text_sm().text_color(rgb(palette(cx).ink)).child("标题（可选）"))
                                 .child(Input::new(&modal.title_input)),
                         )
                         .child(
                             div()
                                 .v_flex()
                                 .gap_2()
-                                .child(div().text_sm().text_color(rgb(INK)).child("说明（可选）"))
+                                .child(div().text_sm().text_color(rgb(palette(cx).ink)).child("说明（可选）"))
                                 .child(
                                     div()
                                         .h(px(120.))
                                         .child(Input::new(&modal.description_input).h_full()),
                                 )
-                                .child(div().text_xs().text_color(rgb(MUTED)).child(
+                                .child(div().text_xs().text_color(rgb(palette(cx).muted)).child(
                                     "图片说明会写入 alt 与 caption；所有说明都会参与全文检索。",
                                 )),
                         )
@@ -5866,6 +5943,7 @@ fn render_editor_resize_handle(
     id: &'static str,
     pane: EditorResizablePane,
     view: Entity<EditorApp>,
+    theme: Palette,
 ) -> gpui::AnyElement {
     div()
         .id(id)
@@ -5876,7 +5954,7 @@ fn render_editor_resize_handle(
         .items_center()
         .justify_center()
         .cursor_col_resize()
-        .hover(|this| this.bg(rgb(ACCENT_SOFT)))
+        .hover(|this| this.bg(rgb(theme.accent_soft)))
         .on_drag(EditorPaneResizeDrag(pane), move |_, _, _, cx| {
             cx.stop_propagation();
             cx.new(|_| EditorPaneResizePreview)
@@ -5891,7 +5969,7 @@ fn render_editor_resize_handle(
                 this.resize_pane_from_pointer(pane, pointer_x, viewport_width, cx);
             });
         })
-        .child(div().h_full().w(px(1.)).bg(rgb(BORDER)))
+        .child(div().h_full().w(px(1.)).bg(rgb(theme.border)))
         .into_any_element()
 }
 
@@ -5907,38 +5985,38 @@ impl Render for EditorApp {
         let (status_icon, status_text, status_color) = if self.closing
             || self.webview_build_gate.close_requested
         {
-            (IconName::BookOpen, "正在安全关闭编辑器…", ACCENT)
+            (IconName::BookOpen, "正在安全关闭编辑器…", palette(cx).accent)
         } else if let Some(operation) = self.active_write.as_ref() {
             match operation.intent {
-                EditorWriteIntent::Save => (IconName::BookOpen, "正在后台保存…", ACCENT),
-                EditorWriteIntent::Export => (IconName::BookOpen, "正在后台保存并导出…", ACCENT),
-                EditorWriteIntent::Close => (IconName::BookOpen, "正在后台保存并关闭…", ACCENT),
+                EditorWriteIntent::Save => (IconName::BookOpen, "正在后台保存…", palette(cx).accent),
+                EditorWriteIntent::Export => (IconName::BookOpen, "正在后台保存并导出…", palette(cx).accent),
+                EditorWriteIntent::Close => (IconName::BookOpen, "正在后台保存并关闭…", palette(cx).accent),
             }
         } else if self.export_dialog_open {
-            (IconName::ExternalLink, "正在选择导出位置…", ACCENT)
+            (IconName::ExternalLink, "正在选择导出位置…", palette(cx).accent)
         } else if self.cover_loading {
-            (IconName::BookOpen, "正在读取封面图片…", ACCENT)
+            (IconName::BookOpen, "正在读取封面图片…", palette(cx).accent)
         } else if self.media_loading {
-            (IconName::BookOpen, "正在读取媒体文件…", ACCENT)
+            (IconName::BookOpen, "正在读取媒体文件…", palette(cx).accent)
         } else if media_modal_open {
-            (IconName::Settings2, "正在编辑媒体信息…", ACCENT)
+            (IconName::Settings2, "正在编辑媒体信息…", palette(cx).accent)
         } else if let Some(pending) = self.pending_snapshot.as_ref() {
             match pending.action {
-                PendingEditorAction::Save => (IconName::BookOpen, "正在同步并保存…", ACCENT),
-                PendingEditorAction::Export => (IconName::BookOpen, "正在同步并导出…", ACCENT),
-                PendingEditorAction::Close => (IconName::BookOpen, "正在保存并关闭…", ACCENT),
-                _ => (IconName::BookOpen, "正在同步富文本…", ACCENT),
+                PendingEditorAction::Save => (IconName::BookOpen, "正在同步并保存…", palette(cx).accent),
+                PendingEditorAction::Export => (IconName::BookOpen, "正在同步并导出…", palette(cx).accent),
+                PendingEditorAction::Close => (IconName::BookOpen, "正在保存并关闭…", palette(cx).accent),
+                _ => (IconName::BookOpen, "正在同步富文本…", palette(cx).accent),
             }
         } else if self.pending_ready_action.is_some() {
-            (IconName::BookOpen, "等待富文本视图就绪…", ACCENT)
+            (IconName::BookOpen, "等待富文本视图就绪…", palette(cx).accent)
         } else if self.webview_build_gate.building {
-            (IconName::BookOpen, "正在初始化预览组件…", ACCENT)
+            (IconName::BookOpen, "正在初始化预览组件…", palette(cx).accent)
         } else if self.tab.uses_webview() && self.editor_webview.is_none() {
-            (IconName::TriangleAlert, "预览组件不可用", DANGER)
+            (IconName::TriangleAlert, "预览组件不可用", palette(cx).danger)
         } else if self.tab == EditorTab::RichText
             && !self.active_web_page.as_ref().is_some_and(|page| page.ready)
         {
-            (IconName::BookOpen, "富文本视图正在加载…", ACCENT)
+            (IconName::BookOpen, "富文本视图正在加载…", palette(cx).accent)
         } else {
             (IconName::CircleCheck, "编辑器已就绪", 0x376441)
         };
@@ -5976,6 +6054,7 @@ impl Render for EditorApp {
             status_color,
             editor_summary,
             editor_context,
+            palette(cx),
         );
 
         let toc_rows = self
@@ -6006,7 +6085,7 @@ impl Render for EditorApp {
                         .pl(px(18. + row.depth.min(4) as f32 * 14.))
                         .pr_3()
                         .py_2()
-                        .when(selected, |this| this.bg(rgb(ACCENT_SOFT)))
+                        .when(selected, |this| this.bg(rgb(palette(cx).accent_soft)))
                         .disabled(write_busy)
                         .on_click(move |_, window, cx| {
                             list_view.update(cx, |this, cx| this.select_toc(&id, window, cx));
@@ -6018,7 +6097,7 @@ impl Render for EditorApp {
                                 .text_left()
                                 .text_sm()
                                 .line_clamp(2)
-                                .text_color(if selected { rgb(ACCENT) } else { rgb(INK) })
+                                .text_color(if selected { rgb(palette(cx).accent) } else { rgb(palette(cx).ink) })
                                 .child(row.label.clone()),
                         )
                         .into_any_element()
@@ -6037,7 +6116,7 @@ impl Render for EditorApp {
                         .py_2()
                         .flex_none()
                         .text_xs()
-                        .text_color(rgb(MUTED))
+                        .text_color(rgb(palette(cx).muted))
                         .child("未列入目录的章节")
                         .into_any_element(),
                 );
@@ -6058,7 +6137,7 @@ impl Render for EditorApp {
                         .justify_start()
                         .px_3()
                         .py_2()
-                        .when(selected, |this| this.bg(rgb(ACCENT_SOFT)))
+                        .when(selected, |this| this.bg(rgb(palette(cx).accent_soft)))
                         .disabled(write_busy)
                         .on_click(move |_, window, cx| {
                             list_view.update(cx, |this, cx| this.select_chapter(index, window, cx));
@@ -6082,7 +6161,7 @@ impl Render for EditorApp {
                         .p_4()
                         .text_center()
                         .text_sm()
-                        .text_color(rgb(MUTED))
+                        .text_color(rgb(palette(cx).muted))
                         .child("当前草稿没有匹配章节")
                         .into_any_element(),
                 ]
@@ -6102,7 +6181,7 @@ impl Render for EditorApp {
                             .justify_start()
                             .px_2()
                             .py_2()
-                            .when(selected, |this| this.bg(rgb(ACCENT_SOFT)))
+                            .when(selected, |this| this.bg(rgb(palette(cx).accent_soft)))
                             .disabled(write_busy)
                             .on_click(move |_, window, cx| {
                                 result_view.update(cx, |this, cx| {
@@ -6122,9 +6201,9 @@ impl Render for EditorApp {
                                             .text_sm()
                                             .font_medium()
                                             .text_color(if selected {
-                                                rgb(ACCENT)
+                                                rgb(palette(cx).accent)
                                             } else {
-                                                rgb(INK)
+                                                rgb(palette(cx).ink)
                                             })
                                             .child(hit.chapter_title.clone()),
                                     )
@@ -6133,7 +6212,7 @@ impl Render for EditorApp {
                                             .line_clamp(2)
                                             .text_left()
                                             .text_xs()
-                                            .text_color(rgb(MUTED))
+                                            .text_color(rgb(palette(cx).muted))
                                             .child(hit.snippet.clone()),
                                     ),
                             )
@@ -6174,8 +6253,8 @@ impl Render for EditorApp {
                 .justify_center()
                 .gap_1()
                 .rounded(px(7.))
-                .bg(rgb(SIDEBAR))
-                .text_color(rgb(ACCENT))
+                .bg(rgb(palette(cx).sidebar))
+                .text_color(rgb(palette(cx).accent))
                 .child(Icon::new(IconName::BookOpen).small())
                 .child(
                     div().text_xs().font_medium().child(
@@ -6219,7 +6298,7 @@ impl Render for EditorApp {
                 .px_3()
                 .py_3()
                 .border_b_1()
-                .border_color(rgb(BORDER))
+                .border_color(rgb(palette(cx).border))
                 .child(
                     div()
                         .w(px(56.))
@@ -6228,7 +6307,7 @@ impl Render for EditorApp {
                         .overflow_hidden()
                         .rounded(px(8.))
                         .border_1()
-                        .border_color(rgb(BORDER))
+                        .border_color(rgb(palette(cx).border))
                         .bg(white())
                         .child(cover_thumbnail),
                 )
@@ -6243,9 +6322,9 @@ impl Render for EditorApp {
                             div()
                                 .text_xs()
                                 .text_color(if self.cover_dirty {
-                                    rgb(ACCENT)
+                                    rgb(palette(cx).accent)
                                 } else {
-                                    rgb(MUTED)
+                                    rgb(palette(cx).muted)
                                 })
                                 .child(cover_status),
                         )
@@ -6290,14 +6369,14 @@ impl Render for EditorApp {
         let toolbar = render_editor_section(|| {
             div()
                 .v_flex()
-                .bg(rgb(SURFACE))
+                .bg(rgb(palette(cx).surface))
                 .border_b_1()
-                .border_color(rgb(BORDER))
+                .border_color(rgb(palette(cx).border))
                 .when_some(self.notice.as_ref(), |toolbar, notice| {
                     let (background, foreground, icon) = if notice.error {
-                        (rgb(0xf7e1df), rgb(0x9f302c), IconName::TriangleAlert)
+                        (rgb(palette(cx).danger_soft), rgb(palette(cx).danger), IconName::TriangleAlert)
                     } else {
-                        (rgb(0xe3efe5), rgb(0x376441), IconName::CircleCheck)
+                        (rgb(palette(cx).success_soft), rgb(palette(cx).success), IconName::CircleCheck)
                     };
                     toolbar.child(
                         div()
@@ -6306,7 +6385,7 @@ impl Render for EditorApp {
                             .px_5()
                             .gap_2()
                             .border_t_1()
-                            .border_color(rgb(BORDER))
+                            .border_color(rgb(palette(cx).border))
                             .bg(background)
                             .text_xs()
                             .text_color(foreground)
@@ -6330,7 +6409,7 @@ impl Render for EditorApp {
                                     div()
                                         .w(px(72.))
                                         .text_sm()
-                                        .text_color(rgb(MUTED))
+                                        .text_color(rgb(palette(cx).muted))
                                         .child("书名"),
                                 )
                                 .child(
@@ -6342,7 +6421,7 @@ impl Render for EditorApp {
                                     div()
                                         .w(px(56.))
                                         .text_sm()
-                                        .text_color(rgb(MUTED))
+                                        .text_color(rgb(palette(cx).muted))
                                         .child("作者"),
                                 )
                                 .child(
@@ -6390,8 +6469,8 @@ impl Render for EditorApp {
                 .h_full()
                 .flex_none()
                 .border_r_1()
-                .border_color(rgb(BORDER))
-                .bg(rgb(SIDEBAR))
+                .border_color(rgb(palette(cx).border))
+                .bg(rgb(palette(cx).sidebar))
                 .child(
                     div()
                         .h_flex()
@@ -6405,7 +6484,7 @@ impl Render for EditorApp {
                                 .gap_2()
                                 .text_sm()
                                 .font_semibold()
-                                .text_color(rgb(INK))
+                                .text_color(rgb(palette(cx).ink))
                                 .child(Icon::new(IconName::Menu).small())
                                 .child(if self.search_query.is_empty() {
                                     format!("目录（{}）", toc_rows.len())
@@ -6504,7 +6583,7 @@ impl Render for EditorApp {
                         .px_2()
                         .py_2()
                         .border_b_1()
-                        .border_color(rgb(BORDER))
+                        .border_color(rgb(palette(cx).border))
                         .child(
                             Input::new(&self.search_input)
                                 .prefix(Icon::new(IconName::Search).small())
@@ -6546,9 +6625,9 @@ impl Render for EditorApp {
                 .items_center()
                 .gap_3()
                 .border_b_1()
-                .border_color(rgb(BORDER))
+                .border_color(rgb(palette(cx).border))
                 .child(
-                    div().text_xs().text_color(rgb(MUTED)).child(
+                    div().text_xs().text_color(rgb(palette(cx).muted)).child(
                         if self
                             .chapters
                             .get(self.selected)
@@ -6662,13 +6741,13 @@ impl Render for EditorApp {
                 .px_4()
                 .py_1()
                 .border_b_1()
-                .border_color(rgb(BORDER))
+                .border_color(rgb(palette(cx).border))
                 // gpui-component 0.5.1's `overflow_x_scrollbar` moves this
                 // element's styles onto a `size_full` wrapper and clears the
                 // inner flex-row style. That makes this fixed-height toolbar
                 // consume the whole editor and stacks its controls vertically.
                 .overflow_x_scroll()
-                .child(div().text_xs().text_color(rgb(MUTED)).child("媒体"))
+                .child(div().text_xs().text_color(rgb(palette(cx).muted)).child("媒体"))
                 .child(
                     Button::new("editor-insert-image")
                         .xsmall()
@@ -6740,7 +6819,7 @@ impl Render for EditorApp {
             EditorTab::Source => div()
                 .flex_1()
                 .min_h(px(0.))
-                .bg(rgb(0xfbfaf7))
+                .bg(rgb(palette(cx).paper))
                 .p_2()
                 .child(Input::new(&self.body_input).h_full().disabled(write_busy))
                 .into_any_element(),
@@ -6748,7 +6827,7 @@ impl Render for EditorApp {
                 Some(webview) => div()
                     .flex_1()
                     .min_h(px(0.))
-                    .bg(rgb(0xfbfaf7))
+                    .bg(rgb(palette(cx).paper))
                     .p_2()
                     .child(
                         div()
@@ -6756,7 +6835,7 @@ impl Render for EditorApp {
                             .overflow_hidden()
                             .rounded(px(10.))
                             .border_1()
-                            .border_color(rgb(BORDER))
+                            .border_color(rgb(palette(cx).border))
                             .bg(white())
                             .child(webview.clone()),
                     )
@@ -6768,7 +6847,7 @@ impl Render for EditorApp {
                     .items_center()
                     .justify_center()
                     .gap_2()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette(cx).muted))
                     .child(Icon::new(IconName::Settings2).large())
                     .child(div().text_sm().child("正在加载预览视图…"))
                     .into_any_element(),
@@ -6781,7 +6860,7 @@ impl Render for EditorApp {
                 .flex_1()
                 .min_w(px(0.))
                 .h_full()
-                .bg(rgb(0xfbfaf7))
+                .bg(rgb(palette(cx).paper))
                 .child(chapter_title_bar)
                 .child(media_toolbar)
                 .child(tab_bar)
@@ -6793,12 +6872,14 @@ impl Render for EditorApp {
             "editor-left-resize",
             EditorResizablePane::Left,
             view.clone(),
+            palette(cx),
         );
         let right_resize_handle = (!self.ai_sidebar_collapsed).then(|| {
             render_editor_resize_handle(
                 "editor-right-resize",
                 EditorResizablePane::Right,
                 view.clone(),
+                palette(cx),
             )
         });
 
@@ -6807,7 +6888,7 @@ impl Render for EditorApp {
                 .relative()
                 .v_flex()
                 .size_full()
-                .bg(rgb(PAPER))
+                .bg(rgb(palette(cx).paper))
                 .child(toolbar)
                 .child(
                     div()

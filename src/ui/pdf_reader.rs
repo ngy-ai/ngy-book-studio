@@ -218,6 +218,45 @@ fn pdf_compact_reading_script(compact_reading: bool) -> &'static str {
     }
 }
 
+/// PDF.js viewer 里跟着皮肤走的部分。
+///
+/// viewer 的样式表是随 PDF.js 一起发布的产物（`assets/pdfjs/viewer.html`），它的
+/// 外壳写死成深色，宿主改不了产物源码，只能在运行时覆盖根元素与占位页。页面卡片
+/// 本身**不跟着变色**：纸张是白的，两套皮肤下染白页都会让正文对比度变差。
+const PDF_APPEARANCE_RULES: &str = r#"
+#status { color: var(--ngy-muted); }
+.pdf-page[data-rendered="false"] { background: var(--ngy-sidebar); }
+.page-placeholder { color: var(--ngy-muted); }
+.page-placeholder.error { color: var(--ngy-danger); }
+.textLayer ::selection { background: var(--ngy-accent-soft); }
+"#;
+
+/// 把当前皮肤写进 PDF.js viewer。
+///
+/// 与编辑器同一套做法：变量写在根元素上，覆盖规则只写一次，两套皮肤各取各的值。
+/// viewer 是独立文档，所以变量与样式表都要在它自己的文档里再放一份。
+fn pdf_appearance_script(appearance: Appearance) -> String {
+    let palette = Palette::for_appearance(appearance);
+    let scheme = appearance.color_scheme();
+    let setters = palette.css_variable_setters();
+    let rules = serde_json::to_string(PDF_APPEARANCE_RULES).unwrap_or_else(|_| "\"\"".into());
+    format!(
+        "(() => {{ const root = document.documentElement; \
+         root.setAttribute('data-ngy-theme', '{scheme}'); \
+         root.style.colorScheme = '{scheme}'; \
+         root.style.background = '{}'; \
+         root.style.color = '{}'; \
+         {setters}\
+         let style = document.getElementById('ngy-pdf-appearance'); \
+         if (!style) {{ style = document.createElement('style'); \
+         style.id = 'ngy-pdf-appearance'; \
+         (document.head || document.documentElement).appendChild(style); }} \
+         style.textContent = {rules}; }})()",
+        Palette::hex(palette.paper),
+        Palette::hex(palette.ink),
+    )
+}
+
 /// Sends one page scale to an already open viewer. The viewer keeps the page
 /// being read at the top of the window while it re-lays out, and reports the
 /// scale back once the reader stops wheeling.
@@ -272,6 +311,7 @@ pub(super) async fn build_pdf_reader_webview(
     initial_page: u32,
     compact_reading: bool,
     parent: &ParentWindowHandle,
+    appearance: Appearance,
 ) -> Result<(
     gpui_component::wry::WebView,
     async_channel::Receiver<PdfIpcMessage>,
@@ -322,7 +362,8 @@ pub(super) async fn build_pdf_reader_webview(
         .with_initialization_script(include_str!("pdf_reader/annotations.js"))
         .with_new_window_req_handler(|_, _| gpui_component::wry::NewWindowResponse::Deny)
         .with_download_started_handler(|_, _| false)
-        .with_background_color((36, 36, 36, 255))
+        // 首页渲染出来之前显示的是这个底色，所以它要和 viewer 的外壳同色。
+        .with_background_color(Palette::bytes(Palette::for_appearance(appearance).paper))
         .with_hotkeys_zoom(false)
         .with_incognito(true)
         .with_url(pdf_viewer_url(initial_page, compact_reading))
@@ -424,6 +465,8 @@ pub struct PdfReaderApp {
     _search_subscription: Subscription,
     _ai_subscription: Subscription,
     _ai_layout_subscription: Subscription,
+    /// 皮肤变化时把新配色重新推给 viewer 文档。
+    _theme_subscription: Subscription,
     webview_build_gate: ReaderWebViewBuildGate,
     pub(super) ipc_sync_task: Option<Task<()>>,
     progress_writer: Option<ReadingProgressWriter>,
@@ -500,6 +543,13 @@ impl PdfReaderApp {
                 cx.notify();
             }
         });
+        // 皮肤是应用级偏好：设置窗口保存后全局状态变一次，已经打开的 viewer 也要
+        // 跟着换外壳颜色，否则它会留在旧配色的页面上。
+        let _theme_subscription = cx.observe_global::<ngy_book_studio::theme::AppTheme>(
+            |this, cx| {
+                this.push_pdf_appearance(cx);
+            },
+        );
         let mut ai_controller = match AiSidebarController::new(
             Arc::clone(&services),
             ChatWindowKind::Reader,
@@ -563,6 +613,7 @@ impl PdfReaderApp {
             _search_subscription,
             _ai_subscription,
             _ai_layout_subscription,
+            _theme_subscription,
             webview_build_gate: ReaderWebViewBuildGate::new(webview_building),
             ipc_sync_task: None,
             progress_writer,
@@ -920,6 +971,23 @@ impl PdfReaderApp {
         }
     }
 
+    /// Sends the current skin to the viewer document. Same idempotence contract as
+    /// the reading preference: the writes are repeats of the same values, so a
+    /// viewer that is still building simply receives them when it reports ready.
+    fn push_pdf_appearance(&mut self, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
+        let Some(webview) = self.webview.clone() else {
+            return;
+        };
+        let script = pdf_appearance_script(current_appearance(cx));
+        if let Err(error) = webview.read(cx).raw().evaluate_script(&script) {
+            // Presentation only: a missed update must not turn into reader error.
+            tracing::warn!(%error, "cannot apply the PDF appearance");
+        }
+    }
+
     pub(super) fn handle_ipc(&mut self, message: PdfIpcMessage, cx: &mut Context<Self>) {
         if self.closing {
             return;
@@ -930,6 +998,7 @@ impl PdfReaderApp {
                 // WebView was still building now reaches a live page.
                 self.push_pdf_compact_reading(cx);
                 self.push_pdf_zoom(cx);
+                self.push_pdf_appearance(cx);
                 self.notice = Some(Notice {
                     text: "正在解析本地 PDF…".to_string(),
                     error: false,
@@ -1362,8 +1431,8 @@ impl PdfReaderApp {
             .flex_none()
             .items_center()
             .border_r_1()
-            .border_color(rgb(BORDER))
-            .bg(rgb(SIDEBAR))
+            .border_color(rgb(palette(cx).border))
+            .bg(rgb(palette(cx).sidebar))
             .py_3()
             .child(
                 Button::new("pdf-navigation-expand")
@@ -1377,7 +1446,7 @@ impl PdfReaderApp {
             .child(
                 div()
                     .mt_3()
-                    .text_color(rgb(ACCENT))
+                    .text_color(rgb(palette(cx).accent))
                     .child(Icon::new(IconName::Menu).small()),
             )
             .into_any_element()
@@ -1405,14 +1474,14 @@ impl PdfReaderApp {
             .items_center()
             .justify_center()
             .cursor_col_resize()
-            .bg(rgb(SURFACE))
+            .bg(rgb(palette(cx).surface))
             .child(
                 div()
                     .h_full()
                     .w(px(if active { 2. } else { 1. }))
-                    .bg(rgb(if active { ACCENT } else { BORDER })),
+                    .bg(rgb(if active { palette(cx).accent } else { palette(cx).border })),
             )
-            .hover(|this| this.bg(rgb(ACCENT_SOFT)))
+            .hover(|this| this.bg(rgb(palette(cx).accent_soft)))
             .on_drag_move(cx.listener(
                 move |this, event: &DragMoveEvent<PdfPaneResizeDrag>, window, cx| {
                     if event.drag(cx).0 != pane {
@@ -1531,13 +1600,13 @@ impl Render for PdfReaderApp {
             .unwrap_or_else(|| format!("第 {current_page} 页"));
         let (status_icon, status_text, status_color) =
             if self.closing || self.webview_build_gate.close_requested {
-                (IconName::BookOpen, "正在安全关闭 PDF 阅读器…", ACCENT)
+                (IconName::BookOpen, "正在安全关闭 PDF 阅读器…", palette(cx).accent)
             } else if self.webview_build_gate.building || !self.pdf_ready {
-                (IconName::BookOpen, "正在加载本地 PDF…", ACCENT)
+                (IconName::BookOpen, "正在加载本地 PDF…", palette(cx).accent)
             } else if self.webview.is_some() {
                 (IconName::CircleCheck, "PDF.js 视图已连接", 0x376441)
             } else {
-                (IconName::TriangleAlert, "PDF 视图不可用", DANGER)
+                (IconName::TriangleAlert, "PDF 视图不可用", palette(cx).danger)
             };
         let status_bar = render_status_bar(
             status_icon,
@@ -1553,18 +1622,19 @@ impl Render for PdfReaderApp {
             } else {
                 format!("全文检索 · {} 个结果", self.search_results.len())
             },
+            palette(cx),
         );
 
         let toolbar = div()
             .v_flex()
-            .bg(rgb(SURFACE))
+            .bg(rgb(palette(cx).surface))
             .border_b_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(palette(cx).border))
             .when_some(self.notice.as_ref(), |toolbar, notice| {
                 let (background, foreground, icon) = if notice.error {
-                    (rgb(0xf7e1df), rgb(0x9f302c), IconName::TriangleAlert)
+                    (rgb(palette(cx).danger_soft), rgb(palette(cx).danger), IconName::TriangleAlert)
                 } else {
-                    (rgb(0xe3efe5), rgb(0x376441), IconName::CircleCheck)
+                    (rgb(palette(cx).success_soft), rgb(palette(cx).success), IconName::CircleCheck)
                 };
                 toolbar.child(
                     div()
@@ -1573,7 +1643,7 @@ impl Render for PdfReaderApp {
                         .px_5()
                         .gap_2()
                         .border_t_1()
-                        .border_color(rgb(BORDER))
+                        .border_color(rgb(palette(cx).border))
                         .bg(background)
                         .text_xs()
                         .text_color(foreground)
@@ -1597,13 +1667,13 @@ impl Render for PdfReaderApp {
                                     .max_w(px(560.))
                                     .truncate()
                                     .font_semibold()
-                                    .text_color(rgb(INK))
+                                    .text_color(rgb(palette(cx).ink))
                                     .child(self.title.clone()),
                             )
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(MUTED))
+                                    .text_color(rgb(palette(cx).muted))
                                     .child(format!("{} · {page_title}", self.preview_label)),
                             ),
                     )
@@ -1636,7 +1706,7 @@ impl Render for PdfReaderApp {
                                 div()
                                     .mr_2()
                                     .text_xs()
-                                    .text_color(rgb(MUTED))
+                                    .text_color(rgb(palette(cx).muted))
                                     .child(format!("{current_page} / {total}")),
                             )
                             .child(
@@ -1669,8 +1739,8 @@ impl Render for PdfReaderApp {
                 div()
                     .h(px(3.))
                     .w_full()
-                    .bg(rgb(BORDER))
-                    .child(div().h_full().w(gpui::relative(progress)).bg(rgb(ACCENT))),
+                    .bg(rgb(palette(cx).border))
+                    .child(div().h_full().w(gpui::relative(progress)).bg(rgb(palette(cx).accent))),
             );
 
         // Every page gets a row so the whole document can be navigated from the
@@ -1696,7 +1766,7 @@ impl Render for PdfReaderApp {
                     .p_4()
                     .text_center()
                     .text_sm()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette(cx).muted))
                     .child("当前 PDF 没有匹配页面")
                     .into_any_element(),
             ]
@@ -1718,7 +1788,7 @@ impl Render for PdfReaderApp {
                         .px_3()
                         .py_2()
                         .rounded(px(7.))
-                        .when(selected, |this| this.bg(rgb(ACCENT_SOFT)))
+                        .when(selected, |this| this.bg(rgb(palette(cx).accent_soft)))
                         .disabled(unit_index.is_none())
                         .on_click(move |_, window, cx| {
                             if let Some(unit_index) = unit_index {
@@ -1739,7 +1809,7 @@ impl Render for PdfReaderApp {
                                         .text_left()
                                         .text_sm()
                                         .font_medium()
-                                        .text_color(if selected { rgb(ACCENT) } else { rgb(INK) })
+                                        .text_color(if selected { rgb(palette(cx).accent) } else { rgb(palette(cx).ink) })
                                         .child(
                                             hit.chapter_title
                                                 .clone()
@@ -1754,7 +1824,7 @@ impl Render for PdfReaderApp {
                                         .line_clamp(2)
                                         .text_left()
                                         .text_xs()
-                                        .text_color(rgb(MUTED))
+                                        .text_color(rgb(palette(cx).muted))
                                         .child(hit.snippet.clone()),
                                 ),
                         )
@@ -1770,8 +1840,8 @@ impl Render for PdfReaderApp {
             .h_full()
             .flex_none()
             .border_r_1()
-            .border_color(rgb(BORDER))
-            .bg(rgb(SIDEBAR))
+            .border_color(rgb(palette(cx).border))
+            .bg(rgb(palette(cx).sidebar))
             .child(
                 div()
                     .h_flex()
@@ -1781,10 +1851,10 @@ impl Render for PdfReaderApp {
                     .justify_between()
                     .gap_2()
                     .border_b_1()
-                    .border_color(rgb(BORDER))
+                    .border_color(rgb(palette(cx).border))
                     .text_sm()
                     .font_semibold()
-                    .text_color(rgb(INK))
+                    .text_color(rgb(palette(cx).ink))
                     .child(
                         div()
                             .h_flex()
@@ -1814,7 +1884,7 @@ impl Render for PdfReaderApp {
                     .px_3()
                     .py_2()
                     .border_b_1()
-                    .border_color(rgb(BORDER))
+                    .border_color(rgb(palette(cx).border))
                     .child(
                         Input::new(&self.search_input)
                             .prefix(Icon::new(IconName::Search).small())
@@ -1841,6 +1911,9 @@ impl Render for PdfReaderApp {
                 let entries = page_entries.clone();
                 let entry_view = view.clone();
                 let pdf_ready = self.pdf_ready;
+                // 虚拟列表是 `move` 闭包，捕获 `cx` 会把借用带出方法体；
+                // `Palette` 是 `Copy`，取一次值即可。
+                let theme = palette(cx);
                 gpui::uniform_list("pdf-page-list", entries.len(), move |range, _, _| {
                     range
                         .map(|index| {
@@ -1854,7 +1927,7 @@ impl Render for PdfReaderApp {
                                 .justify_start()
                                 .px_3()
                                 .rounded(px(7.))
-                                .when(selected, |this| this.bg(rgb(ACCENT_SOFT)))
+                                .when(selected, |this| this.bg(rgb(theme.accent_soft)))
                                 .disabled(!pdf_ready)
                                 .on_click(move |_, _, cx| {
                                     item_view
@@ -1873,9 +1946,9 @@ impl Render for PdfReaderApp {
                                                 .text_sm()
                                                 .font_medium()
                                                 .text_color(if selected {
-                                                    rgb(ACCENT)
+                                                    rgb(theme.accent)
                                                 } else {
-                                                    rgb(INK)
+                                                    rgb(theme.ink)
                                                 })
                                                 .child(format!("第 {page_number} 页")),
                                         )
@@ -1884,7 +1957,7 @@ impl Render for PdfReaderApp {
                                                 .truncate()
                                                 .text_left()
                                                 .text_xs()
-                                                .text_color(rgb(MUTED))
+                                                .text_color(rgb(theme.muted))
                                                 .child(title),
                                         ),
                                 )
@@ -1917,7 +1990,7 @@ impl Render for PdfReaderApp {
                 .items_center()
                 .justify_center()
                 .gap_2()
-                .text_color(rgb(MUTED))
+                .text_color(rgb(palette(cx).muted))
                 .child(Icon::new(IconName::BookOpen).large())
                 .child(div().text_sm().child("正在加载 PDF.js…"))
                 .into_any_element(),
@@ -1926,7 +1999,9 @@ impl Render for PdfReaderApp {
             .flex_1()
             .min_w(px(0.))
             .h_full()
-            .bg(rgb(0x242424))
+            // PDF 外壳与页面卡片由 viewer 自己画；这层是页面到达前以及左右留白的
+            // 底色，必须和 viewer 的根背景同色，否则会露出一圈旧皮肤的边。
+            .bg(rgb(palette(cx).paper))
             .child(body);
         let navigation: gpui::AnyElement = if self.pane_layout.is_navigation_collapsed() {
             self.render_collapsed_navigation(cx)
@@ -1941,7 +2016,7 @@ impl Render for PdfReaderApp {
         div()
             .v_flex()
             .size_full()
-            .bg(rgb(PAPER))
+            .bg(rgb(palette(cx).paper))
             .on_key_down(move |event: &gpui::KeyDownEvent, window, cx| {
                 let view = view.clone();
                 let current_page = current_page;

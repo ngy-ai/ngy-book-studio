@@ -7,6 +7,7 @@ use rbook::{Epub, epub::rewrite::EpubRewriteOptions};
 use crate::{
     document::{AssetRole, BookDocument},
     media::{MediaBackend, MediaMetadata, MediaResponse, MediaService},
+    theme::{Appearance, Palette},
 };
 
 /// Reading text size in pixels: what a chapter renders at before the reader
@@ -18,15 +19,22 @@ pub const READER_FONT_SIZE_MIN: u8 = 14;
 pub const READER_FONT_SIZE_MAX: u8 = 30;
 pub const READER_FONT_SIZE_STEP: u8 = 2;
 
+/// 章节的基线样式表。这里的自定义属性是**兜底**，取值与 `theme::Palette::LIGHT`
+/// 一致：章节由 WebView 直接渲染，宿主只能靠 `reader_appearance_script` 在运行时
+/// 覆盖成当前皮肤。两处宁可重复一份数值，也不要让"脚本没跑到"变成一页不可读的正文。
 const READER_CSS: &str = r#"
   /* ngy-reader-style */
   :root {
     color-scheme: light;
     --ngy-font-size: 18px;
-    --ngy-paper: #fbfaf7;
-    --ngy-text: #302d29;
-    --ngy-muted: #716b63;
-    --ngy-accent: #c35f3f;
+    --ngy-paper: #f7f5f0;
+    --ngy-surface: #fffefa;
+    --ngy-text: #292621;
+    --ngy-muted: #6f6860;
+    --ngy-border: #e1ddd5;
+    --ngy-accent: #b05538;
+    --ngy-accent-strong: #9a4a30;
+    --ngy-accent-soft: #f1ddd5;
   }
   html { background: var(--ngy-paper) !important; }
   body {
@@ -56,7 +64,7 @@ const READER_CSS: &str = r#"
   blockquote {
     margin-left: 0 !important;
     padding-left: 1.2em !important;
-    border-left: 3px solid #dfd4ca !important;
+    border-left: 3px solid var(--ngy-border) !important;
     color: var(--ngy-muted) !important;
   }
   @media (max-width: 720px) {
@@ -511,18 +519,23 @@ fn reader_url_path(url: &str) -> Option<&str> {
         .map(|path| path.split(['?', '#']).next().unwrap_or(path))
 }
 
-/// Applies one reading text size to a chapter document.
+/// 把当前阅读外观写到章节文档的根元素上。
 ///
-/// The size is one custom property on the root element, so a chapter never has
-/// to be re-served when the reader changes it: the served stylesheet carries the
-/// default and this override wins over it. The value is clamped here because the
-/// host is the last place that can bound a size that came back from the page or
-/// from an old settings row.
-pub fn reader_appearance_script(font_size: u8) -> String {
+/// 字号与皮肤都是根元素上的自定义属性，所以一次调用同时生效：章节不必为了改
+/// 字号或换皮肤重新请求，每次章节加载后重放一次即可。字号在这里再夹一次，因为
+/// 宿主是最后一处能约束旧设置行或页面回传值的关口。
+///
+/// 皮肤只改配色相关的自定义属性与 `color-scheme`，不动正文结构：标注位置按正文
+/// 文本计算，换色不能让任何锚点位移。
+pub fn reader_appearance_script(font_size: u8, appearance: Appearance) -> String {
     let font_size = reader_font_size(font_size);
+    let palette = Palette::for_appearance(appearance);
+    let setters = palette.css_variable_setters();
     format!(
-        "(() => {{ document.documentElement.style \
-         .setProperty('--ngy-font-size', '{font_size}px'); }})()"
+        "(() => {{ const root = document.documentElement; \
+         root.style.setProperty('--ngy-font-size', '{font_size}px'); \
+         {setters}root.style.colorScheme = '{scheme}'; }})()",
+        scheme = appearance.color_scheme()
     )
 }
 
@@ -673,9 +686,38 @@ mod tests {
 
         // The applied script always carries the clamped size, whoever asks.
         assert!(
-            reader_appearance_script(0).contains(&format!("{READER_FONT_SIZE_MIN}px")),
+            reader_appearance_script(0, Appearance::Light)
+                .contains(&format!("{READER_FONT_SIZE_MIN}px")),
             "a stored size below the range must not reach the chapter"
         );
-        assert!(reader_appearance_script(u8::MAX).contains(&format!("{READER_FONT_SIZE_MAX}px")));
+        assert!(
+            reader_appearance_script(u8::MAX, Appearance::Light)
+                .contains(&format!("{READER_FONT_SIZE_MAX}px"))
+        );
+    }
+
+    /// 皮肤也必须跟着字号一起下发：只改字号会让深色皮肤下的正文留在浅色样式表上，
+    /// 而只改皮肤会让下一次改字号把皮肤覆盖回兜底值。
+    #[test]
+    fn the_appearance_script_carries_the_skin_with_the_text_size() {
+        let light = reader_appearance_script(18, Appearance::Light);
+        let dark = reader_appearance_script(18, Appearance::Dark);
+        assert_ne!(light, dark);
+        for script in [&light, &dark] {
+            assert!(script.contains("--ngy-font-size"));
+            assert!(script.contains("--ngy-paper"));
+            assert!(script.contains("--ngy-text"));
+            assert!(script.contains("colorScheme"));
+        }
+        assert!(light.contains(&format!(
+            "--ngy-paper', '{}'",
+            Palette::hex(Palette::LIGHT.paper)
+        )));
+        assert!(dark.contains(&format!(
+            "--ngy-paper', '{}'",
+            Palette::hex(Palette::DARK.paper)
+        )));
+        assert!(light.contains("'light'"));
+        assert!(dark.contains("'dark'"));
     }
 }

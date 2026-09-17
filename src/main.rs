@@ -320,6 +320,16 @@ fn open_main_window(
     library: LibraryStore,
     services: Arc<AppServices>,
 ) -> anyhow::Result<()> {
+    // 皮肤是应用级偏好：在开窗口之前应用，主窗口的第一帧就是用户上次选的皮肤，
+    // 不会先闪一帧浅色。读不出来按浅色处理，不因为一条设置打不开界面。
+    let appearance = services
+        .provider_settings()
+        .map(|settings| settings.appearance)
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "cannot read the appearance preference");
+            ngy_book_studio::theme::Appearance::default()
+        });
+    ngy_book_studio::theme::set_appearance(appearance, cx);
     let bounds = Bounds::centered(None, size(px(1260.), px(820.)), cx);
     cx.open_window(
         WindowOptions {

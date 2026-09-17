@@ -957,10 +957,10 @@ impl Render for PageImageApp {
             .map(|notice| {
                 (
                     notice.text.clone(),
-                    if notice.error { DANGER } else { MUTED },
+                    if notice.error { palette(cx).danger } else { palette(cx).muted },
                 )
             })
-            .unwrap_or_else(|| (page_subtitle(page, self.kind), MUTED));
+            .unwrap_or_else(|| (page_subtitle(page, self.kind), palette(cx).muted));
         let page_image = Arc::clone(&page.image);
         let (natural_width, natural_height) = (page.width, page.height);
         let page_number = self.current + 1;
@@ -1030,20 +1030,20 @@ impl Render for PageImageApp {
                 .flex_none()
                 .v_flex()
                 .border_l_1()
-                .border_color(rgb(BORDER))
-                .bg(rgb(SURFACE))
+                .border_color(rgb(palette(cx).border))
+                .bg(rgb(palette(cx).surface))
                 .child(
                     div()
                         .flex_none()
                         .px_3()
                         .py_2()
                         .border_b_1()
-                        .border_color(rgb(BORDER))
+                        .border_color(rgb(palette(cx).border))
                         .child(
                             div()
                                 .text_sm()
                                 .font_semibold()
-                                .text_color(rgb(INK))
+                                .text_color(rgb(palette(cx).ink))
                                 .child("本页文字（可选中复制）"),
                         ),
                 )
@@ -1061,7 +1061,7 @@ impl Render for PageImageApp {
         div()
             .size_full()
             .v_flex()
-            .bg(rgb(PAPER))
+            .bg(rgb(palette(cx).paper))
             .child(
                 div()
                     .h_flex()
@@ -1071,8 +1071,8 @@ impl Render for PageImageApp {
                     .px_5()
                     .py_3()
                     .border_b_1()
-                    .border_color(rgb(BORDER))
-                    .bg(rgb(SURFACE))
+                    .border_color(rgb(palette(cx).border))
+                    .bg(rgb(palette(cx).surface))
                     .child(
                         div()
                             .v_flex()
@@ -1081,7 +1081,7 @@ impl Render for PageImageApp {
                                 div()
                                     .truncate()
                                     .font_semibold()
-                                    .text_color(rgb(INK))
+                                    .text_color(rgb(palette(cx).ink))
                                     .child(self.book_title.clone()),
                             )
                             .child(
@@ -1126,7 +1126,7 @@ impl Render for PageImageApp {
                                     .min_w(px(64.))
                                     .text_center()
                                     .text_sm()
-                                    .text_color(rgb(MUTED))
+                                    .text_color(rgb(palette(cx).muted))
                                     .child(if zoom_milli == ZOOM_FIT {
                                         "适应窗口".to_string()
                                     } else {
@@ -1166,7 +1166,7 @@ impl Render for PageImageApp {
                                     .min_w(px(86.))
                                     .text_center()
                                     .text_sm()
-                                    .text_color(rgb(MUTED))
+                                    .text_color(rgb(palette(cx).muted))
                                     .child(format!("{page_number} / {page_count}")),
                             )
                             .child(

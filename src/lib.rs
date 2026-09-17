@@ -32,6 +32,7 @@ pub mod search;
 pub mod services;
 pub mod startup;
 pub mod storage;
+pub mod theme;
 pub mod translation;
 pub mod web_search;
 #[cfg(target_os = "windows")]

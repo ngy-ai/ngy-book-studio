@@ -666,6 +666,8 @@ pub struct ReaderApp {
     _search_subscription: Subscription,
     _ai_subscription: Subscription,
     _ai_layout_subscription: Subscription,
+    /// 皮肤变化时把新配色重放进章节文档。
+    _theme_subscription: Subscription,
     webview_build_gate: ReaderWebViewBuildGate,
     pub(super) page_sync_task: Option<Task<()>>,
     progress_writer: Option<ReadingProgressWriter>,
@@ -753,6 +755,7 @@ pub(super) async fn build_reader_webview(
     parent: &ParentWindowHandle,
     book_id: String,
     services: Arc<AppServices>,
+    appearance: Appearance,
 ) -> Result<(
     gpui_component::wry::WebView,
     async_channel::Receiver<ReaderWebEvent>,
@@ -871,7 +874,9 @@ pub(super) async fn build_reader_webview(
             }
         })
         .with_download_started_handler(|_, _| false)
-        .with_background_color((251, 250, 247, 255))
+        // 章节到达之前 WebView 显示的是这个底色：深色皮肤下必须是深色，否则每次
+        // 翻页都会闪一帧米白色。
+        .with_background_color(Palette::bytes(Palette::for_appearance(appearance).paper))
         .with_hotkeys_zoom(false)
         .with_incognito(true)
         .with_url(initial_url)
@@ -1091,13 +1096,13 @@ impl Render for ReaderApp {
         };
         let (status_icon, status_text, status_color) =
             if self.closing || self.webview_build_gate.close_requested {
-                (IconName::BookOpen, "正在安全关闭阅读器…", ACCENT)
+                (IconName::BookOpen, "正在安全关闭阅读器…", palette(cx).accent)
             } else if self.webview_build_gate.building {
-                (IconName::BookOpen, "正在创建正文视图…", ACCENT)
+                (IconName::BookOpen, "正在创建正文视图…", palette(cx).accent)
             } else if self.webview.is_some() {
                 (IconName::CircleCheck, "正文视图已连接", 0x376441)
             } else {
-                (IconName::TriangleAlert, "正文视图不可用", DANGER)
+                (IconName::TriangleAlert, "正文视图不可用", palette(cx).danger)
             };
         let reader_summary = format!("第 {} / {} 章 · {chapter_label}", current + 1, total);
         let reader_context = if self.search_query.is_empty() {
@@ -1111,6 +1116,7 @@ impl Render for ReaderApp {
             status_color,
             reader_summary,
             reader_context,
+            palette(cx),
         );
 
         let previous_view = view.clone();
@@ -1165,14 +1171,14 @@ impl Render for ReaderApp {
             });
         let toolbar = div()
             .v_flex()
-            .bg(rgb(SURFACE))
+            .bg(rgb(palette(cx).surface))
             .border_b_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(palette(cx).border))
             .when_some(self.notice.as_ref(), |toolbar, notice| {
                 let (background, foreground, icon) = if notice.error {
-                    (rgb(0xf7e1df), rgb(0x9f302c), IconName::TriangleAlert)
+                    (rgb(palette(cx).danger_soft), rgb(palette(cx).danger), IconName::TriangleAlert)
                 } else {
-                    (rgb(0xe3efe5), rgb(0x376441), IconName::CircleCheck)
+                    (rgb(palette(cx).success_soft), rgb(palette(cx).success), IconName::CircleCheck)
                 };
                 toolbar.child(
                     div()
@@ -1181,7 +1187,7 @@ impl Render for ReaderApp {
                         .px_5()
                         .gap_2()
                         .border_t_1()
-                        .border_color(rgb(BORDER))
+                        .border_color(rgb(palette(cx).border))
                         .bg(background)
                         .text_xs()
                         .text_color(foreground)
@@ -1206,7 +1212,7 @@ impl Render for ReaderApp {
                                         .max_w(px(520.))
                                         .truncate()
                                         .font_semibold()
-                                        .text_color(rgb(INK))
+                                        .text_color(rgb(palette(cx).ink))
                                         .child(self.book.title.clone()),
                                 )
                                 .child(
@@ -1214,7 +1220,7 @@ impl Render for ReaderApp {
                                         .max_w(px(520.))
                                         .truncate()
                                         .text_xs()
-                                        .text_color(rgb(MUTED))
+                                        .text_color(rgb(palette(cx).muted))
                                         .child(chapter_label),
                                 ),
                         ),
@@ -1249,7 +1255,7 @@ impl Render for ReaderApp {
                                         });
                                     }),
                             )
-                            .child(div().mr_2().text_xs().text_color(rgb(MUTED)).child(format!(
+                            .child(div().mr_2().text_xs().text_color(rgb(palette(cx).muted)).child(format!(
                                 "{} / {}",
                                 current + 1,
                                 total
@@ -1281,8 +1287,8 @@ impl Render for ReaderApp {
                 div()
                     .h(px(3.))
                     .w_full()
-                    .bg(rgb(BORDER))
-                    .child(div().h_full().w(gpui::relative(progress)).bg(rgb(ACCENT))),
+                    .bg(rgb(palette(cx).border))
+                    .child(div().h_full().w(gpui::relative(progress)).bg(rgb(palette(cx).accent))),
             );
 
         let navigation_items = if self.search_query.is_empty() {
@@ -1306,7 +1312,7 @@ impl Render for ReaderApp {
                             .pr_3()
                             .py_2()
                             .rounded(px(7.))
-                            .when(selected, |this| this.bg(rgb(ACCENT_SOFT)))
+                            .when(selected, |this| this.bg(rgb(palette(cx).accent_soft)))
                             .on_click(move |_, _, cx| {
                                 toc_view.update(cx, |this, cx| this.go_to_toc(index, cx));
                             })
@@ -1316,7 +1322,7 @@ impl Render for ReaderApp {
                                     .text_left()
                                     .text_sm()
                                     .line_clamp(2)
-                                    .text_color(if selected { rgb(ACCENT) } else { rgb(INK) })
+                                    .text_color(if selected { rgb(palette(cx).accent) } else { rgb(palette(cx).ink) })
                                     .child(item.label.clone()),
                             )
                             .into_any_element()
@@ -1330,7 +1336,7 @@ impl Render for ReaderApp {
                             .py_2()
                             .text_sm()
                             .font_semibold()
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(palette(cx).muted))
                             .child(div().line_clamp(2).child(item.label.clone()))
                             .into_any_element()
                     }
@@ -1343,7 +1349,7 @@ impl Render for ReaderApp {
                         .p_4()
                         .text_center()
                         .text_sm()
-                        .text_color(rgb(MUTED))
+                        .text_color(rgb(palette(cx).muted))
                         .child("当前图书没有匹配章节")
                         .into_any_element(),
                 ]
@@ -1364,7 +1370,7 @@ impl Render for ReaderApp {
                             .px_3()
                             .py_2()
                             .rounded(px(7.))
-                            .when(selected, |this| this.bg(rgb(ACCENT_SOFT)))
+                            .when(selected, |this| this.bg(rgb(palette(cx).accent_soft)))
                             .on_click(move |_, _, cx| {
                                 if let Some(spine_index) = spine_index {
                                     result_view.update(cx, |this, cx| {
@@ -1385,9 +1391,9 @@ impl Render for ReaderApp {
                                             .text_sm()
                                             .font_medium()
                                             .text_color(if selected {
-                                                rgb(ACCENT)
+                                                rgb(palette(cx).accent)
                                             } else {
-                                                rgb(INK)
+                                                rgb(palette(cx).ink)
                                             })
                                             .child(
                                                 hit.chapter_title
@@ -1400,7 +1406,7 @@ impl Render for ReaderApp {
                                             .line_clamp(2)
                                             .text_left()
                                             .text_xs()
-                                            .text_color(rgb(MUTED))
+                                            .text_color(rgb(palette(cx).muted))
                                             .child(hit.snippet.clone()),
                                     ),
                             )
@@ -1417,8 +1423,8 @@ impl Render for ReaderApp {
             .h_full()
             .flex_none()
             .border_r_1()
-            .border_color(rgb(BORDER))
-            .bg(rgb(SIDEBAR))
+            .border_color(rgb(palette(cx).border))
+            .bg(rgb(palette(cx).sidebar))
             .child(
                 div()
                     .h_flex()
@@ -1428,10 +1434,10 @@ impl Render for ReaderApp {
                     .justify_between()
                     .gap_2()
                     .border_b_1()
-                    .border_color(rgb(BORDER))
+                    .border_color(rgb(palette(cx).border))
                     .text_sm()
                     .font_semibold()
-                    .text_color(rgb(INK))
+                    .text_color(rgb(palette(cx).ink))
                     .child(
                         div()
                             .h_flex()
@@ -1461,7 +1467,7 @@ impl Render for ReaderApp {
                     .px_3()
                     .py_2()
                     .border_b_1()
-                    .border_color(rgb(BORDER))
+                    .border_color(rgb(palette(cx).border))
                     .child(
                         Input::new(&self.search_input)
                             .prefix(Icon::new(IconName::Search).small())
@@ -1486,7 +1492,7 @@ impl Render for ReaderApp {
                 .items_center()
                 .justify_center()
                 .gap_2()
-                .text_color(rgb(MUTED))
+                .text_color(rgb(palette(cx).muted))
                 .child(Icon::new(IconName::BookOpen).large())
                 .child(div().text_sm().child("正在加载正文…"))
                 .into_any_element(),
@@ -1495,7 +1501,7 @@ impl Render for ReaderApp {
             .flex_1()
             .min_w(px(0.))
             .h_full()
-            .bg(rgb(0xe9e5de))
+            .bg(rgb(palette(cx).neutral_soft))
             .child(
                 div().size_full().p_3().child(
                     div()
@@ -1503,8 +1509,8 @@ impl Render for ReaderApp {
                         .overflow_hidden()
                         .rounded(px(10.))
                         .border_1()
-                        .border_color(rgb(BORDER))
-                        .bg(rgb(0xfbfaf7))
+                        .border_color(rgb(palette(cx).border))
+                        .bg(rgb(palette(cx).paper))
                         .child(body),
                 ),
             );
@@ -1521,7 +1527,7 @@ impl Render for ReaderApp {
         div()
             .v_flex()
             .size_full()
-            .bg(rgb(PAPER))
+            .bg(rgb(palette(cx).paper))
             .child(toolbar)
             .child(
                 div()
@@ -1627,6 +1633,12 @@ impl ReaderApp {
             .provider_settings()
             .map(|settings| settings.translation_display_mode)
             .unwrap_or_default();
+        // 皮肤是应用级偏好：设置窗口保存后全局状态变一次，已打开的每一章都要跟着
+        // 重放外观脚本，否则正在读的这本书会留在旧配色上直到翻页。
+        let _theme_subscription =
+            cx.observe_global::<ngy_book_studio::theme::AppTheme>(|this, cx| {
+                this.apply_reading_appearance(cx);
+            });
         let mut reader = Self {
             book_id,
             book_incarnation,
@@ -1656,6 +1668,7 @@ impl ReaderApp {
             _search_subscription,
             _ai_subscription,
             _ai_layout_subscription,
+            _theme_subscription,
             webview_build_gate: ReaderWebViewBuildGate::new(webview_building),
             page_sync_task: None,
             progress_writer: Some(progress_writer),
@@ -1704,8 +1717,8 @@ impl ReaderApp {
             .flex_none()
             .items_center()
             .border_r_1()
-            .border_color(rgb(BORDER))
-            .bg(rgb(SIDEBAR))
+            .border_color(rgb(palette(cx).border))
+            .bg(rgb(palette(cx).sidebar))
             .py_3()
             .child(
                 Button::new("reader-navigation-expand")
@@ -1719,7 +1732,7 @@ impl ReaderApp {
             .child(
                 div()
                     .mt_3()
-                    .text_color(rgb(ACCENT))
+                    .text_color(rgb(palette(cx).accent))
                     .child(Icon::new(IconName::Menu).small()),
             )
             .into_any_element()
@@ -1747,14 +1760,14 @@ impl ReaderApp {
             .items_center()
             .justify_center()
             .cursor_col_resize()
-            .bg(rgb(SURFACE))
+            .bg(rgb(palette(cx).surface))
             .child(
                 div()
                     .h_full()
                     .w(px(if active { 2. } else { 1. }))
-                    .bg(rgb(if active { ACCENT } else { BORDER })),
+                    .bg(rgb(if active { palette(cx).accent } else { palette(cx).border })),
             )
-            .hover(|this| this.bg(rgb(ACCENT_SOFT)))
+            .hover(|this| this.bg(rgb(palette(cx).accent_soft)))
             .on_drag_move(cx.listener(
                 move |this, event: &DragMoveEvent<ReaderPaneResizeDrag>, window, cx| {
                     if event.drag(cx).0 != pane {
@@ -2011,7 +2024,7 @@ impl ReaderApp {
         self.run_pending_citation_navigation(url, cx);
         self.configure_annotations(cx);
         self.configure_translations(url, cx);
-        self.apply_text_size(cx);
+        self.apply_reading_appearance(cx);
         cx.notify();
     }
 
@@ -2106,14 +2119,23 @@ impl ReaderApp {
         cx.notify();
     }
 
-    /// Re-applies this book's text size to the chapter on screen.
-    fn apply_text_size(&mut self, cx: &mut Context<Self>) {
+    /// Re-applies this book's text size and the current skin to the chapter on
+    /// screen.
+    ///
+    /// Both live on the same root element, so one script carries both: applying
+    /// only the size would leave a dark skin's chapter on the light stylesheet,
+    /// and applying only the skin would put the size back on its baseline.
+    fn apply_reading_appearance(&mut self, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
         let Some(webview) = self.webview.as_ref() else {
             return;
         };
-        let script = reader_appearance_script(self.text_size);
+        let script = reader_appearance_script(self.text_size, current_appearance(cx));
         if let Err(error) = webview.read(cx).raw().evaluate_script(&script) {
-            tracing::warn!(%error, "cannot apply the reading text size");
+            // Presentation only: a missed update must not become a reader error.
+            tracing::warn!(%error, "cannot apply the reading appearance");
         }
     }
 
@@ -2146,7 +2168,7 @@ impl ReaderApp {
                     return;
                 }
                 this.text_size = stored;
-                this.apply_text_size(cx);
+                this.apply_reading_appearance(cx);
                 cx.notify();
             });
         })
