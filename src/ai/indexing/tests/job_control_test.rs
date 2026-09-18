@@ -8,7 +8,7 @@ use std::sync::{Arc, atomic::Ordering};
 use crate::{db, document::deterministic_id};
 
 #[test]
-fn embedding_failure_keeps_fts_and_can_be_retried() {
+pub(crate) fn embedding_failure_keeps_fts_and_can_be_retried() {
     let fixture = Fixture::new();
     let provider = Arc::new(MockProvider::default());
     provider.fail_embeddings.store(true, Ordering::SeqCst);
@@ -49,7 +49,7 @@ fn embedding_failure_keeps_fts_and_can_be_retried() {
 }
 
 #[test]
-fn queued_controls_pause_resume_and_cancel_without_losing_cursor() {
+pub(crate) fn queued_controls_pause_resume_and_cancel_without_losing_cursor() {
     let fixture = Fixture::new();
     let embedding_job = format!("embedding:{}", fixture.source_id);
     let vision_job = format!("vision:{}", fixture.source_id);
@@ -91,7 +91,7 @@ fn queued_controls_pause_resume_and_cancel_without_losing_cursor() {
 }
 
 #[test]
-fn queued_cancel_binds_both_canonical_jobs_and_survives_restart() {
+pub(crate) fn queued_cancel_binds_both_canonical_jobs_and_survives_restart() {
     let fixture = Fixture::new();
     let embedding_id = format!("embedding:{}", fixture.source_id);
     let vision_id = format!("vision:{}", fixture.source_id);
@@ -204,7 +204,7 @@ fn queued_cancel_binds_both_canonical_jobs_and_survives_restart() {
 }
 
 #[test]
-fn queued_pause_binds_both_canonical_jobs_and_survives_restart() {
+pub(crate) fn queued_pause_binds_both_canonical_jobs_and_survives_restart() {
     let fixture = Fixture::new();
     let embedding_id = format!("embedding:{}", fixture.source_id);
     let vision_id = format!("vision:{}", fixture.source_id);
@@ -317,7 +317,7 @@ fn queued_pause_binds_both_canonical_jobs_and_survives_restart() {
 }
 
 #[test]
-fn running_provider_call_observes_pause_and_resumes() {
+pub(crate) fn running_provider_call_observes_pause_and_resumes() {
     let fixture = Fixture::new();
     let provider = Arc::new(MockProvider::default());
     provider.embedding_delay_ms.store(5_000, Ordering::SeqCst);
@@ -366,7 +366,7 @@ fn running_provider_call_observes_pause_and_resumes() {
 }
 
 #[test]
-fn startup_recovers_an_interrupted_job_from_its_cursor() {
+pub(crate) fn startup_recovers_an_interrupted_job_from_its_cursor() {
     let fixture = Fixture::new();
     let job_id = format!("embedding:{}", fixture.source_id);
     let conn = db::open_conn(&fixture.db_path).unwrap();
@@ -397,7 +397,7 @@ fn startup_recovers_an_interrupted_job_from_its_cursor() {
 }
 
 #[test]
-fn startup_collapses_legacy_model_specific_vision_job_into_canonical_row() {
+pub(crate) fn startup_collapses_legacy_model_specific_vision_job_into_canonical_row() {
     let fixture = Fixture::new();
     let canonical_id = format!("vision:{}", fixture.source_id);
     let conn = db::open_conn(&fixture.db_path).unwrap();

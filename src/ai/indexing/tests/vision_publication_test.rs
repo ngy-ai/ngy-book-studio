@@ -11,7 +11,7 @@ use std::{
 use crate::{ai::OpenAiCompatibleProvider, ai::job_diagnostics::JobLogErrorKind, db};
 
 #[test]
-fn duplicate_reconciliation_preserves_pending_cancel() {
+pub(crate) fn duplicate_reconciliation_preserves_pending_cancel() {
     let fixture = Fixture::new();
     let canonical_id = format!("vision:{}", fixture.source_id);
     let mut conn = db::open_conn(&fixture.db_path).unwrap();
@@ -73,7 +73,7 @@ fn duplicate_reconciliation_preserves_pending_cancel() {
 }
 
 #[test]
-fn vision_model_change_supersedes_running_generation_without_late_publish() {
+pub(crate) fn vision_model_change_supersedes_running_generation_without_late_publish() {
     let fixture = Fixture::new();
     fixture.publish_test_visual_page();
     let provider = Arc::new(MockProvider::default());
@@ -155,7 +155,7 @@ fn vision_model_change_supersedes_running_generation_without_late_publish() {
 }
 
 #[test]
-fn legacy_vision_ids_cannot_be_claimed_or_retried() {
+pub(crate) fn legacy_vision_ids_cannot_be_claimed_or_retried() {
     let fixture = Fixture::new();
     let conn = db::open_conn(&fixture.db_path).unwrap();
     let canonical_id = format!("vision:{}", fixture.source_id);
@@ -209,7 +209,7 @@ fn legacy_vision_ids_cannot_be_claimed_or_retried() {
 }
 
 #[test]
-fn manual_vision_retry_requires_current_execution_identity() {
+pub(crate) fn manual_vision_retry_requires_current_execution_identity() {
     let fixture = Fixture::new();
     let coordinator = IndexingCoordinator {
         inner: fixture.indexing_inner(),
@@ -274,7 +274,7 @@ fn manual_vision_retry_requires_current_execution_identity() {
 }
 
 #[test]
-fn cancelling_a_paused_job_publishes_terminal_state_immediately() {
+pub(crate) fn cancelling_a_paused_job_publishes_terminal_state_immediately() {
     let fixture = Fixture::new();
     let coordinator = IndexingCoordinator {
         inner: fixture.indexing_inner(),
@@ -307,7 +307,7 @@ fn cancelling_a_paused_job_publishes_terminal_state_immediately() {
 }
 
 #[test]
-fn rejected_vision_publication_settles_control_and_cursor_conflicts() {
+pub(crate) fn rejected_vision_publication_settles_control_and_cursor_conflicts() {
     fn running_job(fixture: &Fixture) -> db::index_jobs::IndexJob {
         let conn = db::open_conn(&fixture.db_path).unwrap();
         let job_id = format!("vision:{}", fixture.source_id);
@@ -403,7 +403,7 @@ fn rejected_vision_publication_settles_control_and_cursor_conflicts() {
 }
 
 #[test]
-fn final_vision_publication_atomically_honors_late_pause_and_cancel() {
+pub(crate) fn final_vision_publication_atomically_honors_late_pause_and_cancel() {
     fn running_vision_job(fixture: &Fixture) -> (db::index_jobs::IndexJob, JobCursor) {
         let conn = db::open_conn(&fixture.db_path).unwrap();
         let job_id = format!("vision:{}", fixture.source_id);

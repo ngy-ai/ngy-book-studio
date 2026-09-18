@@ -10,7 +10,7 @@ use crate::{
 };
 
 #[test]
-fn vision_request_disables_model_reasoning() {
+pub(crate) fn vision_request_disables_model_reasoning() {
     // 视觉识别同样只消费 `content` 里的严格 JSON，必须与翻译、Agent 路径一致地
     // 关闭推理，否则思考模型会在整段请求超时内只回空增量。
     let request = vision_request("vision:test", "data:image/png;base64,AAAA".to_string());
@@ -24,7 +24,7 @@ fn vision_request_disables_model_reasoning() {
 }
 
 #[test]
-fn vision_output_requires_bounded_non_empty_regions() {
+pub(crate) fn vision_output_requires_bounded_non_empty_regions() {
     let valid = parse_vision_output(
             r#"{"regions":[{"ocr":"正文","description":"","region":{"left":10,"top":200,"right":900,"bottom":800}},{"ocr":"","description":"全页摘要","region":null},{"ocr":"标题","description":"标题区","region":{"left":10,"top":20,"right":900,"bottom":150}}]}"#,
         )
@@ -76,7 +76,7 @@ fn vision_output_requires_bounded_non_empty_regions() {
 }
 
 #[test]
-fn translation_request_disables_model_reasoning() {
+pub(crate) fn translation_request_disables_model_reasoning() {
     // 思考模型会把整个输出预算和请求超时花在推理上，而 Ollama 的 OpenAI 兼容
     // 端点只回空 content 增量：本地 9B 模型实测在整段请求超时内产出 0 字节正文。
     // 翻译只要 content 里的严格 JSON，所以必须像 Agent 路径一样显式关闭推理。
@@ -114,7 +114,7 @@ fn translation_request_disables_model_reasoning() {
 }
 
 #[test]
-fn translation_stream_shape_separates_missing_repeating_and_thinking_answers() {
+pub(crate) fn translation_stream_shape_separates_missing_repeating_and_thinking_answers() {
     // 2026-09-11 现场：一条仍在稳定输出的流被整体请求超时切断，日志只能看到
     // 「1579 个正文块、7024 字节」；要判断模型是没写出答案、思考没结束还是把答案
     // 重复输出，必须同时记录完整容器数、未闭合容器、片段标记、思考块与重复标记。
@@ -164,7 +164,7 @@ fn translation_stream_shape_separates_missing_repeating_and_thinking_answers() {
 /// provider 静默超时收尾，不再无限期占着 `transitions` 门闩——现场 2026-09-17
 /// 的整本翻译与 AI 设置保存就是这样一起停住的。
 #[test]
-fn stream_silence_is_reported_exactly_at_the_limit() {
+pub(crate) fn stream_silence_is_reported_exactly_at_the_limit() {
     let limit = TRANSLATION_STREAM_SILENCE_LIMIT.as_millis() as u64;
     assert!(!stream_silence_exceeded(0));
     assert!(!stream_silence_exceeded(limit - 1));
@@ -182,7 +182,7 @@ fn stream_silence_is_reported_exactly_at_the_limit() {
 }
 
 #[test]
-fn an_unfinished_stream_is_only_salvaged_by_one_complete_valid_answer() {
+pub(crate) fn an_unfinished_stream_is_only_salvaged_by_one_complete_valid_answer() {
     let source = TranslationSource {
         text: "Hello".to_string(),
         segments: vec!["Hello".to_string()],
@@ -216,7 +216,7 @@ fn an_unfinished_stream_is_only_salvaged_by_one_complete_valid_answer() {
 }
 
 #[test]
-fn translation_format_instructions_forbid_full_width_structure_punctuation() {
+pub(crate) fn translation_format_instructions_forbid_full_width_structure_punctuation() {
     // 现场：中文模型把结构冒号写成全角标点（"text："），于是整段响应不是合法
     // JSON。格式说明必须显式约束结构字符，纠正提示还要按失败分类指出问题。
     let format = crate::ai::translation::FORMAT_INSTRUCTIONS;
@@ -243,7 +243,7 @@ fn translation_format_instructions_forbid_full_width_structure_punctuation() {
 }
 
 #[test]
-fn translation_source_limits_count_raw_whitespace_and_encoded_slot_overhead() {
+pub(crate) fn translation_source_limits_count_raw_whitespace_and_encoded_slot_overhead() {
     let no_context = TranslationContext::default();
     let exact = "a".repeat(MAX_TRANSLATION_SOURCE_CHARS);
     assert!(
@@ -320,7 +320,7 @@ fn translation_source_limits_count_raw_whitespace_and_encoded_slot_overhead() {
 }
 
 #[test]
-fn translation_block_previews_collapse_whitespace_and_truncate() {
+pub(crate) fn translation_block_previews_collapse_whitespace_and_truncate() {
     assert_eq!(translation_block_preview("  a\n\tb  "), "a b");
     let exact = "字".repeat(TRANSLATION_BLOCK_PREVIEW_CHARS);
     assert_eq!(translation_block_preview(&exact), exact);
@@ -330,7 +330,7 @@ fn translation_block_previews_collapse_whitespace_and_truncate() {
 }
 
 #[test]
-fn translation_cache_keys_separate_a_different_leaf_split() {
+pub(crate) fn translation_cache_keys_separate_a_different_leaf_split() {
     assert_eq!(
         translation_cache_key("ab", ["a", "b"].into_iter()),
         translation_cache_key("ab", ["a", "b"].into_iter())
@@ -347,7 +347,7 @@ fn translation_cache_keys_separate_a_different_leaf_split() {
 }
 
 #[test]
-fn translation_prompt_is_shared_by_the_worker_and_the_inspector() {
+pub(crate) fn translation_prompt_is_shared_by_the_worker_and_the_inspector() {
     // The task window shows the body rebuilt through `translation_prompt`,
     // while the worker sends the one inside `translation_request`. If these
     // ever diverge, the debug view silently stops describing the real call.
@@ -393,7 +393,7 @@ fn translation_prompt_is_shared_by_the_worker_and_the_inspector() {
 }
 
 #[test]
-fn translation_request_body_serializes_the_exact_wire_shape() {
+pub(crate) fn translation_request_body_serializes_the_exact_wire_shape() {
     let source = TranslationSource {
         text: "Body".to_string(),
         segments: vec!["Body".to_string()],
@@ -422,12 +422,12 @@ fn translation_request_body_serializes_the_exact_wire_shape() {
 }
 
 #[test]
-fn byte_limits_do_not_split_utf8() {
+pub(crate) fn byte_limits_do_not_split_utf8() {
     assert_eq!(truncate_utf8_bytes("中文abcdef", 5), "中");
 }
 
 #[test]
-fn translation_segment_fallback_covers_only_answered_multi_fragment_blocks() {
+pub(crate) fn translation_segment_fallback_covers_only_answered_multi_fragment_blocks() {
     let single = TranslationSource {
         text: "Hello".to_string(),
         segments: vec!["Hello".to_string()],
@@ -501,7 +501,7 @@ fn translation_segment_fallback_covers_only_answered_multi_fragment_blocks() {
 }
 
 #[test]
-fn translation_shape_labels_are_numbers_only() {
+pub(crate) fn translation_shape_labels_are_numbers_only() {
     // 现场（2026-09-13，block 79）：片段形状是「10 个字符的短名字 + 470 个字符的
     // 正文」，据此可看出文本块是按内联强调切开的，而日志里没有任何原文。
     let segments = vec!["Andrew Stellman".to_string(), " is a developer".to_string()];

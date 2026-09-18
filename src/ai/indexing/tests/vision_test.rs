@@ -16,7 +16,7 @@ use crate::{
 };
 
 #[test]
-fn vision_endpoint_switch_uses_new_provider_and_preserves_embedding_route() {
+pub(crate) fn vision_endpoint_switch_uses_new_provider_and_preserves_embedding_route() {
     let fixture = Fixture::new();
     fixture.publish_test_visual_page();
     let embedding_provider = Arc::new(MockProvider::default());
@@ -110,7 +110,7 @@ fn vision_endpoint_switch_uses_new_provider_and_preserves_embedding_route() {
 }
 
 #[test]
-fn startup_reconciles_saved_endpoint_identity_before_worker_runs() {
+pub(crate) fn startup_reconciles_saved_endpoint_identity_before_worker_runs() {
     let fixture = Fixture::new();
     let job_id = format!("embedding:{}", fixture.source_id);
     let conn = db::open_conn(&fixture.db_path).unwrap();
@@ -195,7 +195,7 @@ fn startup_reconciles_saved_endpoint_identity_before_worker_runs() {
 }
 
 #[test]
-fn post_vision_embedding_records_both_generations_and_rejects_stale_retry() {
+pub(crate) fn post_vision_embedding_records_both_generations_and_rejects_stale_retry() {
     let fixture = Fixture::new();
     let coordinator = IndexingCoordinator {
         inner: fixture.indexing_inner(),
@@ -303,7 +303,7 @@ fn post_vision_embedding_records_both_generations_and_rejects_stale_retry() {
 }
 
 #[test]
-fn endpoint_identity_change_requeues_same_named_vision_model() {
+pub(crate) fn endpoint_identity_change_requeues_same_named_vision_model() {
     let fixture = Fixture::new();
     let canonical_id = format!("vision:{}", fixture.source_id);
     let mut conn = db::open_conn(&fixture.db_path).unwrap();
@@ -359,7 +359,7 @@ fn endpoint_identity_change_requeues_same_named_vision_model() {
 }
 
 #[test]
-fn reconfigure_rolls_back_all_jobs_before_publishing_models() {
+pub(crate) fn reconfigure_rolls_back_all_jobs_before_publishing_models() {
     let fixture = Fixture::new();
     let coordinator = IndexingCoordinator {
         inner: fixture.indexing_inner(),
@@ -533,7 +533,7 @@ fn reconfigure_rolls_back_all_jobs_before_publishing_models() {
 }
 
 #[test]
-fn unknown_or_duplicate_vision_provenance_forces_clean_rebuild() {
+pub(crate) fn unknown_or_duplicate_vision_provenance_forces_clean_rebuild() {
     let fixture = Fixture::new();
     let canonical_id = format!("vision:{}", fixture.source_id);
     let first_ordinal = visual_chunk_ordinal(0, 0).unwrap();

@@ -16,7 +16,7 @@ use crate::{
 /// translation, because that end state is exactly what makes the retry the
 /// only way back to a skipped block.
 #[test]
-fn retrying_named_blocks_rewinds_the_cursor_and_narrows_the_walk() {
+pub(crate) fn retrying_named_blocks_rewinds_the_cursor_and_narrows_the_walk() {
     let fixture = Fixture::new();
     let coordinator = IndexingCoordinator {
         inner: fixture.indexing_inner(),
@@ -90,7 +90,7 @@ fn retrying_named_blocks_rewinds_the_cursor_and_narrows_the_walk() {
 /// requested block is already translated the task is not requeued at all,
 /// because a run over the same set would send nothing.
 #[test]
-fn retrying_skips_blocks_that_already_have_a_translation() {
+pub(crate) fn retrying_skips_blocks_that_already_have_a_translation() {
     let fixture = Fixture::new();
     let coordinator = IndexingCoordinator {
         inner: fixture.indexing_inner(),
@@ -194,7 +194,7 @@ fn retrying_skips_blocks_that_already_have_a_translation() {
 /// resuming the task is the normal case — so a paused task must accept a
 /// per-block retry. A running one must not: the executor owns its cursor.
 #[test]
-fn retrying_works_on_a_paused_task_and_refuses_a_running_one() {
+pub(crate) fn retrying_works_on_a_paused_task_and_refuses_a_running_one() {
     let fixture = Fixture::new();
     let coordinator = IndexingCoordinator {
         inner: fixture.indexing_inner(),
@@ -255,7 +255,7 @@ fn retrying_works_on_a_paused_task_and_refuses_a_running_one() {
 }
 
 #[test]
-fn a_cursor_from_older_block_rules_restarts_the_book() {
+pub(crate) fn a_cursor_from_older_block_rules_restarts_the_book() {
     // 提取文本块的规则变化会改变块数，旧游标的序号不再指向同一块。翻译任务因此退回
     // 书首重扫（已存译文仍按缓存键命中，重扫不花请求），窗口与按块重试的目标一并清空；
     // 版本已经是最新的游标则原样保留。
@@ -297,7 +297,7 @@ fn a_cursor_from_older_block_rules_restarts_the_book() {
 }
 
 #[test]
-fn a_rejected_block_is_re_sent_until_the_model_answers() {
+pub(crate) fn a_rejected_block_is_re_sent_until_the_model_answers() {
     // 一个只有一个片段的文本块被模型答垮时，逐片段回退帮不上忙（片段数必须 > 1），
     // 整块重发是唯一的补救：第二发的答案被接受，这一块不必留在原文。
     let provider = Arc::new(MockMergeProvider::default());
@@ -339,7 +339,7 @@ fn a_rejected_block_is_re_sent_until_the_model_answers() {
 }
 
 #[test]
-fn a_block_that_keeps_failing_is_skipped_after_the_retry_budget() {
+pub(crate) fn a_block_that_keeps_failing_is_skipped_after_the_retry_budget() {
     // 每一次请求都不合协议：整块重发用满 `TRANSLATION_BLOCK_RETRIES` 轮，然后照原来的
     // 规则跳过并保留原文。请求数就是「每轮两次严格尝试 × 轮数」，单片段块没有回退请求。
     let provider = Arc::new(MockMergeProvider::default());
@@ -381,7 +381,7 @@ fn a_block_that_keeps_failing_is_skipped_after_the_retry_budget() {
 }
 
 #[test]
-fn a_provider_failure_is_never_re_sent() {
+pub(crate) fn a_provider_failure_is_never_re_sent() {
     // provider、数据库与取消类失败不是「模型答得不对」，重发同一个请求解决不了：整块
     // 立刻上抛，让整次运行失败（块级重试只管协议失败）。
     let provider = Arc::new(MockMergeProvider::default());
@@ -408,7 +408,7 @@ fn a_provider_failure_is_never_re_sent() {
 }
 
 #[test]
-fn a_merged_multi_fragment_response_is_retried_one_fragment_at_a_time() {
+pub(crate) fn a_merged_multi_fragment_response_is_retried_one_fragment_at_a_time() {
     // 现场：每个多片段文本块都在两次严格尝试后判 segment_count_mismatch，连续三个
     // 文本块就让整本图书的翻译任务失败（当时连续跳过上限是 3，该上限已于 2026-09-15
     // 取消）。逐片段回退必须让这种模型整块翻完。
@@ -455,7 +455,7 @@ fn a_merged_multi_fragment_response_is_retried_one_fragment_at_a_time() {
 }
 
 #[test]
-fn a_correction_that_breaks_json_still_falls_back_on_a_multi_fragment_block() {
+pub(crate) fn a_correction_that_breaks_json_still_falls_back_on_a_multi_fragment_block() {
     // 现场（2026-09-15，run 2，block 1786/1787，qwen3.5:0.8b）：attempt 1 把 3 个片段
     // 合并进 id=0，纠正提示之后模型开始按段写、但 JSON 没闭合。只按最后一次的
     // `incomplete_json` 判定会放弃回退，三块连续跳过就结束整次运行（当时的上限，
@@ -486,7 +486,7 @@ fn a_correction_that_breaks_json_still_falls_back_on_a_multi_fragment_block() {
 }
 
 #[test]
-fn a_fragment_that_still_fails_the_protocol_leaves_the_whole_block_untranslated() {
+pub(crate) fn a_fragment_that_still_fails_the_protocol_leaves_the_whole_block_untranslated() {
     let provider = Arc::new(MockMergeProvider::default());
     provider.fail_fragments.store(true, Ordering::SeqCst);
     let (fixture, job, cursor, translation) =
@@ -510,7 +510,7 @@ fn a_fragment_that_still_fails_the_protocol_leaves_the_whole_block_untranslated(
 }
 
 #[test]
-fn a_truncated_response_is_rejected_as_a_fixed_block_failure() {
+pub(crate) fn a_truncated_response_is_rejected_as_a_fixed_block_failure() {
     // 现场（2026-09-15，block 1762，qwen3.5:0.8b）：模型在 4096 个输出 token 处被
     // 截断，两次运行都在同一个 ordinal、同一个字节数停下。调用方靠 `ResponseError`
     // 决定「跳过当前文本块并继续」，所以截断必须带着这个类型返回，而不是一个不透明的
@@ -543,7 +543,7 @@ fn a_truncated_response_is_rejected_as_a_fixed_block_failure() {
 }
 
 #[test]
-fn a_truncated_block_is_skipped_and_the_run_still_finishes() {
+pub(crate) fn a_truncated_block_is_skipped_and_the_run_still_finishes() {
     // 同一个现场的另一半：截断曾经是运行级失败，于是一个退化文本块让整本书的翻译永远
     // 停在 ordinal 1762 上——任务只有 attempts 在涨，next_ordinal 一动不动。现在它走
     // 「跳过这一块」的规则：整本遍历到底、游标停在书末、按 Succeeded 收尾，被跳过的块

@@ -10,7 +10,7 @@ use std::{
 use crate::db;
 
 #[test]
-fn configured_concurrency_runs_two_queued_jobs_at_once() {
+pub(crate) fn configured_concurrency_runs_two_queued_jobs_at_once() {
     let fixture = Fixture::new();
     fixture.add_second_book();
     let provider = Arc::new(MockProvider::default());
@@ -32,7 +32,7 @@ fn configured_concurrency_runs_two_queued_jobs_at_once() {
 }
 
 #[test]
-fn configured_interval_pauses_between_two_queued_jobs() {
+pub(crate) fn configured_interval_pauses_between_two_queued_jobs() {
     let fixture = Fixture::new();
     fixture.add_second_book();
     let provider = Arc::new(MockProvider::default());

@@ -10,7 +10,7 @@ use std::{
 use crate::{ai::OpenAiCompatibleProvider, db};
 
 #[test]
-fn unchanged_vision_model_does_not_requeue_terminal_canonical_job() {
+pub(crate) fn unchanged_vision_model_does_not_requeue_terminal_canonical_job() {
     let fixture = Fixture::new();
     let provider = Arc::new(MockProvider::default());
     let coordinator = fixture.coordinator(provider.clone());
@@ -59,7 +59,7 @@ fn unchanged_vision_model_does_not_requeue_terminal_canonical_job() {
 }
 
 #[test]
-fn unchanged_embedding_execution_does_not_create_or_reset_model_job() {
+pub(crate) fn unchanged_embedding_execution_does_not_create_or_reset_model_job() {
     let fixture = Fixture::new();
     let coordinator = IndexingCoordinator {
         inner: fixture.indexing_inner(),
@@ -119,7 +119,7 @@ fn unchanged_embedding_execution_does_not_create_or_reset_model_job() {
 }
 
 #[test]
-fn embedding_model_or_endpoint_change_is_enqueued_only_once() {
+pub(crate) fn embedding_model_or_endpoint_change_is_enqueued_only_once() {
     let fixture = Fixture::new();
     let coordinator = IndexingCoordinator {
         inner: fixture.indexing_inner(),
@@ -258,7 +258,7 @@ fn embedding_model_or_endpoint_change_is_enqueued_only_once() {
 }
 
 #[test]
-fn stale_embedding_generation_cannot_publish_after_endpoint_reconcile() {
+pub(crate) fn stale_embedding_generation_cannot_publish_after_endpoint_reconcile() {
     let fixture = Fixture::new();
     let job_id = format!("embedding:{}", fixture.source_id);
     let mut conn = db::open_conn(&fixture.db_path).unwrap();
@@ -356,7 +356,7 @@ fn stale_embedding_generation_cannot_publish_after_endpoint_reconcile() {
 }
 
 #[test]
-fn endpoint_switch_while_provider_is_running_uses_new_generation() {
+pub(crate) fn endpoint_switch_while_provider_is_running_uses_new_generation() {
     let fixture = Fixture::new();
     fixture.publish_test_visual_page();
     let old_provider = Arc::new(MockProvider::default());

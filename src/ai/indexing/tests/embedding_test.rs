@@ -17,7 +17,7 @@ use crate::{
 use std::io::Cursor;
 
 #[test]
-fn embedding_and_vision_jobs_use_their_assigned_providers() {
+pub(crate) fn embedding_and_vision_jobs_use_their_assigned_providers() {
     let fixture = Fixture::new();
     fixture.publish_test_visual_page();
     let embedding_provider = Arc::new(MockProvider::default());
@@ -66,7 +66,7 @@ fn embedding_and_vision_jobs_use_their_assigned_providers() {
 }
 
 #[test]
-fn execution_diagnostics_keep_failed_and_retried_batches_in_their_library() {
+pub(crate) fn execution_diagnostics_keep_failed_and_retried_batches_in_their_library() {
     let fixture = Fixture::new();
     let inner = fixture.indexing_inner();
     let provider = Arc::new(MockProvider::default());
@@ -145,7 +145,7 @@ fn execution_diagnostics_keep_failed_and_retried_batches_in_their_library() {
 }
 
 #[test]
-fn queued_embedding_resumes_and_persists_vectors() {
+pub(crate) fn queued_embedding_resumes_and_persists_vectors() {
     let fixture = Fixture::new();
     let provider = Arc::new(MockProvider::default());
     let coordinator = fixture.coordinator(provider.clone());
@@ -180,7 +180,7 @@ fn queued_embedding_resumes_and_persists_vectors() {
 }
 
 #[test]
-fn vision_waits_for_pages_then_indexes_and_embeds_description() {
+pub(crate) fn vision_waits_for_pages_then_indexes_and_embeds_description() {
     let fixture = Fixture::new();
     let provider = Arc::new(MockProvider::default());
     let coordinator = fixture.coordinator(provider.clone());
@@ -343,7 +343,7 @@ fn vision_waits_for_pages_then_indexes_and_embeds_description() {
 }
 
 #[test]
-fn legacy_office_preview_pages_with_guessed_units_are_rejected() {
+pub(crate) fn legacy_office_preview_pages_with_guessed_units_are_rejected() {
     let fixture = Fixture::new();
     let conn = db::open_conn(&fixture.db_path).unwrap();
     let first_unit = db::content_units::list_for_source(&conn, &fixture.source_id)
@@ -489,7 +489,7 @@ fn legacy_office_preview_pages_with_guessed_units_are_rejected() {
 }
 
 #[test]
-fn valid_office_preview_pages_skip_vision_and_clear_stale_chunks() {
+pub(crate) fn valid_office_preview_pages_skip_vision_and_clear_stale_chunks() {
     let fixture = Fixture::new();
     let conn = db::open_conn(&fixture.db_path).unwrap();
     conn.execute(

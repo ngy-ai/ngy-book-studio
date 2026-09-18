@@ -16,7 +16,7 @@ use crate::db;
 /// 因为并发只决定几个任务在跑，任务内部仍逐块串行。这条用例同时固定三件事：模型真的
 /// 被并发调用、窗口写进了持久游标（任务窗口就靠它显示处理中）、游标永不越过还在等的块。
 #[test]
-fn a_translation_run_keeps_the_configured_number_of_blocks_in_flight() {
+pub(crate) fn a_translation_run_keeps_the_configured_number_of_blocks_in_flight() {
     let provider = Arc::new(MockMergeProvider::default());
     provider.delay_ms.store(20, Ordering::SeqCst);
     let (fixture, job, mut cursor, translation) =
@@ -84,7 +84,7 @@ fn a_translation_run_keeps_the_configured_number_of_blocks_in_flight() {
 
 /// 并发数就是窗口上限：设成 1 时一次只有一个块在飞（同一个设置既限任务也限块）。
 #[test]
-fn a_concurrency_of_one_keeps_the_translation_serial() {
+pub(crate) fn a_concurrency_of_one_keeps_the_translation_serial() {
     let provider = Arc::new(MockMergeProvider::default());
     provider.delay_ms.store(5, Ordering::SeqCst);
     let (fixture, job, mut cursor, translation) =
@@ -124,7 +124,7 @@ fn a_concurrency_of_one_keeps_the_translation_serial() {
 /// 行留在 `running`、`attempts` 已加一、没有任何执行者 —— 现场 2026-09-17，新导入
 /// 的图书点「恢复」后一直显示运行中，已处理 0、处理中 0，刷新也不动。
 #[test]
-fn a_reconfigured_translation_job_runs_instead_of_abandoning_its_first_execution() {
+pub(crate) fn a_reconfigured_translation_job_runs_instead_of_abandoning_its_first_execution() {
     let provider = Arc::new(MockMergeProvider::default());
     let fixture = Fixture::new();
     let inner = fixture.indexing_inner();
@@ -204,7 +204,7 @@ fn a_reconfigured_translation_job_runs_instead_of_abandoning_its_first_execution
 /// 暂停之后不许继续声称有请求在飞：窗口清空必须落盘，而且发布的结果必须就是清空后
 /// 的那份游标 —— 否则发布时会按旧 JSON 匹配不上，任务卡在「处理中」。
 #[test]
-fn a_paused_run_clears_a_window_left_by_a_previous_execution() {
+pub(crate) fn a_paused_run_clears_a_window_left_by_a_previous_execution() {
     let provider = Arc::new(MockMergeProvider::default());
     let (fixture, job, cursor, translation) =
         translation_block_fixture(&provider, "translation-v2:chat-test");

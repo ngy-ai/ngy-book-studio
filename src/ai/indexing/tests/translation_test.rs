@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, atomic::Ordering};
 use crate::{ai::OpenAiCompatibleProvider, db, document::BlockDocument};
 
 #[test]
-fn translation_blocks_flatten_text_blocks_in_document_order() {
+pub(crate) fn translation_blocks_flatten_text_blocks_in_document_order() {
     use crate::document::{Block, ListItem, TableCell, TableRow};
 
     let temp = tempfile::tempdir().unwrap();
@@ -96,7 +96,7 @@ fn translation_blocks_flatten_text_blocks_in_document_order() {
 }
 
 #[test]
-fn translation_blocks_parse_preserved_epub_html_when_the_ast_is_raw() {
+pub(crate) fn translation_blocks_parse_preserved_epub_html_when_the_ast_is_raw() {
     use crate::document::Block;
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join(db::DATABASE_FILE);
@@ -158,7 +158,7 @@ fn translation_blocks_parse_preserved_epub_html_when_the_ast_is_raw() {
 }
 
 #[test]
-fn retranslating_a_translation_job_resets_it_and_clears_its_rows() {
+pub(crate) fn retranslating_a_translation_job_resets_it_and_clears_its_rows() {
     let fixture = Fixture::new();
     let coordinator = IndexingCoordinator {
         inner: fixture.indexing_inner(),
@@ -244,7 +244,7 @@ fn retranslating_a_translation_job_resets_it_and_clears_its_rows() {
 }
 
 #[test]
-fn retranslating_a_translation_job_keeps_a_manual_edit_and_clears_the_rest() {
+pub(crate) fn retranslating_a_translation_job_keeps_a_manual_edit_and_clears_the_rest() {
     let fixture = Fixture::new();
     let coordinator = IndexingCoordinator {
         inner: fixture.indexing_inner(),
@@ -325,7 +325,7 @@ fn retranslating_a_translation_job_keeps_a_manual_edit_and_clears_the_rest() {
 }
 
 #[test]
-fn translation_block_inspection_is_revision_pinned_and_read_only() {
+pub(crate) fn translation_block_inspection_is_revision_pinned_and_read_only() {
     let fixture = Fixture::new();
     let coordinator = IndexingCoordinator {
         inner: fixture.indexing_inner(),
@@ -401,7 +401,7 @@ fn translation_block_inspection_is_revision_pinned_and_read_only() {
 }
 
 #[test]
-fn translation_block_detail_rebuilds_the_worker_request_and_stays_read_only() {
+pub(crate) fn translation_block_detail_rebuilds_the_worker_request_and_stays_read_only() {
     let fixture = Fixture::new();
     let coordinator = IndexingCoordinator {
         inner: fixture.indexing_inner(),
@@ -515,7 +515,7 @@ fn translation_block_detail_rebuilds_the_worker_request_and_stays_read_only() {
 /// 失败块的现场重放：把模型**原样**的回答端出来，并且除这一次外部请求之外不产生
 /// 任何副作用 —— 不改游标、不写译文、不记诊断。
 #[test]
-fn replaying_a_failed_block_returns_the_raw_answer_and_changes_nothing() {
+pub(crate) fn replaying_a_failed_block_returns_the_raw_answer_and_changes_nothing() {
     let provider = Arc::new(MockMergeProvider::default());
     // 先让模型回一个「答了、但形状不对」的答案：空 translations，正是文本块被跳过
     // 的那种形状。

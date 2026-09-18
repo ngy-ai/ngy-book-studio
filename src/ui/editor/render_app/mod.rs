@@ -2,6 +2,16 @@
 
 use super::*;
 
+use chapters::*;
+use cover::*;
+use status::*;
+
+mod chapters;
+
+mod cover;
+
+mod status;
+
 impl Render for EditorApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.closing && !self.removal_scheduled {
@@ -11,111 +21,12 @@ impl Render for EditorApp {
         let view = cx.entity().clone();
         let write_busy = self.active_write.is_some() || self.export_dialog_open;
         let media_modal_open = self.media_modal.is_some();
-        let (status_icon, status_text, status_color) =
-            if self.closing || self.webview_build_gate.close_requested {
-                (
-                    IconName::BookOpen,
-                    "正在安全关闭编辑器…",
-                    palette(cx).accent,
-                )
-            } else if let Some(operation) = self.active_write.as_ref() {
-                match operation.intent {
-                    EditorWriteIntent::Save => {
-                        (IconName::BookOpen, "正在后台保存…", palette(cx).accent)
-                    }
-                    EditorWriteIntent::Export => (
-                        IconName::BookOpen,
-                        "正在后台保存并导出…",
-                        palette(cx).accent,
-                    ),
-                    EditorWriteIntent::Close => (
-                        IconName::BookOpen,
-                        "正在后台保存并关闭…",
-                        palette(cx).accent,
-                    ),
-                }
-            } else if self.export_dialog_open {
-                (
-                    IconName::ExternalLink,
-                    "正在选择导出位置…",
-                    palette(cx).accent,
-                )
-            } else if self.cover_loading {
-                (IconName::BookOpen, "正在读取封面图片…", palette(cx).accent)
-            } else if self.media_loading {
-                (IconName::BookOpen, "正在读取媒体文件…", palette(cx).accent)
-            } else if media_modal_open {
-                (IconName::Settings2, "正在编辑媒体信息…", palette(cx).accent)
-            } else if let Some(pending) = self.pending_snapshot.as_ref() {
-                match pending.action {
-                    PendingEditorAction::Save => {
-                        (IconName::BookOpen, "正在同步并保存…", palette(cx).accent)
-                    }
-                    PendingEditorAction::Export => {
-                        (IconName::BookOpen, "正在同步并导出…", palette(cx).accent)
-                    }
-                    PendingEditorAction::Close => {
-                        (IconName::BookOpen, "正在保存并关闭…", palette(cx).accent)
-                    }
-                    _ => (IconName::BookOpen, "正在同步富文本…", palette(cx).accent),
-                }
-            } else if self.pending_ready_action.is_some() {
-                (
-                    IconName::BookOpen,
-                    "等待富文本视图就绪…",
-                    palette(cx).accent,
-                )
-            } else if self.webview_build_gate.building {
-                (
-                    IconName::BookOpen,
-                    "正在初始化预览组件…",
-                    palette(cx).accent,
-                )
-            } else if self.tab.uses_webview() && self.editor_webview.is_none() {
-                (
-                    IconName::TriangleAlert,
-                    "预览组件不可用",
-                    palette(cx).danger,
-                )
-            } else if self.tab == EditorTab::RichText
-                && !self.active_web_page.as_ref().is_some_and(|page| page.ready)
-            {
-                (
-                    IconName::BookOpen,
-                    "富文本视图正在加载…",
-                    palette(cx).accent,
-                )
-            } else {
-                (IconName::CircleCheck, "编辑器已就绪", 0x376441)
-            };
+        let (status_icon, status_text, status_color) = editor_status(self, media_modal_open, cx);
         let chapter_title = self.chapter_title_input.read(cx).value().trim().to_string();
-        let editor_summary = if self.chapters.get(self.selected).is_some() {
-            format!(
-                "第 {} / {} 章 · {}",
-                self.selected + 1,
-                self.chapters.len(),
-                if chapter_title.is_empty() {
-                    "未命名章节"
-                } else {
-                    chapter_title.as_str()
-                }
-            )
-        } else {
-            "暂无章节".to_string()
-        };
-        let mode = match self.tab {
-            EditorTab::Source => "HTML 源码编辑",
-            EditorTab::Preview => "只读预览",
-            EditorTab::RichText => "富文本 · 所见即所得",
-        };
-        let editor_context = if self.search_query.is_empty() {
-            format!("{mode} · 手动保存")
-        } else {
-            format!(
-                "{mode} · 检索 {} 个结果 · 手动保存",
-                self.search_results.len()
-            )
-        };
+        let editor_summary = editor_summary_text(self, &chapter_title);
+        let mode = editor_mode_label(self.tab);
+        let editor_context =
+            editor_context_label(mode, &self.search_query, self.search_results.len());
         let status_bar = render_status_bar(
             status_icon,
             status_text.to_string(),
@@ -131,168 +42,14 @@ impl Render for EditorApp {
             .map(|document| editor_toc_rows(&document.toc))
             .unwrap_or_default();
         let selected_toc_id = self.current_toc_id();
-        let chapter_list = if self.search_query.is_empty() {
-            let listed_units = toc_rows
-                .iter()
-                .map(|row| row.unit_id.as_str())
-                .collect::<HashSet<_>>();
-            let mut items = toc_rows
-                .iter()
-                .map(|row| {
-                    let selected = selected_toc_id.as_deref() == Some(row.id.as_str());
-                    let id = row.id.clone();
-                    let list_view = view.clone();
-                    Button::new(SharedString::from(format!("editor-toc-{}", row.id)))
-                        .debug_selector(|| format!("editor-toc-{}", row.id))
-                        .ghost()
-                        .w_full()
-                        .h_auto()
-                        .min_h(px(38.))
-                        .flex_none()
-                        .justify_start()
-                        .pl(px(18. + row.depth.min(4) as f32 * 14.))
-                        .pr_3()
-                        .py_2()
-                        .when(selected, |this| this.bg(rgb(palette(cx).accent_soft)))
-                        .disabled(write_busy)
-                        .on_click(move |_, window, cx| {
-                            list_view.update(cx, |this, cx| this.select_toc(&id, window, cx));
-                        })
-                        .child(
-                            div()
-                                .w_full()
-                                .min_w(px(0.))
-                                .text_left()
-                                .text_sm()
-                                .line_clamp(2)
-                                .text_color(if selected {
-                                    rgb(palette(cx).accent)
-                                } else {
-                                    rgb(palette(cx).ink)
-                                })
-                                .child(row.label.clone()),
-                        )
-                        .into_any_element()
-                })
-                .collect::<Vec<_>>();
-            let unlisted = self
-                .unit_states
-                .iter()
-                .enumerate()
-                .filter(|(_, unit)| !listed_units.contains(unit.id.as_str()))
-                .collect::<Vec<_>>();
-            if !toc_rows.is_empty() && !unlisted.is_empty() {
-                items.push(
-                    div()
-                        .px_3()
-                        .py_2()
-                        .flex_none()
-                        .text_xs()
-                        .text_color(rgb(palette(cx).muted))
-                        .child("未列入目录的章节")
-                        .into_any_element(),
-                );
-            }
-            for (index, _) in unlisted {
-                let Some(chapter) = self.chapters.get(index) else {
-                    continue;
-                };
-                let selected = index == self.selected;
-                let list_view = view.clone();
-                items.push(
-                    Button::new(("editor-chapter", index))
-                        .ghost()
-                        .w_full()
-                        .h_auto()
-                        .min_h(px(38.))
-                        .flex_none()
-                        .justify_start()
-                        .px_3()
-                        .py_2()
-                        .when(selected, |this| this.bg(rgb(palette(cx).accent_soft)))
-                        .disabled(write_busy)
-                        .on_click(move |_, window, cx| {
-                            list_view.update(cx, |this, cx| this.select_chapter(index, window, cx));
-                        })
-                        .child(
-                            div()
-                                .w_full()
-                                .text_left()
-                                .text_sm()
-                                .line_clamp(2)
-                                .child(chapter.title.clone()),
-                        )
-                        .into_any_element(),
-                );
-            }
-            items
-        } else {
-            if self.search_results.is_empty() {
-                vec![
-                    div()
-                        .p_4()
-                        .text_center()
-                        .text_sm()
-                        .text_color(rgb(palette(cx).muted))
-                        .child("当前草稿没有匹配章节")
-                        .into_any_element(),
-                ]
-            } else {
-                self.search_results
-                    .iter()
-                    .enumerate()
-                    .map(|(index, hit)| {
-                        let selected = hit.chapter_index == self.selected;
-                        let chapter_index = hit.chapter_index;
-                        let result_view = view.clone();
-                        Button::new(("editor-search-result", index))
-                            .ghost()
-                            .w_full()
-                            .h_auto()
-                            .min_h(px(66.))
-                            .justify_start()
-                            .px_2()
-                            .py_2()
-                            .when(selected, |this| this.bg(rgb(palette(cx).accent_soft)))
-                            .disabled(write_busy)
-                            .on_click(move |_, window, cx| {
-                                result_view.update(cx, |this, cx| {
-                                    this.select_chapter(chapter_index, window, cx)
-                                });
-                            })
-                            .child(
-                                div()
-                                    .v_flex()
-                                    .w_full()
-                                    .min_w(px(0.))
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .truncate()
-                                            .text_left()
-                                            .text_sm()
-                                            .font_medium()
-                                            .text_color(if selected {
-                                                rgb(palette(cx).accent)
-                                            } else {
-                                                rgb(palette(cx).ink)
-                                            })
-                                            .child(hit.chapter_title.clone()),
-                                    )
-                                    .child(
-                                        div()
-                                            .line_clamp(2)
-                                            .text_left()
-                                            .text_xs()
-                                            .text_color(rgb(palette(cx).muted))
-                                            .child(hit.snippet.clone()),
-                                    ),
-                            )
-                            .into_any_element()
-                    })
-                    .collect::<Vec<_>>()
-            }
-        };
+        let chapter_list = editor_chapter_list(
+            self,
+            &view,
+            &toc_rows,
+            selected_toc_id.as_deref(),
+            write_busy,
+            cx,
+        );
 
         let add_view = view.clone();
         let remove_view = view.clone();
@@ -311,132 +68,14 @@ impl Render for EditorApp {
             || self.pending_snapshot.is_some()
             || self.pending_ready_action.is_some()
             || self.closing;
-        let cover_thumbnail = if let Some(image) = self.cover_preview.as_ref() {
-            img(image.clone())
-                .size_full()
-                .rounded(px(7.))
-                .object_fit(ObjectFit::Cover)
-                .into_any_element()
-        } else {
-            div()
-                .v_flex()
-                .size_full()
-                .items_center()
-                .justify_center()
-                .gap_1()
-                .rounded(px(7.))
-                .bg(rgb(palette(cx).sidebar))
-                .text_color(rgb(palette(cx).accent))
-                .child(Icon::new(IconName::BookOpen).small())
-                .child(
-                    div().text_xs().font_medium().child(
-                        self.canonical_document
-                            .as_ref()
-                            .map(editor_book_format_label)
-                            .unwrap_or("图书"),
-                    ),
-                )
-                .into_any_element()
-        };
-        let cover_status = if self.cover_loading {
-            "正在读取…"
-        } else if self.cover_dirty && self.cover.is_none() {
-            "封面已清除 · 待保存"
-        } else if self.cover_dirty {
-            "新封面 · 待保存"
-        } else if self.cover.is_some() {
-            "当前封面"
-        } else {
-            "暂无封面"
-        };
-        let change_cover_disabled = self.cover_loading
-            || self.canonical_document.is_none()
-            || self.media_loading
-            || media_modal_open
-            || write_busy
-            || self.webview_build_gate.building
-            || self.pending_snapshot.is_some()
-            || self.pending_ready_action.is_some()
-            || self.closing;
-        let clear_cover_enabled =
-            editor_clear_cover_enabled(self.cover.is_some(), change_cover_disabled);
-        let cover_panel = render_editor_section(|| {
-            div()
-                .h_flex()
-                .min_h(px(104.))
-                .flex_none()
-                .items_center()
-                .gap_3()
-                .px_3()
-                .py_3()
-                .border_b_1()
-                .border_color(rgb(palette(cx).border))
-                .child(
-                    div()
-                        .w(px(56.))
-                        .h(px(76.))
-                        .flex_none()
-                        .overflow_hidden()
-                        .rounded(px(8.))
-                        .border_1()
-                        .border_color(rgb(palette(cx).border))
-                        .bg(white())
-                        .child(cover_thumbnail),
-                )
-                .child(
-                    div()
-                        .v_flex()
-                        .min_w(px(0.))
-                        .flex_1()
-                        .items_start()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(if self.cover_dirty {
-                                    rgb(palette(cx).accent)
-                                } else {
-                                    rgb(palette(cx).muted)
-                                })
-                                .child(cover_status),
-                        )
-                        .child(
-                            div()
-                                .h_flex()
-                                .gap_2()
-                                .child(
-                                    Button::new("editor-change-cover")
-                                        .small()
-                                        .outline()
-                                        .label(if self.cover_loading {
-                                            "读取中…"
-                                        } else if self.cover.is_some() {
-                                            "更换封面"
-                                        } else {
-                                            "选择封面"
-                                        })
-                                        .disabled(change_cover_disabled)
-                                        .on_click(move |_, window, cx| {
-                                            change_cover_view.update(cx, |this, cx| {
-                                                this.change_cover(window, cx)
-                                            });
-                                        }),
-                                )
-                                .child(
-                                    Button::new("editor-clear-cover")
-                                        .small()
-                                        .outline()
-                                        .label("清除封面")
-                                        .disabled(!clear_cover_enabled)
-                                        .on_click(move |_, _, cx| {
-                                            clear_cover_view
-                                                .update(cx, |this, cx| this.clear_cover(cx));
-                                        }),
-                                ),
-                        ),
-                )
-                .into_any_element()
-        });
+        let cover_panel = editor_cover_panel(
+            self,
+            change_cover_view,
+            clear_cover_view,
+            media_modal_open,
+            write_busy,
+            cx,
+        );
 
         let toolbar = render_editor_section(|| {
             div()
