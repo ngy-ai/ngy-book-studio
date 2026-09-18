@@ -15,20 +15,20 @@ use ngy_book_studio::ai::translation::TranslationSegment;
 use ngy_book_studio::services::{BackgroundJobStatus, TranslatedBlock, TranslationDisplayMode};
 
 /// Task kind of a whole-book translation job, as persisted in `index_jobs`.
-const TRANSLATION_JOB_KIND: &str = "translation";
+pub(crate) const TRANSLATION_JOB_KIND: &str = "translation";
 /// How often the reader asks whether the book's translation task advanced.
-const TRANSLATION_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+pub(crate) const TRANSLATION_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 /// Upper bounds for one manual translation request. The host re-reads the stored
 /// row and revalidates the edit, so these only reject nonsense before the work
 /// starts; the same limits are enforced again by the service.
-const MAX_MANUAL_TRANSLATION_KEY_BYTES: usize = 256;
-const MAX_MANUAL_TRANSLATION_SEGMENTS: usize = 512;
-const MAX_MANUAL_TRANSLATION_SEGMENT_BYTES: usize = 8 * 1024;
-const MAX_MANUAL_TRANSLATION_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_MANUAL_TRANSLATION_KEY_BYTES: usize = 256;
+pub(crate) const MAX_MANUAL_TRANSLATION_SEGMENTS: usize = 512;
+pub(crate) const MAX_MANUAL_TRANSLATION_SEGMENT_BYTES: usize = 8 * 1024;
+pub(crate) const MAX_MANUAL_TRANSLATION_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(in crate::ui) enum ManualTranslationAction {
+pub(crate) enum ManualTranslationAction {
     /// Replace the model output of one block with the reader's own text.
     Update,
     /// Drop the reader's own text and show the model output again.
@@ -41,17 +41,17 @@ pub(in crate::ui) enum ManualTranslationAction {
 /// original text is and whether it is still current are decided by the host from
 /// the stored row, never from this payload.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-pub(in crate::ui) struct ManualTranslationRequest {
-    action: ManualTranslationAction,
-    revision: u64,
-    request_id: u64,
-    key: String,
+pub(crate) struct ManualTranslationRequest {
+    pub(crate) action: ManualTranslationAction,
+    pub(crate) revision: u64,
+    pub(crate) request_id: u64,
+    pub(crate) key: String,
     #[serde(default)]
-    segments: Vec<TranslationSegment>,
+    pub(crate) segments: Vec<TranslationSegment>,
 }
 
 impl ManualTranslationRequest {
-    pub(super) fn valid(&self) -> bool {
+    pub(crate) fn valid(&self) -> bool {
         let mut total = 0;
         let segments_ok = self.segments.iter().all(|segment| {
             // Count both halves: the host stores the sources beside the text, and
@@ -77,30 +77,30 @@ impl ManualTranslationRequest {
     }
 }
 
-pub(super) struct ReaderTranslations {
-    session: String,
-    generation: u64,
+pub(crate) struct ReaderTranslations {
+    pub(crate) session: String,
+    pub(crate) generation: u64,
     /// Highest block count reported by the book's unfinished translation task
     /// at the last poll; `None` while nothing is queued, running, or paused.
-    observed_progress: Option<usize>,
+    pub(crate) observed_progress: Option<usize>,
     /// Chapter and payload fingerprint the page currently shows, so the poll
     /// never rewrites the DOM with translations that are already displayed.
-    pushed: Option<(String, u64)>,
+    pub(crate) pushed: Option<(String, u64)>,
     /// Set while a poll is in flight so a slow query cannot stack ticks.
-    polling: bool,
+    pub(crate) polling: bool,
     /// Choice made in this reading window for this book. `None` means the book
     /// still follows the global "system configuration" preference; a stored
     /// choice always wins over it.
-    override_mode: Option<TranslationDisplayMode>,
+    pub(crate) override_mode: Option<TranslationDisplayMode>,
     /// Mode currently applied to the page: the book's choice, or the global
     /// preference while the book has none.
-    effective: TranslationDisplayMode,
+    pub(crate) effective: TranslationDisplayMode,
     /// Keeps the refresh task alive for the window's lifetime.
-    _refresh_task: Option<Task<()>>,
+    pub(crate) _refresh_task: Option<Task<()>>,
 }
 
 impl ReaderTranslations {
-    pub(super) fn new(global: TranslationDisplayMode) -> Self {
+    pub(crate) fn new(global: TranslationDisplayMode) -> Self {
         Self {
             session: String::new(),
             generation: 0,
@@ -114,19 +114,19 @@ impl ReaderTranslations {
     }
 
     /// The mode the reading window switch shows and the page renders with.
-    pub(super) fn effective(&self) -> TranslationDisplayMode {
+    pub(crate) fn effective(&self) -> TranslationDisplayMode {
         self.effective
     }
 
     /// Whether the book carries its own choice instead of following the global
     /// preference. The reading window only offers "跟随全局" while it does.
-    pub(super) fn overrides_global(&self) -> bool {
+    pub(crate) fn overrides_global(&self) -> bool {
         self.override_mode.is_some()
     }
 }
 
 impl ReaderApp {
-    fn translation_script(
+    pub(crate) fn translation_script(
         &mut self,
         method: &str,
         value: serde_json::Value,
@@ -143,7 +143,7 @@ impl ReaderApp {
 
     /// Starts the background poll that surfaces the translations of the chapter
     /// being read as soon as the task commits its blocks.
-    pub(super) fn start_translation_refresh(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn start_translation_refresh(&mut self, cx: &mut Context<Self>) {
         self.translations._refresh_task = Some(cx.spawn(async move |view, cx| {
             loop {
                 Timer::after(TRANSLATION_REFRESH_INTERVAL).await;
@@ -155,7 +155,7 @@ impl ReaderApp {
         }));
     }
 
-    fn poll_translation_progress(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn poll_translation_progress(&mut self, cx: &mut Context<Self>) {
         if self.closing || self.translations.polling {
             return;
         }
@@ -197,7 +197,7 @@ impl ReaderApp {
 
     /// Loads the current chapter's translations and pushes them into the page.
     /// A newer chapter/session always wins; stale completions are dropped.
-    pub(super) fn configure_translations(&mut self, url: &str, cx: &mut Context<Self>) {
+    pub(crate) fn configure_translations(&mut self, url: &str, cx: &mut Context<Self>) {
         self.load_translations(url, true, cx);
     }
 
@@ -219,7 +219,7 @@ impl ReaderApp {
 
     /// Applies the choice made in this reading window. The choice belongs to the
     /// book, so from here on it wins over the global preference.
-    pub(super) fn set_translation_display(
+    pub(crate) fn set_translation_display(
         &mut self,
         mode: TranslationDisplayMode,
         cx: &mut Context<Self>,
@@ -253,7 +253,7 @@ impl ReaderApp {
 
     /// Drops the book's own choice so it follows the global preference again,
     /// which is also what the next window open will read back.
-    pub(super) fn follow_global_translation_display(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn follow_global_translation_display(&mut self, cx: &mut Context<Self>) {
         if self.translations.override_mode.is_none() {
             return;
         }
@@ -280,7 +280,7 @@ impl ReaderApp {
     /// actually showing, at the revision it was pushed with; the service then
     /// revalidates the whole edit against the stored row, so a stale or forged
     /// payload can never write another block's text.
-    pub(super) fn handle_manual_translation(
+    pub(crate) fn handle_manual_translation(
         &mut self,
         url: &str,
         request: ManualTranslationRequest,
@@ -326,7 +326,7 @@ impl ReaderApp {
         .detach();
     }
 
-    fn finish_manual_translation(
+    pub(crate) fn finish_manual_translation(
         &mut self,
         url: &str,
         request_id: u64,
@@ -356,7 +356,7 @@ impl ReaderApp {
     /// Loads the book's stored display choice once per window. Until it arrives
     /// the window shows the global preference, so an unreadable row keeps that
     /// default rather than blocking the chapter.
-    pub(super) fn load_translation_display_override(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn load_translation_display_override(&mut self, cx: &mut Context<Self>) {
         let book_id = self.book_id.clone();
         let services = Arc::clone(&self.services);
         cx.spawn(async move |view, cx| {
@@ -383,7 +383,7 @@ impl ReaderApp {
     /// republish unconditionally (chapter change, display preference change);
     /// the background refresh passes `false` and skips a push whose chapter and
     /// payload are already on screen.
-    fn load_translations(&mut self, url: &str, force: bool, cx: &mut Context<Self>) {
+    pub(crate) fn load_translations(&mut self, url: &str, force: bool, cx: &mut Context<Self>) {
         static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
         let Some(spine_index) = self.book.spine_index_for_url(url) else {
             return;
@@ -486,7 +486,10 @@ impl ReaderApp {
 /// Highest block count reported by the book's unfinished translation task.
 /// `None` means no translation task is queued, running, or paused, which is
 /// also the signal that the last committed blocks are worth one final reload.
-async fn active_translation_progress(services: &AppServices, book_id: String) -> Option<usize> {
+pub(crate) async fn active_translation_progress(
+    services: &AppServices,
+    book_id: String,
+) -> Option<usize> {
     let jobs = services
         .background_jobs_for_books(vec![book_id])
         .await
@@ -509,7 +512,10 @@ async fn active_translation_progress(services: &AppServices, book_id: String) ->
 /// reloaded. A running task is polled block by block, and the transition to
 /// "no task" reloads once so blocks committed between the last two polls are
 /// not lost; an idle book never triggers a query.
-fn translation_refresh_due(observed: &mut Option<usize>, current: Option<usize>) -> bool {
+pub(crate) fn translation_refresh_due(
+    observed: &mut Option<usize>,
+    current: Option<usize>,
+) -> bool {
     let changed = *observed != current;
     let was_active = observed.is_some();
     *observed = current;
@@ -524,7 +530,7 @@ fn translation_refresh_due(observed: &mut Option<usize>, current: Option<usize>)
 /// work starts. A chapter without a revision entry is pushed as 0 and therefore
 /// has to accept an echoed 0: rejecting that would forbid editing the
 /// translations of such a chapter outright.
-fn manual_edit_belongs_to_current_chapter(
+pub(crate) fn manual_edit_belongs_to_current_chapter(
     edited_chapter: Option<usize>,
     current_chapter: usize,
     pushed_revision: Option<u64>,
@@ -533,7 +539,7 @@ fn manual_edit_belongs_to_current_chapter(
     edited_chapter == Some(current_chapter) && pushed_revision.unwrap_or(0) == requested_revision
 }
 
-fn translation_display_mode_label(mode: TranslationDisplayMode) -> &'static str {
+pub(crate) fn translation_display_mode_label(mode: TranslationDisplayMode) -> &'static str {
     match mode {
         TranslationDisplayMode::Bilingual => "bilingual",
         TranslationDisplayMode::OriginalOnly => "original-only",
@@ -544,7 +550,11 @@ fn translation_display_mode_label(mode: TranslationDisplayMode) -> &'static str 
 /// Fingerprint of one chapter's rendered translation layer. The session string
 /// is deliberately excluded: it changes on every load, while the fingerprint
 /// must only change when the chapter or its translations really did.
-fn translation_fingerprint(unit_id: &str, display_mode: &str, blocks: &[serde_json::Value]) -> u64 {
+pub(crate) fn translation_fingerprint(
+    unit_id: &str,
+    display_mode: &str,
+    blocks: &[serde_json::Value],
+) -> u64 {
     let payload = serde_json::to_string(blocks).unwrap_or_default();
     let mut buffer = Vec::with_capacity(unit_id.len() + display_mode.len() + payload.len() + 2);
     buffer.extend_from_slice(unit_id.as_bytes());
@@ -558,7 +568,7 @@ fn translation_fingerprint(unit_id: &str, display_mode: &str, blocks: &[serde_js
     u64::from_le_bytes(truncated)
 }
 
-fn translated_block_json(block: &TranslatedBlock) -> serde_json::Value {
+pub(crate) fn translated_block_json(block: &TranslatedBlock) -> serde_json::Value {
     serde_json::json!({
         "key": block.key,
         "source": block.source,

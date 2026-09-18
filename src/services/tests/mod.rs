@@ -1,12 +1,12 @@
 //! Shared fixtures and test doubles for the service tests.
 
-mod mutation;
+mod mutation_test;
 
-mod settings;
+mod settings_test;
 
-mod settings_validation;
+mod settings_validation_test;
 
-mod translation;
+mod translation_test;
 
 mod visual;
 

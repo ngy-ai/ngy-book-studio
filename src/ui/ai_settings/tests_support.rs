@@ -8,7 +8,7 @@ use super::*;
 use gpui::{Focusable as _, Modifiers, TestAppContext, VisualTestContext};
 use ngy_book_studio::ai::credentials::MemoryCredentialStore;
 
-pub(super) fn open_settings_view<V: SettingsWindowView>(
+pub(crate) fn open_settings_view<V: SettingsWindowView>(
     cx: &mut TestAppContext,
     build: impl FnOnce(Arc<AppServices>, ProviderSettings, &mut Window, &mut Context<V>) -> V + 'static,
 ) -> (tempfile::TempDir, Entity<V>, &mut VisualTestContext) {
@@ -33,13 +33,13 @@ pub(super) fn open_settings_view<V: SettingsWindowView>(
     (directory, settings_view.unwrap(), visual)
 }
 
-pub(super) fn redraw(visual: &mut VisualTestContext) {
+pub(crate) fn redraw(visual: &mut VisualTestContext) {
     visual.run_until_parked();
     visual.update(|window, cx| window.draw(cx).clear());
     visual.run_until_parked();
 }
 
-pub(super) fn edit_input(visual: &mut VisualTestContext, input: &Entity<InputState>, text: &str) {
+pub(crate) fn edit_input(visual: &mut VisualTestContext, input: &Entity<InputState>, text: &str) {
     visual.update(|window, cx| {
         input.update(cx, |input, cx| input.focus(window, cx));
     });
@@ -56,7 +56,7 @@ pub(super) fn edit_input(visual: &mut VisualTestContext, input: &Entity<InputSta
 }
 
 /// 不经过键盘、直接改写输入框内容，用于只需要一个新值的场景。
-pub(super) fn set_input_value(
+pub(crate) fn set_input_value(
     visual: &mut VisualTestContext,
     input: &Entity<InputState>,
     text: &str,
@@ -69,7 +69,7 @@ pub(super) fn set_input_value(
     redraw(visual);
 }
 
-pub(super) fn assert_hidden_input_does_not_receive_text(
+pub(crate) fn assert_hidden_input_does_not_receive_text(
     visual: &mut VisualTestContext,
     input: &Entity<InputState>,
     expected: &str,
@@ -83,7 +83,7 @@ pub(super) fn assert_hidden_input_does_not_receive_text(
 }
 
 /// 一次点击后的确认：元素必须存在且可见。
-pub(super) fn click(visual: &mut VisualTestContext, selector: &'static str) {
+pub(crate) fn click(visual: &mut VisualTestContext, selector: &'static str) {
     let bounds = visual
         .debug_bounds(selector)
         .unwrap_or_else(|| panic!("{selector} must be rendered"));

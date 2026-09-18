@@ -21,13 +21,13 @@ const BACKGROUND_PUBLICATION_TIMEOUT: std::time::Duration = std::time::Duration:
 /// EPUB importer ignored the OPF, and `create_book` never records one at all.
 /// The startup repair reads the tag back, must never replace a language
 /// somebody else already set, and must not run a second time.
-mod annotations;
+mod annotations_test;
 
-mod media;
+mod media_test;
 
-mod progress;
+mod progress_test;
 
-mod store;
+mod store_test;
 
 fn create_two_unit_book(library: &mut LibraryStore) -> (BookRecord, String, String) {
     let book = library.create_book("双章节进度", "作者").unwrap();

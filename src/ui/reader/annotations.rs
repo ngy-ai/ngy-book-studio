@@ -5,9 +5,9 @@ use ngy_book_studio::annotations::{Annotation, AnnotationDraft, AnnotationKind, 
 
 // This bounds only the derived display. Stored Markdown retains its existing
 // limits and is never replaced with HTML.
-const MAX_NOTE_DISPLAY_HTML_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_NOTE_DISPLAY_HTML_BYTES: usize = 8 * 1024 * 1024;
 
-fn thought_display_html(content: &str) -> String {
+pub(crate) fn thought_display_html(content: &str) -> String {
     let display = crate::ui::ai_sidebar::markdown::assistant_display_markdown(content);
     if let Ok(html) = ::markdown::to_html_with_options(&display, &::markdown::Options::gfm())
         && html.len() <= MAX_NOTE_DISPLAY_HTML_BYTES
@@ -29,7 +29,7 @@ fn thought_display_html(content: &str) -> String {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum NoteAction {
+pub(crate) enum NoteAction {
     List,
     Highlight,
     Wavy,
@@ -45,28 +45,28 @@ pub(super) enum NoteAction {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-pub(in crate::ui) struct AnnotationAction {
-    action: NoteAction,
-    session: String,
-    revision: u64,
-    request_id: u64,
+pub(crate) struct AnnotationAction {
+    pub(crate) action: NoteAction,
+    pub(crate) session: String,
+    pub(crate) revision: u64,
+    pub(crate) request_id: u64,
     #[serde(default)]
-    anchor: Option<TextAnchor>,
+    pub(crate) anchor: Option<TextAnchor>,
     #[serde(default)]
-    id: Option<String>,
+    pub(crate) id: Option<String>,
     #[serde(default)]
-    content: Option<String>,
+    pub(crate) content: Option<String>,
     /// Text the reader actually displayed for the selection, sent only for an AI
     /// explanation of reading-time translation text. The stored anchor, citation
     /// and note stay the original; this only names the passage in the question.
     #[serde(default)]
-    displayed_text: Option<String>,
+    pub(crate) displayed_text: Option<String>,
     #[serde(default)]
-    dirty: bool,
+    pub(crate) dirty: bool,
 }
 
 impl AnnotationAction {
-    pub(super) fn valid(&self) -> bool {
+    pub(crate) fn valid(&self) -> bool {
         !self.session.is_empty()
             && self.session.len() <= 128
             && (1..=(1_u64 << 53) - 1).contains(&self.request_id)
@@ -94,23 +94,23 @@ impl AnnotationAction {
 }
 
 #[derive(Clone)]
-struct PendingAiNote {
-    action: AnnotationAction,
-    draft: AnnotationDraft,
-    request_id: Option<u64>,
+pub(crate) struct PendingAiNote {
+    pub(crate) action: AnnotationAction,
+    pub(crate) draft: AnnotationDraft,
+    pub(crate) request_id: Option<u64>,
 }
 
-pub(super) struct ReaderAnnotations {
-    pub(super) revisions: (u64, Vec<u64>),
-    session: String,
-    last_request: u64,
-    busy: bool,
-    dirty: bool,
-    pending_ai: Option<PendingAiNote>,
+pub(crate) struct ReaderAnnotations {
+    pub(crate) revisions: (u64, Vec<u64>),
+    pub(crate) session: String,
+    pub(crate) last_request: u64,
+    pub(crate) busy: bool,
+    pub(crate) dirty: bool,
+    pub(crate) pending_ai: Option<PendingAiNote>,
 }
 
 impl ReaderAnnotations {
-    pub(super) fn new(revisions: (u64, Vec<u64>)) -> Self {
+    pub(crate) fn new(revisions: (u64, Vec<u64>)) -> Self {
         Self {
             revisions,
             session: String::new(),
@@ -122,7 +122,7 @@ impl ReaderAnnotations {
     }
 }
 
-fn notes_json(notes: Vec<Annotation>) -> serde_json::Value {
+pub(crate) fn notes_json(notes: Vec<Annotation>) -> serde_json::Value {
     serde_json::Value::Array(
         notes
             .into_iter()
@@ -143,7 +143,7 @@ fn notes_json(notes: Vec<Annotation>) -> serde_json::Value {
 }
 
 impl ReaderApp {
-    pub(super) fn refresh_note_navigation_gate(&self) {
+    pub(crate) fn refresh_note_navigation_gate(&self) {
         if let Some(gate) = &self.protocol_gate {
             gate.annotation_navigation_blocked.store(
                 self.annotations.dirty
@@ -153,7 +153,12 @@ impl ReaderApp {
             );
         }
     }
-    fn note_script(&mut self, method: &str, value: serde_json::Value, cx: &mut Context<Self>) {
+    pub(crate) fn note_script(
+        &mut self,
+        method: &str,
+        value: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
         let Some(webview) = self.webview.as_ref() else {
             return;
         };
@@ -163,7 +168,7 @@ impl ReaderApp {
         }
     }
 
-    pub(super) fn configure_annotations(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn configure_annotations(&mut self, cx: &mut Context<Self>) {
         static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
         self.annotations.session = NEXT_SESSION.fetch_add(1, Ordering::Relaxed).to_string();
         self.annotations.last_request = 0;
@@ -184,7 +189,7 @@ impl ReaderApp {
         );
     }
 
-    fn note_result(
+    pub(crate) fn note_result(
         &mut self,
         action: &AnnotationAction,
         result: Result<serde_json::Value, String>,
@@ -209,7 +214,7 @@ impl ReaderApp {
         self.note_script("result", payload, cx);
     }
 
-    pub(super) fn annotation_navigation_blocked(&mut self, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn annotation_navigation_blocked(&mut self, cx: &mut Context<Self>) -> bool {
         let reason = if self.annotations.dirty {
             Some("人工想法尚未保存，请先保存或取消编辑。")
         } else if self.annotations.busy {
@@ -234,7 +239,7 @@ impl ReaderApp {
         }
     }
 
-    fn note_draft(
+    pub(crate) fn note_draft(
         &self,
         action: &AnnotationAction,
         kind: AnnotationKind,
@@ -254,7 +259,7 @@ impl ReaderApp {
         })
     }
 
-    pub(super) fn handle_annotation_action(
+    pub(crate) fn handle_annotation_action(
         &mut self,
         url: &str,
         action: AnnotationAction,
@@ -329,7 +334,7 @@ impl ReaderApp {
         self.write_or_load_notes(action, draft, cx);
     }
 
-    fn write_or_load_notes(
+    pub(crate) fn write_or_load_notes(
         &mut self,
         action: AnnotationAction,
         draft: Option<AnnotationDraft>,
@@ -431,7 +436,7 @@ impl ReaderApp {
         }).detach();
     }
 
-    fn start_annotation_explanation(
+    pub(crate) fn start_annotation_explanation(
         &mut self,
         url: &str,
         action: AnnotationAction,
@@ -493,7 +498,7 @@ impl ReaderApp {
         }).detach();
     }
 
-    pub(super) fn on_annotation_ai_submitted(
+    pub(crate) fn on_annotation_ai_submitted(
         &mut self,
         _: Entity<AiSidebar>,
         event: &AiExplanationSubmitted,
@@ -506,7 +511,7 @@ impl ReaderApp {
         }
     }
 
-    pub(super) fn on_annotation_ai_completed(
+    pub(crate) fn on_annotation_ai_completed(
         &mut self,
         _: Entity<AiSidebar>,
         event: &AiAnswerCompleted,
@@ -531,7 +536,7 @@ impl ReaderApp {
         self.write_or_load_notes(pending.action, Some(pending.draft), cx);
     }
 
-    pub(super) fn on_annotation_ai_failed(
+    pub(crate) fn on_annotation_ai_failed(
         &mut self,
         _: Entity<AiSidebar>,
         event: &AiExplanationFailed,

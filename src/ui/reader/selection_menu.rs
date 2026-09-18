@@ -11,7 +11,7 @@ use webview2_com::{
 };
 use windows::core::{BOOL, Interface, PWSTR, w};
 
-const MAX_MENU_DOCUMENT_URI_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_MENU_DOCUMENT_URI_BYTES: usize = 16 * 1024;
 
 /// The WebView owns its context-menu handler; each menu owns its click handler.
 /// Neither callback retains the WebView/controller or a GPUI entity, so teardown
@@ -89,7 +89,7 @@ pub(crate) fn install<E: Send + 'static>(
     Ok(())
 }
 
-fn append_explain_item<E: Send + 'static>(
+pub(crate) fn append_explain_item<E: Send + 'static>(
     environment: &ICoreWebView2Environment9,
     args: &ICoreWebView2ContextMenuRequestedEventArgs,
     event_sender: &async_channel::Sender<E>,
@@ -198,7 +198,7 @@ fn append_explain_item<E: Send + 'static>(
 
 /// The EPUB reader's private document check, exposed so `reader.rs` can hand it
 /// to the shared menu installer as a plain function pointer.
-pub(super) fn reader_document_uri(value: &str) -> Option<Uri> {
+pub(crate) fn reader_document_uri(value: &str) -> Option<Uri> {
     if value.len() > MAX_MENU_DOCUMENT_URI_BYTES {
         return None;
     }
@@ -216,13 +216,13 @@ pub(super) fn reader_document_uri(value: &str) -> Option<Uri> {
     is_reader_document_uri(&uri).then_some(uri)
 }
 
-fn matching_documents(page: Option<&Uri>, frame: Option<&Uri>) -> bool {
+pub(crate) fn matching_documents(page: Option<&Uri>, frame: Option<&Uri>) -> bool {
     // http::Uri normalizes scheme/host case and omits fragments. Path, query,
     // port and origin must still match; different private documents do not.
     page.zip(frame).is_some_and(|(page, frame)| page == frame)
 }
 
-fn bounded_selection(value: &str, max_bytes: usize) -> Option<String> {
+pub(crate) fn bounded_selection(value: &str, max_bytes: usize) -> Option<String> {
     let mut normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.len() > max_bytes {
         let mut end = max_bytes;

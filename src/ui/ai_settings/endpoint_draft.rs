@@ -16,32 +16,32 @@ use ngy_book_studio::{
 };
 
 /// 一个 Endpoint 的可编辑草稿。密钥只以掩码输入框的形式存在，明文不回填。
-pub(super) struct EndpointDraft {
-    pub(super) id: String,
-    pub(super) name_input: Entity<InputState>,
-    pub(super) base_url_input: Entity<InputState>,
-    pub(super) request_timeout_input: Entity<InputState>,
-    pub(super) api_key_input: Entity<InputState>,
-    pub(super) remote_content_confirmed: bool,
-    pub(super) allow_insecure_remote_http: bool,
-    pub(super) confirmed_remote_endpoint: String,
-    pub(super) delete_api_key: bool,
+pub(crate) struct EndpointDraft {
+    pub(crate) id: String,
+    pub(crate) name_input: Entity<InputState>,
+    pub(crate) base_url_input: Entity<InputState>,
+    pub(crate) request_timeout_input: Entity<InputState>,
+    pub(crate) api_key_input: Entity<InputState>,
+    pub(crate) remote_content_confirmed: bool,
+    pub(crate) allow_insecure_remote_http: bool,
+    pub(crate) confirmed_remote_endpoint: String,
+    pub(crate) delete_api_key: bool,
     /// 检测结果对应的规范化地址：地址一变，旧结果立刻作废。
-    pub(super) observed_url: String,
+    pub(crate) observed_url: String,
     /// 最近一次检测返回的模型名；`None` 表示还没检测过。
-    pub(super) detected_models: Option<Vec<String>>,
-    pub(super) discovery_generation: u64,
-    api_key_subscription: Subscription,
-    _subscriptions: Vec<Subscription>,
+    pub(crate) detected_models: Option<Vec<String>>,
+    pub(crate) discovery_generation: u64,
+    pub(crate) api_key_subscription: Subscription,
+    pub(crate) _subscriptions: Vec<Subscription>,
 }
 
 impl EndpointDraft {
-    fn invalidate_models(&mut self) {
+    pub(crate) fn invalidate_models(&mut self) {
         self.detected_models = None;
         self.discovery_generation = self.discovery_generation.wrapping_add(1);
     }
 
-    pub(super) fn entered(&self, cx: &App) -> Result<EndpointSettings> {
+    pub(crate) fn entered(&self, cx: &App) -> Result<EndpointSettings> {
         Ok(EndpointSettings {
             id: self.id.clone(),
             name: self.name_input.read(cx).value().trim().to_string(),
@@ -55,7 +55,7 @@ impl EndpointDraft {
         })
     }
 
-    pub(super) fn api_key_update(&self, cx: &App) -> ApiKeyUpdate {
+    pub(crate) fn api_key_update(&self, cx: &App) -> ApiKeyUpdate {
         api_key_update_for_input(
             self.api_key_input.read(cx).value().as_ref(),
             self.delete_api_key,
@@ -63,7 +63,7 @@ impl EndpointDraft {
     }
 }
 
-pub(super) fn new_endpoint_draft<V: EndpointBackedWindow>(
+pub(crate) fn new_endpoint_draft<V: EndpointBackedWindow>(
     endpoint: EndpointSettings,
     window: &mut Window,
     cx: &mut Context<V>,
@@ -134,7 +134,7 @@ pub(super) fn new_endpoint_draft<V: EndpointBackedWindow>(
     }
 }
 
-fn new_api_key_input<V>(window: &mut Window, cx: &mut Context<V>) -> Entity<InputState> {
+pub(crate) fn new_api_key_input<V>(window: &mut Window, cx: &mut Context<V>) -> Entity<InputState> {
     cx.new(|cx| {
         InputState::new(window, cx)
             .masked(true)
@@ -142,7 +142,7 @@ fn new_api_key_input<V>(window: &mut Window, cx: &mut Context<V>) -> Entity<Inpu
     })
 }
 
-fn subscribe_endpoint_key<V: EndpointBackedWindow>(
+pub(crate) fn subscribe_endpoint_key<V: EndpointBackedWindow>(
     input: &Entity<InputState>,
     endpoint_id: &str,
     cx: &mut Context<V>,
@@ -163,7 +163,7 @@ fn subscribe_endpoint_key<V: EndpointBackedWindow>(
 }
 
 /// 换一个地址就换一套密钥：清空输入框并重建订阅，撤销历史不会把旧密钥带回来。
-fn reset_endpoint_key<V: EndpointBackedWindow>(
+pub(crate) fn reset_endpoint_key<V: EndpointBackedWindow>(
     endpoint: &mut EndpointDraft,
     window: &mut Window,
     cx: &mut Context<V>,
@@ -174,7 +174,7 @@ fn reset_endpoint_key<V: EndpointBackedWindow>(
 }
 
 /// 勾选/取消「删除已保存的密钥」。勾选时同时清空输入框，避免撤销把旧值带回来。
-pub(super) fn set_delete_endpoint_key<V: EndpointBackedWindow>(
+pub(crate) fn set_delete_endpoint_key<V: EndpointBackedWindow>(
     this: &mut V,
     endpoint_id: &str,
     delete: bool,
@@ -198,7 +198,7 @@ pub(super) fn set_delete_endpoint_key<V: EndpointBackedWindow>(
 
 /// 读取某个 Endpoint 的模型列表。凭据与网络 I/O 都由 `AppServices` 派发到它自己的
 /// Tokio runtime 上，这个 GPUI 任务只负责等待与应用结果。
-pub(super) fn detect_models<V: EndpointBackedWindow>(
+pub(crate) fn detect_models<V: EndpointBackedWindow>(
     this: &mut V,
     endpoint_id: &str,
     window: &mut Window,
@@ -266,7 +266,7 @@ pub(super) fn detect_models<V: EndpointBackedWindow>(
 }
 
 /// 检测结果回到界面时，草稿是否还是发起检测的那一份（同一个 Endpoint、同一代、同一地址）。
-pub(super) fn detection_matches<V: EndpointBackedWindow>(
+pub(crate) fn detection_matches<V: EndpointBackedWindow>(
     this: &V,
     endpoint: &EndpointSettings,
     generation: u64,
@@ -280,7 +280,7 @@ pub(super) fn detection_matches<V: EndpointBackedWindow>(
     })
 }
 
-pub(super) fn apply_detected_models<V: EndpointBackedWindow>(
+pub(crate) fn apply_detected_models<V: EndpointBackedWindow>(
     this: &mut V,
     endpoint: &EndpointSettings,
     models: Vec<ModelInfo>,
@@ -307,7 +307,7 @@ pub(super) fn apply_detected_models<V: EndpointBackedWindow>(
 }
 
 /// 检测结果的卡片：返回的模型列表、与当前模型不匹配的名字、以及本地 Ollama 的拉取提示。
-pub(super) fn render_model_detection<V: EndpointBackedWindow>(
+pub(crate) fn render_model_detection<V: EndpointBackedWindow>(
     view: &V,
     endpoint: &EndpointDraft,
     role: Option<ModelRole>,
@@ -399,7 +399,7 @@ pub(super) fn render_model_detection<V: EndpointBackedWindow>(
     )
 }
 
-pub(super) fn parse_request_timeout_secs(value: &str) -> Result<u64> {
+pub(crate) fn parse_request_timeout_secs(value: &str) -> Result<u64> {
     let value = value.trim();
     let timeout = value.parse::<u64>().map_err(|_| {
         anyhow::anyhow!(
@@ -413,17 +413,17 @@ pub(super) fn parse_request_timeout_secs(value: &str) -> Result<u64> {
     Ok(timeout)
 }
 
-pub(super) fn canonical_endpoint(endpoint: &str) -> Option<String> {
+pub(crate) fn canonical_endpoint(endpoint: &str) -> Option<String> {
     normalize_provider_base_url(endpoint.trim())
         .ok()
         .map(|url| url.to_string())
 }
 
-pub(super) fn endpoint_draft_identity(endpoint: &str) -> String {
+pub(crate) fn endpoint_draft_identity(endpoint: &str) -> String {
     canonical_endpoint(endpoint).unwrap_or_else(|| endpoint.trim().to_string())
 }
 
-fn ollama_pull_commands(endpoint: &str, missing_models: &[String]) -> Vec<String> {
+pub(crate) fn ollama_pull_commands(endpoint: &str, missing_models: &[String]) -> Vec<String> {
     if !looks_like_local_ollama(endpoint) {
         return Vec::new();
     }
@@ -433,7 +433,7 @@ fn ollama_pull_commands(endpoint: &str, missing_models: &[String]) -> Vec<String
         .collect()
 }
 
-fn looks_like_local_ollama(endpoint: &str) -> bool {
+pub(crate) fn looks_like_local_ollama(endpoint: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(endpoint.trim()) else {
         return false;
     };

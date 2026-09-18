@@ -2,9 +2,9 @@
 
 mod coordinator;
 
-mod persistence;
+mod persistence_test;
 
-mod render;
+mod render_test;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 

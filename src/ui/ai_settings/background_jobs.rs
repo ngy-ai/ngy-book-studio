@@ -15,16 +15,16 @@ use ngy_book_studio::services::{
     ProviderSettings,
 };
 
-pub(super) struct BackgroundJobsSettingsWindow {
-    services: Arc<AppServices>,
-    auto_run_background_jobs: bool,
-    background_job_concurrency_input: Entity<InputState>,
-    background_job_interval_input: Entity<InputState>,
-    state: SettingsWindowState,
+pub(crate) struct BackgroundJobsSettingsWindow {
+    pub(crate) services: Arc<AppServices>,
+    pub(crate) auto_run_background_jobs: bool,
+    pub(crate) background_job_concurrency_input: Entity<InputState>,
+    pub(crate) background_job_interval_input: Entity<InputState>,
+    pub(crate) state: SettingsWindowState,
 }
 
 impl BackgroundJobsSettingsWindow {
-    pub(super) fn new(
+    pub(crate) fn new(
         services: Arc<AppServices>,
         settings: ProviderSettings,
         window: &mut Window,
@@ -52,7 +52,7 @@ impl BackgroundJobsSettingsWindow {
     }
 
     /// 以已保存设置为底，只覆盖运行方式与调度字段。
-    fn entered_settings(&self, cx: &App) -> Result<ProviderSettings> {
+    pub(crate) fn entered_settings(&self, cx: &App) -> Result<ProviderSettings> {
         let mut settings = self.services.provider_settings()?;
         settings.auto_run_background_jobs = self.auto_run_background_jobs;
         settings.background_job_concurrency = parse_background_job_concurrency(
@@ -69,7 +69,7 @@ impl BackgroundJobsSettingsWindow {
     }
 
     #[inline(never)]
-    fn render_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(crate) fn render_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = palette(cx);
         let auto_run_view = cx.entity();
         let busy = self.state.busy();
@@ -191,7 +191,7 @@ impl Render for BackgroundJobsSettingsWindow {
     }
 }
 
-fn parse_background_job_concurrency(value: &str) -> Result<usize> {
+pub(crate) fn parse_background_job_concurrency(value: &str) -> Result<usize> {
     let value = value.trim();
     let concurrency = value.parse::<usize>().map_err(|_| {
         anyhow::anyhow!(
@@ -205,7 +205,7 @@ fn parse_background_job_concurrency(value: &str) -> Result<usize> {
     Ok(concurrency)
 }
 
-fn parse_background_job_interval_ms(value: &str) -> Result<u64> {
+pub(crate) fn parse_background_job_interval_ms(value: &str) -> Result<u64> {
     let value = value.trim();
     let interval_ms = value.parse::<u64>().map_err(|_| {
         anyhow::anyhow!("后台任务间隔必须是 0 到 {MAX_BACKGROUND_JOB_INTERVAL_MS} 之间的整数毫秒")

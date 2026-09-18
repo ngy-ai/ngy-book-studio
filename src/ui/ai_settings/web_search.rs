@@ -15,25 +15,25 @@ use ngy_book_studio::ai::web_search::{
 };
 use ngy_book_studio::services::{ApiKeyUpdate, ProviderSettings};
 
-pub(super) struct WebSearchSettingsWindow {
-    services: Arc<AppServices>,
-    web_search_enabled: bool,
-    web_search_url_input: Entity<InputState>,
-    web_search_method_input: Entity<InputState>,
-    web_search_body_input: Entity<InputState>,
-    web_search_key_header_input: Entity<InputState>,
-    web_search_api_key_input: Entity<InputState>,
-    web_search_timeout_input: Entity<InputState>,
-    web_search_max_results_input: Entity<InputState>,
-    web_search_remote_confirmed: bool,
-    web_search_allow_insecure_http: bool,
-    web_search_confirmed_remote_endpoint: String,
-    delete_web_search_api_key: bool,
-    state: SettingsWindowState,
+pub(crate) struct WebSearchSettingsWindow {
+    pub(crate) services: Arc<AppServices>,
+    pub(crate) web_search_enabled: bool,
+    pub(crate) web_search_url_input: Entity<InputState>,
+    pub(crate) web_search_method_input: Entity<InputState>,
+    pub(crate) web_search_body_input: Entity<InputState>,
+    pub(crate) web_search_key_header_input: Entity<InputState>,
+    pub(crate) web_search_api_key_input: Entity<InputState>,
+    pub(crate) web_search_timeout_input: Entity<InputState>,
+    pub(crate) web_search_max_results_input: Entity<InputState>,
+    pub(crate) web_search_remote_confirmed: bool,
+    pub(crate) web_search_allow_insecure_http: bool,
+    pub(crate) web_search_confirmed_remote_endpoint: String,
+    pub(crate) delete_web_search_api_key: bool,
+    pub(crate) state: SettingsWindowState,
 }
 
 impl WebSearchSettingsWindow {
-    pub(super) fn new(
+    pub(crate) fn new(
         services: Arc<AppServices>,
         settings: ProviderSettings,
         window: &mut Window,
@@ -101,7 +101,7 @@ impl WebSearchSettingsWindow {
     }
 
     /// 以已保存设置为底，只覆盖联网搜索字段。
-    fn entered_settings(&self, cx: &App) -> Result<ProviderSettings> {
+    pub(crate) fn entered_settings(&self, cx: &App) -> Result<ProviderSettings> {
         let mut settings = self.services.provider_settings()?;
         let body_template = {
             let raw = self.web_search_body_input.read(cx).value();
@@ -149,20 +149,20 @@ impl WebSearchSettingsWindow {
         Ok(settings)
     }
 
-    fn web_api_key_update(&self, cx: &App) -> ApiKeyUpdate {
+    pub(crate) fn web_api_key_update(&self, cx: &App) -> ApiKeyUpdate {
         api_key_update_for_input(
             self.web_search_api_key_input.read(cx).value().as_ref(),
             self.delete_web_search_api_key,
         )
     }
 
-    fn clear_entered_web_api_key(&self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn clear_entered_web_api_key(&self, window: &mut Window, cx: &mut Context<Self>) {
         let input = self.web_search_api_key_input.clone();
         input.update(cx, |input, cx| input.set_value("", window, cx));
     }
 
     #[inline(never)]
-    fn render_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(crate) fn render_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = palette(cx);
         let web_enable_view = cx.entity();
         let web_confirm_view = cx.entity();
@@ -369,7 +369,7 @@ impl Render for WebSearchSettingsWindow {
     }
 }
 
-fn parse_web_search_timeout_secs(value: &str) -> Result<u64> {
+pub(crate) fn parse_web_search_timeout_secs(value: &str) -> Result<u64> {
     let value = value.trim();
     let timeout = value.parse::<u64>().map_err(|_| {
         anyhow::anyhow!(
@@ -383,7 +383,7 @@ fn parse_web_search_timeout_secs(value: &str) -> Result<u64> {
     Ok(timeout)
 }
 
-fn parse_web_search_max_results(value: &str) -> Result<usize> {
+pub(crate) fn parse_web_search_max_results(value: &str) -> Result<usize> {
     let value = value.trim();
     let count = value.parse::<usize>().map_err(|_| {
         anyhow::anyhow!("联网搜索结果数必须是 1 到 {MAX_WEB_SEARCH_RESULTS} 之间的整数")

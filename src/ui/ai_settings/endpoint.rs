@@ -14,20 +14,20 @@ use ngy_book_studio::services::{
     ApiKeyUpdate, DEFAULT_ENDPOINT_ID, EndpointSettings, ProviderSettings,
 };
 
-pub(super) struct EndpointSettingsWindow {
-    services: Arc<AppServices>,
-    endpoints: Vec<EndpointDraft>,
-    selected_endpoint_id: String,
+pub(crate) struct EndpointSettingsWindow {
+    pub(crate) services: Arc<AppServices>,
+    pub(crate) endpoints: Vec<EndpointDraft>,
+    pub(crate) selected_endpoint_id: String,
     /// 已保存设置里各模型绑定的 Endpoint。删除时用它挡住仍被模型使用的连接；
     /// 每次删除前重新读一遍已保存设置，避免用旧快照放走正在被使用的 Endpoint。
-    chat_endpoint_id: String,
-    embedding_endpoint_id: String,
-    vision_endpoint_id: String,
-    state: SettingsWindowState,
+    pub(crate) chat_endpoint_id: String,
+    pub(crate) embedding_endpoint_id: String,
+    pub(crate) vision_endpoint_id: String,
+    pub(crate) state: SettingsWindowState,
 }
 
 impl EndpointSettingsWindow {
-    pub(super) fn new(
+    pub(crate) fn new(
         services: Arc<AppServices>,
         settings: ProviderSettings,
         window: &mut Window,
@@ -50,7 +50,7 @@ impl EndpointSettingsWindow {
     }
 
     /// 以已保存设置为底，只覆盖本窗口负责的字段。
-    fn entered_settings(&self, cx: &App) -> Result<ProviderSettings> {
+    pub(crate) fn entered_settings(&self, cx: &App) -> Result<ProviderSettings> {
         let mut settings = self.services.provider_settings()?;
         let mut endpoints = self
             .endpoints
@@ -73,14 +73,19 @@ impl EndpointSettingsWindow {
         Ok(settings)
     }
 
-    fn selected_endpoint(&self) -> &EndpointDraft {
+    pub(crate) fn selected_endpoint(&self) -> &EndpointDraft {
         self.endpoints
             .iter()
             .find(|endpoint| endpoint.id == self.selected_endpoint_id)
             .expect("the selected endpoint remains in the draft registry")
     }
 
-    fn select_endpoint(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn select_endpoint(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.state.busy() || !self.endpoints.iter().any(|endpoint| endpoint.id == id) {
             return;
         }
@@ -93,7 +98,7 @@ impl EndpointSettingsWindow {
         cx.notify();
     }
 
-    fn add_endpoint(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn add_endpoint(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.state.busy() {
             return;
         }
@@ -127,7 +132,7 @@ impl EndpointSettingsWindow {
     /// 绑定，后者兜住已保存设置读不出来、以及两个窗口同时打开时本窗口还没来得及看到新
     /// 绑定的情况。真正的兜底仍是保存时的 `ProviderSettings::validate`（它会在绑定已经
     /// 不存在时报错），这里只是尽量提前把话说明白。
-    fn endpoint_is_bound(&self, id: &str) -> bool {
+    pub(crate) fn endpoint_is_bound(&self, id: &str) -> bool {
         let saved_bound = self.services.provider_settings().is_ok_and(|settings| {
             [
                 settings.endpoint_routing.chat_endpoint_id,
@@ -147,7 +152,7 @@ impl EndpointSettingsWindow {
             .any(|bound| bound == id)
     }
 
-    fn delete_selected_endpoint(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn delete_selected_endpoint(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.state.busy() || self.selected_endpoint_id == DEFAULT_ENDPOINT_ID {
             return;
         }
@@ -165,7 +170,7 @@ impl EndpointSettingsWindow {
     }
 
     #[inline(never)]
-    fn render_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(crate) fn render_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         div()
             .v_flex()
             .gap_5()
@@ -175,7 +180,7 @@ impl EndpointSettingsWindow {
     }
 
     #[inline(never)]
-    fn render_endpoint_card(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(crate) fn render_endpoint_card(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = palette(cx);
         let endpoint = self.selected_endpoint();
         let busy = self.state.busy();
@@ -274,7 +279,7 @@ impl EndpointSettingsWindow {
     }
 
     #[inline(never)]
-    fn render_endpoint_list(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(crate) fn render_endpoint_list(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = palette(cx);
         let busy = self.state.busy();
         div()
@@ -324,7 +329,7 @@ impl EndpointSettingsWindow {
     }
 
     #[inline(never)]
-    fn render_api_key_card(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(crate) fn render_api_key_card(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = palette(cx);
         let endpoint = self.selected_endpoint();
         let endpoint_id = endpoint.id.clone();
@@ -360,7 +365,7 @@ impl EndpointSettingsWindow {
     }
 
     /// 底栏上的「检测模型」：检测当前选中的 Endpoint，结果可用于对话模型窗口。
-    fn render_footer_actions(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(crate) fn render_footer_actions(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let detecting = self.state.operation == PendingOperation::Detecting;
         Button::new("ai-endpoint-detect-models")
             .debug_selector(|| "ai-endpoint-detect-models".into())
