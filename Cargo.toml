@@ -55,7 +55,7 @@ tree-sitter-python = "=0.23.6"
 zip = { version = "8.6", default-features = false }
 
 # Deliberately pinned pre-v1 Kindle parser. Keep changes behind the Windows
-# corpus and hostile-file gates documented in AGENTS.md.
+# corpus and hostile-file gates documented in docs/agent/.
 ebook-rs = { version = "=0.16.4", default-features = false }
 ngy-utils-tracing = "0.6.0"
 

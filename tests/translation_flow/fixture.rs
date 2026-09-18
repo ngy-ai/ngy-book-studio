@@ -242,7 +242,8 @@ pub(crate) fn assert_one_correction(endpoint: &TranslationEndpoint) {
 }
 
 /// 「冻结输入 + 一次纠正」这两次请求的全部约束，与总请求数无关：逐片段回退只允许在
-/// 这两步**之后**再发请求（`AGENTS.md`），但主路径这两次本身必须逐字一致。
+/// 这两步**之后**再发请求（见 `docs/agent/code-map-ai.md`），但主路径这两次本身必须
+/// 逐字一致。
 pub(crate) fn assert_corrected_main_path(endpoint: &TranslationEndpoint) {
     let requests = endpoint.requests();
     assert!(

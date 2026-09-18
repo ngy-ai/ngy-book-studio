@@ -62,7 +62,8 @@ impl Default for TranslationStreamStats {
 
 /// Safe shape summary of one translation response. Only the JSON container kind,
 /// structural flags and counts are retained; field names, 原文 and 译文 are never
-/// exposed (see the translation diagnostics constraints in AGENTS.md). The extra
+/// exposed (see the translation diagnostics constraints in
+/// `docs/agent/code-map-ai.md`). The extra
 /// counters exist to tell apart the three ways a block can fail to produce an
 /// answer: the model never wrote a container, it wrote an answer and then kept
 /// generating (repetition), or it never closed the thinking block it opened.

@@ -66,7 +66,7 @@ pub fn parse_response(
 /// decoder as [`parse_response`], so a rejected response is described by exactly
 /// the fragments the protocol saw. Only numbers leave this function — no model
 /// text, field name or wrapper prose can reach a log line (see the translation
-/// diagnostics constraints in AGENTS.md).
+/// diagnostics constraints in `docs/agent/code-map-ai.md`).
 pub fn decoded_segment_shapes(
     response: &str,
 ) -> std::result::Result<Vec<(usize, usize)>, ResponseError> {
