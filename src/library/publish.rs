@@ -98,6 +98,7 @@ impl LibraryStore {
             Some(format!("{}.epub", safe_file_stem(&title))),
             "normalized",
             Some(&current),
+            None,
         )?;
         self.books[position] = updated.clone();
         if let Err(error) = self.reload_cover(&book_id) {
@@ -153,6 +154,10 @@ impl LibraryStore {
         self.apply_document(editor.into_document())
     }
 
+    /// `group_id` only files a book that is being inserted. Saving an existing
+    /// book keeps the group its catalog row already has, so a publish cannot
+    /// move a book as a side effect.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn persist_document(
         &self,
         imported: ImportedBook,
@@ -161,6 +166,7 @@ impl LibraryStore {
         source_name: Option<String>,
         source_kind: &str,
         previous: Option<&BookRecord>,
+        group_id: Option<&str>,
     ) -> Result<BookRecord> {
         imported.validate(&ImportLimits::default())?;
         // This method is called on an AppServices blocking worker (or during
@@ -198,6 +204,7 @@ impl LibraryStore {
             asset_keys,
             previous,
             previous_progress.as_ref(),
+            group_id.map(str::to_owned),
         )?;
         // `graph.book` is the exact catalog row validated and published by
         // the transaction below. Do not issue a fallible SELECT after commit:

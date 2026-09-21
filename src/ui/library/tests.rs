@@ -283,3 +283,22 @@ fn group_picker_without_a_current_group_expands_nothing() {
     assert!(picker_expanded_groups(&[]).is_empty());
     assert!(picker_expanded_groups(&[test_group("root", None)]).is_empty());
 }
+
+#[test]
+fn only_a_concrete_existing_group_files_an_import() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut library = LibraryStore::load_from(temp.path().join("library")).unwrap();
+    let group = library.create_group("导入目标", None).unwrap();
+
+    assert_eq!(import_target_group(&library, &GroupFilter::All), None);
+    assert_eq!(import_target_group(&library, &GroupFilter::Ungrouped), None);
+    assert_eq!(
+        import_target_group(&library, &GroupFilter::Group(group.id.clone())),
+        Some(group.id.clone())
+    );
+    assert_eq!(
+        import_target_group(&library, &GroupFilter::Group("deleted".to_string())),
+        None,
+        "a group missing from the library must not fail a durable import"
+    );
+}

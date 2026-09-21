@@ -74,6 +74,13 @@
   排序都不受影响；完成标记 `library.language_backfill.v1` 写进 `settings`，让重读原件
   只发生一次（原件可能很大，不能每次启动都读）。空库不写标记——没有书可查就不该
   提前用掉这次机会；有条目读不出来或解析失败也不写标记，留给下次启动重试。
+  `import_into_group` 是图书库界面的导入入口：`group_id` 只作用于本次插入的书，
+  由 `build_persisted_graph` 写进同一条 `books` 行（`previous` 的分组优先，保存与
+  编辑因此不会顺带移动图书）；内容哈希命中的 `AlreadyExists` 不移动既有图书。
+  界面在 `ui/library/state.rs::import_target_group` 里只把“停在某个具体分组”翻成
+  目标分组，“全部图书/未分组”返回 `None`；分组已从图书库消失时同样返回 `None`，
+  不让一次本可成功的导入因为分组校验失败（`import_into_group` 收到不存在的分组会
+  直接报错）。
 - `src/annotations.rs`、`src/db/annotations.rs`：三种划线、人工想法与 AI 想法统一使用
   `annotations` 一张表。宿主按实际阅读章节 body 文本（排除 script/style/noscript/template，
   移除 ECMAScript 空白）的 UTF-16 起止位置校验 quote、书/单元归属及打开时的版本。

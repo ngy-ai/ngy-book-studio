@@ -236,6 +236,7 @@ fn deleted_and_reimported_book_rejects_the_old_reader_incarnation() {
             Some("reimported.epub".to_string()),
             "normalized",
             None,
+            None,
         )
         .unwrap();
     assert!(matches!(

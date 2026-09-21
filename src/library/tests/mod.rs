@@ -29,6 +29,18 @@ mod progress_test;
 
 mod store_test;
 
+/// Writes an EPUB produced by this build to `directory` and returns its path.
+/// Import tests need a real source file, and generating one keeps a binary
+/// fixture out of the repository.
+pub(crate) fn epub_source_file(directory: &Path, title: &str) -> PathBuf {
+    let mut origin = LibraryStore::load_from(directory.join("epub-source")).unwrap();
+    let template = origin.create_book(title, "作者").unwrap();
+    let bytes = origin.epub_bytes(&template.id).unwrap();
+    let path = directory.join(format!("{title}.epub"));
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
 fn create_two_unit_book(library: &mut LibraryStore) -> (BookRecord, String, String) {
     let book = library.create_book("双章节进度", "作者").unwrap();
     let document = library.document(&book.id).unwrap();

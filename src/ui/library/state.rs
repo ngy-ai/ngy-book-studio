@@ -21,6 +21,15 @@ impl GroupFilter {
     }
 }
 
+/// The group a newly imported book is filed into: the shelf the user is on,
+/// but only when that shelf is one concrete group. "全部图书" and "未分组"
+/// leave the import as it is, and a group that disappeared after it was picked
+/// leaves the import unfiled instead of failing a durable import.
+pub(crate) fn import_target_group(library: &LibraryStore, filter: &GroupFilter) -> Option<String> {
+    let group_id = filter.group_id()?;
+    library.group(group_id).map(|group| group.id.clone())
+}
+
 /// Groups the book group picker expands on open: every ancestor of the current
 /// group, so the current selection is visible without expanding the tree by
 /// hand. The group itself stays collapsed unless it has expanded children.

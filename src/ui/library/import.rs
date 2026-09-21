@@ -28,6 +28,9 @@ impl EpubReaderApp {
             self.is_importing = false;
             return;
         };
+        // The file dialog is modal, so the shelf cannot change while it is
+        // open; capture the target group before the background import runs.
+        let target_group = import_target_group(&self.library, &self.group_filter);
         let services = Arc::clone(&self.services);
         cx.spawn_in(window, async move |view, cx| {
             let path = match dialog.show() {
@@ -91,7 +94,9 @@ impl EpubReaderApp {
                 path = %selected_path.display(),
                 "图书库界面：已选择文件，开始导入"
             );
-            let task = services.spawn_library_projected(move |library| library.import(&path));
+            let task = services.spawn_library_projected(move |library| {
+                library.import_into_group(&path, target_group.as_deref())
+            });
             let outcome = task.await;
             let close_window = view.update_in(cx, |this, _window, cx| {
                 this.is_importing = false;

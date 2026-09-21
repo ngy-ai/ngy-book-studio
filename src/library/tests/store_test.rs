@@ -508,3 +508,62 @@ fn media_insert_replace_delete_uses_owned_immutable_assets() {
         2
     );
 }
+
+#[test]
+fn import_into_group_files_a_new_book_and_leaves_a_duplicate_where_it_is() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = epub_source_file(temp.path(), "分组导入");
+
+    let mut library = LibraryStore::load_from(temp.path().join("library")).unwrap();
+    let target = library.create_group("待阅读", None).unwrap();
+    let other = library.create_group("参考资料", None).unwrap();
+
+    let ImportOutcome::Added(book) = library
+        .import_into_group(&source_path, Some(&target.id))
+        .unwrap()
+    else {
+        panic!("a fresh library must not deduplicate the import");
+    };
+    assert_eq!(book.group_id.as_deref(), Some(target.id.as_str()));
+    assert_eq!(
+        library.books()[0].group_id.as_deref(),
+        Some(target.id.as_str())
+    );
+
+    // The grouping is part of the import transaction, not a later repair.
+    let restored = LibraryStore::load_from(temp.path().join("library")).unwrap();
+    assert_eq!(
+        restored.books()[0].group_id.as_deref(),
+        Some(target.id.as_str())
+    );
+
+    // Re-importing the same source never moves the book the library has.
+    let ImportOutcome::AlreadyExists(existing) = library
+        .import_into_group(&source_path, Some(&other.id))
+        .unwrap()
+    else {
+        panic!("the second import must be deduplicated");
+    };
+    assert_eq!(existing.group_id.as_deref(), Some(target.id.as_str()));
+    assert_eq!(
+        library.books()[0].group_id.as_deref(),
+        Some(target.id.as_str())
+    );
+}
+
+#[test]
+fn import_without_a_group_keeps_the_book_unfiled_and_rejects_an_unknown_group() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = epub_source_file(temp.path(), "未分组导入");
+    let mut library = LibraryStore::load_from(temp.path().join("library")).unwrap();
+
+    let ImportOutcome::Added(book) = library.import(&source_path).unwrap() else {
+        panic!("a fresh library must not deduplicate the import");
+    };
+    assert_eq!(book.group_id, None);
+
+    let error = library
+        .import_into_group(&source_path, Some("missing-group"))
+        .expect_err("an unknown target group must not import a book unfiled");
+    assert!(format!("{error:#}").contains("分组不存在"), "{error:#}");
+}

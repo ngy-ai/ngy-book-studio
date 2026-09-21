@@ -34,6 +34,7 @@ impl PersistedGraph {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_persisted_graph(
     imported: ImportedBook,
     source_key: BlobKey,
@@ -44,6 +45,7 @@ pub(crate) fn build_persisted_graph(
     asset_keys: HashMap<String, BlobKey>,
     previous: Option<&BookRecord>,
     previous_progress: Option<&db::progress::ReadingProgress>,
+    group_id: Option<String>,
 ) -> Result<PersistedGraph> {
     let now = now_secs();
     let document = imported.document;
@@ -192,7 +194,11 @@ pub(crate) fn build_persisted_graph(
         added_at: previous.map(|record| record.added_at).unwrap_or(now),
         updated_at: now,
         last_spine: progress_spine,
-        group_id: previous.and_then(|record| record.group_id.clone()),
+        // A save keeps the group the catalog already has; only a fresh import
+        // may file the new book into the shelf the user is on.
+        group_id: previous
+            .and_then(|record| record.group_id.clone())
+            .or(group_id),
     };
     let source = db::book_sources::BookSource {
         id: source_id,

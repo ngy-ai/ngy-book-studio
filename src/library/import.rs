@@ -4,6 +4,21 @@ use super::*;
 
 impl LibraryStore {
     pub fn import(&mut self, source_path: &Path) -> Result<ImportOutcome> {
+        self.import_into_group(source_path, None)
+    }
+
+    /// Imports a source file and, when `group_id` names an existing group,
+    /// files the new book into it in the same transaction that publishes it.
+    /// A content hash the library already has is still reported as
+    /// `AlreadyExists` and leaves that book — group included — untouched.
+    pub fn import_into_group(
+        &mut self,
+        source_path: &Path,
+        group_id: Option<&str>,
+    ) -> Result<ImportOutcome> {
+        if let Some(group_id) = group_id {
+            ensure!(self.group(group_id).is_some(), "分组不存在");
+        }
         tracing::info!(target: "ngy_import", path = %source_path.display(), "图书库：开始导入");
         let imported = self
             .registry
@@ -53,6 +68,7 @@ impl LibraryStore {
                 source_name,
                 "original",
                 None,
+                group_id,
             )
             .inspect_err(|error| {
                 tracing::error!(
@@ -142,6 +158,7 @@ impl LibraryStore {
             "application/epub+zip",
             None,
             "created",
+            None,
             None,
         )?;
         self.progress_incarnations

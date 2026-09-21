@@ -249,6 +249,7 @@ fn concurrent_reuse_cannot_be_deleted_by_a_stale_gc_candidate() {
             None,
             "created",
             None,
+            None,
         );
         finished_tx.send(result).unwrap();
     });
