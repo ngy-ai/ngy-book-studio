@@ -49,8 +49,7 @@ fn embed_icon() {
     // 版本号与描述都跟着 Cargo.toml 走，别在这儿写死一份会过期的东西。
     let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.1.0".to_string());
     let name = std::env::var("CARGO_PKG_NAME").unwrap_or_else(|_| "app".to_string());
-    let description =
-        std::env::var("CARGO_PKG_DESCRIPTION").unwrap_or_else(|_| name.clone());
+    let description = std::env::var("CARGO_PKG_DESCRIPTION").unwrap_or_else(|_| name.clone());
 
     let mut resource = winresource::WindowsResource::new();
     resource.set_icon(&icon.to_string_lossy());
