@@ -530,16 +530,11 @@ impl EpubReaderApp {
                     return;
                 }
                 let name = input.read(cx).value().trim().to_string();
-                if name.is_empty() {
+                if name.is_empty()
+                    && let Some(message) = name_input_required_message(&action)
+                {
                     if let Some(GroupModal::NameInput { error, .. }) = self.group_modal.as_mut() {
-                        *error = Some(
-                            match action {
-                                NameInputAction::CreateBook => "图书名称不能为空",
-                                NameInputAction::CreateGroup(_)
-                                | NameInputAction::RenameGroup(_) => "分组名称不能为空",
-                            }
-                            .to_string(),
-                        );
+                        *error = Some(message.to_string());
                     }
                     cx.notify();
                     return;
@@ -551,6 +546,13 @@ impl EpubReaderApp {
                     }
                     NameInputAction::RenameGroup(group_id) => {
                         self.rename_group(group_id.clone(), name.clone(), cx);
+                    }
+                    NameInputAction::RenameBook(book_id) => {
+                        self.rename_book(book_id.clone(), name.clone(), cx);
+                    }
+                    // A blank author is submitted: it clears the book's authors.
+                    NameInputAction::SetBookAuthor(book_id) => {
+                        self.set_book_author(book_id.clone(), name.clone(), cx);
                     }
                 }
             }

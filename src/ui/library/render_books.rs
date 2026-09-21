@@ -80,9 +80,9 @@ impl EpubReaderApp {
         let open_id = book_id.clone();
         let card_id = SharedString::from(format!("book-card-{book_id}"));
 
-        // Right-click menu: open / group / edit / export / delete. Groups are
-        // edited in a tree dialog instead of a flat entry per group, so the
-        // menu stays short whatever the library size is.
+        // Right-click menu: open / group / title / author / edit / export /
+        // delete. Groups are edited in a tree dialog instead of a flat entry
+        // per group, so the menu stays short whatever the library size is.
         let office_supported = is_office_format_name(&book.format);
         let office_running = self
             .office_preview
@@ -200,6 +200,38 @@ impl EpubReaderApp {
                             .on_click(move |_, window, cx| {
                                 edit_view.update(cx, |this, cx| {
                                     this.open_book_editor(edit_book_id.clone(), window, cx);
+                                });
+                            }),
+                    );
+
+                    let rename_view = menu_view.clone();
+                    let rename_book_id = menu_book_id.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new("修改名称…")
+                            .icon(Icon::new(IconName::CaseSensitive))
+                            .on_click(move |_, window, cx| {
+                                rename_view.update(cx, |this, cx| {
+                                    this.open_rename_book_dialog(
+                                        rename_book_id.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            }),
+                    );
+
+                    let author_view = menu_view.clone();
+                    let author_book_id = menu_book_id.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new("修改作者…")
+                            .icon(Icon::new(IconName::User))
+                            .on_click(move |_, window, cx| {
+                                author_view.update(cx, |this, cx| {
+                                    this.open_set_book_author_dialog(
+                                        author_book_id.clone(),
+                                        window,
+                                        cx,
+                                    );
                                 });
                             }),
                     );

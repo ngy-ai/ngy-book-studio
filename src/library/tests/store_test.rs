@@ -567,3 +567,65 @@ fn import_without_a_group_keeps_the_book_unfiled_and_rejects_an_unknown_group() 
         .expect_err("an unknown target group must not import a book unfiled");
     assert!(format!("{error:#}").contains("分组不存在"), "{error:#}");
 }
+
+#[test]
+fn rename_book_updates_catalog_and_keeps_chapter_revisions() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut library = LibraryStore::load_from(temp.path().join("library")).unwrap();
+    let book = library.create_book("改名之前", "作者").unwrap();
+    let unit_before = library.document(&book.id).unwrap().units[0].clone();
+
+    let renamed = library.rename_book(&book.id, "  改名之后  ").unwrap();
+
+    assert_eq!(renamed.title, "改名之后");
+    assert_eq!(renamed.revision, book.revision + 1);
+    let document = library.document(&book.id).unwrap();
+    assert_eq!(document.title, "改名之后");
+    // The title is metadata: a chapter whose body did not change keeps its own
+    // revision, so its notes and its whole-book translation stay valid.
+    assert_eq!(document.units[0].revision, unit_before.revision);
+    assert_eq!(document.units[0].source, unit_before.source);
+
+    let restored = LibraryStore::load_from(temp.path().join("library")).unwrap();
+    assert_eq!(restored.books()[0].title, "改名之后");
+}
+
+#[test]
+fn set_book_author_replaces_and_clears_authors_without_touching_content() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut library = LibraryStore::load_from(temp.path().join("library")).unwrap();
+    let book = library.create_book("作者测试", "原作者").unwrap();
+    let unit_before = library.document(&book.id).unwrap().units[0].clone();
+
+    let updated = library.set_book_author(&book.id, " 张三 、 李四 ").unwrap();
+
+    assert_eq!(updated.author, "张三、李四");
+    assert_eq!(updated.revision, book.revision + 1);
+    let document = library.document(&book.id).unwrap();
+    assert_eq!(document.authors, vec!["张三", "李四"]);
+    // The author is metadata: the chapter keeps its own revision and body.
+    assert_eq!(document.units[0].revision, unit_before.revision);
+    assert_eq!(document.units[0].source, unit_before.source);
+
+    let cleared = library.set_book_author(&book.id, "  \t\n ").unwrap();
+    assert_eq!(cleared.author, "未知作者");
+    assert!(library.document(&book.id).unwrap().authors.is_empty());
+
+    let restored = LibraryStore::load_from(temp.path().join("library")).unwrap();
+    assert!(restored.document(&book.id).unwrap().authors.is_empty());
+}
+
+#[test]
+fn rename_book_rejects_a_blank_title_without_touching_the_book() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut library = LibraryStore::load_from(temp.path().join("library")).unwrap();
+    let book = library.create_book("保持原名", "作者").unwrap();
+
+    let error = library
+        .rename_book(&book.id, "  \t\n ")
+        .expect_err("a blank title must be rejected");
+
+    assert!(format!("{error:#}").contains("图书名称不能为空"));
+    assert_eq!(library.books()[0].title, "保持原名");
+    assert_eq!(library.document(&book.id).unwrap().title, "保持原名");
+}

@@ -40,6 +40,31 @@ fn pending_name_modal_cannot_be_dismissed_or_resync_ai_during_close() {
 }
 
 #[test]
+fn blank_names_are_rejected_except_for_a_book_author() {
+    assert_eq!(
+        name_input_required_message(&NameInputAction::CreateBook),
+        Some("图书名称不能为空")
+    );
+    assert_eq!(
+        name_input_required_message(&NameInputAction::RenameBook("book-1".to_string())),
+        Some("图书名称不能为空")
+    );
+    assert_eq!(
+        name_input_required_message(&NameInputAction::CreateGroup(None)),
+        Some("分组名称不能为空")
+    );
+    assert_eq!(
+        name_input_required_message(&NameInputAction::RenameGroup("group-1".to_string())),
+        Some("分组名称不能为空")
+    );
+    assert_eq!(
+        name_input_required_message(&NameInputAction::SetBookAuthor("book-1".to_string())),
+        None,
+        "a blank author clears the authors instead of being rejected"
+    );
+}
+
+#[test]
 fn older_library_projection_cannot_replace_a_newer_group_projection() {
     assert!(should_apply_library_projection(12, 12));
     assert!(should_apply_library_projection(13, 12));

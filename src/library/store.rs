@@ -472,6 +472,31 @@ impl LibraryStore {
         Ok(())
     }
 
+    /// Renames one book. The title is stored in the canonical document as well
+    /// as in the catalog row, so the rename publishes a new revision through
+    /// the normal save path instead of writing `books.title` behind the
+    /// document's back. A chapter whose body did not change keeps its own
+    /// revision, and therefore its notes and its whole-book translation.
+    pub fn rename_book(&mut self, book_id: &str, title: &str) -> Result<BookRecord> {
+        let title = title.trim();
+        ensure!(!title.is_empty(), "图书名称不能为空");
+        let mut document = self.document(book_id)?;
+        document.title = title.to_string();
+        document.validate()?;
+        self.apply_document(document)
+    }
+
+    /// Replaces a book's authors. An empty value clears them, which the catalog
+    /// then reports as its placeholder; several authors written with `、`,
+    /// `,` or `;` are split exactly like the importer splits them, so the value
+    /// read back from the catalog round-trips unchanged.
+    pub fn set_book_author(&mut self, book_id: &str, author: &str) -> Result<BookRecord> {
+        let mut document = self.document(book_id)?;
+        document.authors = split_authors(author);
+        document.validate()?;
+        self.apply_document(document)
+    }
+
     pub fn delete_group(&mut self, id: &str) -> Result<()> {
         ensure!(self.groups.iter().any(|group| group.id == id), "分组不存在");
         let cached = self

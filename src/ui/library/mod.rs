@@ -16,7 +16,11 @@ mod annotations;
 
 mod app;
 
+mod book_author;
+
 mod book_ops;
+
+mod book_rename;
 
 mod editor_open;
 

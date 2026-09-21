@@ -139,8 +139,23 @@ pub(crate) fn library_ai_scope(library: &LibraryStore, filter: &GroupFilter) -> 
 #[derive(Clone)]
 pub(crate) enum NameInputAction {
     CreateBook,
+    RenameBook(String),
+    SetBookAuthor(String),
     CreateGroup(Option<String>),
     RenameGroup(String),
+}
+
+/// The inline error shown for a blank name, or `None` when blank is a
+/// meaningful value for this action: clearing a book's authors is legitimate,
+/// so an empty author is submitted instead of rejected.
+pub(crate) fn name_input_required_message(action: &NameInputAction) -> Option<&'static str> {
+    match action {
+        NameInputAction::CreateBook | NameInputAction::RenameBook(_) => Some("图书名称不能为空"),
+        NameInputAction::CreateGroup(_) | NameInputAction::RenameGroup(_) => {
+            Some("分组名称不能为空")
+        }
+        NameInputAction::SetBookAuthor(_) => None,
+    }
 }
 
 /// Modal dialogs for library and group actions. The pinned `gpui-component`
