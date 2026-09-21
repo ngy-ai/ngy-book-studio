@@ -53,9 +53,11 @@ pub(crate) async fn worker_loop(inner: Arc<IndexingInner>, index: usize) {
         if let Err(error) = run_queued_job(&inner, job).await {
             tracing::error!(%error, "后台索引任务状态提交失败");
         }
-        // Configurable pause between two jobs on the same worker. This is the
-        // only thing protecting a low-end machine from back-to-back model
-        // calls when the concurrency is 1.
+        // Configurable pause between two jobs on the same worker; vision and
+        // embedding work is paced by this alone. Whole-book translation has a
+        // second, request-level pause of the same value (one per in-flight
+        // block, see `pause_after_translation_request`), because one book is a
+        // single job and a job-level pause cannot pace anything inside it.
         let interval = inner.scheduling().interval;
         if !interval.is_zero() {
             tokio::time::sleep(interval).await;
@@ -175,7 +177,7 @@ pub(crate) async fn run_queued_job(
     // `attempts` 已经加一、没有任何执行者，任务窗口于是显示「运行中」而「处理中」
     // 恒为 0，点「恢复」也不会有任何进展（现场 2026-09-17）。
     //
-    // 未配置对话模型时不绑定：那次运行会以「翻译模型尚未配置」失败并正常发布终态，
+    // 未配置翻译模型时不绑定：那次运行会以「翻译模型尚未配置」失败并正常发布终态，
     // 而不是在这里悄悄不动。
     if job.kind == TRANSLATION_JOB_KIND
         && let Some(translation) = models.translation.as_ref()

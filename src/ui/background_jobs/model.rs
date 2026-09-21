@@ -204,12 +204,17 @@ impl TranslationProgress {
     }
 }
 
-/// Ordinals the running worker has in flight, read from the durable cursor.
+/// Ordinals the running worker has in flight, as the service layer projected them.
 ///
 /// 只有整本翻译会填这个集合（其他任务逐项走、窗口恒空），所以它同时也是「这本图书现在
-/// 有几块在跑」的唯一权威读数。缺口一律按「没有在飞的块」处理：旧格式游标、写坏的 JSON、
-/// 已经不在运行的任务都不该凭空显示成处理中。已提交的块（序号小于游标）永远不算在飞 ——
-/// 提交意味着这一块已经写完，游标也不会越过还在等的块。
+/// 有几块在跑」的唯一权威读数。缺口一律按「没有在飞的块」处理：投影缺失（旧格式游标、
+/// 写坏的 JSON）、已经不在运行的任务都不该凭空显示成处理中。已提交的块（序号小于游标）
+/// 永远不算在飞 —— 提交意味着这一块已经写完，游标也不会越过还在等的块。
+///
+/// 读数来自 `BackgroundJobProgress::processing`，**不是**快照里的原始游标：运行中的
+/// 翻译任务不下发内部游标 JSON（见 `BackgroundJobSnapshot::cursor_json`），窗口由服务层
+/// 解析后交出来。现场 2026-09-20：并发 16 的翻译任务「已处理」一直在涨、「处理中」恒为 0，
+/// 因为界面当时只能去读那一份永远缺失的游标。
 pub(crate) fn in_flight_blocks(
     job: &BackgroundJobSnapshot,
     cursor: usize,
@@ -218,19 +223,11 @@ pub(crate) fn in_flight_blocks(
     if job.status != BackgroundJobStatus::Running {
         return Vec::new();
     }
-    let Some(cursor_json) = job.cursor_json.as_deref() else {
-        return Vec::new();
-    };
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(cursor_json) else {
-        return Vec::new();
-    };
-    let Some(ordinals) = parsed.get("inflight").and_then(|value| value.as_array()) else {
-        return Vec::new();
-    };
-    let mut blocks = ordinals
+    let mut blocks = job
+        .progress
+        .processing
         .iter()
-        .filter_map(|ordinal| ordinal.as_u64())
-        .filter_map(|ordinal| usize::try_from(ordinal).ok())
+        .copied()
         .filter(|ordinal| *ordinal >= cursor && *ordinal < total)
         .collect::<Vec<_>>();
     blocks.sort_unstable();

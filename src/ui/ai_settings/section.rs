@@ -25,7 +25,7 @@ impl AiSettingsSection {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Endpoint => "Endpoint",
-            Self::Models => "对话模型",
+            Self::Models => "模型设置",
             Self::WebSearch => "联网搜索",
             Self::BackgroundJobs => "后台任务",
             Self::System => "系统配置",
@@ -47,7 +47,9 @@ impl AiSettingsSection {
     pub(crate) fn subtitle(self) -> &'static str {
         match self {
             Self::Endpoint => "连接、密钥与远程授权；每个 Endpoint 独立保存。",
-            Self::Models => "三个模型各自选择 Endpoint，并配置对话生成参数。",
+            Self::Models => {
+                "问答、翻译、向量与视觉模型各自选择 Endpoint 与模型；问答模型另带生成参数。"
+            }
             Self::WebSearch => "书中检索不到时的可选联网补充。",
             Self::BackgroundJobs => "新任务的运行方式与调度节奏。",
             Self::System => "界面外观、阅读偏好、翻译默认与存储位置。",
@@ -69,7 +71,7 @@ impl AiSettingsSection {
     pub(crate) fn success_notice(self) -> &'static str {
         match self {
             Self::Endpoint => "Endpoint 设置已保存；新的请求会使用新的连接与密钥。",
-            Self::Models => "对话模型设置已保存；新的搜索与问答请求会使用它们。",
+            Self::Models => "模型设置已保存；新的问答、翻译与检索请求会使用它们。",
             Self::WebSearch => "联网搜索设置已保存；新的搜索请求会使用它们。",
             Self::BackgroundJobs => {
                 "后台任务设置已保存；调度立即对新任务生效，正在运行的任务不受影响。"

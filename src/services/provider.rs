@@ -309,8 +309,8 @@ impl AppServices {
                 {
                     Ok(()) => indexing
                         .configure_translation(
-                            Arc::clone(&next.provider),
-                            next.settings.chat_model.clone(),
+                            Arc::clone(&next.translation_provider),
+                            next.settings.translation_model.clone(),
                             translation_identity,
                             next.settings.default_language.clone(),
                             next.settings.auto_run_background_jobs,

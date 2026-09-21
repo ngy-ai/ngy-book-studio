@@ -1,6 +1,6 @@
 //! 一个 Endpoint 在设置窗口里的草稿，以及围绕它的连接检测。
 //!
-//! Endpoint 与对话模型两个窗口都要列出 Endpoint、都要能检测某个 Endpoint 的模型，所以
+//! Endpoint 与模型设置两个窗口都要列出 Endpoint、都要能检测某个 Endpoint 的模型，所以
 //! 草稿与检测放在这里共用：两个窗口各持有一份自己的草稿（同步在窗口里编辑的字段彼此
 //! 独立），保存时才各自提交。
 
@@ -246,7 +246,7 @@ pub(crate) fn detect_models<V: EndpointBackedWindow>(
             }
             match outcome {
                 Ok(models) => {
-                    // Endpoint 窗口没有模型输入，检测结果只列出来；对话模型窗口可以直接点选。
+                    // Endpoint 窗口没有模型输入，检测结果只列出来；模型设置窗口可以直接点选。
                     let picks_models = this.role_model(ModelRole::Chat, cx).is_some();
                     apply_detected_models(this, &endpoint, models, picks_models);
                 }
@@ -298,7 +298,7 @@ pub(crate) fn apply_detected_models<V: EndpointBackedWindow>(
     let hint = if picks_models {
         "可在各模型区域查看或选择。"
     } else {
-        "可在下方列表查看，回到「对话模型」窗口即可选用。"
+        "可在下方列表查看，回到「模型设置」窗口即可选用。"
     };
     this.state_mut().report(
         format!("{} 连接成功，返回 {count} 个模型；{hint}", endpoint.name),

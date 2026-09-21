@@ -120,6 +120,89 @@ fn background_job_scheduling_setting_is_validated_and_clamped_on_load() {
     );
 }
 
+/// 翻译执行身份只由翻译模型与它的 Endpoint 派生：换问答模型（或换问答 Endpoint）
+/// 不该让已翻完的图书重翻，换翻译模型或翻译 Endpoint 才该。
+#[test]
+fn translation_identity_tracks_only_the_translation_model_and_its_endpoint() {
+    let mut base = ProviderSettings::default();
+    base.endpoint_routing.additional_endpoints = vec![endpoint_fixture("translate", 21438)];
+    let expected = translation_execution_identity(&base).unwrap();
+
+    let mut unrelated = base.clone();
+    unrelated.chat_model = "chat-other".to_string();
+    unrelated.chat_generation.max_output_tokens = 128;
+    unrelated.translation_display_mode = TranslationDisplayMode::Bilingual;
+    unrelated.endpoint_routing.chat_endpoint_id = "translate".into();
+    assert_eq!(
+        translation_execution_identity(&unrelated).unwrap(),
+        expected
+    );
+
+    let mut different_model = base.clone();
+    different_model.translation_model = "translate-other".to_string();
+    assert_ne!(
+        translation_execution_identity(&different_model).unwrap(),
+        expected
+    );
+
+    let mut different_endpoint = base;
+    different_endpoint.endpoint_routing.translation_endpoint_id = "translate".into();
+    assert_ne!(
+        translation_execution_identity(&different_endpoint).unwrap(),
+        expected
+    );
+}
+
+/// 老版本保存的行里没有翻译模型与翻译 Endpoint：加载时按当时的问答配置补齐，
+/// 因此升级后翻译执行身份逐字不变，已翻完的图书不会因为升级被重翻。
+#[test]
+fn rows_written_before_translation_was_split_follow_the_question_model() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join(db::DATABASE_FILE);
+    let conn = db::open_or_recreate(&db_path).unwrap();
+    let mut legacy = ProviderSettings::default();
+    legacy.chat_model = "legacy-chat-model".to_string();
+    let mut provider = serde_json::to_value(&legacy).unwrap();
+    provider
+        .as_object_mut()
+        .unwrap()
+        .remove("translation_model");
+    let mut routing = serde_json::to_value(&legacy.endpoint_routing).unwrap();
+    routing
+        .as_object_mut()
+        .unwrap()
+        .remove("translation_endpoint_id");
+    for (key, value_json) in [
+        (PROVIDER_SETTINGS_KEY, provider.to_string()),
+        (ENDPOINT_ROUTING_SETTINGS_KEY, routing.to_string()),
+    ] {
+        db::settings::upsert(
+            &conn,
+            &db::settings::Setting {
+                key: key.into(),
+                value_json,
+                updated_at: 1,
+            },
+        )
+        .unwrap();
+    }
+
+    let loaded = load_provider_settings(&db_path).unwrap();
+    assert_eq!(loaded.translation_model, "legacy-chat-model");
+    assert_eq!(
+        loaded.endpoint_routing.translation_endpoint_id,
+        DEFAULT_ENDPOINT_ID
+    );
+    // 旧公式就是「问答 Endpoint + 问答模型」，所以补齐后的身份与旧版相同。
+    let mut as_before_the_split = ProviderSettings::default();
+    as_before_the_split.chat_model = "legacy-chat-model".to_string();
+    as_before_the_split.translation_model = "legacy-chat-model".to_string();
+    assert_eq!(
+        translation_execution_identity(&loaded).unwrap(),
+        translation_execution_identity(&as_before_the_split).unwrap()
+    );
+}
+
 #[test]
 fn generation_save_failure_rolls_back_provider_generation_and_credentials() {
     let temp = tempfile::tempdir().unwrap();

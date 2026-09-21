@@ -1,5 +1,7 @@
 //! Shared fixtures and test doubles for the service tests.
 
+mod jobs_test;
+
 mod mutation_test;
 
 mod settings_test;

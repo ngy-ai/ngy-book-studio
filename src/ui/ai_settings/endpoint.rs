@@ -1,6 +1,6 @@
 //! Endpoint 设置窗口：连接、密钥与远程授权。
 //!
-//! 这里只管 Endpoint 本身；模型绑定与模型名在对话模型窗口里选。保存时以已保存的
+//! 这里只管 Endpoint 本身；模型绑定与模型名在模型设置窗口里选。保存时以已保存的
 //! `ProviderSettings` 为底，只覆盖 Endpoint 列表与各 Endpoint 的密钥。
 
 use super::*;
@@ -21,6 +21,7 @@ pub(crate) struct EndpointSettingsWindow {
     /// 已保存设置里各模型绑定的 Endpoint。删除时用它挡住仍被模型使用的连接；
     /// 每次删除前重新读一遍已保存设置，避免用旧快照放走正在被使用的 Endpoint。
     pub(crate) chat_endpoint_id: String,
+    pub(crate) translation_endpoint_id: String,
     pub(crate) embedding_endpoint_id: String,
     pub(crate) vision_endpoint_id: String,
     pub(crate) state: SettingsWindowState,
@@ -43,6 +44,7 @@ impl EndpointSettingsWindow {
             endpoints,
             selected_endpoint_id: DEFAULT_ENDPOINT_ID.to_string(),
             chat_endpoint_id: settings.endpoint_routing.chat_endpoint_id,
+            translation_endpoint_id: settings.endpoint_routing.translation_endpoint_id,
             embedding_endpoint_id: settings.endpoint_routing.embedding_endpoint_id,
             vision_endpoint_id: settings.endpoint_routing.vision_endpoint_id,
             state: SettingsWindowState::new(window),
@@ -128,7 +130,7 @@ impl EndpointSettingsWindow {
 
     /// 这个 Endpoint 是否仍被某个模型使用。
     ///
-    /// 取「已保存设置」与「窗口打开时的快照」的并集：前者承接对话模型窗口里刚保存的
+    /// 取「已保存设置」与「窗口打开时的快照」的并集：前者承接模型设置窗口里刚保存的
     /// 绑定，后者兜住已保存设置读不出来、以及两个窗口同时打开时本窗口还没来得及看到新
     /// 绑定的情况。真正的兜底仍是保存时的 `ProviderSettings::validate`（它会在绑定已经
     /// 不存在时报错），这里只是尽量提前把话说明白。
@@ -136,6 +138,7 @@ impl EndpointSettingsWindow {
         let saved_bound = self.services.provider_settings().is_ok_and(|settings| {
             [
                 settings.endpoint_routing.chat_endpoint_id,
+                settings.endpoint_routing.translation_endpoint_id,
                 settings.endpoint_routing.embedding_endpoint_id,
                 settings.endpoint_routing.vision_endpoint_id,
             ]
@@ -145,6 +148,7 @@ impl EndpointSettingsWindow {
         saved_bound
             || [
                 &self.chat_endpoint_id,
+                &self.translation_endpoint_id,
                 &self.embedding_endpoint_id,
                 &self.vision_endpoint_id,
             ]
@@ -158,7 +162,7 @@ impl EndpointSettingsWindow {
         }
         if self.endpoint_is_bound(&self.selected_endpoint_id) {
             self.state.report(
-                "这个 Endpoint 仍被模型使用，请先在“对话模型”窗口中重新选择对应 Endpoint。",
+                "这个 Endpoint 仍被模型使用，请先在「模型设置」窗口中重新选择对应 Endpoint。",
                 true,
             );
             cx.notify();
@@ -323,7 +327,7 @@ impl EndpointSettingsWindow {
             )
             .child(card_note(
                 theme,
-                "每个 Endpoint 独立保存连接、密钥和远程授权。模型使用中的 Endpoint 需先在「对话模型」窗口里重新分配才能删除。",
+                "每个 Endpoint 独立保存连接、密钥和远程授权。模型使用中的 Endpoint 需先在「模型设置」窗口里重新分配才能删除。",
             ))
             .into_any_element()
     }
@@ -364,7 +368,7 @@ impl EndpointSettingsWindow {
         )
     }
 
-    /// 底栏上的「检测模型」：检测当前选中的 Endpoint，结果可用于对话模型窗口。
+    /// 底栏上的「检测模型」：检测当前选中的 Endpoint，结果可用于模型设置窗口。
     pub(crate) fn render_footer_actions(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let detecting = self.state.operation == PendingOperation::Detecting;
         Button::new("ai-endpoint-detect-models")

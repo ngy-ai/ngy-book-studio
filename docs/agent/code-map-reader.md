@@ -9,8 +9,8 @@
   `src/ui/reader/selection_menu.rs` 是 EPUB 与 PDF 共用的 WebView2 原生「AI解释」菜单，
   由调用方提供私有文档判定与事件构造，仍要求 page/frame 为同一私有文档。
 - `src/ui/reader/translations.rs`、`translations.js`：Reader 双语对照展示。宿主在
-  `sync_loaded_page` 之后按当前书/单元从 `translations` 表读取与当前
-  `(document_revision, unit_revision)` 和对话模型一致的译文，经 session/generation
+  `sync_loaded_page` 之后按当前书/单元从   `translations` 表读取与当前
+  `(document_revision, unit_revision)`、翻译模型与翻译执行身份一致的译文，经 session/generation
   单调门控 `evaluate_script` 注入；打开新章后的迟到完成不得覆盖当前章。译文逐块写入，
   一章不必等整本任务结束：窗口按 2 秒轮询本书未完成翻译任务的游标 `completed`，前进时
   重新读取当前单元，并按（单元、显示方式、译文载荷）指纹跳过未变化的推送，任务结束再

@@ -84,8 +84,11 @@ pub(crate) async fn walk_translation_blocks(
     // republished instead of being sent again.
     let mut unit_cache: HashMap<String, HashMap<String, StoredTranslation>> = HashMap::new();
     // A per-block retry narrows the walk to the requested ordinals; a normal run
-    // leaves this empty and visits everything.
+    // leaves this empty and visits everything. The span ends at the last target:
+    // beyond it the run is no longer allowed to decide anything about a block that
+    // has no译文 (see `BlockPlan::Untouched`).
     let retry_targets: HashSet<usize> = run.cursor.retry_ordinals.iter().copied().collect();
+    let retry_last = run.cursor.retry_ordinals.last().copied();
     // Ordinals in `[next_ordinal, frontier)` are exactly the window: each of them
     // is either finished (`resolved`) or waiting on a request (`in_flight`).
     let mut frontier = run.cursor.next_ordinal;
@@ -101,6 +104,8 @@ pub(crate) async fn walk_translation_blocks(
     // model.
     let mut saved_blocks = 0usize;
     let mut untranslated_blocks = 0usize;
+    // 收窄的重试在范围之外撞上一个还没翻译的块：运行停在这里，任务留在可继续的状态。
+    let mut retry_stopped = false;
     loop {
         // 1) Commit everything that is next in ordinal order. The durable cursor
         //    may never step over a block that is still waiting, and a settings
@@ -161,6 +166,7 @@ pub(crate) async fn walk_translation_blocks(
                     ordinal,
                     revision,
                     &retry_targets,
+                    retry_last,
                     &mut unit_cache,
                     stats,
                 )
@@ -172,6 +178,12 @@ pub(crate) async fn walk_translation_blocks(
                     }
                     BlockPlan::Cached(stored) => {
                         resolved.insert(ordinal, BlockSlot::Cached(*stored));
+                    }
+                    // 重试范围之外还没有译文的块：不发请求，也绝不提交。停止打开
+                    // 窗口，把已经解析出来的槽位提交完之后收尾。
+                    BlockPlan::Untouched => {
+                        retry_stopped = true;
+                        break;
                     }
                     BlockPlan::Request { source, context } => {
                         // The window is part of the durable cursor: the task window
@@ -195,6 +207,9 @@ pub(crate) async fn walk_translation_blocks(
                                     context,
                                 )
                                 .await;
+                                // 这一发收尾后才轮到本槽位休息，所以休眠永远发生在请求
+                                // 之后，不会挤占模型的响应时间。
+                                pause_after_translation_request(&inner, &walk).await;
                                 (ordinal, walk)
                             }
                             .boxed(),
@@ -204,11 +219,25 @@ pub(crate) async fn walk_translation_blocks(
             }
             frontier += 1;
         }
-        // 3) Every ordinal in the window is committed, or nothing is open.
-        if in_flight.is_empty() {
+        // 3) Nothing is open and nothing is left to commit: every ordinal of the
+        //    window was applied in order. The check has to cover `resolved` too —
+        //    a round whose blocks all came from the cache (or had nothing to
+        //    translate) opens no request while still holding blocks to commit, so
+        //    breaking on the empty window alone ends the run 「succeeded」 without
+        //    committing anything and leaves the durable cursor where it was. That
+        //    is exactly the「点恢复后一会儿就完成、文本块一个都没处理」report:
+        //    the task window reads 已处理 from the cursor, so it stays at 0.
+        //    （现场 2026-09-18：模型或端点变化把游标从书首重扫时，前几块全是
+        //    缓存命中，任务立刻按 Succeeded 收尾，只有清空后的游标没有前进。）
+        if in_flight.is_empty() && resolved.is_empty() {
             break;
         }
-        // 4) Wait for the next block to come back.
+        // 4) Wait for the next block to come back. A round that only resolved
+        //    blocks has nothing to wait for; the next iteration commits those
+        //    slots in ordinal order and fills the window again.
+        if in_flight.is_empty() {
+            continue;
+        }
         let Some((ordinal, walk)) = in_flight.next().await else {
             continue;
         };
@@ -238,6 +267,24 @@ pub(crate) async fn walk_translation_blocks(
         };
         resolved.insert(ordinal, slot);
     }
+    if retry_stopped {
+        // 收窄的重试在范围之外撞上一个还没翻译的块：这一块既不在本次重试里（不许替它
+        // 发请求），也没有译文（不许被记成已处理）。运行停在这里，窗口清空之后按「暂停」
+        // 发布 —— 任务留在可继续的状态，而重试集合在上面最后一次提交时已经清掉，用户点
+        // 「恢复」时那次运行会按整本书继续翻。绝不能按 Succeeded 收尾：那是「整本都处理
+        // 过了」的谎话，也正是这次现场里「任务已完成、阅读端没有译文」的来源。
+        tracing::info!(
+            target: "ngy_ai",
+            stage = "translation_retry_incomplete",
+            next_ordinal = run.cursor.next_ordinal,
+            total_blocks = total,
+            "Narrowed translation retry stopped before the end of the book"
+        );
+        let _transition = inner.transitions.lock().await;
+        return run
+            .interrupt(inner, job, RunOutcome::Paused(run.cursor.clone()))
+            .await;
+    }
     if untranslated_blocks > 0 {
         // The per-block warnings above are the durable record; this summary keeps
         // the console honest about a run that finished with partial text.
@@ -253,6 +300,26 @@ pub(crate) async fn walk_translation_blocks(
     // Every block the window opened was committed: nothing may still be in flight.
     debug_assert!(run.cursor.inflight.is_empty(), "翻译运行结束时窗口必须为空");
     Ok(RunOutcome::Succeeded(run.cursor.clone()))
+}
+
+/// 一发模型请求收尾后的块级节流，也就是「任务间隔」真正生效的地方。
+///
+/// 间隔原本只作用于两个任务之间（`worker_loop`），而一整本书就是一个任务：书内几十上百
+/// 次请求之间毫无停顿，本机模型（Ollama 等）会连续把 GPU 吃到满载 —— 现场 2026-09-20，
+/// 用户把间隔调成 5000 毫秒也不起作用，持续满载时显示器黑屏。现在按请求计：每个并发
+/// 槽位发出一发就休眠一次，窗口仍按「任务并发」填，整体请求频率因此被限制在
+/// 「每个槽位一发 / 间隔」。缓存命中与「不必处理」的块不发请求，也就不会休眠。
+///
+/// 停止请求（暂停、取消、换版本）不休眠：这类结果要求马上把控制权交回 `walk`，
+/// 让它清空窗口并按终态发布，多睡一个间隔只会拖慢用户的暂停操作。
+async fn pause_after_translation_request(inner: &Arc<IndexingInner>, walk: &Result<BlockWalk>) {
+    if matches!(walk, Ok(BlockWalk::Stopped(_))) {
+        return;
+    }
+    let interval = inner.scheduling().interval;
+    if !interval.is_zero() {
+        tokio::time::sleep(interval).await;
+    }
 }
 
 /// Remembers one committed translation so a later block with the same text hits it
@@ -291,40 +358,48 @@ pub(crate) async fn plan_translation_block<'a>(
     ordinal: usize,
     revision: u64,
     retry_targets: &HashSet<usize>,
+    retry_last: Option<usize>,
     unit_cache: &mut HashMap<String, HashMap<String, StoredTranslation>>,
     stats: &mut TranslationRunStats,
 ) -> Result<BlockPlan<'a>> {
-    // Not part of a per-block retry: walk past it without a provider request. Its
-    // stored translation is untouched, so nothing has to be republished.
-    if !retry_targets.is_empty() && !retry_targets.contains(&ordinal) {
+    // 出了本次重试范围（最后一个目标之后）的块不能再被「跳过」：跳过它等于把它记成
+    // 已处理，而它可能从来没有译文。那里只允许走缓存命中，没有译文就由调用方停下运行。
+    let beyond_retry = retry_last.is_some_and(|last| ordinal > last);
+    // Not part of a per-block retry, and still inside the retried span: walk past it
+    // without a provider request. Its stored translation is untouched, so nothing has
+    // to be republished.
+    if !retry_targets.is_empty() && !retry_targets.contains(&ordinal) && !beyond_retry {
         return Ok(BlockPlan::Pass);
     }
     let block = &blocks[ordinal];
-    record_index_event(
-        inner,
-        job,
-        JobLogEvent::ItemStarted,
-        JobLogMetrics {
-            ordinal: Some(block.ordinal as u64),
-            total: Some(blocks.len() as u64),
-            expected_count: Some(block.source.segments.len() as u64),
-            ..JobLogMetrics::default()
-        },
-    );
-    tracing::debug!(
-        target: "ngy_ai",
-        stage = "translation_block_start",
-        block_ordinal = block.ordinal,
-        block_id = %block.block_id,
-        total_blocks = blocks.len(),
-        unit_ordinal = block.unit_ordinal,
-        segments = block.source.segments.len(),
-        multi_segment = block.source.segments.len() > 1,
-        segment_chars = %translation_segment_chars(&block.source.segments),
-        source_chars = block.source.text.chars().count(),
-        request_bytes = block.source.request_input(&block.translation_context()).len(),
-        "Translation block started"
-    );
+    // 范围之外的块不是这次运行「开始处理」的块：不许留下 item_started 这种读数。
+    if !beyond_retry {
+        record_index_event(
+            inner,
+            job,
+            JobLogEvent::ItemStarted,
+            JobLogMetrics {
+                ordinal: Some(block.ordinal as u64),
+                total: Some(blocks.len() as u64),
+                expected_count: Some(block.source.segments.len() as u64),
+                ..JobLogMetrics::default()
+            },
+        );
+        tracing::debug!(
+            target: "ngy_ai",
+            stage = "translation_block_start",
+            block_ordinal = block.ordinal,
+            block_id = %block.block_id,
+            total_blocks = blocks.len(),
+            unit_ordinal = block.unit_ordinal,
+            segments = block.source.segments.len(),
+            multi_segment = block.source.segments.len() > 1,
+            segment_chars = %translation_segment_chars(&block.source.segments),
+            source_chars = block.source.text.chars().count(),
+            request_bytes = block.source.request_input(&block.translation_context()).len(),
+            "Translation block started"
+        );
+    }
     if block.source.segments.is_empty() {
         tracing::debug!(
             target: "ngy_ai",
@@ -375,6 +450,18 @@ pub(crate) async fn plan_translation_block<'a>(
         .and_then(|unit| unit.get(&cache_key))
     {
         return Ok(BlockPlan::Cached(Box::new(stored.clone())));
+    }
+    if beyond_retry {
+        // 不在本次重试里、又没有译文：既不发请求，也不许提交。调用方会停在
+        // 这一块上，任务因此留在「还没翻完、可以继续」的状态。
+        tracing::info!(
+            target: "ngy_ai",
+            stage = "translation_retry_stop_block",
+            block_ordinal = block.ordinal,
+            total_blocks = blocks.len(),
+            "Narrowed retry reached an untranslated block outside its targets"
+        );
+        return Ok(BlockPlan::Untouched);
     }
     Ok(BlockPlan::Request {
         source: &block.source,

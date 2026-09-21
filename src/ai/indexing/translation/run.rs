@@ -75,6 +75,9 @@ pub(crate) enum BlockStep<T> {
 pub(crate) enum BlockPlan<'a> {
     /// Nothing to send and nothing to publish: outside the retried set.
     Pass,
+    /// 出了本次重试范围、又没有译文：本次运行既不许替它发请求，也不许把它记成
+    /// 已处理（那正是「任务显示完成、书却还是原文」的来源）。运行停在这里。
+    Untouched,
     /// The block has no text leaves to translate.
     NoSegments,
     /// Publish the translation already stored for this block text.
@@ -119,17 +122,44 @@ impl TranslationRun {
     /// Writes the current cursor to the durable row and then publishes it to the
     /// in-flight requests. The order matters: a request must never accept a value
     /// the database has not seen.
+    ///
+    /// A rejected write also rolls the cursor back to the value the row really
+    /// holds. This execution must keep reporting the last committed position:
+    /// a cursor the database never accepted is not just a lost update, it also
+    /// makes the failure publication unmatchable, so the task would stay「运行中」
+    /// with a phantom in-flight block forever（现场：夹具拒绝游标推进后，任务卡在
+    /// running、处理中恒有一块，终态永远发布不出去）。
     pub(crate) async fn persist(
-        &self,
+        &mut self,
         inner: &Arc<IndexingInner>,
         job: &db::index_jobs::IndexJob,
     ) -> Result<()> {
-        persist_running_cursor(inner, job, &self.cursor).await?;
+        if let Err(error) = persist_running_cursor(inner, job, &self.cursor).await {
+            self.restore_committed_cursor();
+            return Err(error);
+        }
         *self
             .committed
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = self.cursor.encode()?;
         Ok(())
+    }
+
+    /// Rolls the cursor back to the JSON this run last persisted successfully.
+    ///
+    /// That value is by construction the row's current cursor, so the failure
+    /// publication after a rejected write still matches the row and the task still
+    /// reaches a terminal state. An unparseable snapshot leaves the cursor alone:
+    /// the publication then reports「已被替换」instead of guessing a position.
+    fn restore_committed_cursor(&mut self) {
+        let committed = self
+            .committed
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        if let Ok(cursor) = serde_json::from_str::<JobCursor>(&committed) {
+            self.cursor = cursor;
+        }
     }
 
     /// Moves the cursor past one committed block. Only called in ordinal order.
@@ -141,6 +171,18 @@ impl TranslationRun {
     ) -> Result<()> {
         self.cursor.next_ordinal = ordinal + 1;
         self.cursor.close_inflight(ordinal);
+        // 最后一个重试目标已经提交，这份收窄就到此用完了，必须立刻从持久游标里去掉：
+        // 留着它以后每一次恢复、重试或重跑都还会被收窄成「只跑这几块」，而 walk 会
+        // 把其余的块当成不必处理一路推过去 —— 现场 2026-09-20：18168 块的书只翻了 71
+        // 块，任务却显示「已完成 / 已处理 18168」，阅读端整本没有译文。
+        if self
+            .cursor
+            .retry_ordinals
+            .last()
+            .is_some_and(|last| ordinal >= *last)
+        {
+            self.cursor.retry_ordinals.clear();
+        }
         self.persist(inner, job).await
     }
 

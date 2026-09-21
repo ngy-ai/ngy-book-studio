@@ -27,8 +27,8 @@ pub(crate) fn one_untranslatable_block_is_skipped_and_the_run_continues() {
         let (book_id, unit_id) = import(&services, &path).await;
         let job = translate(&services, &book_id).await;
 
-        // 四个文本块：一个始终非法（两次请求），其余各一次请求。
-        assert_eq!(endpoint.requests().len(), 5);
+        // 四个文本块：一个始终非法（用满块级重发预算），其余各一次请求。
+        assert_eq!(endpoint.requests().len(), 3 + EXHAUSTED_BLOCK_ATTEMPTS);
         let logs = services
             .background_job_logs(job.id.clone(), vec![book_id.clone()])
             .await
@@ -99,15 +99,18 @@ pub(crate) fn consecutive_untranslatable_blocks_are_skipped_until_the_whole_book
                 .await
                 .unwrap()
         );
-        // 一个成功块 + 三个连续失败块 + 一个成功块：四个可译块各花两次严格尝试，
-        // 三个毒块各再走一次逐片段回退（= 1 次请求），最后一个块仍然被请求。
+        // 一个成功块 + 三个连续失败块 + 一个成功块：两个可译块各一次请求，三个毒块
+        // 各自用满块级重发预算，最后一个块仍然被请求 —— 失败不会让运行提前结束。
         let finished = wait_translation(&services, &book_id, BackgroundJobStatus::Succeeded).await;
 
-        assert_eq!(endpoint.requests().len(), 11);
+        assert_eq!(endpoint.requests().len(), 2 + 3 * EXHAUSTED_BLOCK_ATTEMPTS);
         assert!(finished.error.is_none());
         // 游标走到整本末尾，跳过与缓存命中一样推进；失败块就是没有译文的那三个。
         assert_eq!(finished.progress.completed, 5);
-        assert_eq!(finished.progress.total, Some(5));
+        assert_eq!(
+            finished.progress.total, None,
+            "整本翻译的总块数只有文本块明细知道，任务快照不带它"
+        );
         assert_eq!(row_count(&services), 2);
     });
 }

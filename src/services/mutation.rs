@@ -5,6 +5,8 @@ use super::*;
 pub(crate) struct AiServices {
     pub(crate) settings: ProviderSettings,
     pub(crate) provider: Arc<dyn OpenAiCompatibleProvider>,
+    /// 翻译任务专用连接：与问答分开绑定 Endpoint，因此换问答模型不影响翻译。
+    pub(crate) translation_provider: Arc<dyn OpenAiCompatibleProvider>,
     pub(crate) embedding_provider: Arc<dyn OpenAiCompatibleProvider>,
     pub(crate) vision_provider: Arc<dyn OpenAiCompatibleProvider>,
     pub(crate) search: Arc<SearchService>,

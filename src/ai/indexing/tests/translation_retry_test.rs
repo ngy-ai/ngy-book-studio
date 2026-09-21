@@ -338,6 +338,45 @@ pub(crate) fn a_rejected_block_is_re_sent_until_the_model_answers() {
     );
 }
 
+/// 模型显式声明「这段不需要翻译」时，块按原文保存：不算失败、不算跳过、也不会重发。
+///
+/// 现场（2026-09-20，qwen3:0.6b）：模型对纯符号/数字片段留空回答，而空 text 一直被当成
+/// `empty_segment_text` 错误 —— 整块因此重试、逐片段回退，最后按未翻译跳过。现在这种片段
+/// 由 `{"id":N,"text":"","keep":true}` 显式声明，第一次请求就被接受。
+#[test]
+pub(crate) fn a_kept_segment_is_published_as_the_source_text_without_retrying() {
+    let provider = Arc::new(MockMergeProvider::default());
+    provider.keep_segments.store(true, Ordering::SeqCst);
+    let (fixture, job, cursor, translation) =
+        translation_block_fixture(&provider, "translation-v2:chat-test");
+    let source = single_fragment_source();
+
+    let walk = translate_block_source(&fixture, &job, &cursor, &translation, &source).unwrap();
+    let BlockWalk::Stored(stored, _) = walk else {
+        panic!("声明不需要翻译的答案必须被接受");
+    };
+    assert_eq!(stored.segments[0].translated, source.segments[0]);
+    assert_eq!(
+        provider.requests.load(Ordering::SeqCst),
+        1,
+        "第一发就该被接受，不需要纠正或重发"
+    );
+
+    let events = recorded_events(&fixture, &job.id);
+    assert!(
+        !events
+            .iter()
+            .any(|entry| entry.event == JobLogEvent::ProtocolSkipped),
+        "模型声明过的片段不是失败块"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|entry| entry.event == JobLogEvent::ProtocolRejected),
+        "声明不需要翻译的答案不该被拒"
+    );
+}
+
 #[test]
 pub(crate) fn a_block_that_keeps_failing_is_skipped_after_the_retry_budget() {
     // 每一次请求都不合协议：整块重发用满 `TRANSLATION_BLOCK_RETRIES` 轮，然后照原来的

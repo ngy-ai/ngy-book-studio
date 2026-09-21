@@ -16,7 +16,7 @@ impl AppServices {
         let Some(target_language) = settings.default_language.clone() else {
             return Ok(Vec::new());
         };
-        let chat_model = settings.chat_model.clone();
+        let translation_model = settings.translation_model.clone();
         let execution_identity = translation_execution_identity(&settings)?;
         let db_path = self.db_path.clone();
         self.runtime
@@ -64,7 +64,7 @@ impl AppServices {
                                 manual: true,
                             });
                         }
-                        if row.model != chat_model {
+                        if row.model != translation_model {
                             return None;
                         }
                         let translation = serde_json::from_str::<

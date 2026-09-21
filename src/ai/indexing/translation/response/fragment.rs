@@ -39,6 +39,7 @@ pub(crate) fn fragment_fallback_applies(
                     | "duplicate_segment_id"
                     | "empty_segment_text"
                     | "invalid_segment_text"
+                    | "keep_with_text"
                     | "positional_segments"
             )
         })
@@ -117,6 +118,7 @@ pub(crate) async fn translate_block_by_fragment(
             &context,
             None,
         );
+        let request_body = translation_request_body(&request);
         tracing::debug!(
             target: "ngy_ai",
             parent: &span,
@@ -143,6 +145,7 @@ pub(crate) async fn translate_block_by_fragment(
             index + 1,
             &fragment,
             &context,
+            &request_body,
             &translation.execution_identity,
             stream,
         )
@@ -185,9 +188,8 @@ pub(crate) async fn translate_block_by_fragment(
                     &span,
                     scope.ordinal,
                     index + 1,
+                    &request_body,
                     &response,
-                    &fragment,
-                    &context,
                     "fragment_rejected",
                 );
                 return Err(error.context(format!(
@@ -207,6 +209,15 @@ pub(crate) async fn translate_block_by_fragment(
             fragments,
             translated_chars = stored.translated.chars().count(),
             "Translation fragment translated"
+        );
+        // 逐片段回退的答案同样要能逐块核对（同一开关，默认关闭）。
+        dump_raw_translation_response(
+            &span,
+            scope.ordinal,
+            index + 1,
+            &request_body,
+            &response,
+            "fragment_accepted",
         );
         translated.push(stored.translated);
         stats.fragment_fallback_requests += 1;

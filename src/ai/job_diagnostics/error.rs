@@ -84,7 +84,7 @@ pub fn classify_error(error: &anyhow::Error) -> JobLogErrorKind {
         // 位置数组是「结构无效」的一个更具体的子类：模型按段答了，只是把
         // `{"id","text"}` 写成了 serde 的位置序列。任务日志沿用同一分类，
         // 逐片段回退的判定在读 `ResponseError::kind()` 时已经能把两者分开。
-        "invalid_schema" | "json_data" | "positional_segments" => InvalidSchema,
+        "invalid_schema" | "json_data" | "positional_segments" | "keep_with_text" => InvalidSchema,
         "incomplete_reasoning" => IncompleteReasoning,
         "ambiguous_json" => AmbiguousJson,
         "missing_json" => MissingJson,

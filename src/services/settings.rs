@@ -28,6 +28,9 @@ pub(crate) const MAX_LOADED_VISUAL_PAGES: usize = 20_000;
 pub(crate) const MAX_LOADED_VISUAL_PAGE_BYTES: u64 = 512 * 1024 * 1024;
 
 pub const DEFAULT_CHAT_MODEL: &str = "qwen3.5:0.8b";
+/// 翻译任务自带的默认模型。老版本没有这个字段，`load_provider_settings` 会把缺失的
+/// 翻译模型填成当时保存的问答模型，因此升级不会改变翻译执行身份。
+pub const DEFAULT_TRANSLATION_MODEL: &str = "qwen3.5:0.8b";
 pub const DEFAULT_EMBEDDING_MODEL: &str = "qwen3-embedding:0.6b";
 pub const DEFAULT_VISION_MODEL: &str = "qwen3.5:0.8b";
 /// Upper bounds for one manually edited translation block. The reading window
@@ -70,6 +73,9 @@ pub fn translation_language_label(tag: &str) -> Option<&'static str> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModelRole {
     Chat,
+    /// 整本翻译专用的模型与 Endpoint：与问答模型分开配置，翻译执行身份也只由它派生，
+    /// 因此换问答模型不会让已翻完的书重翻。
+    Translation,
     Embedding,
     Vision,
 }
@@ -132,6 +138,10 @@ pub struct EndpointRoutingSettings {
     pub default_endpoint_name: String,
     pub additional_endpoints: Vec<EndpointSettings>,
     pub chat_endpoint_id: String,
+    /// 翻译模型自己的 Endpoint。老版本的绑定行里没有这个键，缺失时
+    /// `load_provider_settings` 会把它填成当时的问答 Endpoint。
+    #[serde(default = "default_endpoint_id")]
+    pub translation_endpoint_id: String,
     pub embedding_endpoint_id: String,
     pub vision_endpoint_id: String,
 }
@@ -142,6 +152,7 @@ impl Default for EndpointRoutingSettings {
             default_endpoint_name: "默认 Endpoint".into(),
             additional_endpoints: Vec::new(),
             chat_endpoint_id: DEFAULT_ENDPOINT_ID.into(),
+            translation_endpoint_id: DEFAULT_ENDPOINT_ID.into(),
             embedding_endpoint_id: DEFAULT_ENDPOINT_ID.into(),
             vision_endpoint_id: DEFAULT_ENDPOINT_ID.into(),
         }
@@ -184,6 +195,14 @@ pub(crate) fn default_background_job_interval_ms() -> u64 {
 
 pub(crate) fn default_embedding_dimensions() -> usize {
     DEFAULT_EMBEDDING_DIMENSIONS
+}
+
+pub(crate) fn default_translation_model() -> String {
+    DEFAULT_TRANSLATION_MODEL.to_string()
+}
+
+pub(crate) fn default_endpoint_id() -> String {
+    DEFAULT_ENDPOINT_ID.to_string()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -387,6 +406,11 @@ pub struct ProviderSettings {
     #[serde(skip)]
     pub endpoint_routing: EndpointRoutingSettings,
     pub chat_model: String,
+    /// 整本翻译专用的模型。与问答模型分开：问答模型变化不再让翻译任务重跑。
+    /// 老版本的主 JSON 没有这个键，缺失时按当时的问答模型补齐（见
+    /// `load_provider_settings`），所以升级不会改变翻译执行身份。
+    #[serde(default = "default_translation_model")]
+    pub translation_model: String,
     /// Stored under its own settings key and combined here for the UI/runtime.
     #[serde(skip)]
     pub chat_generation: ChatGenerationSettings,
@@ -486,6 +510,7 @@ impl Default for ProviderSettings {
             base_url: DEFAULT_OLLAMA_OPENAI_BASE_URL.to_string(),
             endpoint_routing: EndpointRoutingSettings::default(),
             chat_model: DEFAULT_CHAT_MODEL.to_string(),
+            translation_model: default_translation_model(),
             chat_generation: ChatGenerationSettings::default(),
             auto_run_background_jobs: default_auto_run_background_jobs(),
             background_job_concurrency: default_background_job_concurrency(),
@@ -519,6 +544,7 @@ impl Default for ProviderSettings {
 impl ProviderSettings {
     pub fn validate(&self) -> Result<()> {
         validate_model_name("chat", &self.chat_model)?;
+        validate_model_name("translation", &self.translation_model)?;
         validate_model_name("embedding", &self.embedding_model)?;
         validate_model_name("vision", &self.vision_model)?;
         ensure!(
@@ -555,7 +581,12 @@ impl ProviderSettings {
                 "Endpoint 地址重复：请共用已有 Endpoint，并为各模型选择它"
             );
         }
-        for role in [ModelRole::Chat, ModelRole::Embedding, ModelRole::Vision] {
+        for role in [
+            ModelRole::Chat,
+            ModelRole::Translation,
+            ModelRole::Embedding,
+            ModelRole::Vision,
+        ] {
             self.endpoint_for(role)?;
         }
         // Validate the web endpoint eagerly so a malformed configuration is
@@ -590,6 +621,7 @@ impl ProviderSettings {
     pub fn endpoint_for(&self, role: ModelRole) -> Result<EndpointSettings> {
         let id = match role {
             ModelRole::Chat => &self.endpoint_routing.chat_endpoint_id,
+            ModelRole::Translation => &self.endpoint_routing.translation_endpoint_id,
             ModelRole::Embedding => &self.endpoint_routing.embedding_endpoint_id,
             ModelRole::Vision => &self.endpoint_routing.vision_endpoint_id,
         };

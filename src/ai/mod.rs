@@ -59,6 +59,8 @@ pub use error::*;
 
 pub use provider::*;
 
+pub(crate) use provider::chat_request_body;
+
 pub use settings::*;
 
 pub use wire::*;

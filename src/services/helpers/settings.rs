@@ -119,14 +119,18 @@ pub(crate) fn manual_translation_segments(
 }
 
 /// Non-secret identity for deciding whether persisted whole-book translations
-/// are stale. A changed chat endpoint or model restarts every translation job
-/// from the first block; the target language is part of each job's identity.
+/// are stale. A changed translation endpoint or translation model restarts
+/// every translation job from the first block; the target language is part of
+/// each job's identity. 问答 Endpoint 与问答模型刻意不进这个摘要：换问答模型
+/// 不该让已翻完的图书重翻。
 pub(crate) fn translation_execution_identity(settings: &ProviderSettings) -> Result<String> {
-    let endpoint = normalize_provider_base_url(&settings.endpoint_for(ModelRole::Chat)?.base_url)?;
+    let endpoint =
+        normalize_provider_base_url(&settings.endpoint_for(ModelRole::Translation)?.base_url)?;
     Ok(format!(
         "{}:{}",
         crate::ai::translation::EXECUTION_IDENTITY_PROTOCOL,
-        blake3::hash(format!("{}\0{}", endpoint.as_str(), settings.chat_model).as_bytes()).to_hex()
+        blake3::hash(format!("{}\0{}", endpoint.as_str(), settings.translation_model).as_bytes())
+            .to_hex()
     ))
 }
 

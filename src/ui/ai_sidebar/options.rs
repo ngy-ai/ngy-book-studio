@@ -63,7 +63,8 @@ impl AiEndpointStatus {
     pub(super) fn from_settings(settings: &ProviderSettings) -> Self {
         let mut remote = Vec::new();
         for (role, label) in [
-            (ModelRole::Chat, "对话"),
+            (ModelRole::Chat, "问答"),
+            (ModelRole::Translation, "翻译"),
             (ModelRole::Embedding, "Embedding"),
             (ModelRole::Vision, "视觉"),
         ] {

@@ -14,7 +14,7 @@ use std::{
 
 use ngy_book_studio::{
     ai::credentials::MemoryCredentialStore,
-    ai::job_diagnostics::JobLogErrorKind,
+    ai::job_diagnostics::{JobLogErrorKind, JobLogEvent},
     ai::translation::TranslationSegment,
     library::ImportOutcome,
     services::{

@@ -93,8 +93,8 @@ impl AppServices {
             Duration::from_millis(ai.settings.background_job_interval_ms),
         );
         runtime.block_on(indexing.configure_translation(
-            Arc::clone(&ai.provider),
-            ai.settings.chat_model.clone(),
+            Arc::clone(&ai.translation_provider),
+            ai.settings.translation_model.clone(),
             translation_execution_identity(&ai.settings)?,
             ai.settings.default_language.clone(),
             ai.settings.auto_run_background_jobs,

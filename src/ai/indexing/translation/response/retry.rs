@@ -125,7 +125,7 @@ pub(crate) async fn translate_block(
                 if round == rounds {
                     return Err(error.context(format!(
                         "翻译响应在自动纠正一次并重发 {TRANSLATION_BLOCK_RETRIES} 次后仍不符合格式要求，\
-                         请重试或更换支持指令的对话模型"
+                         请重试或在 AI 设置的「模型设置」里更换支持指令的翻译模型"
                     )));
                 }
             }
@@ -213,6 +213,8 @@ pub(crate) async fn translate_block_round(
             &context,
             correction_kind,
         );
+        // 本次尝试真正要发出去的 body，供 NGY_DUMP_TRANSLATION_RAW 原样打印。
+        let request_body = translation_request_body(&request);
         tracing::debug!(
             target: "ngy_ai",
             parent: &span,
@@ -256,6 +258,7 @@ pub(crate) async fn translate_block_round(
                 attempt,
                 source,
                 &context,
+                &request_body,
                 &translation.execution_identity,
                 stream,
             )
@@ -335,12 +338,32 @@ pub(crate) async fn translate_block_round(
             &translation.execution_identity,
         ) {
             Ok(parsed) => {
+                // 「保持原文」的片段在解码形状里就是长度 0（`keep` 必须与空 text 同时给出，
+                // 空 text 又不带 keep 的答案会在校验里被拒），所以这个计数是模型声明了
+                // 「这段不需要翻译」的片段数，也是排查「任务完成但阅读端没有译文」的第一手读数。
+                let kept_segments = decoded
+                    .as_ref()
+                    .map(|shapes| shapes.iter().filter(|(_, chars)| *chars == 0).count())
+                    .unwrap_or_default();
                 tracing::debug!(
                     target: "ngy_ai",
                     parent: &span,
                     stage = "translation_response_accepted",
                     segments = parsed.segments.len(),
+                    kept_segments,
                     "Translation response accepted"
+                );
+                // 被接受的答案也要留下「模型收到了什么、答了什么」这一对原始读数：
+                // 译文到底是不是真的由模型翻出来的，聚合计数证明不了（现场 2026-09-20：
+                // 任务显示「已处理 18168」而库里只有 71 行译文）。与拒绝路径同一开关，
+                // 默认关闭，只有 NGY_DUMP_TRANSLATION_RAW 打开时才输出。
+                dump_raw_translation_response(
+                    &span,
+                    scope.ordinal,
+                    attempt,
+                    &request_body,
+                    &response,
+                    "accepted",
                 );
                 if attempt > 1 {
                     tracing::info!(target: "ngy_ai", parent: &span, "Translation response corrected");
@@ -418,9 +441,8 @@ pub(crate) async fn translate_block_round(
                     &span,
                     scope.ordinal,
                     attempt,
+                    &request_body,
                     &response,
-                    source,
-                    &context,
                     "protocol_rejected",
                 );
                 if !retry {

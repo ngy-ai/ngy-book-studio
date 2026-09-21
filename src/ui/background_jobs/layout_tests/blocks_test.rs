@@ -8,8 +8,11 @@ pub(crate) fn translation_block_inspector_pages_filters_and_marks_the_in_flight_
     let mut job = snapshots().remove(0);
     job.status = BackgroundJobStatus::Running;
     // 并发 3 的一次运行：游标只说「第一块没完成的」，处理中的三块由窗口集合给出。
-    job.cursor_json =
-        Some(serde_json::json!({ "next_ordinal": 17, "inflight": [17, 18, 19] }).to_string());
+    // 窗口来自服务层投影（运行中的翻译任务不下发原始游标），所以这里只给投影，
+    // `cursor_json` 保持为空 —— 现场 2026-09-20：界面回去读那份永远缺失的游标，
+    // 于是「已处理」一直在涨而「处理中」恒为 0。
+    job.cursor_json = None;
+    job.progress.processing = vec![17, 18, 19];
     let inspector = BlockInspector::new(&job, blocks.total, None);
     let progress = &inspector.progress;
     assert_eq!(
@@ -42,7 +45,7 @@ pub(crate) fn translation_block_inspector_pages_filters_and_marks_the_in_flight_
     // A task whose row says running but whose cursor carries no window (an older
     // format, or a process that died between two rounds) claims nothing is in
     // flight instead of inventing one block at the cursor.
-    job.cursor_json = Some(serde_json::json!({ "next_ordinal": 17 }).to_string());
+    job.progress.processing = Vec::new();
     let unwindowed = BlockInspector::new(&job, blocks.total, None);
     assert!(unwindowed.progress.processing.is_empty());
     assert_eq!(unwindowed.progress.pending, 61);
@@ -53,8 +56,7 @@ pub(crate) fn translation_block_inspector_pages_filters_and_marks_the_in_flight_
 
     // A finished task leaves no block in flight, and the page controls cannot
     // scroll past the last block.
-    job.cursor_json =
-        Some(serde_json::json!({ "next_ordinal": 17, "inflight": [17, 18, 19] }).to_string());
+    job.progress.processing = vec![17, 18, 19];
     job.progress.completed = blocks.total;
     let finished = BlockInspector::new(&job, blocks.total, None);
     assert_eq!(
@@ -217,8 +219,8 @@ pub(crate) fn translation_block_inspector_scopes_failures_to_the_newest_executio
     assert!(failure_banner(&job, &inspector, Palette::LIGHT).is_none());
 
     // Without any log at all the inspector still renders from the cursor: 已处理与待处理
-    // 由游标决定，处理中由游标里的窗口集合决定（单块在飞时就是游标那一块）。
-    job.cursor_json = Some(serde_json::json!({ "next_ordinal": 12, "inflight": [12] }).to_string());
+    // 由游标决定，处理中由快照投影的窗口集合决定（单块在飞时就是游标那一块）。
+    job.progress.processing = vec![12];
     let bare = BlockInspector::new(&job, blocks.total, None);
     assert_eq!(bare.progress.failed, 0);
     assert_eq!(bare.state(11), BlockState::Done);

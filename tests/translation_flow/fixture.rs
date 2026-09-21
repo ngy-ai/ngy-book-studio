@@ -61,7 +61,10 @@ pub(crate) fn settings_with_timeout(
 ) -> ProviderSettings {
     ProviderSettings {
         base_url: endpoint.url.clone(),
+        // 问答模型与翻译模型取两个不同的名字：翻译请求必须带翻译模型，所以夹具里
+        // 的模型断言能发现「翻译误用问答模型」。
         chat_model: "same-chat-model".into(),
+        translation_model: "same-translation-model".into(),
         default_language: Some("zh-Hans".into()),
         auto_run_background_jobs: false,
         background_job_interval_ms: 0,
@@ -88,6 +91,15 @@ pub(crate) async fn import(services: &AppServices, path: &Path) -> (String, Stri
         .unwrap();
     (book.id, unit_id)
 }
+
+/// 一个「模型答了、但形状不对」的文本块在块级重发预算内会发出的整块请求次数。
+///
+/// 每轮两次严格尝试（`TRANSLATION_RESPONSE_ATTEMPTS`），共
+/// `TRANSLATION_BLOCK_RETRIES + 1` 轮，所以 = 2 × 6 = 12；最后一轮还会为多片段文本块
+/// 追加逐片段回退的请求（每次只问一个文字叶）。这两个常量都只在 lib 内部可见，这里按
+/// 同一份规则写下推导，改动预算时必须同时改这里 —— 用例断言的是「模型答垮一整块要花
+/// 多少请求」，正是这个数字把「答了但形状不对」和「根本没答」分开。
+pub(crate) const EXHAUSTED_BLOCK_ATTEMPTS: usize = 12;
 
 /// How long a run may stop making progress before the fixture gives up on it.
 /// Every case in this file runs in parallel, so a loaded machine can make an
@@ -231,12 +243,16 @@ pub(crate) fn row_count(services: &AppServices) -> usize {
         .unwrap()
 }
 
+/// 主路径就是两次请求：冻结输入的严格尝试 + 一次协议纠正。
+///
+/// 这条断言只适用于「纠正之后就通过」的用例。块级重发要等这两次都失败才开始，所以一个
+/// 答垮的块会走到 `EXHAUSTED_BLOCK_ATTEMPTS`（12 次）—— 用满预算的用例不能用这个 helper。
 pub(crate) fn assert_one_correction(endpoint: &TranslationEndpoint) {
     let requests = endpoint.requests();
     assert_eq!(
         requests.len(),
         2,
-        "one correction is the complete retry budget"
+        "one correction is the complete main-path budget"
     );
     assert_corrected_main_path(endpoint);
 }

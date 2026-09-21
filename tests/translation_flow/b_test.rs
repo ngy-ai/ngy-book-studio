@@ -2,12 +2,12 @@
 
 use super::*;
 
-/// 响应少写一条片段时，主路径（整块 + 一次纠正）两次都没通过，随后逐片段回退只问了
-/// 第一个文字叶、同样被拒绝，整块因此跳过：不允许保存半段译文，全书唯一的文本块没译成，
-/// 任务判失败。
+/// 响应少写一条片段：整块重发预算用尽，最后一轮的逐片段回退也只问了第一个文字叶并
+/// 同样被拒，于是这一块保持原文、跳过 —— 绝不允许保存半段译文。
 ///
-/// 现场（2026-09-13，`block 79/80/81`）就是这一类：弱模型把整段译文合并进 `id=0`，
-/// 两次尝试后仍判 `segment_count_mismatch`，连续三块让整本图书失败。
+/// 跳过是终态，修复路径是明细里的按块重试，所以整次运行按 `Succeeded` 收尾、游标推进
+/// 到书末。现场（2026-09-13，`block 79/80/81`）连续三块被判失败曾让整本图书失败；那个
+/// 运行级中止条件已经取消（见 `docs/agent/code-map-ai.md`）。
 #[test]
 pub(crate) fn an_incomplete_response_is_never_persisted_as_a_partial_block() {
     let endpoint = TranslationEndpoint::start("错误：", ReplyMode::MissingId);
@@ -32,31 +32,50 @@ pub(crate) fn an_incomplete_response_is_never_persisted_as_a_partial_block() {
                 .await
                 .unwrap()
         );
-        let failed = wait_translation(&services, &book_id, BackgroundJobStatus::Failed).await;
-        assert!(failed.error.is_some());
-        assert_eq!(failed.progress.completed, 0);
+        let finished = wait_translation(&services, &book_id, BackgroundJobStatus::Succeeded).await;
+        assert!(finished.error.is_none());
+        assert_eq!(
+            finished.progress.completed, 1,
+            "跳过的块与缓存命中一样推进游标"
+        );
         let requests = endpoint.requests();
+        let mut expected = vec![3; EXHAUSTED_BLOCK_ATTEMPTS];
+        expected.push(1);
         assert_eq!(
             request_segment_counts(&requests),
-            vec![3, 3, 1],
-            "主路径是完整文本块的两次请求，回退再按片段逐条问，第一条被拒就停"
+            expected,
+            "整块重发用满预算后，逐片段回退只问第一个文字叶，被拒即停"
         );
         assert_corrected_main_path(&endpoint);
         assert_eq!(row_count(&services), 0, "少一条片段的响应绝不能落库");
         assert!(
             services
-                .translation_blocks_for_unit(book_id, unit_id)
+                .translation_blocks_for_unit(book_id.clone(), unit_id)
                 .await
                 .unwrap()
                 .is_empty()
         );
+        // 跳过必须留在明细里：它是用户之后按块重试的唯一入口。
+        let logs = services
+            .background_job_logs(finished.id, vec![book_id])
+            .await
+            .unwrap();
+        let skipped: Vec<_> = logs
+            .entries
+            .iter()
+            .filter(|entry| entry.event == JobLogEvent::ProtocolSkipped)
+            .collect();
+        assert_eq!(skipped.len(), 1, "跳过的文本块必须留下可读记录");
+        assert_eq!(skipped[0].metrics.ordinal, Some(0));
     });
 }
 
-/// 片段 ID 重复的响应同属「模型答了、但片段不完整」：整块请求两次都不通过后，逐片段
-/// 回退把三个文字叶各问一次，全部通过并按原顺序拼回一条完整的 `StoredTranslation`。
+/// 片段 ID 重复的响应同属「模型答了、但片段不完整」：整块重发把预算用满都不能通过后，
+/// 逐片段回退把三个文字叶各问一次，全部通过并按原顺序拼回一条完整的 `StoredTranslation`。
+///
 /// 回退是唯一一条「弱模型也能翻完」的路径，这条回归把它固定下来：请求形状、落库行数与
-/// 片段边界空白都必须与主路径一致。
+/// 片段边界空白都必须与主路径一致。整块重发排在前面是刻意的（重发带着上一轮的失败分类，
+/// 换的是请求形状而不是只赌运气），回退只留给最后一轮。
 #[test]
 pub(crate) fn a_duplicate_id_response_is_repaired_one_fragment_at_a_time() {
     let endpoint = TranslationEndpoint::start("译：", ReplyMode::DuplicateId);
@@ -77,10 +96,12 @@ pub(crate) fn a_duplicate_id_response_is_repaired_one_fragment_at_a_time() {
         let succeeded = translate(&services, &book_id).await;
         assert!(succeeded.error.is_none());
         let requests = endpoint.requests();
+        let mut expected = vec![3; EXHAUSTED_BLOCK_ATTEMPTS];
+        expected.extend([1, 1, 1]);
         assert_eq!(
             request_segment_counts(&requests),
-            vec![3, 3, 1, 1, 1],
-            "整块 + 一次纠正都拿不到不重复的 ID，回退改为每个文字叶各问一次"
+            expected,
+            "整块重发用满预算后，回退才改为每个文字叶各问一次"
         );
         assert_corrected_main_path(&endpoint);
         assert_eq!(row_count(&services), 1);
@@ -90,7 +111,8 @@ pub(crate) fn a_duplicate_id_response_is_repaired_one_fragment_at_a_time() {
             .unwrap();
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].segments.len(), 3, "回退结果按原顺序拼回整块");
-        for (segment, request) in blocks[0].segments.iter().zip(&requests[2..]) {
+        let fragments = &requests[requests.len() - 3..];
+        for (segment, request) in blocks[0].segments.iter().zip(fragments) {
             let leaf = request["segments"][0]["text"].as_str().unwrap();
             assert_eq!(segment.source, leaf, "回退按文字叶切分，顺序不变");
             let core = leaf.trim();
@@ -326,8 +348,13 @@ pub(crate) fn malformed_or_plain_first_response_gets_one_immutable_structured_co
     }
 }
 
+/// 每一次应答都不合协议时：整块重发预算用尽后这一块保持原文、跳过，整次运行仍按
+/// `Succeeded` 收尾 —— 修复路径是明细里的按块重试，不是让整本书失败。
+///
+/// 诊断里只允许出现固定分类：模型的原样输出（这里故意塞了 256 遍私有前缀）绝不能进
+/// 任务错误、任务日志或数据库。
 #[test]
-pub(crate) fn exhausted_correction_fails_after_two_calls_without_storing_response_text() {
+pub(crate) fn an_exhausted_response_budget_skips_the_block_without_storing_provider_text() {
     let endpoint = TranslationEndpoint::start("无效：", ReplyMode::AlwaysInvalid);
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("exhausted-response.epub");
@@ -350,17 +377,19 @@ pub(crate) fn exhausted_correction_fails_after_two_calls_without_storing_respons
                 .await
                 .unwrap()
         );
-        let failed = wait_translation(&services, &book_id, BackgroundJobStatus::Failed).await;
-        assert_one_correction(&endpoint);
-        let error = failed.error.unwrap();
-        assert!(!error.contains(INVALID_RESPONSE_SENTINEL));
-        assert!(!error.contains("仅供隔离测试的无效模型前缀"));
+        let finished = wait_translation(&services, &book_id, BackgroundJobStatus::Succeeded).await;
         assert!(
-            error.len() < 1024,
-            "job error must remain bounded and independent of provider text"
+            finished.error.is_none(),
+            "协议类失败只让这一块跳过，不该让整次运行失败"
         );
-        assert_eq!(failed.progress.completed, 0);
-        assert_eq!(row_count(&services), 0);
+        let requests = endpoint.requests();
+        assert_eq!(
+            request_segment_counts(&requests),
+            vec![3; EXHAUSTED_BLOCK_ATTEMPTS],
+            "JSON 层面答不出来时换请求形状无用：只重发整块，不走逐片段回退"
+        );
+        assert_eq!(finished.progress.completed, 1, "跳过的块与缓存命中一样推进游标");
+        assert_eq!(row_count(&services), 0, "不合格的响应绝不能落库");
         assert!(
             services
                 .translation_blocks_for_unit(book_id.clone(), unit_id)
@@ -368,14 +397,37 @@ pub(crate) fn exhausted_correction_fails_after_two_calls_without_storing_respons
                 .unwrap()
                 .is_empty()
         );
+        // 持久化错误与任务日志都必须与 provider 文本无关。
         let persisted_error: String = open_fixture_conn(services.database_path())
             .query_row(
-                "SELECT error FROM index_jobs WHERE book_id = ?1 AND kind = 'translation'",
+                "SELECT coalesce(error, '') FROM index_jobs WHERE book_id = ?1 AND kind = 'translation'",
                 [&book_id],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(persisted_error, error);
+        assert!(!persisted_error.contains(INVALID_RESPONSE_SENTINEL));
+        assert!(
+            persisted_error.len() < 1024,
+            "job error must remain bounded and independent of provider text"
+        );
+        let logs = services
+            .background_job_logs(finished.id, vec![book_id])
+            .await
+            .unwrap();
+        assert!(
+            logs.entries
+                .iter()
+                .any(|entry| entry.event == JobLogEvent::ProtocolSkipped),
+            "跳过的块必须留下记录"
+        );
+        for entry in &logs.entries {
+            let line = entry.format_line();
+            assert!(
+                !line.contains(INVALID_RESPONSE_SENTINEL)
+                    && !line.contains("仅供隔离测试的无效模型前缀"),
+                "任务日志不得包含模型原文：{line}"
+            );
+        }
     });
 }
 

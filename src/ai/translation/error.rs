@@ -82,6 +82,7 @@ impl fmt::Display for ResponseError {
             "duplicate_segment_id" => "翻译模型返回了重复片段编号",
             "missing_segment_id" => "翻译模型遗漏了原文片段",
             "empty_segment_text" => "翻译模型返回了空片段",
+            "keep_with_text" => "翻译模型声明片段不需要翻译，却又返回了译文文本",
             "invalid_segment_text" => "翻译模型返回的片段包含 NUL 字符",
             _ => "翻译模型未返回有效的分段 JSON",
         })

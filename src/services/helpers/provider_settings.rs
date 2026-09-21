@@ -6,18 +6,43 @@ pub(crate) fn load_provider_settings(db_path: &Path) -> Result<ProviderSettings>
     let mut conn = db::open_conn(db_path)?;
     let tx = conn.transaction().context("无法读取 AI 设置快照")?;
     let mut settings = match db::settings::get(&tx, PROVIDER_SETTINGS_KEY)? {
-        Some(row) => serde_json::from_str::<ProviderSettings>(&row.value_json)
-            .context("stored AI provider settings are invalid")?,
+        Some(row) => {
+            let value = serde_json::from_str::<serde_json::Value>(&row.value_json)
+                .context("stored AI provider settings are invalid")?;
+            let mut settings = serde_json::from_value::<ProviderSettings>(value.clone())
+                .context("stored AI provider settings are invalid")?;
+            // 迁移：翻译模型是后加的键。老行的翻译任务本来就用问答模型，缺失时按当时保存的
+            // 问答模型补齐，翻译执行身份因此逐字不变 —— 升级不会把已翻完的图书重翻一遍。
+            if !value
+                .get("translation_model")
+                .is_some_and(serde_json::Value::is_string)
+            {
+                settings.translation_model = settings.chat_model.clone();
+            }
+            settings
+        }
         None => ProviderSettings::default(),
     };
     settings.chat_generation = match db::settings::get(&tx, CHAT_GENERATION_SETTINGS_KEY)? {
         Some(row) => serde_json::from_str::<ChatGenerationSettings>(&row.value_json)
-            .context("保存的对话模型参数无效")?,
+            .context("保存的问答生成参数无效")?,
         None => ChatGenerationSettings::default(),
     };
     settings.endpoint_routing = match db::settings::get(&tx, ENDPOINT_ROUTING_SETTINGS_KEY)? {
-        Some(row) => serde_json::from_str::<EndpointRoutingSettings>(&row.value_json)
-            .context("保存的 Endpoint 与模型绑定设置无效")?,
+        Some(row) => {
+            let value = serde_json::from_str::<serde_json::Value>(&row.value_json)
+                .context("保存的 Endpoint 与模型绑定设置无效")?;
+            let mut routing = serde_json::from_value::<EndpointRoutingSettings>(value.clone())
+                .context("保存的 Endpoint 与模型绑定设置无效")?;
+            // 与翻译模型同一套迁移：老绑定行没有翻译 Endpoint，按当时的问答 Endpoint 补齐。
+            if !value
+                .get("translation_endpoint_id")
+                .is_some_and(serde_json::Value::is_string)
+            {
+                routing.translation_endpoint_id = routing.chat_endpoint_id.clone();
+            }
+            routing
+        }
         None => EndpointRoutingSettings::default(),
     };
     let background_jobs = match db::settings::get(&tx, BACKGROUND_JOB_SETTINGS_KEY)? {
@@ -94,7 +119,7 @@ pub(crate) fn save_provider_settings(db_path: &Path, settings: &ProviderSettings
     let generation = db::settings::Setting {
         key: CHAT_GENERATION_SETTINGS_KEY.to_string(),
         value_json: serde_json::to_string(&settings.chat_generation)
-            .context("无法序列化对话模型参数")?,
+            .context("无法序列化问答生成参数")?,
         updated_at,
     };
     let background_jobs = db::settings::Setting {
@@ -154,7 +179,7 @@ pub(crate) fn save_provider_settings(db_path: &Path, settings: &ProviderSettings
     );
     ensure!(
         db::settings::upsert(&tx, &generation)? == 1,
-        "对话模型参数未能保存"
+        "问答生成参数未能保存"
     );
     ensure!(
         db::settings::upsert(&tx, &background_jobs)? == 1,

@@ -143,6 +143,13 @@
     复刻 PDF.js 文字投影，因此改为校验页面范围与引文长度一致，不比对规范页面文字
     （尚未在真实 Windows 窗口逐项冒烟复核）
   - [x] 新建图书先要求用户输入非空名称，确认后创建默认包含 HTML 章节的图书
+  - [x] 图书右键菜单提供“修改名称”与“修改作者”，复用新建图书的名称输入弹窗并预填
+    当前值；名称为空不保存，作者留空清除作者（此时列表显示「未知作者」）。两者都经
+    统一文档的保存路径推进图书版本，正文未变的章节保留自身版本，已保存的笔记与整本
+    译文不受影响。验证：
+    `rename_book_updates_catalog_and_keeps_chapter_revisions`、
+    `rename_book_rejects_a_blank_title_without_touching_the_book`、
+    `set_book_author_replaces_and_clears_authors_without_touching_content` 通过
   - [x] 编辑元数据、封面、内容单元类型及 HTML 正文，源码与富文本共享 HTML 格式
   - [x] 新增、删除、重排内容单元，目录嵌套、缩进与提升
   - [x] 编辑器显示独立目录树的全部节点，按稳定目标 ID 选择正文；同章子目录独立
@@ -194,6 +201,10 @@
   - [x] 文本块级重发：一轮（两次严格尝试 + 一次协议纠正）失败后整块重发，最多 5 次；重发的
     第一发带上一次失败的分类，逐片段回退只留在最后一轮，失败分类跨轮累积；只有协议类失败
     才重发，provider、数据库与取消照旧让整次运行失败
+  - [x] 不需要翻译的片段由模型显式声明：片段项支持可选的 `keep`，模型对纯符号/数字/公式/
+    代码片段必须返回 `{"id":N,"text":"","keep":true}`，该片段整段保持原文（首尾空白一并保留）；
+    `keep` 只能与留空的 `text` 同时出现（同时给出译文按 `keep_with_text` 拒绝），留空
+    `text` 而不声明 `keep` 仍按 `empty_segment_text` 拒绝——「没写」不等于「确认过」
   - [x] 失败块的“模型响应”页：诊断日志只保存固定分类、不保存模型回复，所以这一页按同一份
     冻结原文**重新向模型请求一次**（用户点“重新请求一次”才发，请求中按钮禁用），把返回的
     原文逐字显示——合法 JSON 缩进显示，带围栏或被截断的答案原样显示——并标出流是否正常收尾、
@@ -209,7 +220,11 @@
     不打断或改变此前已排队、正在运行的任务
   - [x] 后台任务并发与任务间隔可配置（AI 设置「后台任务」窗口：并发 1–1024 默认 1，任务间隔
     0–60000 毫秒默认 10）；保存后对后续任务立即生效，不打断正在运行的任务；同一个并发值
-    也限制一本图书翻译内部同时打开的文本块数（运行中的翻译在下一轮按新并发开窗）
+    也限制一本图书翻译内部同时打开的文本块数（运行中的翻译在下一轮按新并发开窗）；
+    任务间隔对整本翻译按**请求**生效（每个并发槽位每翻完一块休眠一次，
+    `pause_after_translation_request`，停止请求不休眠），因为一整本书只是一个任务，
+    任务粒度的间隔约束不到书内的连续请求（现场 2026-09-20：本机模型连续满载导致 GPU
+    占用过高、桌面黑屏，用户把间隔调到 5000 毫秒仍无效）
   - [x] 每个图书的当前来源只保留一个有效视觉理解任务；AI 配置未变化时不重复投递，
     视觉模型变化时替换旧任务；遗留重复/来源不明任务会清理旧派生结果后重建，且 AI
     配置与全部当前来源的索引契约原子切换、失败整体回滚
@@ -246,6 +261,17 @@
     token（正整数，默认 4096，由用户按模型设置，不设固定上限）；可选参数留空使用
     服务默认值，支持恢复默认后统一保存。参数共用
     一份配置，保存后用于后续新问答及其联网后备回答，不改变进行中的问答或视觉理解
+  - [x] 2026-09-21「对话模型」窗口改为「模型设置」，用 Tab 切换问答、翻译、Embedding、
+    视觉四个模型（`ProviderSettings.chat_model` / `translation_model`，端点绑定
+    `chat_endpoint_id` / `translation_endpoint_id`，各自是 `ModelRole::Chat` /
+    `ModelRole::Translation`）：对话模型改名问答模型，只服务侧栏问答与工具调用；
+    新增翻译模型只服务整本后台翻译，翻译执行身份只由翻译端点与翻译模型派生，
+    `AiServices.translation_provider` 也按翻译端点构建，阅读端按
+    `translations.model == translation_model` 过滤，所以换问答模型不再让已翻完的书重排。
+    两个新键缺失时按当时保存的问答配置补齐（老版本行为不变，不触发整本重译）；
+    问答生成参数只显示在问答模型 Tab 下。回归：`translation_identity_tracks_only_the_translation_model_and_its_endpoint`、
+    `rows_written_before_translation_was_split_follow_the_question_model`、
+    `model_tabs_switch_the_visible_role_and_keep_translation_independent`
   - [x] API key 存 Windows Credential Manager
   - [x] 只读 `search_books`、`read_passages`、`get_outline` 工具和宿主范围硬过滤
   - [x] 按实际工具调用次数统一预算；多调用批次超出的部分回填未执行结果，额度用完后

@@ -79,6 +79,31 @@ impl OpenAiHttpProvider {
     }
 }
 
+/// The JSON body one chat request is sent with: the serialized request plus the
+/// streaming fields this transport adds.
+///
+/// The send path and the `NGY_DUMP_TRANSLATION_RAW` diagnostic build the body
+/// through here, so a dumped body is byte-for-byte the one that goes on the wire
+/// instead of a second copy of this shape that can drift away from the transport.
+pub(crate) fn chat_request_body(request: &ChatRequest) -> Result<serde_json::Value> {
+    let mut body = serde_json::to_value(request).context("failed to encode chat request")?;
+    let object = body
+        .as_object_mut()
+        .context("chat request must be an object")?;
+    object.insert("stream".to_string(), serde_json::Value::Bool(true));
+    object.insert(
+        "stream_options".to_string(),
+        serde_json::json!({ "include_usage": true }),
+    );
+    if !request.tools.is_empty() {
+        object.insert(
+            "tool_choice".to_string(),
+            serde_json::Value::String("auto".into()),
+        );
+    }
+    Ok(body)
+}
+
 impl OpenAiCompatibleProvider for OpenAiHttpProvider {
     fn models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>>> {
         async move {
@@ -146,22 +171,7 @@ impl OpenAiCompatibleProvider for OpenAiHttpProvider {
                     bail!("at least one chat message is required");
                 }
 
-                let mut body =
-                    serde_json::to_value(&request).context("failed to encode chat request")?;
-                let object = body
-                    .as_object_mut()
-                    .context("chat request must be an object")?;
-                object.insert("stream".to_string(), serde_json::Value::Bool(true));
-                object.insert(
-                    "stream_options".to_string(),
-                    serde_json::json!({ "include_usage": true }),
-                );
-                if !request.tools.is_empty() {
-                    object.insert(
-                        "tool_choice".to_string(),
-                        serde_json::Value::String("auto".into()),
-                    );
-                }
+                let body = chat_request_body(&request)?;
 
                 let http_request = self
                     .authorized(self.client.post(self.endpoint("chat/completions")?))

@@ -14,6 +14,8 @@ fn a_manual_translation_is_shown_independently_of_the_machine_identity() {
     let settings = ProviderSettings {
         base_url: "https://models.example.test/v1".to_string(),
         chat_model: "chat-test".to_string(),
+        // 译文行按翻译模型过滤，所以这里必须与上面写入行的模型一致。
+        translation_model: "chat-test".to_string(),
         default_language: Some("zh-Hans".to_string()),
         remote_content_confirmed: true,
         confirmed_remote_endpoint: "https://models.example.test/v1/".to_string(),

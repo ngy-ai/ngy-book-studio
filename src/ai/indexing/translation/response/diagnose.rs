@@ -193,18 +193,40 @@ pub(crate) fn unclosed_thinking_block(response: &str) -> bool {
 /// so default diagnostics never log response content. It prints the frozen model
 /// input as well, so one failure can be replayed against the same model. Remove
 /// once the provider failure modes are settled.
+///
+/// It is called for **every** answer this client keeps — accepted ones included
+/// (`reason = "accepted"` / `"fragment_accepted"`) — because the only way to tell
+/// whether a text block really was translated is to see the bytes the model was
+/// given and the bytes it answered with; aggregate counters cannot prove it
+/// (现场 2026-09-20：任务显示「已处理 18168」，库里只有 71 行译文).
+///
+/// `request_body` is the whole serialized chat-completions body this attempt
+/// sends (system prompt, user message, model and sampling fields) and
+/// `response` is the model's answer, both byte for byte.
+/// `reason` is the only free-form field and stays a fixed label chosen by the
+/// caller; the switch is never enabled in product runs.
 pub(crate) fn dump_raw_translation_response(
     span: &tracing::Span,
     block_ordinal: usize,
     attempt: usize,
+    request_body: &str,
     response: &str,
-    source: &TranslationSource,
-    context: &TranslationContext<'_>,
     reason: &'static str,
 ) {
     if std::env::var_os("NGY_DUMP_TRANSLATION_RAW").is_none() {
         return;
     }
+    tracing::warn!(
+        target: "ngy_ai",
+        parent: span,
+        stage = "translation_request_dump",
+        block_ordinal,
+        attempt,
+        reason,
+        request_bytes = request_body.len(),
+        body = %request_body,
+        "Translation request body (NGY_DUMP_TRANSLATION_RAW)"
+    );
     tracing::warn!(
         target: "ngy_ai",
         parent: span,
@@ -214,19 +236,7 @@ pub(crate) fn dump_raw_translation_response(
         reason,
         response_bytes = response.len(),
         response = %response,
-        "Raw rejected translation response (NGY_DUMP_TRANSLATION_RAW)"
-    );
-    tracing::warn!(
-        target: "ngy_ai",
-        parent: span,
-        stage = "translation_request_dump",
-        block_ordinal,
-        attempt,
-        reason,
-        source_chars = source.text.chars().count(),
-        request_bytes = source.request_input(context).len(),
-        input = %source.request_input(context),
-        "Frozen translation request input (NGY_DUMP_TRANSLATION_RAW)"
+        "Translation response JSON (NGY_DUMP_TRANSLATION_RAW)"
     );
 }
 

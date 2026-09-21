@@ -30,14 +30,15 @@ impl SettingsWindowView for ModelsSettingsWindow {
         let settings = match self.entered_settings(cx) {
             Ok(settings) => settings,
             Err(error) => {
-                self.state
-                    .report(format!("对话模型设置无效：{error:#}"), true);
+                self.state.report(format!("模型设置无效：{error:#}"), true);
                 cx.notify();
                 return;
             }
         };
         // When the embedding model or dimensions change, all existing vector
         // indices become incompatible. Warn the user before proceeding.
+        // 翻译模型/翻译 Endpoint 变化不需要确认：`reconfigure_translation_jobs` 会给已翻好
+        // 的行重盖新身份、只把没翻的块交给新模型，没有要丢弃的数据。
         let confirmation = match self.services.provider_settings() {
             Ok(current)
                 if current.embedding_model != settings.embedding_model

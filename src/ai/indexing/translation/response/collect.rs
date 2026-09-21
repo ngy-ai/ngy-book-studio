@@ -30,6 +30,7 @@ pub(crate) async fn collect_translation_response(
     request_attempt: usize,
     source: &TranslationSource,
     context: &TranslationContext<'_>,
+    request_body: &str,
     identity: &str,
     mut stream: crate::ai::ChatEventStream,
 ) -> Result<BlockStep<String>> {
@@ -261,9 +262,8 @@ pub(crate) async fn collect_translation_response(
                 &span,
                 scope.ordinal,
                 request_attempt,
+                request_body,
                 &response,
-                source,
-                context,
                 stats.end,
             );
             // 流没有正常结束，但已经收到的字节可能包含一个完整、能通过全部片段校验的

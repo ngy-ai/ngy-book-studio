@@ -29,6 +29,11 @@ pub(crate) struct MockMergeProvider {
     pub(crate) reject_requests: AtomicUsize,
     /// provider 直接失败（HTTP/连接类，不是协议失败），用于固定「非协议失败不重试」。
     pub(crate) fail_provider: AtomicBool,
+    /// 每个请求都声明「不需要翻译」：`{"id":N,"text":"","keep":true}`。
+    pub(crate) keep_segments: AtomicBool,
+    /// 每个请求的开始时刻，用于固定「请求之间必须休眠任务间隔」——
+    /// `delay_ms` 只能证明请求叠在一起，证明不了它们被节流。
+    pub(crate) starts: Mutex<Vec<std::time::Instant>>,
 }
 
 impl MockMergeProvider {
@@ -54,6 +59,14 @@ impl MockMergeProvider {
             })
             .unwrap_or_default()
     }
+
+    /// 每次模型请求的开始时刻，按发起顺序。
+    pub(crate) fn request_starts(&self) -> Vec<std::time::Instant> {
+        self.starts
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
 }
 
 impl OpenAiCompatibleProvider for MockMergeProvider {
@@ -73,6 +86,10 @@ impl OpenAiCompatibleProvider for MockMergeProvider {
         let probe = self.probe.get();
         async move {
                 requests.fetch_add(1, Ordering::SeqCst);
+                self.starts
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push(std::time::Instant::now());
                 if self.fail_provider.load(Ordering::SeqCst) {
                     // provider 级别的失败：重发同一个请求解决不了，整次运行必须失败。
                     anyhow::bail!("mock provider is unavailable");
@@ -131,7 +148,14 @@ impl OpenAiCompatibleProvider for MockMergeProvider {
                 let segments = value["segments"]
                     .as_array()
                     .context("mock translation input had no segments")?;
-                let reply = if segments.len() == 1 {
+                let reply = if self.keep_segments.load(Ordering::SeqCst) {
+                    // 每个片段都声明「不需要翻译」：`keep` 必须与空 text 一起出现。
+                    let items = (0..segments.len())
+                        .map(|id| format!("{{\"id\":{id},\"text\":\"\",\"keep\":true}}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!("{{\"translations\":[{items}]}}")
+                } else if segments.len() == 1 {
                     fragment_requests.fetch_add(1, Ordering::SeqCst);
                     if fail_fragments {
                         // 单片段请求都没有通过协议：整个文本块必须保持未翻译。

@@ -17,6 +17,7 @@ pub(crate) fn build_ai_services(
         )?))
     };
     let provider = build_role(ModelRole::Chat)?;
+    let translation_provider = build_role(ModelRole::Translation)?;
     let embedding_provider = build_role(ModelRole::Embedding)?;
     let vision_provider = build_role(ModelRole::Vision)?;
     let search = Arc::new(SearchService::new_with_execution_identity(
@@ -29,6 +30,7 @@ pub(crate) fn build_ai_services(
     Ok(AiServices {
         settings,
         provider,
+        translation_provider,
         embedding_provider,
         vision_provider,
         search,

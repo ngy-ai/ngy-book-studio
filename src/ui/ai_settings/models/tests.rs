@@ -2,9 +2,8 @@
 
 use super::super::tests_support::*;
 use super::*;
-use super::*;
 use gpui::{Modifiers, TestAppContext, VisualTestContext};
-use ngy_book_studio::services::DEFAULT_ENDPOINT_ID;
+use ngy_book_studio::services::{DEFAULT_ENDPOINT_ID, DEFAULT_TRANSLATION_MODEL};
 
 fn open_window(
     cx: &mut TestAppContext,
@@ -21,7 +20,11 @@ fn role_bindings_change_without_saving_and_block_missing_endpoints(cx: &mut Test
     let (_directory, settings, visual) = open_window(cx);
     visual.simulate_resize(size(px(1080.), px(1600.)));
     redraw(visual);
-    let choice = visual.debug_bounds("ai-embedding-endpoint-0").unwrap();
+    // 一个 Tab 只显示一个模型：先切到 Embedding 才看得到它的 Endpoint 选择。
+    click(visual, "ai-models-tab-embedding");
+    let choice = visual
+        .debug_bounds("ai-embedding-endpoint-0")
+        .expect("the embedding tab must render its endpoint choices");
     visual.simulate_click(choice.center(), Modifiers::none());
     redraw(visual);
     settings.read_with(visual, |view, cx| {
@@ -170,4 +173,74 @@ fn generation_text_parsing_supports_blank_options_and_rejects_invalid_drafts() {
     assert!(parse_chat_generation("", "1.1", "4096", "", "").is_err());
     assert!(parse_chat_generation("", "", "4096", "-2.1", "").is_err());
     assert!(parse_chat_generation("", "", "4096", "", "2.1").is_err());
+}
+
+/// 模型设置用 Tab 切换四个配置：一次只渲染一个模型的区域，问答生成参数只跟着问答
+/// 模型；翻译模型与问答模型是两个独立字段，草稿在同一个实体里因此切 Tab 不会丢。
+#[gpui::test]
+fn model_tabs_switch_the_visible_role_and_keep_translation_independent(cx: &mut TestAppContext) {
+    let (_directory, settings, visual) = open_window(cx);
+    visual.simulate_resize(size(px(1080.), px(1600.)));
+    redraw(visual);
+
+    // 默认停在问答模型：四个 Tab 与它的检测按钮都在。
+    for selector in [
+        "ai-models-tab-chat",
+        "ai-models-tab-translation",
+        "ai-models-tab-embedding",
+        "ai-models-tab-vision",
+        "ai-detect-chat-models",
+        "ai-reset-chat-generation",
+    ] {
+        assert!(
+            visual.debug_bounds(selector).is_some(),
+            "{selector} 应该在问答 Tab 上渲染"
+        );
+    }
+    settings.read_with(visual, |view, _| {
+        assert_eq!(view.active_model_tab, ModelRole::Chat);
+    });
+
+    // 切到翻译 Tab：它的区域出现。
+    // 注意 `debug_bounds` 不清理旧帧的选择器，所以这里只断言新区域出现、不靠它断言
+    // 旧区域消失；「一次只渲染一个模型」由 `active_model_tab` 与渲染分派保证。
+    click(visual, "ai-models-tab-translation");
+    settings.read_with(visual, |view, _| {
+        assert_eq!(view.active_model_tab, ModelRole::Translation);
+    });
+    assert!(
+        visual
+            .debug_bounds("ai-detect-translation-models")
+            .is_some()
+    );
+
+    let translation_input =
+        settings.read_with(visual, |view, _| view.translation_model_input.clone());
+    edit_input(visual, &translation_input, "translation-only-model");
+    settings.read_with(visual, |view, cx| {
+        // 保存前只改草稿：已存设置不动。
+        assert_eq!(
+            view.entered_settings(cx).unwrap().translation_model,
+            "translation-only-model"
+        );
+        assert_eq!(
+            view.services.provider_settings().unwrap().translation_model,
+            DEFAULT_TRANSLATION_MODEL
+        );
+    });
+
+    click(visual, "ai-models-tab-chat");
+    let chat_input = settings.read_with(visual, |view, _| view.chat_model_input.clone());
+    edit_input(visual, &chat_input, "chat-only-model");
+    settings.read_with(visual, |view, cx| {
+        let entered = view.entered_settings(cx).unwrap();
+        assert_eq!(entered.chat_model, "chat-only-model");
+        assert_eq!(entered.translation_model, "translation-only-model");
+        assert_eq!(view.active_model_tab, ModelRole::Chat);
+        // 切走再切回，翻译草稿仍在。
+        assert_eq!(
+            view.translation_model_input.read(cx).value().as_ref(),
+            "translation-only-model"
+        );
+    });
 }

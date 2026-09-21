@@ -16,6 +16,7 @@ fn job(status: BackgroundJobStatus) -> BackgroundJobSnapshot {
         progress: BackgroundJobProgress {
             completed: 3,
             total: Some(10),
+            processing: Vec::new(),
         },
         error: None,
         created_at: 1_700_000_000,

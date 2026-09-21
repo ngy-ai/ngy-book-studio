@@ -24,7 +24,7 @@ pub(crate) trait SettingsWindowView: Render + Sized + 'static {
     fn apply_saved_preferences(&mut self, _cx: &mut App) {}
 }
 
-/// 需要在窗口里列出各 Endpoint 的设置窗口（Endpoint 与对话模型）。
+/// 需要在窗口里列出各 Endpoint 的设置窗口（Endpoint 与模型设置）。
 pub(crate) trait EndpointBackedWindow: SettingsWindowView {
     fn endpoints(&self) -> &[EndpointDraft];
 

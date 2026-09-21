@@ -26,10 +26,14 @@ pub enum BackgroundJobAction {
     Retranslate,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BackgroundJobProgress {
     pub completed: usize,
     pub total: Option<usize>,
+    /// 整本翻译此刻打开在窗口里的文本块（升序块号）。块级明细的「处理中」只认这一份
+    /// 读数：原始游标对运行中的任务是不下发的（见 `cursor_json`），所以窗口必须由
+    /// 服务层解析后交出去，界面不自己读内部 JSON。其它任务逐项走、窗口恒空。
+    pub processing: Vec<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,6 +61,9 @@ pub struct BackgroundJobSnapshot {
     /// Raw renderer/provider cursor JSON. Only kept for `Failed` jobs and
     /// for `visual_render` jobs so users can see which renderer profile and
     /// units were used; otherwise the cursor can be very large and noisy.
+    /// A running whole-book translation therefore does *not* ship its cursor:
+    /// the live block window it needs is projected into
+    /// [`BackgroundJobProgress::processing`] instead.
     pub cursor_json: Option<String>,
 }
 
@@ -148,6 +155,10 @@ pub(crate) fn background_job_snapshot(
         ("visual_render", _) => None,
         _ => None,
     };
+    let processing = match job.kind.as_str() {
+        "translation" => in_flight_ordinals(cursor.as_ref()),
+        _ => Vec::new(),
+    };
     let kept_cursor = snapshot_cursor_json(&job.kind, job.status, &job.cursor_json);
     Ok(BackgroundJobSnapshot {
         id: job.id,
@@ -165,7 +176,11 @@ pub(crate) fn background_job_snapshot(
         pause_requested: job.pause_requested,
         cancel_requested: job.cancel_requested,
         attempts: job.attempts,
-        progress: BackgroundJobProgress { completed, total },
+        progress: BackgroundJobProgress {
+            completed,
+            total,
+            processing,
+        },
         error: job.error,
         created_at: job.created_at,
         updated_at: job.updated_at,
@@ -191,6 +206,28 @@ pub(crate) fn snapshot_cursor_json(
     } else {
         None
     }
+}
+
+/// 整本翻译在持久游标里记下的「处理中」窗口，升序、去重。
+///
+/// 只有整本翻译会填 `inflight`（其它任务逐项走、窗口恒空），所以它是「这本图书现在
+/// 有几块在跑」的唯一权威读数。缺字段、写坏的 JSON 或非数字项一律按「没有在飞的块」
+/// 处理，绝不猜一个出来：旧格式游标不该凭空显示成处理中。
+pub(crate) fn in_flight_ordinals(cursor: Option<&serde_json::Value>) -> Vec<usize> {
+    let mut blocks = cursor
+        .and_then(|value| value.get("inflight"))
+        .and_then(serde_json::Value::as_array)
+        .map(|ordinals| {
+            ordinals
+                .iter()
+                .filter_map(|ordinal| ordinal.as_u64())
+                .filter_map(|ordinal| usize::try_from(ordinal).ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    blocks.sort_unstable();
+    blocks.dedup();
+    blocks
 }
 
 pub(crate) fn json_usize(value: Option<&serde_json::Value>) -> Option<usize> {

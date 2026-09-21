@@ -28,17 +28,27 @@ pub fn parse_response(
         if translated[segment.id].is_some() {
             return Err(ResponseError::new("duplicate_segment_id").into());
         }
+        // Translation changes the text, while spacing at formatting boundaries
+        // belongs to the source template (for example `word <strong>word</strong>`).
+        let original = &source.segments[segment.id];
         let value = segment.text.trim_matches(is_matching_whitespace);
+        if segment.keep {
+            // 模型显式声明这个片段不需要翻译（纯符号、数字、公式、代码等）：整段保持
+            // 原文，首尾空白一起保留。声明必须与空 text 同时给出 —— 同时给了译文就
+            // 说明模型没想清楚要哪一个，按协议错误拒绝，交给重试或逐片段回退，而不是
+            // 替它猜。留空 text 又不声明 keep 的答案仍走下面的 `empty_segment_text`。
+            if !value.is_empty() {
+                return Err(ResponseError::new("keep_with_text").into());
+            }
+            translated[segment.id] = Some(original.clone());
+            continue;
+        }
         if value.is_empty() {
             return Err(ResponseError::new("empty_segment_text").into());
         }
         if value.contains('\0') {
             return Err(ResponseError::new("invalid_segment_text").into());
         }
-
-        // Translation changes the text, while spacing at formatting boundaries
-        // belongs to the source template (for example `word <strong>word</strong>`).
-        let original = &source.segments[segment.id];
         let start = original.len() - original.trim_start_matches(is_matching_whitespace).len();
         let end = original.trim_end_matches(is_matching_whitespace).len();
         ensure!(start < end, "原文片段没有可翻译文字");

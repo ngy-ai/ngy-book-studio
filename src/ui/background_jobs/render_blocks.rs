@@ -137,7 +137,7 @@ impl BackgroundJobsWindow {
                 div()
                     .text_color(rgb(palette(cx).muted))
                     .child(
-                        "更换更擅长指令的对话模型后，可用右上方「重试失败块」重跑全部未翻译的块；\
+                        "更换更擅长指令的翻译模型后，可用右上方「重试失败块」重跑全部未翻译的块；\
                          行内「重试」只重跑这一块。",
                     )
                     .into_any_element(),

@@ -223,6 +223,14 @@ pub(crate) fn translation_format_instructions_forbid_full_width_structure_punctu
     assert!(format.contains("半角 ASCII"));
     assert!(format.contains("全角标点"));
     assert!(format.contains("绝不能写在键名、冒号或逗号的位置"));
+    // 不需要翻译的片段必须由模型显式声明（`keep`），留空 text 不算声明。
+    assert!(format.contains("keep"));
+    assert!(format.contains("留空会被判为错误"));
+    // 字段数只能有一种说法：普通项是 id+text，`keep` 项才多一个 keep。现场
+    // 2026-09-21 block 589 的 `keep_with_text`：格式说明说「每项只有 id、text、keep
+    // 三个字段」、纠正提示却说「每项只有 id 和 text 两个字段」，弱模型两头都对不上。
+    assert!(format.contains("每项只有 id 与 text 两个字段"));
+    assert!(!format.contains("三个字段"));
 
     for kind in [
         "invalid_json",
@@ -231,7 +239,8 @@ pub(crate) fn translation_format_instructions_forbid_full_width_structure_punctu
         "missing_json",
     ] {
         let reminder = translation_correction_reminder(kind, 4);
-        assert!(reminder.contains(kind));
+        // 内部失败分类是指令噪音，弱模型甚至会把它抄进答案，绝不能进提示词。
+        assert!(!reminder.contains(kind));
         assert!(reminder.contains("半角冒号"));
         assert!(reminder.contains("全部 4 个片段"));
         assert!(reminder.contains("id 为 0 到 3 的整数"));
@@ -240,6 +249,44 @@ pub(crate) fn translation_format_instructions_forbid_full_width_structure_punctu
     assert!(counts.contains("片段编号不完整或有重复"));
     let blanks = translation_correction_reminder("empty_segment_text", 1);
     assert!(blanks.contains("非空的译文"));
+    // 声明「不需要翻译」的写法必须出现在纠正提示里，否则弱模型只会一直留空。
+    assert!(blanks.contains("keep"));
+    // 单片段不得拼出「id 为 0 到 0 的整数」这种机器病句。
+    assert!(blanks.contains("id 只能取整数 0"));
+    assert!(!blanks.contains("0 到 0"));
+    let kept = translation_correction_reminder("keep_with_text", 1);
+    assert!(kept.contains("keep"));
+    // keep 的语义必须说成「保持原文」这一层应用行为之外的可判定写法。
+    assert!(kept.contains("空字符串"));
+    assert!(!kept.contains("每项只有 id 和 text 两个字段"));
+}
+
+#[test]
+pub(crate) fn translation_prompt_resolves_the_number_rule_and_hides_the_failure_label() {
+    // 现场 2026-09-21 block 589：单片段「188M trained」、源语言 en，模型回了
+    // keep + 译文，按 `keep_with_text` 拒绝。两份提示各给了一个相反的动作：
+    // ① 开头说「保留专有名词与数字」，格式说明又说纯数字片段要写 keep；
+    // ② 格式说明说「每项只有 id、text、keep 三个字段」，纠正提示说「两个字段」。
+    // 「保持原文」又只是应用行为，模型于是把原文抄进 text。四件事一起钉住。
+    let source = TranslationSource {
+        text: "188M trained".to_string(),
+        segments: vec!["188M trained".to_string()],
+    };
+    let system = translation_prompt("zh-Hans", Some("en"), &source, Some("keep_with_text"));
+    // 数字与专有名词只要求「本身不改写」，其余文字仍必须给出译文。
+    assert!(system.contains("数字与专有名词本身不改写"));
+    assert!(!system.contains("保留专有名词与数字"));
+    // keep 项必须是可判定的写法：空字符串 + keep，且不得同时给出译文。
+    assert!(system.contains("text 必须恰好是空字符串"));
+    assert!(system.contains("既写 keep 又给出译文会被判为错误"));
+    // 字段数只有一种说法。
+    assert!(system.contains("每项只有 id 与 text 两个字段"));
+    assert!(!system.contains("三个字段"));
+    assert!(!system.contains("每项只有 id 和 text 两个字段"));
+    // 内部失败分类不得进入提示词，单片段也不得拼出「0 到 0」。
+    assert!(!system.contains("keep_with_text"));
+    assert!(system.contains("id 只能取整数 0"));
+    assert!(!system.contains("0 到 0"));
 }
 
 #[test]
@@ -367,6 +414,8 @@ pub(crate) fn translation_prompt_is_shared_by_the_worker_and_the_inspector() {
         translation_prompt("zh-Hans", Some("en"), &source, None)
     );
     assert!(system.contains("中文（简体）"));
+    // 语言提示是前置的肯定句：语境内联在提示词开头，而不是收尾处的一句猜测。
+    assert!(system.starts_with("原文语言是 en。"));
     // Segments are only allowed to be translated, so the prompt names them.
     assert!(system.contains("segments"));
 
@@ -390,6 +439,7 @@ pub(crate) fn translation_prompt_is_shared_by_the_worker_and_the_inspector() {
         MessageContent::Parts(_) => panic!("the system prompt is plain text"),
     };
     assert!(!system.contains("原文可能的语言标记"));
+    assert!(!system.contains("原文语言是"));
 }
 
 #[test]
@@ -398,17 +448,24 @@ pub(crate) fn translation_request_body_serializes_the_exact_wire_shape() {
         text: "Body".to_string(),
         segments: vec!["Body".to_string()],
     };
-    let request = translation_request(
-        "chat-test",
-        "zh-Hans",
-        Some("en"),
-        &source,
-        &TranslationContext::default(),
-        None,
+    let context = TranslationContext::new("A Book", "Chapter One");
+    let request = translation_request("chat-test", "zh-Hans", Some("en"), &source, &context, None);
+    // 诊断转储打印的 body 必须就是 provider 真正发出去的那一份：`stream` 与
+    // `stream_options` 由传输层追加，转储不能自己另拼一套形状，否则「模型收到的
+    // 是什么」就又变成了猜测。
+    let body = translation_request_body(&request);
+    assert_eq!(
+        body,
+        crate::ai::chat_request_body(&request).unwrap().to_string(),
+        "转储的请求体必须与网线上那一份逐字节相同"
     );
-    let body = serde_json::to_string(&request).unwrap();
     let parsed = serde_json::from_str::<serde_json::Value>(&body).unwrap();
     assert_eq!(parsed["model"], "chat-test");
+    assert_eq!(parsed["stream"], true);
+    assert_eq!(
+        parsed["stream_options"],
+        serde_json::json!({ "include_usage": true })
+    );
     assert_eq!(parsed["temperature"], 0.0);
     assert_eq!(
         parsed["max_tokens"],
@@ -419,6 +476,21 @@ pub(crate) fn translation_request_body_serializes_the_exact_wire_shape() {
     assert_eq!(parsed["messages"][1]["role"], "user");
     // Tools are empty and must not be serialized into the body at all.
     assert!(parsed.get("tools").is_none());
+    // 系统提示里的格式约定只在这一份 body 里（只打印用户消息时看不到）。
+    assert!(
+        parsed["messages"][0]["content"]
+            .as_str()
+            .expect("the system prompt is plain text")
+            .contains("translations"),
+        "系统提示必须随 body 一起转储"
+    );
+    // 用户消息就是冻结输入：书名、章节、整段原文与片段都在这一条里。
+    let user: serde_json::Value =
+        serde_json::from_str(parsed["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(user["book"], "A Book");
+    assert_eq!(user["chapter"], "Chapter One");
+    assert_eq!(user["source"], "Body");
+    assert_eq!(user["segments"][0]["text"], "Body");
 }
 
 #[test]
@@ -448,6 +520,7 @@ pub(crate) fn translation_segment_fallback_covers_only_answered_multi_fragment_b
         "duplicate_segment_id",
         "empty_segment_text",
         "invalid_segment_text",
+        "keep_with_text",
         "positional_segments",
     ] {
         assert!(fragment_fallback_applies(&multi, &[kind]), "{kind}");

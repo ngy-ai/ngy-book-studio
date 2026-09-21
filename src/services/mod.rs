@@ -93,7 +93,7 @@ pub use mutation::LibraryMutation;
 pub use settings::{
     ApiKeyUpdate, DEFAULT_BACKGROUND_JOB_CONCURRENCY, DEFAULT_BACKGROUND_JOB_INTERVAL_MS,
     DEFAULT_CHAT_MODEL, DEFAULT_EMBEDDING_DIMENSIONS, DEFAULT_EMBEDDING_MODEL, DEFAULT_ENDPOINT_ID,
-    DEFAULT_VISION_MODEL, EndpointRoutingSettings, EndpointSettings,
+    DEFAULT_TRANSLATION_MODEL, DEFAULT_VISION_MODEL, EndpointRoutingSettings, EndpointSettings,
     MAX_BACKGROUND_JOB_CONCURRENCY, MAX_BACKGROUND_JOB_INTERVAL_MS, MIN_BACKGROUND_JOB_CONCURRENCY,
     ModelRole, ProviderSettings, ReaderZoomSurface, TRANSLATION_LANGUAGES, TranslationDisplayMode,
     translation_language_label,

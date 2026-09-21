@@ -148,6 +148,60 @@ pub(crate) fn wrapped_answers_retain_strict_ids_fields_and_text_validation() {
     }
 }
 
+/// 不需要翻译的片段必须由模型**显式声明**：`{"id":N,"text":"","keep":true}` 让该片段保持
+/// 原文（含首尾空白）；留空 text 却不声明 keep 仍按 `empty_segment_text` 拒绝，声明了
+/// keep 又同时给出译文按 `keep_with_text` 拒绝。
+///
+/// 现场（2026-09-20，qwen3:0.6b）：模型对纯符号/数字片段留空回答，整块因此反复重试，
+/// 最后按未翻译跳过 —— 用户要的是「模型确认过这段不需要翻译」才算数。
+#[test]
+pub(crate) fn keep_declares_a_segment_without_translation_and_stays_strict() {
+    let source = TranslationSource {
+        text: "12 Hello world".to_string(),
+        segments: vec!["12 ".into(), "Hello world".into()],
+    };
+
+    let stored = parse_response(
+        &source,
+        r#"{"translations":[{"id":0,"text":"","keep":true},{"id":1,"text":"你好世界"}]}"#,
+        "v2",
+    )
+    .unwrap();
+    assert_eq!(
+        stored.segments[0].translated, "12 ",
+        "声明不需要翻译的片段必须整段保持原文"
+    );
+    assert_eq!(stored.segments[1].translated, "你好世界");
+
+    for (json, kind) in [
+        (
+            // 没有 keep 的空白译文：照旧是错误，不是「不用翻译」。
+            r#"{"translations":[{"id":0,"text":""},{"id":1,"text":"你好世界"}]}"#,
+            "empty_segment_text",
+        ),
+        (
+            // 声明与译文同时出现：模型没想清楚要哪一个，按协议错误拒绝。
+            r#"{"translations":[{"id":0,"text":"12","keep":true},{"id":1,"text":"你好世界"}]}"#,
+            "keep_with_text",
+        ),
+        (
+            r#"{"translations":[{"id":0,"text":"","keep":false},{"id":1,"text":"你好世界"}]}"#,
+            "empty_segment_text",
+        ),
+        (
+            r#"{"translations":[{"id":0,"text":"","keep":"yes"},{"id":1,"text":"你好世界"}]}"#,
+            "invalid_schema",
+        ),
+    ] {
+        let error = parse_response(&source, json, "v2").unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ResponseError>().unwrap().kind(),
+            kind,
+            "{json}"
+        );
+    }
+}
+
 #[test]
 pub(crate) fn response_requires_object_segments_without_losing_duplicate_field_rejection() {
     let source = TranslationSource {

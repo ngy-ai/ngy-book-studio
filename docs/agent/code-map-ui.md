@@ -4,19 +4,24 @@
 
 ## 模块
 
-- `src/ui/ai_settings/`：AI 设置的**五个独立窗口**（`Endpoint`、`对话模型`、`联网搜索`、
+- `src/ui/ai_settings/`：AI 设置的**五个独立窗口**（`Endpoint`、`模型设置`、`联网搜索`、
   `后台任务`、`系统配置`）；工具栏“AI 设置”是选择窗口的菜单，五个窗口可同时打开。
   `mod.rs` 放五窗口共用的身份（`AiSettingsSection`）、应用级单例登记
   （`SettingsWindowTrackers`，一条登记只服务一个窗口）、状态与提示、统一外框
-  （`settings_frame`）与统一提交（`commit_settings`）；`endpoint.rs`、`models.rs`、
+  （`settings_frame`）与统一提交（`commit_settings`）；`endpoint.rs`、`models/`、
   `web_search.rs`、`background_jobs.rs`、`system.rs` 各自持有草稿、校验与面板；
-  `endpoint_draft.rs` 是 Endpoint 与对话模型两个窗口共用的 Endpoint 草稿与模型检测。
+  `endpoint_draft.rs` 是 Endpoint 与模型设置两个窗口共用的 Endpoint 草稿与模型检测。
+  `models/` 里四个模型（问答、翻译、Embedding、视觉）**用一个 Tab 条切换**，一次只渲染
+  当前 Tab 的模型区域，问答生成参数只跟着问答模型。Tab 用分段按钮实现而不是
+  `gpui_component::tab::TabBar`：`TabBar` 的子项不暴露 `debug_selector`，而本仓库的 GUI
+  冒烟与 GPUI 测试都按选择器定位控件。Tab 的选择器是 `ai-models-tab-<role>`；`debug_bounds`
+  不清理旧帧的选择器，因此测试只能断言「新 Tab 的控件出现」，不能靠它断言旧 Tab 消失。
   **每个窗口只保存自己那一块**：各窗口的 `entered_settings` 一律以
   `services.provider_settings()` 的当前值为底、只覆盖本窗口字段，然后交给
   `AppServices::configure_providers`（唯一的提交入口），因此任何窗口的保存都不会把别的
   窗口里还没提交的输入写进数据库（改动前是一个窗口、五个标签、一次统一保存全部配置）。
   新增设置项时必须同时决定它归哪个窗口，并保持「只覆盖本窗口字段」这条约定；跨窗口共享
-  的草稿只读展示，不要在窗口之间互相写入。模型检测在 Endpoint 与对话模型两个窗口都可用，
+  的草稿只读展示，不要在窗口之间互相写入。模型检测在 Endpoint 与模型设置两个窗口都可用，
   结果按 Endpoint 标识、`discovery_generation` 与规范化地址三重校验，换地址即作废；
   删除仍被模型绑定的 Endpoint 会被拒绝（以已保存设置的绑定为准，窗口快照兜底）。保存流程
   的两条上限（`SAVE_WAIT_LIMIT` 与 `AI_SETTINGS_GATE_TIMEOUT`）对五个窗口同样适用。
@@ -47,9 +52,13 @@
   日志失败不得改变任务结果；不接受任意正文、URL 或错误字符串，不逐 token 记录。
   日志读取经服务重新核验当前任务归属，时间明确为 UTC，保留清理与无历史记录须可见。
   翻译任务的「文本块明细」不止由持久游标推导：`BlockInspector` 的已处理/待处理来自
-  游标（`completed` 就是 `next_ordinal`），「处理中」来自游标 JSON 里的 `inflight` 窗口集合
-  —— 整本翻译会同时开多块，单看游标说不出在跑哪几块；旧格式游标、写坏的 JSON、非运行态一律
-  当作「没有在飞的块」，不得凭空把游标那一块显示成处理中。失败块必须来自该任务最新一次执行的
+  游标（`completed` 就是 `next_ordinal`），「处理中」来自服务层投影
+  `BackgroundJobProgress::processing` —— 整本翻译会同时开多块，单看游标说不出在跑哪几块；
+  旧格式游标、写坏的 JSON、非运行态一律当作「没有在飞的块」，不得凭空把游标那一块显示成
+  处理中。**这份窗口必须由服务层解析后交给界面**：运行中的翻译任务不下发原始游标
+  （`BackgroundJobSnapshot::cursor_json` 只留给失败任务和 `visual_render`），界面回去读那份
+  永远缺失的游标就只会读到 0（现场 2026-09-20：并发 16 的翻译任务「已处理」一直在涨、
+  「处理中」恒为 0，手工刷新也一样）。失败块必须来自该任务最新一次执行的
   `ProtocolSkipped` 与带 ordinal 的 `StepFailed`
   事件（回滚式失败只把游标退回第一个未翻译块，命名不了整批失败块）。失败块从游标给的状态
   里移出，四个计数必须恒等于块总数；筛选、跳到当前进度、复制都要按同一个视图计算。
@@ -62,7 +71,7 @@
   因此 worker（`translate_block`）与检查器必须共用同一个 `translation_prompt()`，不得各写
   一份；`translation_request` 的温度固定为 `TRANSLATION_TEMPERATURE = 0.0`，两边一起生效。
   模型名取任务的持久游标（任务执行过就以它钉住的模型为准），只有从未执行的任务才回落到
-  AI 设置的 `models.translation.model`（可能为空）。读取路径与列表同为**只读**：不认领、
+  AI 设置里当前配置的翻译模型（「模型设置」窗口 → 翻译模型，可能为空）。读取路径与列表同为**只读**：不认领、
   不推进、不发布任务，也不写 `translations`；单块读取复用 `load_translation_blocks` 后按
   `ordinal` 线性查找，代价与列表同量级，可由用户点击触发。面板必须给正文硬高度上限并套
   内层滚动容器——GPUI 无法光栅化超出纹理上限的自然高度长文本。

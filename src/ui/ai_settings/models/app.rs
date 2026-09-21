@@ -2,6 +2,25 @@
 
 use super::*;
 
+/// 一个模型角色在界面上的三件套：Tab/字段标签、说明、选择器短名。选择器短名同时
+/// 用于 Tab 与角色面板（`ai-models-tab-chat`、`ai-role-chat`、`ai-detect-chat-models`）。
+fn model_role_text(role: ModelRole) -> (&'static str, &'static str, &'static str) {
+    match role {
+        ModelRole::Chat => ("问答模型", "用于侧栏问答、引用与只读工具调用。", "chat"),
+        ModelRole::Translation => (
+            "翻译模型",
+            "只用于整本图书的后台翻译；换问答模型不会让已翻完的图书重翻。",
+            "translation",
+        ),
+        ModelRole::Embedding => (
+            "Embedding 模型",
+            "用于向量索引；不可用时全文检索仍可工作。",
+            "embedding",
+        ),
+        ModelRole::Vision => ("视觉模型", "用于页面 OCR 与视觉说明任务。", "vision"),
+    }
+}
+
 impl ModelsSettingsWindow {
     pub(crate) fn new(
         services: Arc<AppServices>,
@@ -18,6 +37,11 @@ impl ModelsSettingsWindow {
             InputState::new(window, cx)
                 .default_value(settings.chat_model.clone())
                 .placeholder(DEFAULT_CHAT_MODEL)
+        });
+        let translation_model_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(settings.translation_model.clone())
+                .placeholder(DEFAULT_TRANSLATION_MODEL)
         });
         let generation = &settings.chat_generation;
         let temperature_input = optional_parameter_input(generation.temperature, window, cx);
@@ -51,9 +75,11 @@ impl ModelsSettingsWindow {
             services,
             endpoints,
             chat_endpoint_id: settings.endpoint_routing.chat_endpoint_id,
+            translation_endpoint_id: settings.endpoint_routing.translation_endpoint_id,
             embedding_endpoint_id: settings.endpoint_routing.embedding_endpoint_id,
             vision_endpoint_id: settings.endpoint_routing.vision_endpoint_id,
             chat_model_input,
+            translation_model_input,
             temperature_input,
             top_p_input,
             max_output_tokens_input,
@@ -62,6 +88,7 @@ impl ModelsSettingsWindow {
             embedding_model_input,
             embedding_dimensions_input,
             vision_model_input,
+            active_model_tab: MODEL_TABS[0],
             state: SettingsWindowState::new(window),
         }
     }
@@ -70,6 +97,12 @@ impl ModelsSettingsWindow {
     pub(crate) fn entered_settings(&self, cx: &App) -> Result<ProviderSettings> {
         let mut settings = self.services.provider_settings()?;
         settings.chat_model = self.chat_model_input.read(cx).value().trim().to_string();
+        settings.translation_model = self
+            .translation_model_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
         settings.chat_generation = parse_chat_generation(
             self.temperature_input.read(cx).value().as_ref(),
             self.top_p_input.read(cx).value().as_ref(),
@@ -87,6 +120,7 @@ impl ModelsSettingsWindow {
             parse_embedding_dimensions(self.embedding_dimensions_input.read(cx).value().as_ref())?;
         settings.vision_model = self.vision_model_input.read(cx).value().trim().to_string();
         settings.endpoint_routing.chat_endpoint_id = self.chat_endpoint_id.clone();
+        settings.endpoint_routing.translation_endpoint_id = self.translation_endpoint_id.clone();
         settings.endpoint_routing.embedding_endpoint_id = self.embedding_endpoint_id.clone();
         settings.endpoint_routing.vision_endpoint_id = self.vision_endpoint_id.clone();
         settings.validate()?;
@@ -96,6 +130,7 @@ impl ModelsSettingsWindow {
     pub(crate) fn endpoint_id_for(&self, role: ModelRole) -> &str {
         match role {
             ModelRole::Chat => &self.chat_endpoint_id,
+            ModelRole::Translation => &self.translation_endpoint_id,
             ModelRole::Embedding => &self.embedding_endpoint_id,
             ModelRole::Vision => &self.vision_endpoint_id,
         }
@@ -107,6 +142,7 @@ impl ModelsSettingsWindow {
         }
         match role {
             ModelRole::Chat => self.chat_endpoint_id = id.to_string(),
+            ModelRole::Translation => self.translation_endpoint_id = id.to_string(),
             ModelRole::Embedding => self.embedding_endpoint_id = id.to_string(),
             ModelRole::Vision => self.vision_endpoint_id = id.to_string(),
         }
@@ -117,9 +153,19 @@ impl ModelsSettingsWindow {
     pub(crate) fn model_input_for(&self, role: ModelRole) -> &Entity<InputState> {
         match role {
             ModelRole::Chat => &self.chat_model_input,
+            ModelRole::Translation => &self.translation_model_input,
             ModelRole::Embedding => &self.embedding_model_input,
             ModelRole::Vision => &self.vision_model_input,
         }
+    }
+
+    /// 切换当前显示的模型 Tab。四个 Tab 共用同一个实体，因此未提交的草稿不会丢。
+    pub(crate) fn select_model_tab(&mut self, role: ModelRole, cx: &mut Context<Self>) {
+        if self.active_model_tab == role {
+            return;
+        }
+        self.active_model_tab = role;
+        cx.notify();
     }
 
     pub(crate) fn reset_chat_generation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -149,27 +195,65 @@ impl ModelsSettingsWindow {
             input.update(cx, |input, cx| input.set_value(value, window, cx));
         }
         self.state
-            .report("对话生成参数已恢复默认，点击“保存设置”后生效。", false);
+            .report("问答生成参数已恢复默认，点击“保存设置”后生效。", false);
         cx.notify();
     }
 
     #[inline(never)]
     pub(crate) fn render_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = palette(cx);
-        panel(
-            theme,
-            vec![
-                card_note(
-                    theme,
-                    "Endpoint 名称与地址在「Endpoint」窗口里编辑；这里的选择在打开本窗口时读取，\
-                     那边新增或改名后重新打开本窗口即可看到。",
-                ),
-                self.render_role_panel(ModelRole::Chat, cx),
-                self.render_role_panel(ModelRole::Embedding, cx),
-                self.render_role_panel(ModelRole::Vision, cx),
-                self.render_generation_panel(cx),
-            ],
-        )
+        // 一个 Tab 只显示一个模型的配置；问答生成参数只属于问答模型，所以只在它的
+        // Tab 里出现 —— 它随问答请求一起发送，翻译请求不使用它。
+        let mut children = vec![
+            card_note(
+                theme,
+                "Endpoint 名称与地址在「Endpoint」窗口里编辑；这里的选择在打开本窗口时读取，\
+                 那边新增或改名后重新打开本窗口即可看到。",
+            ),
+            self.render_model_tabs(cx),
+            self.render_role_panel(self.active_model_tab, cx),
+        ];
+        if self.active_model_tab == ModelRole::Chat {
+            children.push(self.render_generation_panel(cx));
+        }
+        panel(theme, children)
+    }
+
+    /// 模型 Tab 条。
+    ///
+    /// 用分段按钮而不是 `gpui_component::tab::TabBar`：`TabBar` 的子项不暴露
+    /// `debug_selector`，而本仓库的 GUI 冒烟与 GPUI 测试都按
+    /// `ai-models-tab-<role>` 定位控件（`docs/agent/code-map-ui.md`）。
+    #[inline(never)]
+    pub(crate) fn render_model_tabs(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = palette(cx);
+        let busy = self.state.busy();
+        let mut tabs = div().h_flex().flex_wrap().gap_1();
+        for role in MODEL_TABS {
+            let (label, _, role_selector) = model_role_text(role);
+            let selector = AiSettingsSection::Models.selector(&format!("tab-{role_selector}"));
+            let element_id = selector.clone();
+            let selected = self.active_model_tab == role;
+            tabs = tabs.child(
+                Button::new(SharedString::from(element_id))
+                    .small()
+                    .ghost()
+                    .label(label)
+                    .disabled(busy)
+                    .when(selected, |button| {
+                        button.custom(
+                            ButtonCustomVariant::new(cx)
+                                .color(rgb(theme.accent_soft).into())
+                                .foreground(rgb(theme.accent_strong).into()),
+                        )
+                    })
+                    .debug_selector(move || selector.clone())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_model_tab(role, cx);
+                    })),
+            );
+        }
+        tabs.into_any_element()
     }
 
     #[inline(never)]
@@ -179,15 +263,7 @@ impl ModelsSettingsWindow {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = palette(cx);
-        let (label, description, selector) = match role {
-            ModelRole::Chat => ("对话模型", "用于流式问答和只读工具调用。", "chat"),
-            ModelRole::Embedding => (
-                "Embedding 模型",
-                "用于向量索引；不可用时全文检索仍可工作。",
-                "embedding",
-            ),
-            ModelRole::Vision => ("视觉模型", "用于页面 OCR 与视觉说明任务。", "vision"),
-        };
+        let (label, description, selector) = model_role_text(role);
         let endpoint_id = self.endpoint_id_for(role).to_string();
         let endpoint = self
             .endpoints
@@ -267,7 +343,7 @@ impl ModelsSettingsWindow {
                     .h_flex()
                     .justify_between()
                     .gap_3()
-                    .child(card_title(theme, "对话生成参数"))
+                    .child(card_title(theme, "问答生成参数"))
                     .child(
                         Button::new("ai-reset-chat-generation")
                             .label("恢复默认")
@@ -280,7 +356,8 @@ impl ModelsSettingsWindow {
             )
             .child(card_note(
                 theme,
-                "保存后用于新的对话请求。除最大输出外，其余参数可留空，使用服务端默认值；具体支持以所选模型为准。",
+                "保存后用于新的问答请求；翻译任务不使用这些参数。\
+                 除最大输出外，其余参数可留空，使用服务端默认值；具体支持以所选模型为准。",
             ))
             .child(render_input_field(
                 theme,

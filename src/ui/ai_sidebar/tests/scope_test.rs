@@ -50,7 +50,7 @@ fn endpoint_status_reports_remote_embedding_with_local_chat() {
     let status = AiEndpointStatus::from_settings(&settings);
     assert!(status.is_warning());
     assert!(status.label().contains("Embedding：vectors.example.test"));
-    assert!(!status.label().contains("对话："));
+    assert!(!status.label().contains("问答："));
     settings.endpoint_routing.vision_endpoint_id = "missing".into();
     assert_eq!(
         AiEndpointStatus::from_settings(&settings),

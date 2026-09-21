@@ -189,7 +189,7 @@ impl TranslationEndpoint {
                 );
                 let body: Value =
                     serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
-                assert_eq!(body["model"], "same-chat-model");
+                assert_eq!(body["model"], "same-translation-model");
                 let user = body["messages"]
                     .as_array()
                     .unwrap()

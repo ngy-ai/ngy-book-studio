@@ -21,22 +21,36 @@
   子模块一律用 `use super::*;` 取得上面的共享项，跨模块引用按 `pub(crate)`（测试夹具用
   `pub(super)`）收口；协调器
   的 `impl` 块可以分散在 `mod.rs` 与 `inspection.rs`。执行器固定启动
-  `MAX_BACKGROUND_JOB_CONCURRENCY` 个 worker，只有序号小于当前并发的 worker 扫描队列，
-  每个任务提交后按配置间隔休眠；两者由 AI 设置的「后台任务」窗口经
+  `MAX_BACKGROUND_JOB_CONCURRENCY` 个 worker，只有序号小于当前并发的 worker 扫描队列；
+  并发上限与间隔由 AI 设置的「后台任务」窗口经
   `IndexingCoordinator::configure_scheduling` 实时发布，写坏的值按范围钳制。
+  「任务间隔」有两个作用点：① 任务粒度 —— `worker_loop` 在每个任务提交后休眠一次（视觉与
+  向量任务靠它节流）；② **请求粒度** —— 整本翻译的每个并发槽位在自己的 `translate_block`
+  收尾后、接下块之前再休眠一次（`pause_after_translation_request`，停止请求不休眠）。
+  只有②能约束一本书内部的请求频率：一整本书是一个任务，①对它等于不存在（现场 2026-09-20：
+  本机模型连续请求把 GPU 吃到满载、桌面黑屏，用户把间隔调到 5000 毫秒也不起作用）。
   同一个「任务并发」既是任务上限，也是**单个整本翻译的块窗口上限**：一轮里最多同时开
   `concurrency` 个文本块请求（`walk_translation_blocks` 的窗口，每轮重读设置，所以运行中
   调大只让 walk 走得更前、不打断任何在飞请求），因此一本翻译自己也会出现多个「处理中」。
   `ai/indexing/translation/` 另实现整本图书翻译任务
   `kind="translation"`：任务标识为 `translation:<source_id>:<target_language>`，游标用
-  `next_ordinal` 记录「第一块尚未提交的文本块」，并按序调用对话模型 `chat_stream` 写入
+  `next_ordinal` 记录「第一块尚未提交的文本块」，并按序调用**翻译模型** `chat_stream` 写入
   `translations` 表，可暂停/恢复/重试/取消；文本块按 `content_units.block_json` 的 `BlockDocument` 确定性
   提取（段落、标题、引用、列表项、表格单元格；代码保持原样），以
-  `(document_revision, unit_revision, target_language, 对话模型)` 判定失效并重译。目标语言
-  或对话模型变化由 `AppServices::configure_translations` 经
+  `(document_revision, unit_revision, target_language, 翻译模型)` 判定失效并重译。目标语言
+  或翻译模型变化由 `AppServices::configure_translations` 经
   `transactions::reconfigure_translation_jobs` 重排；每本当前来源只保留一个目标语言任务。
-  源语言（`books.language` 主语言子标签）等于目标语言时跳过；翻译任务未配置对话模型时
+  源语言（`books.language` 主语言子标签）等于目标语言时跳过；翻译任务未配置翻译模型时
   失败而不猜测。模型调用不得逐 token 打日志，也不得记录正文或译文内容。
+  **问答模型与翻译模型是两个独立设置**（`ProviderSettings.chat_model` /
+  `translation_model`，端点绑定 `EndpointRoutingSettings.chat_endpoint_id` /
+  `translation_endpoint_id`，各自是 `ModelRole::Chat` / `ModelRole::Translation`）。
+  翻译执行身份 `translation_execution_identity` 只由**翻译端点 + 翻译模型**派生，
+  `AiServices.translation_provider` 也按翻译端点构建，因此换问答模型或问答端点都不会让
+  已翻完的图书重翻；阅读端按 `translations.model == translation_model` 过滤。
+  两个字段是后加的键：`load_provider_settings` 读不到 `translation_model` /
+  `translation_endpoint_id` 时按当时保存的问答模型与问答端点补齐，所以升级不会改变既有
+  翻译执行身份、也不会触发整本重译。
  凡是只认 `content` 里严格 JSON 的调用（翻译、vision、Agent）都固定发送
  `reasoning_effort="none"`：思考模型会把整段输出预算和请求超时全花在推理上，Ollama 的
  OpenAI 兼容端点对思考模型只回空 `content` 增量，表现为整段超时里 0 字节正文（本机 9B
@@ -61,12 +75,28 @@
   片段对象数组折进同一外壳（现场：`qwen3.5:0.8b` 逐块返回 `[{"id":0,"text":"…"}]`，整本书
   的块都判 `invalid_schema` 而任务失败），元素仍必须是严格片段对象——位置化片段、带额外字段
   的元素和 `[{"translations":[…]}]` 这类包裹别的答案的容器一律拒绝，绝不搜索嵌套结果。多个
-  答案、截断 JSON、缺失/重复/未知 ID 均拒绝。
+  答案、截断 JSON、缺失/重复/未知 ID 均拒绝。片段对象只有 `id`、`text` 和**可选的** `keep`
+  三个字段。不需要翻译的片段（纯符号、数字、公式、代码）必须由模型显式声明：
+  `{"id":0,"text":"","keep":true}`，该片段整段保持原文（首尾空白一并保留）。`keep` 只能与
+  留空的 `text` 同时出现：同时给出译文按 `keep_with_text` 拒绝，留空 `text` 又不声明 `keep`
+  仍按 `empty_segment_text` 拒绝 —— 「没写」不等于「确认过」。现场 2026-09-20（`qwen3:0.6b`）：
+  模型对纯符号片段留空回答，块因此反复重试后被判未翻译，用户要求改为「模型确认过这段不需要
+  翻译」才接受。提示词侧必须与解码器逐条对齐，且**每条规则只写一处**：`keep` 的写法只出现在格式
+  说明里（普通项就是 `id`+`text` 两个字段，只有 `keep` 项才多一个字段），纠正提示复用同一套说法；
+  「保持原文」是应用行为，提示词只描述可判定的写法（`text` 恰好是空字符串），否则弱模型会把原文抄
+  进 `text` 而落到 `keep_with_text`（现场 2026-09-21 block 589：`188M trained`）。数字与专有名词
+  只要求「本身不改写」，与「整段没有需要翻译的文字才写 `keep`」划清边界，避免「保留数字」与
+  「数字片段不翻译」给出相反动作。片段首尾与相邻片段之间的空白由 `parse_response` 从原文补回，
+  提示词不再要求模型保留，只说「由应用补回，不需要你处理」。
   解析失败时只允许一次**结构标点归一**：把字符串字面量之外的全角结构字符（`：，｛｝［］＂“”`）
   换成半角 ASCII 后再走同一条严格流水线。它只改写 JSON 里只可能是结构的位置，因此合法
   响应永不进入该路径、译文内容逐字不变；键名吞掉分隔符（现场 266 块 `"text："`）要恢复
   只能猜模型意图，必须继续拒绝并保留原始终止行列。格式说明必须显式要求结构字符用半角
-  ASCII、全角标点只能出现在 `text` 值里，纠正提示按固定失败分类复述要修的部分。
+  ASCII、全角标点只能出现在 `text` 值里，纠正提示按固定失败分类挑一段中文复述要修的部分。
+  内部失败分类标识符（`keep_with_text` 之类）只用来选择段落，**不得**写进提示词：对中文翻译
+  模型它是指令噪音，可能被直接抄进答案；提示词也不提「续写上一次响应」，被拒的答案本来就不回传。
+  单片段不得拼出「id 为 0 到 0 的整数」这类机器病句，源语言提示统一成前置肯定句（「原文语言是
+  en。」），不再用「可能的」把确定信息降级成猜测。
   分段协议校验失败时使用冻结的原始输入和服务额外纠正一次，不回传模型的错误输出，
   不把纯文本猜分段，也不为 HTTP、流中断这类 provider 失败做协议纠正。重试前后检查任务
   控制与身份，失败沿用本执行游标，不能读取新任务游标后将新任务标为失败。
@@ -98,7 +128,20 @@
   会被这一轮的旧游标覆盖），但等 provider 响应时绝不持锁；③ 暂停/取消/换版本/被替换一律先
   `settle()` 清空窗口并落盘，再按**清空后的**游标发布结果 —— 发布里的 JSON 必须与库里那份
   逐字相同，否则 `finalize_running_from_cursor` 匹配不上，任务卡在「处理中」；`Abandoned`
-  一个字节都不写。块请求不借用游标：它拿到的是 `TranslationBlockScope`（块号、revision、
+  一个字节都不写。
+  写入本身被数据库拒绝时（`TranslationRun::persist` 返回错误），运行必须先把内存游标**回滚
+  到最后一次成功落盘的那一份**再上抛：库里没接受过的那份游标不只是丢一次更新，它还会让失败
+  发布同样匹配不上，任务于是永远停在「运行中」并带着一个幽灵在飞块（`translation_flow::`
+  `failed_cursor_publication_settles_the_owned_execution_and_retry_reuses_saved_output` 用
+  `BEFORE UPDATE OF cursor_json` 触发器固定这条）。回滚后的失败按最后一次提交的位置发布，
+  「重试」因此只重做没提交的那一块，已保存的译文仍按缓存命中复用。
+  窗口的退出条件是「没有在飞请求**且**没有待提交槽位」（`in_flight.is_empty() &&
+  resolved.is_empty()`）：一轮里的块全部命中缓存、或全部不需要翻译（代码块、没有文字叶）时
+  不会开出任何请求，但 `resolved` 里仍压着要按序提交的块。只按「没有在飞请求」退出会让这次
+  运行不提交任何块就按 `Succeeded` 收尾、游标停在原处 —— 任务窗口的「已处理」正是从游标读出
+  来的，于是显示完成而一个文本块都没处理（现场 2026-09-18：模型/端点变化让游标退回书首重扫，
+  开头几块早已有译文，任务点「恢复」后一会儿就完成）。重扫本身是对的，逐块提交的缓存命中
+  会把已存译文重挂到当前块 ID，不需要任何模型请求。块请求不借用游标：它拿到的是 `TranslationBlockScope`（块号、revision、
   运行最后持久化的 JSON），每次控制轮询拿它与库里那一行比对，所以窗口前进不会被误判成
   「这一行已经不属于我」。
   被跳过的块靠明细里的两条重试路径修复，都必须复用同一个 worker 与同一套跳过规则：页顶
@@ -109,6 +152,15 @@
   人工修订；从 `paused` 起始的翻译任务也要能重试（新任务默认暂停），这条走独立的
   `reset_for_translation_block_retry`，不得放宽通用的 `reset_terminal`（视觉替换依赖它拒绝
   活跃任务）。
+  收窄只到**最后一个目标**为止，两条边界不能松：① 最后一个目标提交的那一刻必须把
+  `retry_ordinals` 从持久游标里清掉（`TranslationRun::commit`）—— 留着它，以后每一次恢复或
+  重跑都会被永久收窄成「只跑这几块」，而 walk 会把其余块当不必处理一路推过去；② 范围之外
+  只允许缓存命中（命中就照常重挂），撞上「没有译文、又不在重试范围」的块由
+  `BlockPlan::Untouched` 停下运行并按 **`Paused`** 发布，绝不按 `Succeeded` 收尾 —— 跳过
+  一个没有译文的块等于把它记成已处理。现场 2026-09-20：第 70 块 provider 500 失败后用户
+  只重试这一块，那次运行把 71—18168 全部推了过去，任务显示「已完成 / 已处理 18168」，而
+  库里只有 71 行译文，阅读端整本没有译文可显示；现在它停在 71 并按「已暂停」收尾，用户点
+  「恢复」时集合已清空，那一次按整本书继续翻。
   「截断不额外纠正」不等于「让整次运行失败」：`finish_reason=length` 的截断必须按固定
   分类 `response_truncated` 返回，才能落进上面这条按块跳过、推进游标的规则。它没有运行级
   含义，同一种请求换个请求形状只会再截断一次，因此既不额外纠正也不做逐片段回退；返回成不
@@ -125,8 +177,9 @@
   往下走）；主路径仍必须先是「冻结输入 + 一次纠正」那两次请求，回退只允许发生
   在这一步之后。回退只针对「模型答了、但片段不完整」的固定分类（`segment_count_mismatch`、
   `missing_segment_id`、`unknown_segment_id`、`duplicate_segment_id`、`empty_segment_text`、
-  `invalid_segment_text`、`positional_segments`）：JSON 层面的失败说明模型没写出答案，换请求
-  形状无用；片段数超过 `MAX_TRANSLATION_FRAGMENT_FALLBACKS` 的块也不回退，直接沿用跳过规则。
+  `invalid_segment_text`、`keep_with_text`、`positional_segments`）：JSON 层面的失败说明模型
+  没写出答案，换请求形状无用；片段数超过 `MAX_TRANSLATION_FRAGMENT_FALLBACKS` 的块也不回退，
+  直接沿用跳过规则。
   **判定读整块的失败分类（跨重发轮累积），不是只读最后一次。** 纠正提示与块级重发都会改变
   模型写出的错误形状：现场
   2026-09-15（block 1786/1787，`qwen3.5:0.8b`）attempt 1 把 3 个片段合并进 `id=0`
@@ -159,7 +212,15 @@
   答案重复标记），流结束时把同一组形状计数写进 `translation_stream`，失败时另存
   `translation_response_salvaged`。这些计数只说明“模型没写出答案 / 思考没结束 / 答案重复
   输出 / 容器被打断”，不含任何正文；`NGY_DUMP_TRANSLATION_RAW` 仍是唯一会打印响应与
-  冻结输入的开关，并且现在也覆盖流失败。收流还有一条自己的**静默**上限
+  请求正文的开关，并且现在也覆盖流失败与**每一个被采用的答案**
+  （`reason = accepted` / `fragment_accepted`，与拒绝路径同一对
+  `translation_request_dump` + `translation_response_dump`）——「这一块真的翻过吗」只能靠
+  这一对原始字节回答，聚合计数证明不了（现场 2026-09-20：任务显示「已处理 18168」，库里
+  只有 71 行译文）。`translation_request_dump` 打的是 `body=`，由传输层自己的
+  `chat_request_body` 构造，因此是**完整**的 chat-completions 请求体（系统提示 + 用户消息 +
+  模型与生成参数 + `stream`/`stream_options`），不是只把用户消息那一小段再抄一遍；
+  `translation_response_dump` 打 `response=`，是模型原样回答。两处共用同一个构造函数，
+  转储才等于网线上的字节。开关默认关闭，产品运行永远不打开。收流还有一条自己的**静默**上限
   （`TRANSLATION_STREAM_SILENCE_LIMIT`，与 `PROVIDER_STEP_TIMEOUT` 同值）：provider 层的
   静默计时兜不住「流不再产生任何事件」——现场 2026-09-17 的整本翻译在开出 8 个块请求后
   彻底静默（job-logs 无写入、进程没有任何 TCP 连接、`await_translation_step` 的 180 秒

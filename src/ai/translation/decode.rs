@@ -7,6 +7,12 @@ use super::*;
 pub(crate) struct ResponseSegment {
     pub(crate) id: usize,
     pub(crate) text: String,
+    /// 模型对「这个片段不需要翻译」的显式声明：`{"id":0,"text":"","keep":true}`。
+    ///
+    /// 缺失即为 `false`，所以留空 text 而不声明 keep 的答案仍按 `empty_segment_text`
+    /// 拒绝 —— 协议要的是肯定性确认，不是「没写」。
+    #[serde(default)]
+    pub(crate) keep: bool,
 }
 
 #[derive(Deserialize)]
