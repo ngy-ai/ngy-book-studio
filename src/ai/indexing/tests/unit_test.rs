@@ -231,6 +231,16 @@ pub(crate) fn translation_format_instructions_forbid_full_width_structure_punctu
     // 三个字段」、纠正提示却说「每项只有 id 和 text 两个字段」，弱模型两头都对不上。
     assert!(format.contains("每项只有 id 与 text 两个字段"));
     assert!(!format.contains("三个字段"));
+    // 值里的转义与换行编码是模型无法从示例里推断出来的硬缺口，必须逐字写在格式说明里：
+    // 片段里出现直引号时，不转义的答案不是合法 JSON，而更正路径只归一化结构标点，救不回来。
+    // 现场 2026-09-22：`“FlashAttention packing”` 用的是弯引号，恰好绕开了这条。
+    assert!(format.contains("带引号的 \"188\" 这样的形式"));
+    assert!(format.contains("片段内部的换行在 JSON 里写成 \\n"));
+    assert!(format.contains("双引号写成 \\\"，反斜杠写成 \\\\"));
+    assert!(format.contains("例如 {\"id\":0,\"text\":\"他说 \\\"你好\\\"\"}。"));
+    // book 与 chapter 是可选字段：空标题整段省略时，提示词不该说它们一定在。
+    assert!(format.contains("带有 book 与 chapter 时"));
+    assert!(!format.contains("用户输入是 JSON，book 与 chapter 是"));
 
     for kind in [
         "invalid_json",

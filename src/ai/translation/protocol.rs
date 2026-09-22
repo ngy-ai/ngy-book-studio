@@ -15,9 +15,10 @@ pub fn execution_identity_protocol(identity: &str) -> &str {
     identity.split(':').next().unwrap_or_default()
 }
 
-pub const FORMAT_INSTRUCTIONS: &str = "用户输入是 JSON，book 与 chapter 是文本块所属图书的书名与章节标题，\
-     source 是完整文本块上下文，segments 是允许翻译的文本片段。\
-     book 与 chapter 只用来理解语境和术语，不要翻译、不要改写，也不要写进译文。\
+pub const FORMAT_INSTRUCTIONS: &str = "用户输入是 JSON：source 是完整文本块上下文，\
+     segments 是允许翻译的文本片段。\
+     带有 book 与 chapter 时它们是文本块所属图书的书名与章节标题，\
+     只用来理解语境和术语，不要翻译、不要改写，也不要写进译文。\
      结合整个文本块翻译每个片段，只翻译 segments 给出的片段，\
      不要把一个片段的内容移到另一个片段，也不要翻译或补写 source 中不属于 segments 的内容。\
      仅返回 JSON 对象 {\"translations\":[{\"id\":0,\"text\":\"译文\"}]}。\
@@ -31,10 +32,14 @@ pub const FORMAT_INSTRUCTIONS: &str = "用户输入是 JSON，book 与 chapter �
      这一项保持原文。除此之外 text 一律必须是非空的译文，留空会被判为错误。\
      keep 只能出现在 text 为空字符串的项里，同一项既写 keep 又给出译文会被判为错误；\
      片段里只要还有需要翻译的词，就不要写 keep，直接给出译文。\
+     text 的值必须是字符串，即使整段只是数字也要写成带引号的 \"188\" 这样的形式；\
      text 只能是译文纯文本，不生成 HTML 或 Markdown 格式标记。\
-     片段内部的换行照原样保留；片段首尾与相邻片段之间的空白由应用补回，不需要你处理。\
+     片段内部的换行在 JSON 里写成 \\n，应用会把它还原成换行；\
+     片段首尾与相邻片段之间的空白由应用补回，不需要你处理。\
      JSON 的结构字符（花括号、方括号、双引号、冒号、逗号）必须使用半角 ASCII：\
      键名只能用半角双引号包裹，键名与值之间只能用半角冒号，各项之间只能用半角逗号。\
+     text 的值里出现双引号或反斜杠时必须转义：双引号写成 \\\"，反斜杠写成 \\\\，\
+     例如 {\"id\":0,\"text\":\"他说 \\\"你好\\\"\"}。\
      全角标点（：，、；「」等）只能出现在 text 的值里面，绝不能写在键名、冒号或逗号的位置。\
      每个片段都必须写成 {\"id\":0,\"text\":\"译文\"} 或 {\"id\":0,\"text\":\"\",\"keep\":true} 这样的完整形式，\
      不要省略键名、引号、冒号或逗号。";
