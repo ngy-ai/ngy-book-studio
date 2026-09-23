@@ -68,8 +68,13 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
 - 不要顺手升级 GPUI、`gpui-component`、Wry/WebView2、`rbook`、`office_oxide`、
   `ebook-rs`、PDF.js 或 `sqlite-vec`。这些依赖已固定并涉及 Windows 句柄、解析安全、
   资产一致性或数据库 ABI；确需升级时按高风险变更重新走完整门禁。
-- `Cargo.toml` 中的 Apache-2.0 元数据与当前 `LICENSE` 的禁止封装分发文字不一致。
-  在用户解决该冲突前，不要发布、打包、重新分发或替用户作许可证结论。
+- 许可证口径（2026-09-23 已由用户裁定，不要再改动除非他改口）：`LICENSE` 全文是
+  「源码公开供阅读，禁止任何形式的封装/再分发」。`Cargo.toml` 已同步为
+  `LicenseRef-NoRedistribution` + `license-file`。含义是：**作者本人**可以在 GitHub
+  发布官方构建产物；**第三方**不得再封装或再分发。因此不要替它挑一个标准开源许可证，
+  也不要宣称本项目是 Apache-2.0 / MIT 等。打包产物里必须带上 `LICENSE` 原文。
+  官方 Release 为 Windows/macOS/Linux 三平台预编译包，其中 macOS/Linux 仅验证构建、
+  未验证运行，Release 说明必须照实写明。
 
 ## 验证与完成标准
 

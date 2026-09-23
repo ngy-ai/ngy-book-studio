@@ -3,7 +3,11 @@ name = "ngy-book-studio"
 version = "0.1.0"
 edition = "2024"
 description = "A native Windows library, reader, editor, and AI workspace for books and documents"
-license = "Apache-2.0"
+# 本仓库**不是** Apache-2.0。LICENSE 全文只有一条：源码公开供阅读，禁止任何形式的
+# 封装/再分发。没有标准 SPDX 标识符对应这套条款，所以用 LicenseRef 表达
+# 「自定义条款，见 LICENSE 文件」。作者本人发布的官方构建产物不属于第三方分发。
+license = "LicenseRef-NoRedistribution"
+license-file = "LICENSE"
 
 [dependencies]
 anyhow = "1.0"
