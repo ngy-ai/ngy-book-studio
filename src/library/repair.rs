@@ -1,29 +1,25 @@
-//! 一次性修复：清理导入时泄漏进正文的 `<head>`/`<title>` 文本。
+//! 导入解析泄漏的就地修复（不删除图书、不推进版本、保留译文与批注）。
 //!
-//! 旧版 `parse_html` 会把 XHTML `<head>` 里的 `<title>`（常被 pandoc 写成章节
-//! 文件名）当作正文第一段，于是阅读视图顶部出现裸文件名、且导出层标题去重失效
-//! 导致标题重复。这里就地修复单本书，不推进任何文档版本，因此笔记与整本译文
-//! 仍然有效：删除首块后剩余块按位置重排（id 整体左移一位），译文行重映射到新
-//! id，批注偏移按被删文本在 `reader_body_text` 中的 UTF-16 长度前移，最后用清理
-//! 后的文档重生成规范化 EPUB 投影。
+//! 旧解析器会把每个 XHTML 的 `<head>/<title>` 文本当成正文首段，导致每章重复渲染
+//! 标题。这里直接就地修改存储的内容单元，避免重新导入（重导入会丢掉已付费的译文）。
 
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::*;
 use anyhow::{Result, bail};
-use rusqlite::{params, TransactionBehavior};
+use rusqlite::{TransactionBehavior, params};
 
 use crate::annotations::{compact_text, reader_body_text};
-use crate::db::{self, blobs::BlobRecord};
+use crate::db::{self};
 use crate::document::{Block, BlockDocument, ContentUnit, SourceLocator};
-use crate::export::{BuiltinDocumentExporter, ExportFormat};
 use crate::markup::{parse_source_for_unit, serialize_source};
 use crate::storage::BlobKey;
-use rusqlite::OptionalExtension;
 use rbook::Epub;
+use rusqlite::OptionalExtension;
 
 /// 单本书修复的结果摘要，供调用方记录与核对。
 #[derive(Clone, Copy, Debug, Default)]
@@ -37,22 +33,25 @@ pub struct RepairReport {
 impl LibraryStore {
     /// 就地修复一本书导入时产生的 `<head>` 文本泄漏。返回被改动的单元与批注数量。
     ///
-    /// 不推进文档版本，因此笔记与整本译文保持可读。需要调用方在修复后重新打开图书
-    /// 以刷新内存中的投影。
+    /// 只改动 `content_units` 及其派生的 `translations`/`annotations` 偏移，**不**触碰
+    /// `book_sources` 与 `books` 的外键关系。因此数据库不变量（尤其是
+    /// `current_sources_are_valid` 要求的 `book_sources.object_key = books.source_object_key`）
+    /// 保持不变，重启时不会被判定为“数据关系不符”而重建数据库。阅读器与导出都从
+    /// `content_units` 重新生成，因此正文会变为干净。
+    ///
+    /// 不推进文档版本，因此笔记与整本译文保持可读。需要调用方在修复后重新打开图书以刷新
+    /// 内存中的投影。
     pub fn repair_leaked_head_titles(&mut self, book_id: &str) -> Result<RepairReport> {
         let mut document = self.document(book_id)?;
         let book_title = document.title.clone();
-        let current_revision = document.revision.get();
         let mut units = document.units;
 
         // 精确识别泄漏块：读取原书 EPUB 中每个单元的 <head><title>，与单元首块文本比对。
         let original_titles = self.original_unit_titles(book_id)?;
 
         // unit_id -> (block_json, source, old_block_id -> (new_block_id, ordinal), removed_len)
-        let mut changed: HashMap<
-            String,
-            (String, String, HashMap<String, (String, u64)>, u64),
-        > = HashMap::new();
+        let mut changed: HashMap<String, (String, String, HashMap<String, (String, u64)>, u64)> =
+            HashMap::new();
         let mut report = RepairReport::default();
 
         for unit in units.iter_mut() {
@@ -76,11 +75,10 @@ impl LibraryStore {
                     (new_block.id().to_string(), (index - 1) as u64),
                 );
             }
-            let removed_len = reader_body_text(&serialize_source(&BlockDocument::new(vec![
-                removed,
-            ]))?)
-            .encode_utf16()
-            .count() as u64;
+            let removed_len =
+                reader_body_text(&serialize_source(&BlockDocument::new(vec![removed]))?)
+                    .encode_utf16()
+                    .count() as u64;
 
             let new_document = reindexed.document;
             let new_source = serialize_source(&new_document)?;
@@ -98,31 +96,11 @@ impl LibraryStore {
             return Ok(report);
         }
 
-        document.units = units;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        let mut conn = crate::db::open_conn(&self.db_path)?;
-        let resolver = |asset_id: &str| self.asset_bytes(book_id, asset_id);
-        let new_bytes =
-            BuiltinDocumentExporter.export_bytes(&document, ExportFormat::Epub, &resolver)?;
-        let new_key = self
-            .io
-            .block_on(self.blob_store.put(new_bytes.as_slice()))?;
-
-        // book_sources.object_key 外键指向 blobs 表，必须先登记新对象元数据。
-        db::blobs::ensure_present(
-            &conn,
-            &BlobRecord {
-                object_key: new_key.as_str().to_string(),
-                media_type: "application/epub+zip".into(),
-                byte_len: new_bytes.len() as u64,
-                hash: new_key.digest().to_string(),
-                created_at: now as u64,
-            },
-        )?;
-
+        let mut conn = db::open_conn(&self.db_path)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for (unit_id, (block_json, source, id_map, removed_len)) in &changed {
             tx.execute(
@@ -158,11 +136,6 @@ impl LibraryStore {
                 report.annotations_deleted += deleted as u64;
             }
         }
-        tx.execute(
-            "UPDATE book_sources SET object_key = ?1 WHERE book_id = ?2 AND revision = ?3",
-            params![new_key.as_str(), book_id, current_revision as i64],
-        )
-        .context("无法更新规范化 EPUB 投影")?;
         tx.commit()?;
 
         if let Some(position) = self.books.iter().position(|book| book.id == book_id) {
@@ -172,7 +145,7 @@ impl LibraryStore {
     }
 }
 
-/// 若单元首块是被旧解析器泄漏的 `<head>`/`<title>` 文本，返回 `true`。
+/// 若单元首块是被旧解析器泄漏的 `<head>/<title>` 文本，返回 `true`。
 ///
 /// 精确判定依据单元原始 XHTML 的 `<title>`（与首块压缩后文本相等即视为泄漏）；
 /// 读不到原书时回退到启发式：首块文本等于章节文件名或书名。
@@ -286,7 +259,7 @@ mod tests {
     use crate::ai::translation::{StoredTranslation, TranslationSegment};
     use crate::annotations::{Annotation, AnnotationKind, TextAnchor};
     use crate::db;
-    use crate::document::{deterministic_id, Block, BlockDocument, Inline};
+    use crate::document::{Block, BlockDocument, Inline, deterministic_id};
     use rusqlite::params;
     use tempfile::tempdir;
 
@@ -345,15 +318,14 @@ mod tests {
                 created_at: 1,
                 updated_at: 1,
             };
-            translation.translated_text =
-                serde_json::to_string(&StoredTranslation {
-                    execution_identity: "translation-v2:t".into(),
-                    segments: vec![TranslationSegment {
-                        source: "x".into(),
-                        translated: format!("译文-{index}"),
-                    }],
-                })
-                .unwrap();
+            translation.translated_text = serde_json::to_string(&StoredTranslation {
+                execution_identity: "translation-v2:t".into(),
+                segments: vec![TranslationSegment {
+                    source: "x".into(),
+                    translated: format!("译文-{index}"),
+                }],
+            })
+            .unwrap();
             db::translations::upsert(&conn, &translation).expect("测试：写入译文");
             let _ = block;
         }
@@ -402,16 +374,11 @@ mod tests {
         assert_eq!(units[0].document.blocks.len(), 2);
 
         // 文档版本未推进，笔记与整本译文保持可读。
-        assert_eq!(
-            store.book_record(&book.id).unwrap().revision,
-            book.revision
-        );
+        assert_eq!(store.book_record(&book.id).unwrap().revision, book.revision);
 
         // 标题译文按重排后的 id（序号 0）仍然可查。
-        let new_heading_id = deterministic_id(
-            "block",
-            format!("{0}\0heading\0{1}", unit.id, 0).as_bytes(),
-        );
+        let new_heading_id =
+            deterministic_id("block", format!("{0}\0heading\0{1}", unit.id, 0).as_bytes());
         let conn = db::open_conn(&store.db_path).unwrap();
         let rows = db::translations::list_for_unit(&conn, &unit.id, "zh-Hans").unwrap();
         assert_eq!(rows.len(), 2);
@@ -424,5 +391,49 @@ mod tests {
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].anchor.start, 100 - 4);
         assert_eq!(notes[0].anchor.end, 104 - 4);
+
+        // 回归守卫：修复后数据库不变量必须成立，否则重启会被判定重建。
+        assert!(db::schema::is_current(&conn).unwrap());
+    }
+
+    /// 仅在设置 `MOYE_REPAIR_DIR` 时运行，对真实数据目录就地修复并校验不变量。
+    /// 正常 `cargo test` 不触发，避免误改真实书库。
+    #[test]
+    fn repair_preserves_invariants_on_real_data_dir() {
+        let Ok(dir) = std::env::var("MOYE_REPAIR_DIR") else {
+            return;
+        };
+        let mut store = LibraryStore::load_from(PathBuf::from(&dir)).unwrap();
+        let targets: Vec<String> = store.books.iter().map(|b| b.id.clone()).collect();
+        assert!(!targets.is_empty(), "未找到任何图书，无法验证修复");
+        for book_id in &targets {
+            let report = store.repair_leaked_head_titles(book_id).unwrap();
+            eprintln!("repair {book_id}: {report:?}");
+        }
+        // 重新打开并校验数据库不变量，确保不会被判定重建。
+        let conn = db::open_conn(&store.db_path).unwrap();
+        assert!(
+            db::schema::is_current(&conn).unwrap(),
+            "修复后数据库不变量不成立，重启会被重建"
+        );
+        // 图书与译文仍然可读。
+        assert_eq!(store.books.len(), targets.len());
+        for book_id in &targets {
+            let translations: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM translations WHERE book_id = ?1",
+                    params![book_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let annotations: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM annotations WHERE book_id = ?1",
+                    params![book_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            eprintln!("book {book_id}: translations={translations} annotations={annotations}");
+        }
     }
 }
