@@ -18,7 +18,11 @@ use crate::db;
 #[test]
 pub(crate) fn a_translation_run_keeps_the_configured_number_of_blocks_in_flight() {
     let provider = Arc::new(MockMergeProvider::default());
-    provider.delay_ms.store(20, Ordering::SeqCst);
+    // 延迟要盖得住「把下一个块规划出来」的时间：窗口里的第二个块要先走一遍
+    // `plan_translation_block`（内部是 spawn_blocking 查库）才会发出请求，全量跑测试时
+    // blocking 池被几百个用例抢，这一段能超过 20ms —— 第一个请求已经睡醒，第二次
+    // `active.fetch_add` 就永远叠不上去，`peak` 停在 1。200ms 是留给这段规划的余量。
+    provider.delay_ms.store(200, Ordering::SeqCst);
     let (fixture, job, mut cursor, translation) =
         translation_block_fixture(&provider, "translation-v2:chat-test");
     let conn = db::open_conn(&fixture.db_path).unwrap();
