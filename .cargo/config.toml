@@ -1,0 +1,5 @@
+# Windows：静态链接 CRT。
+# 否则用户机器上没装 VC++ 运行库就打不开，而这类用户的第一句话是「你们的程序坏了」。
+# 验证方式见 packaging/package.py 的 check_crt_static（读导入表里还有没有 VCRUNTIME140.dll）。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

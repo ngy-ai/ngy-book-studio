@@ -1,0 +1,219 @@
+name: Release
+
+# tag 推送 → 构建 + 创建 Release；手动触发 → 只构建、留 artifact、不发 Release。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # 双保险：脚本自己也会 reconfigure，但 runner 的控制台代码页在脚本启动前就可能出事。
+  PYTHONIOENCODING: utf-8
+
+jobs:
+  build:
+    name: build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            test: true
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            test: true
+          # macos-latest 本身是 arm64，x86_64 靠交叉。
+          # test: false —— 交叉出来的产物在 arm64 runner 上根本跑不起来；
+          # 「跑不了所以不测」比「跳过测试装作测过了」诚实。
+          - name: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            test: false
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            test: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 用 runner 镜像自带的 Rust，不 rustup update stable：
+      # 编译器每次漂移到「当天最新」，会多出一个与代码毫无关系、且只在发布当天暴露的失败来源。
+      - name: 添加交叉目标
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: rustup target add x86_64-apple-darwin
+
+      - name: 安装 Linux 系统依赖
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake pkg-config clang libclang-dev \
+            libfontconfig1-dev libfreetype6-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-dev libxcb1-dev libvulkan-dev \
+            libgtk-3-dev libwebkit2gtk-4.1-dev libsoup-3.0-dev \
+            libayatana-appindicator3-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: 校验 tag 与版本号一致
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          CARGO_VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          echo "tag=$VERSION cargo=$CARGO_VERSION"
+          if [ "$VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::tag $TAG 与 Cargo.toml 的 $CARGO_VERSION 不一致"
+            exit 1
+          fi
+
+      # 编译与测试拆两步：cargo test 返回 101 分不清「编译失败」与「测试失败」。
+      - name: 编译测试目标
+        if: matrix.test
+        run: cargo test --locked --target ${{ matrix.target }} --no-run
+
+      - name: 运行测试
+        if: matrix.test
+        run: cargo test --locked --target ${{ matrix.target }} --no-fail-fast
+
+      - name: 构建 release
+        env:
+          # 交叉到 x86_64 时，带 C 部分的依赖要靠它选对架构。
+          CMAKE_OSX_ARCHITECTURES: ${{ matrix.target == 'x86_64-apple-darwin' && 'x86_64' || '' }}
+        run: cargo build --release --locked --bin ngy-book-studio --target ${{ matrix.target }}
+
+      # 与本地完全同一条命令：在 workflow 里写只存在于 CI 的打包命令，
+      # 那段代码永远不会被本地跑过。
+      - name: 打包
+        run: python packaging/package.py --target ${{ matrix.target }} --out dist
+
+      - name: 列出产物
+        shell: bash
+        run: ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      # 必须 checkout：gh 靠 git remote 回答「往哪个仓库发」，
+      # 没有 .git 的工作目录只在日志里留一句 exit code 1。
+      # 且要放在 download 之前 —— checkout 会清理工作目录，反过来会把刚取回的 dist/ 删掉。
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - name: 产物齐全检查
+        run: |
+          ls -la dist
+          COUNT=$(ls -1 dist | grep -cE '\.(zip|tar\.gz)$' || true)
+          echo "产物数量：$COUNT"
+          # 少一个就不发：只挂了一半产物的 Release 比没有 Release 更容易误导人。
+          if [ "$COUNT" -ne 4 ]; then
+            echo "::error::期望 4 个产物，实际 $COUNT"
+            exit 1
+          fi
+
+      - name: 写 Release 说明
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          cat > notes.md <<EOF
+          ## 墨页 ${VERSION}
+
+          本地图书库、阅读器与编辑器。导入 EPUB / PDF / DOC / DOCX / PPTX / XLSX / DjVu
+          与未加密的 MOBI/AZW/AZW3/KFX，转成统一内容模型后统一编辑，并永久保留每本导入
+          图书字节一致的原文件。
+
+          ### 下载
+
+          | 平台 | 文件 |
+          | --- | --- |
+          | Windows 10/11 (x86_64) | ngy-book-studio-${VERSION}-windows-x86_64.zip |
+          | macOS 12+ (Apple Silicon) | ngy-book-studio-${VERSION}-macos-arm64.zip |
+          | macOS 12+ (Intel) | ngy-book-studio-${VERSION}-macos-x86_64.zip |
+          | Linux (x86_64) | ngy-book-studio-${VERSION}-linux-x86_64.tar.gz |
+
+          ### 平台验证状态（请先读这一条）
+
+          - **Windows 11 / MSVC**：唯一完整验收的平台，日常开发与人工冒烟都在它上面。
+          - **macOS（arm64 与 x86_64）**：只验证了「编得过、打得出来」，**没有人真的运行过 GUI**。
+          - **Linux x86_64**：同上，**只验证了构建，未验证运行**。
+
+          在 macOS / Linux 上遇到渲染、字体、WebView 或输入法问题，请当作已知未验证区域来报告。
+
+          ### 首次打开
+
+          - **macOS**：包内的 \`.app\` 只做了 ad-hoc 签名（没有 Developer ID 证书、未经公证）。
+            Gatekeeper 会拦住它，请**右键点击 .app →「打开」**，不要双击 —— 这不是包坏了。
+          - **Windows**：需要 Microsoft Edge WebView2 Runtime；缺失时应用会询问是否打开下载页。
+          - **Linux**：便携包里的二进制不在系统 PATH 中，\`.desktop\` 的 \`Exec=\` 假设你已把它放进 PATH。
+
+          ### 许可证
+
+          LICENSE 全文只有一条：**源码公开供阅读，禁止任何形式的封装/再分发。**
+          本 Release 的构建产物由作者本人发布；第三方不得再封装或再分发。
+          EOF
+          cat notes.md
+
+      - name: 创建或更新 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            # --draft=false 不是可有可无的：删 tag 重推的那个窗口里 GitHub 会把
+            # Release 打回 draft，而 draft 在匿名 API 与 Releases 页面上都看不见。
+            # gh 带 token 看得见 draft，于是每一步都「成功」，而外面什么都没有。
+            gh release edit "${TAG}" --draft=false --title "${TAG}" --notes-file notes.md
+            gh release upload "${TAG}" dist/* --clobber
+          else
+            gh release create "${TAG}" --title "${TAG}" --notes-file notes.md dist/*
+          fi
+
+      # 诊断步骤本身不要弄成红的：它红了会盖住真正失败的那一步。
+      - name: 匿名校验 Release 真的公开
+        continue-on-error: true
+        run: |
+          STATUS=$(curl -sS -o /tmp/release.json -w '%{http_code}' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}")
+          echo "匿名 GET 状态码：$STATUS"
+          if [ "$STATUS" != "200" ]; then
+            echo "::warning::匿名请求看不到这个 Release（$STATUS）—— 很可能还是 draft"
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json, pathlib
+          data = json.loads(pathlib.Path("/tmp/release.json").read_text(encoding="utf-8"))
+          print("draft:", data.get("draft"), "assets:", len(data.get("assets", [])))
+          assert data.get("draft") is False, "Release 仍是 draft"
+          assert len(data.get("assets", [])) == 4, "产物数量不是 4"
+          PY
