@@ -35,6 +35,7 @@ use directories::ProjectDirs;
 pub use crate::db::book_search::SearchHit;
 pub use crate::db::books::BookRecord;
 pub use crate::db::groups::BookGroup;
+pub use repair::RepairReport;
 
 mod annotations;
 
@@ -51,6 +52,8 @@ mod maintenance;
 mod media;
 
 mod publish;
+
+mod repair;
 
 mod search;
 

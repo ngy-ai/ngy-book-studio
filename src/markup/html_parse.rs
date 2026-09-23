@@ -39,7 +39,13 @@ pub fn sanitize_html(source: &str) -> String {
 }
 
 pub(crate) fn parse_html(source: &str, unit_id: &str) -> Result<BlockDocument> {
-    let source = sanitize_html(source);
+    // Only the `<body>` subtree is 正文. `sanitize_html` removes the `<head>`
+    // *element* but keeps its text, so a pandoc EPUB's
+    // `<title>ch027.xhtml</title>` used to become a leading "ch027.xhtml"
+    // paragraph: the reader showed it above the real chapter heading and it
+    // also defeated the exporter's title de-duplication. Read the body first.
+    let source = body_fragment(source)?;
+    let source = sanitize_html(&source);
     if source.trim().is_empty() {
         return Ok(BlockDocument::default());
     }
@@ -52,6 +58,23 @@ pub(crate) fn parse_html(source: &str, unit_id: &str) -> Result<BlockDocument> {
     };
     let blocks = parser.children(&body, 0)?;
     Ok(BlockDocument::new(blocks))
+}
+
+/// Serializes only the `<body>` subtree of a document-shaped HTML source.
+///
+/// Fragments are returned unchanged: html5ever always materializes a `body`
+/// element, so the fallback only guards a detached tree. The depth limit is
+/// checked on the body itself, matching [`parse_html`]'s model depth (the
+/// `html`/`body` transport wrappers do not consume model depth).
+fn body_fragment(source: &str) -> Result<String> {
+    let dom = parse_document(RcDom::default(), Default::default()).one(source);
+    match find_html_element(&dom.document, "body") {
+        Some(body) => {
+            ensure_html_dom_depth(&body)?;
+            serialize_html_node(&body)
+        }
+        None => Ok(source.to_string()),
+    }
 }
 
 pub(crate) struct HtmlAstParser<'a> {
