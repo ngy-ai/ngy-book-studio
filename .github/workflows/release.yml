@@ -12,6 +12,11 @@ permissions:
 env:
   # 双保险：脚本自己也会 reconfigure，但 runner 的控制台代码页在脚本启动前就可能出事。
   PYTHONIOENCODING: utf-8
+  # 磁盘：这个项目的 debug 产物在本机累积到 27GB，而 runner 只有十几 GB。
+  # 去掉调试符号能砍掉一大半，发布流程也不需要它们。
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   build:
@@ -24,22 +29,23 @@ jobs:
           - name: windows-x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
+            # 唯一完整验收的平台，四个里只有它跑测试。
             test: true
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            # 不跑测试：runner 上 release 与 debug 两份产物装不下。
+            # 这一条必须和 Release 说明里的「仅验证构建」对上，不要假装测过。
+            test: false
           - name: macos-arm64
             os: macos-latest
             target: aarch64-apple-darwin
-            test: true
+            test: false
           # macos-latest 本身是 arm64，x86_64 靠交叉。
-          # test: false —— 交叉出来的产物在 arm64 runner 上根本跑不起来；
-          # 「跑不了所以不测」比「跳过测试装作测过了」诚实。
           - name: macos-x86_64
             os: macos-latest
             target: x86_64-apple-darwin
             test: false
-          - name: linux-x86_64
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            test: true
 
     steps:
       - uses: actions/checkout@v4
@@ -47,6 +53,34 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      # 必须在编译前腾地方：这个仓库一次完整构建远超 runner 的默认剩余空间。
+      # 第一次跑（2026-09-24）四个平台全部倒在编译上，耗时 200s / 250s / 414s / 487s
+      # —— 失败顺序正好等于各 runner 的磁盘紧张程度，就是写满了。
+      - name: 腾磁盘
+        shell: bash
+        run: |
+          echo "::group::清理前"
+          df -h
+          echo "::endgroup::"
+          case "${{ runner.os }}" in
+            Linux)
+              sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                          /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+              ;;
+            macOS)
+              # 只删模拟器运行时，不动 Xcode —— 交叉编译 x86_64 还要靠它的 SDK。
+              sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* || true
+              sudo rm -rf /Library/Developer/CoreSimulator/Caches/* || true
+              rm -rf ~/Library/Caches/* || true
+              ;;
+            Windows)
+              rm -rf "/c/Program Files/Android" "/c/Program Files (x86)/Android" || true
+              ;;
+          esac
+          echo "::group::清理后"
+          df -h
+          echo "::endgroup::"
 
       # 用 runner 镜像自带的 Rust，不 rustup update stable：
       # 编译器每次漂移到「当天最新」，会多出一个与代码毫无关系、且只在发布当天暴露的失败来源。
@@ -83,15 +117,6 @@ jobs:
             exit 1
           fi
 
-      # 编译与测试拆两步：cargo test 返回 101 分不清「编译失败」与「测试失败」。
-      - name: 编译测试目标
-        if: matrix.test
-        run: cargo test --locked --target ${{ matrix.target }} --no-run
-
-      - name: 运行测试
-        if: matrix.test
-        run: cargo test --locked --target ${{ matrix.target }} --no-fail-fast
-
       - name: 构建 release
         env:
           # 交叉到 x86_64 时，带 C 部分的依赖要靠它选对架构。
@@ -105,13 +130,34 @@ jobs:
 
       - name: 列出产物
         shell: bash
-        run: ls -la dist
+        run: |
+          ls -la dist
+          df -h | head -6
 
       - uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.name }}
           path: dist/*
           if-no-files-found: error
+
+      # 产物已经进 artifact 了，把 release 目录删掉再编译测试：
+      # 否则 debug 与 release 两份同时占地，Windows 上就是这么写满的。
+      - name: 腾出 release 产物
+        if: matrix.test
+        shell: bash
+        run: |
+          rm -rf "target/${{ matrix.target }}/release"
+          df -h | head -6
+
+      # 测试放在最后，跑完这个 job 也就结束了。
+      # 编译与测试拆两步 —— cargo test 返回 101 分不清「编译失败」与「测试失败」。
+      - name: 编译测试目标
+        if: matrix.test
+        run: cargo test --locked --target ${{ matrix.target }} --no-run
+
+      - name: 运行测试
+        if: matrix.test
+        run: cargo test --locked --target ${{ matrix.target }} --no-fail-fast
 
   release:
     name: publish release
@@ -157,23 +203,24 @@ jobs:
           | 平台 | 文件 |
           | --- | --- |
           | Windows 10/11 (x86_64) | ngy-book-studio-${VERSION}-windows-x86_64.zip |
+          | Linux (x86_64) | ngy-book-studio-${VERSION}-linux-x86_64.tar.gz |
           | macOS 12+ (Apple Silicon) | ngy-book-studio-${VERSION}-macos-arm64.zip |
           | macOS 12+ (Intel) | ngy-book-studio-${VERSION}-macos-x86_64.zip |
-          | Linux (x86_64) | ngy-book-studio-${VERSION}-linux-x86_64.tar.gz |
 
           ### 平台验证状态（请先读这一条）
 
-          - **Windows 11 / MSVC**：唯一完整验收的平台，日常开发与人工冒烟都在它上面。
-          - **macOS（arm64 与 x86_64）**：只验证了「编得过、打得出来」，**没有人真的运行过 GUI**。
-          - **Linux x86_64**：同上，**只验证了构建，未验证运行**。
+          - **Windows 10/11 / MSVC**：唯一完整验收的平台。本次发布在 runner 上跑了全量测试。
+          - **Linux x86_64**：只验证了「编得过、打得出来」，**没有跑测试，也没有人运行过界面**。
+          - **macOS（arm64 与 x86_64）**：同上，**只验证构建**；x86_64 那一份还是交叉编译出来的。
 
-          在 macOS / Linux 上遇到渲染、字体、WebView 或输入法问题，请当作已知未验证区域来报告。
+          在 Linux / macOS 上遇到渲染、字体、WebView 或输入法问题，请当作已知未验证区域来报告。
 
           ### 首次打开
 
           - **macOS**：包内的 \`.app\` 只做了 ad-hoc 签名（没有 Developer ID 证书、未经公证）。
             Gatekeeper 会拦住它，请**右键点击 .app →「打开」**，不要双击 —— 这不是包坏了。
           - **Windows**：需要 Microsoft Edge WebView2 Runtime；缺失时应用会询问是否打开下载页。
+            CRT 已静态链接，不需要另外安装 VC++ 运行库。
           - **Linux**：便携包里的二进制不在系统 PATH 中，\`.desktop\` 的 \`Exec=\` 假设你已把它放进 PATH。
 
           ### 许可证
