@@ -26,7 +26,8 @@ pub const LOG_PREFIX: &str = "ngy-book-studio";
 /// 保留的日志文件数上限（含当天），由 `ngy_utils_tracing` 的保留策略执行。
 pub const LOG_MAX_FILES: usize = 7;
 /// 未设置 `RUST_LOG` 时的默认过滤，控制台与文件一致。
-pub const DEFAULT_LOG_FILTER: &str = "warn,ngy_ai=info,ngy_import=debug,ngy_reader=debug";
+pub const DEFAULT_LOG_FILTER: &str =
+    "warn,ngy_ai=info,ngy_import=debug,ngy_library=debug,ngy_reader=debug";
 
 /// 数据目录对应的日志目录。
 pub fn log_directory(data_dir: &Path) -> PathBuf {

@@ -23,6 +23,12 @@ impl EpubReaderApp {
         };
         let input = cx.new(|cx| InputState::new(window, cx).default_value(book.title.clone()));
         input.update(cx, |state, cx| state.focus(window, cx));
+        tracing::debug!(
+            target: "ngy_library",
+            book_id = %book_id,
+            title = %book.title,
+            "书库：已打开修改名称弹窗"
+        );
         self.group_modal = Some(GroupModal::NameInput {
             title: format!("修改「{}」的名称", book.title),
             confirm_label: "保存".to_string(),
@@ -37,6 +43,11 @@ impl EpubReaderApp {
 
     pub(super) fn rename_book(&mut self, book_id: String, title: String, cx: &mut Context<Self>) {
         let Some(request_id) = self.begin_library_request("正在修改图书名称…", cx) else {
+            tracing::warn!(
+                target: "ngy_library",
+                book_id = %book_id,
+                "书库：窗口正在关闭，拒绝修改图书名称"
+            );
             return;
         };
         if let Some(GroupModal::NameInput {
@@ -50,6 +61,14 @@ impl EpubReaderApp {
         }
         let services = Arc::clone(&self.services);
         let completed_title = title.clone();
+        let started = std::time::Instant::now();
+        tracing::info!(
+            target: "ngy_library",
+            request_id,
+            book_id = %book_id,
+            title = %completed_title,
+            "书库：开始修改图书名称"
+        );
         let task =
             services.spawn_library_projected(move |library| library.rename_book(&book_id, &title));
         cx.spawn(async move |view, cx| {
@@ -57,6 +76,12 @@ impl EpubReaderApp {
             let close_window = view.update(cx, |this, cx| {
                 match outcome {
                     Ok(Ok(mutation)) => {
+                        tracing::info!(
+                            target: "ngy_library",
+                            request_id,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "书库：图书名称已修改"
+                        );
                         if this
                             .apply_shared_library_projection(mutation.generation, mutation.snapshot)
                         {
@@ -73,11 +98,25 @@ impl EpubReaderApp {
                     }
                     Ok(Err(error)) => {
                         let message = format!("修改图书名称失败：{error:#}");
+                        tracing::warn!(
+                            target: "ngy_library",
+                            request_id,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            error = %format!("{error:#}"),
+                            "书库：修改图书名称失败"
+                        );
                         this.finish_name_modal_request(request_id, Some(message.clone()), cx);
                         this.set_library_request_error(request_id, message, cx);
                     }
                     Err(error) => {
                         let message = format!("修改图书名称任务异常停止：{error}");
+                        tracing::warn!(
+                            target: "ngy_library",
+                            request_id,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            error = %error,
+                            "书库：修改图书名称任务异常停止"
+                        );
                         this.finish_name_modal_request(request_id, Some(message.clone()), cx);
                         this.set_library_request_error(request_id, message, cx);
                     }

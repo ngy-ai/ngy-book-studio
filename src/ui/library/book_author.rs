@@ -57,6 +57,11 @@ impl EpubReaderApp {
             .map(|book| book.title.clone())
             .unwrap_or_default();
         let Some(request_id) = self.begin_library_request("正在修改图书作者…", cx) else {
+            tracing::warn!(
+                target: "ngy_library",
+                book_id = %book_id,
+                "书库：窗口正在关闭，拒绝修改图书作者"
+            );
             return;
         };
         if let Some(GroupModal::NameInput {
@@ -69,6 +74,14 @@ impl EpubReaderApp {
             *error = None;
         }
         let services = Arc::clone(&self.services);
+        let started = std::time::Instant::now();
+        tracing::info!(
+            target: "ngy_library",
+            request_id,
+            book_id = %book_id,
+            author = %author,
+            "书库：开始修改图书作者"
+        );
         let task = services
             .spawn_library_projected(move |library| library.set_book_author(&book_id, &author));
         cx.spawn(async move |view, cx| {
@@ -77,6 +90,12 @@ impl EpubReaderApp {
                 match outcome {
                     Ok(Ok(mutation)) => {
                         let saved = mutation.value.author.clone();
+                        tracing::info!(
+                            target: "ngy_library",
+                            request_id,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "书库：图书作者已修改"
+                        );
                         if this
                             .apply_shared_library_projection(mutation.generation, mutation.snapshot)
                         {
@@ -97,11 +116,25 @@ impl EpubReaderApp {
                     }
                     Ok(Err(error)) => {
                         let message = format!("修改图书作者失败：{error:#}");
+                        tracing::warn!(
+                            target: "ngy_library",
+                            request_id,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            error = %format!("{error:#}"),
+                            "书库：修改图书作者失败"
+                        );
                         this.finish_name_modal_request(request_id, Some(message.clone()), cx);
                         this.set_library_request_error(request_id, message, cx);
                     }
                     Err(error) => {
                         let message = format!("修改图书作者任务异常停止：{error}");
+                        tracing::warn!(
+                            target: "ngy_library",
+                            request_id,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            error = %error,
+                            "书库：修改图书作者任务异常停止"
+                        );
                         this.finish_name_modal_request(request_id, Some(message.clone()), cx);
                         this.set_library_request_error(request_id, message, cx);
                     }

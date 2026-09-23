@@ -40,6 +40,13 @@ pub struct LibraryMutation<T> {
     pub generation: u64,
 }
 
+/// How long one admitted turn may hold the queue before the dispatcher warns
+/// about it (`ngy_library` target). A turn is held for the whole operation —
+/// including its SQLite transaction and object I/O — so a warning here is the
+/// first evidence that what looks like a frozen library is one slow operation
+/// rather than a stuck queue.
+const HOLDING_TURN_WARNING: Duration = Duration::from_secs(5);
+
 /// FIFO admission for every mutation of the process-level library snapshot.
 ///
 /// `spawn_blocking` does not promise that jobs begin in submission order. A
@@ -133,7 +140,22 @@ pub(crate) async fn run_library_mutation_turnstile(
             // sending the turn returns it to us; dropping it releases the
             // dispatcher immediately and does not leave a ticket-sized hole.
             if ready.send(turn).is_ok() {
+                let granted = std::time::Instant::now();
                 let _ = completion.await;
+                // A turn that outlives several seconds is what makes the whole
+                // library look frozen: every later request is still waiting for
+                // admission and none of them has reported a failure. Name the
+                // ticket so the log shows which operation was holding the queue.
+                let held = granted.elapsed();
+                if held >= HOLDING_TURN_WARNING {
+                    tracing::warn!(
+                        target: "ngy_library",
+                        ticket = next_ticket.wrapping_sub(1),
+                        held_ms = held.as_millis() as u64,
+                        "书库写入：上一次写入占用许可超过 {} 秒，后续书库操作一直在排队",
+                        HOLDING_TURN_WARNING.as_secs()
+                    );
+                }
             }
         }
     }

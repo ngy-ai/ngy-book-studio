@@ -568,42 +568,94 @@ fn import_without_a_group_keeps_the_book_unfiled_and_rejects_an_unknown_group() 
     assert!(format!("{error:#}").contains("分组不存在"), "{error:#}");
 }
 
+/// Row identities that a metadata-only change must leave alone: the current
+/// source revision, every content unit, every search chunk (plus its full-text
+/// row) and every derived job. A rename that publishes a document revision
+/// instead would rebuild all of them — which is what made renaming a large book
+/// appear frozen, because re-inserting the chunks also deletes them, and the FTS
+/// delete scans the whole full-text table per row.
+fn derived_rows(data_dir: &Path) -> Vec<String> {
+    let conn = db::open_conn(&data_dir.join(db::DATABASE_FILE)).unwrap();
+    [
+        (
+            "source",
+            "SELECT id || ':' || revision FROM book_sources ORDER BY id",
+        ),
+        (
+            "unit",
+            "SELECT id || ':' || revision FROM content_units ORDER BY id",
+        ),
+        (
+            "chunk",
+            "SELECT id || ':' || created_at FROM search_chunks ORDER BY id",
+        ),
+        (
+            "fts",
+            "SELECT search_chunk_id FROM search_chunks_fts ORDER BY search_chunk_id",
+        ),
+        (
+            "job",
+            "SELECT id || ':' || status FROM index_jobs ORDER BY id",
+        ),
+    ]
+    .into_iter()
+    .map(|(label, sql)| {
+        let mut statement = conn.prepare(sql).unwrap();
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        format!("{label}={rows:?}")
+    })
+    .collect()
+}
+
 #[test]
-fn rename_book_updates_catalog_and_keeps_chapter_revisions() {
+fn rename_book_only_updates_the_catalog_row() {
     let temp = tempfile::tempdir().unwrap();
-    let mut library = LibraryStore::load_from(temp.path().join("library")).unwrap();
-    let book = library.create_book("改名之前", "作者").unwrap();
+    let data_dir = temp.path().join("library");
+    let mut library = LibraryStore::load_from(data_dir.clone()).unwrap();
+    let (book, _, _) = create_two_unit_book(&mut library);
     let unit_before = library.document(&book.id).unwrap().units[0].clone();
+    let derived_before = derived_rows(&data_dir);
 
     let renamed = library.rename_book(&book.id, "  改名之后  ").unwrap();
 
     assert_eq!(renamed.title, "改名之后");
-    assert_eq!(renamed.revision, book.revision + 1);
+    // A rename is catalog metadata. Publishing a revision for it would re-export
+    // the EPUB, re-read every asset and rebuild every chunk/job of the book.
+    assert_eq!(renamed.revision, book.revision);
+    assert_eq!(renamed.source_object_key, book.source_object_key);
+    assert_eq!(derived_rows(&data_dir), derived_before);
     let document = library.document(&book.id).unwrap();
     assert_eq!(document.title, "改名之后");
-    // The title is metadata: a chapter whose body did not change keeps its own
-    // revision, so its notes and its whole-book translation stay valid.
+    // A chapter keeps its own revision and body, so its notes and its whole-book
+    // translation stay valid.
     assert_eq!(document.units[0].revision, unit_before.revision);
     assert_eq!(document.units[0].source, unit_before.source);
 
-    let restored = LibraryStore::load_from(temp.path().join("library")).unwrap();
+    let restored = LibraryStore::load_from(data_dir).unwrap();
     assert_eq!(restored.books()[0].title, "改名之后");
 }
 
 #[test]
 fn set_book_author_replaces_and_clears_authors_without_touching_content() {
     let temp = tempfile::tempdir().unwrap();
-    let mut library = LibraryStore::load_from(temp.path().join("library")).unwrap();
-    let book = library.create_book("作者测试", "原作者").unwrap();
+    let data_dir = temp.path().join("library");
+    let mut library = LibraryStore::load_from(data_dir.clone()).unwrap();
+    let (book, _, _) = create_two_unit_book(&mut library);
     let unit_before = library.document(&book.id).unwrap().units[0].clone();
+    let derived_before = derived_rows(&data_dir);
 
     let updated = library.set_book_author(&book.id, " 张三 、 李四 ").unwrap();
 
     assert_eq!(updated.author, "张三、李四");
-    assert_eq!(updated.revision, book.revision + 1);
+    // The author is catalog metadata too: no document revision is published.
+    assert_eq!(updated.revision, book.revision);
+    assert_eq!(derived_rows(&data_dir), derived_before);
     let document = library.document(&book.id).unwrap();
     assert_eq!(document.authors, vec!["张三", "李四"]);
-    // The author is metadata: the chapter keeps its own revision and body.
     assert_eq!(document.units[0].revision, unit_before.revision);
     assert_eq!(document.units[0].source, unit_before.source);
 
@@ -611,8 +663,37 @@ fn set_book_author_replaces_and_clears_authors_without_touching_content() {
     assert_eq!(cleared.author, "未知作者");
     assert!(library.document(&book.id).unwrap().authors.is_empty());
 
-    let restored = LibraryStore::load_from(temp.path().join("library")).unwrap();
+    let restored = LibraryStore::load_from(data_dir).unwrap();
     assert!(restored.document(&book.id).unwrap().authors.is_empty());
+}
+
+#[test]
+fn rename_book_of_an_imported_book_keeps_the_original_and_its_format() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = epub_source_file(temp.path(), "导入后改名");
+    let mut library = LibraryStore::load_from(temp.path().join("library")).unwrap();
+    let ImportOutcome::Added(book) = library.import(&source_path).unwrap() else {
+        panic!("a fresh library must not deduplicate the import");
+    };
+    let unit_before = library.document(&book.id).unwrap().units[0].clone();
+    let original_before = library.source_bytes(&book.id).unwrap();
+
+    let renamed = library.rename_book(&book.id, "导入后改名成功").unwrap();
+
+    assert_eq!(renamed.title, "导入后改名成功");
+    assert_eq!(renamed.revision, book.revision);
+    // Renaming metadata must not turn an imported book into a different format:
+    // the reader, the Office enhancement and the original export all branch on it.
+    assert_eq!(renamed.format, book.format, "改名不得改变图书的格式判定");
+    let document = library.document(&book.id).unwrap();
+    assert_eq!(document.title, "导入后改名成功");
+    assert_eq!(document.units[0].revision, unit_before.revision);
+    assert_eq!(document.units[0].source, unit_before.source);
+    assert_eq!(
+        library.source_bytes(&book.id).unwrap(),
+        original_before,
+        "改名不得替换导入图书的原件"
+    );
 }
 
 #[test]

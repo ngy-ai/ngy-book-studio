@@ -144,12 +144,15 @@
     （尚未在真实 Windows 窗口逐项冒烟复核）
   - [x] 新建图书先要求用户输入非空名称，确认后创建默认包含 HTML 章节的图书
   - [x] 图书右键菜单提供“修改名称”与“修改作者”，复用新建图书的名称输入弹窗并预填
-    当前值；名称为空不保存，作者留空清除作者（此时列表显示「未知作者」）。两者都经
-    统一文档的保存路径推进图书版本，正文未变的章节保留自身版本，已保存的笔记与整本
-    译文不受影响。验证：
-    `rename_book_updates_catalog_and_keeps_chapter_revisions`、
-    `rename_book_rejects_a_blank_title_without_touching_the_book`、
-    `set_book_author_replaces_and_clears_authors_without_touching_content` 通过
+    当前值；名称为空不保存，作者留空清除作者（此时列表显示「未知作者」）。两者只写
+    `books` 的标题/作者一行、不推进文档版本：`BookDocument` 每次读取都从该行取标题，
+    规范投影本来就一致；重发表整本文档（含重导 EPUB、重读资源、重建全书检索分块与
+    派生任务）会为改一个字符串付出全书代价，在有数万检索分块的书上实际不会结束，
+    已修（2026-09-23 现场：9 302 块的书改名 75 s～110 s，改成单行更新后 12 ms）。
+    验证：`rename_book_only_updates_the_catalog_row`、
+    `set_book_author_replaces_and_clears_authors_without_touching_content`、
+    `rename_book_of_an_imported_book_keeps_the_original_and_its_format`、
+    `rename_book_rejects_a_blank_title_without_touching_the_book` 通过
   - [x] 编辑元数据、封面、内容单元类型及 HTML 正文，源码与富文本共享 HTML 格式
   - [x] 新增、删除、重排内容单元，目录嵌套、缩进与提升
   - [x] 编辑器显示独立目录树的全部节点，按稳定目标 ID 选择正文；同章子目录独立

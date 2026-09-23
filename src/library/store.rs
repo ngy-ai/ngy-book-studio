@@ -472,29 +472,92 @@ impl LibraryStore {
         Ok(())
     }
 
-    /// Renames one book. The title is stored in the canonical document as well
-    /// as in the catalog row, so the rename publishes a new revision through
-    /// the normal save path instead of writing `books.title` behind the
-    /// document's back. A chapter whose body did not change keeps its own
-    /// revision, and therefore its notes and its whole-book translation.
+    /// Renames one book.
+    ///
+    /// The title is catalog metadata: `BookDocument` is built from the row's
+    /// `title` on every read, so the canonical projection already agrees with
+    /// the new name without publishing a document revision. Renaming therefore
+    /// updates that single row and deliberately does **not** go through
+    /// `apply_document`: a republish re-exports the whole EPUB, re-reads and
+    /// re-hashes every asset (including a byte-exact original that may be
+    /// gigabytes), deletes and rebuilds every search chunk of the book, drops
+    /// every derived index/vision job and restarts the whole-book translation —
+    /// all to change one string. The chunk rebuild is the worst of those: the
+    /// FTS delete trigger scans the whole full-text table for each deleted row
+    /// (the chunk id is an UNINDEXED FTS column), so republishing a book with
+    /// tens of thousands of chunks effectively never finishes. A rename must
+    /// stay one small update no matter how large the book is.
     pub fn rename_book(&mut self, book_id: &str, title: &str) -> Result<BookRecord> {
         let title = title.trim();
         ensure!(!title.is_empty(), "图书名称不能为空");
-        let mut document = self.document(book_id)?;
-        document.title = title.to_string();
-        document.validate()?;
-        self.apply_document(document)
+        self.update_catalog_metadata(book_id, Some(title), None)
     }
 
     /// Replaces a book's authors. An empty value clears them, which the catalog
     /// then reports as its placeholder; several authors written with `、`,
     /// `,` or `;` are split exactly like the importer splits them, so the value
-    /// read back from the catalog round-trips unchanged.
+    /// read back from the catalog round-trips unchanged. Like
+    /// [`Self::rename_book`] this is catalog metadata only and does not publish
+    /// a document revision.
     pub fn set_book_author(&mut self, book_id: &str, author: &str) -> Result<BookRecord> {
-        let mut document = self.document(book_id)?;
-        document.authors = split_authors(author);
-        document.validate()?;
-        self.apply_document(document)
+        let authors = split_authors(author);
+        let author = if authors.is_empty() {
+            // The catalog's placeholder for "no author"; `split_authors` filters
+            // it out again when the record is read back.
+            "未知作者".to_string()
+        } else {
+            authors.join("、")
+        };
+        self.update_catalog_metadata(book_id, None, Some(&author))
+    }
+
+    /// Writes title/author into the catalog row, then refreshes this projection
+    /// from the row that was actually written. Every other catalog field keeps
+    /// its current value, and `revision`, `source_object_key`, the content units
+    /// and the derived index/translation rows are untouched: a metadata change
+    /// must not invalidate anything a user already produced for this book.
+    fn update_catalog_metadata(
+        &mut self,
+        book_id: &str,
+        title: Option<&str>,
+        author: Option<&str>,
+    ) -> Result<BookRecord> {
+        let current = self
+            .books
+            .iter()
+            .find(|book| book.id == book_id)
+            .cloned()
+            .context("图书不存在")?;
+        let title = title.unwrap_or(&current.title);
+        let author = author.unwrap_or(&current.author);
+        let updated_at = now_secs();
+        let conn = db::open_conn(&self.db_path)?;
+        let changed = db::books::update_catalog(
+            &conn,
+            book_id,
+            &db::books::BookCatalogUpdate {
+                title,
+                author,
+                language: current.language.as_deref(),
+                description: current.description.as_deref(),
+                updated_at,
+            },
+        )?;
+        drop(conn);
+        ensure!(changed == 1, "图书不存在");
+        let record = self.book_record(book_id)?;
+        if let Some(position) = self.books.iter().position(|book| book.id == book_id) {
+            self.books[position] = record.clone();
+        }
+        tracing::info!(
+            target: "ngy_library",
+            book_id,
+            title = %record.title,
+            author = %record.author,
+            revision = record.revision,
+            "书库：图书元数据已更新（不推进文档版本）"
+        );
+        Ok(record)
     }
 
     pub fn delete_group(&mut self, id: &str) -> Result<()> {

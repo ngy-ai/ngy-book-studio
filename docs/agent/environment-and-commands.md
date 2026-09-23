@@ -213,6 +213,21 @@ cargo run --locked --bin ngy-book-studio 2>&1 | Tee-Object -FilePath $importLog
 生成投影，再用 `reader::load_resource` 取出 WebView 真正会收到的字节，按行/列报告
 XML 解析不了的命名实体。
 
+## 书库操作诊断日志
+
+书库写入（改名、改作者、分组、移动、删除、导入落库、编辑保存、阅读进度）统一使用
+`ngy_library` target。未设置 `RUST_LOG` 时默认开启 debug：
+`spawn_library` / `spawn_library_projected` 在**每个等待前后各记一行**——已排队（ticket）、
+已获准进入（等待写入许可的毫秒数）、已取得共享书库锁（等待毫秒数）、已提交/已失败
+（执行毫秒数）；排队 FIFO 的派发器在一张许可被占用超过 5 秒时告警并打出 ticket。界面层
+另记「开始/完成/失败」与请求号、耗时，元数据提交（`update_catalog_metadata`）和文档版本
+提交（`publish_document_with_assets`）各自记一行 info，重发表文档前还会记下
+`units` / `toc_entries` / `search_chunks` / `assets` 数量。
+
+因此“界面一直显示处理中、控制台什么都没打”这类反馈有了第一手依据：最后一条 `ngy_library`
+日志就是卡住的那一步（停在“已排队”＝卡在写入许可；停在“开始执行”＝卡在该操作内部，日志里的
+分块数量说明它是不是在重发表整本文档）。阅读器与导入的对应 target 见上文。
+
 ## 真实格式语料门禁
 
 真实第三方语料不加入仓库。将以下九个文件放入一个仓库外目录，且只使用有权测试的

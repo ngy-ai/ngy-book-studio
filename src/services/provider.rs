@@ -86,6 +86,11 @@ impl AppServices {
     /// Runs synchronous LibraryStore work away from GPUI and Tokio core
     /// workers. The returned handle belongs to the dedicated application
     /// runtime and may be awaited from a GPUI task.
+    ///
+    /// The mutation is logged stage by stage under the `ngy_library` target
+    /// (queue ticket, admission, shared lock, commit) so a request that never
+    /// finishes is still attributable to the stage it is stuck in: the last
+    /// line records the wait that never returned.
     pub fn spawn_library<T, F>(&self, operation: F) -> tokio::task::JoinHandle<Result<T>>
     where
         T: Send + 'static,
@@ -94,15 +99,47 @@ impl AppServices {
         let library = Arc::clone(&self.library);
         let library_generation = Arc::clone(&self.library_generation);
         let mutation_turn = self.library_mutations.reserve();
+        let ticket = mutation_turn.ticket;
         let indexing = Arc::clone(&self.indexing);
+        tracing::debug!(target: "ngy_library", ticket, "书库写入：已排队，等待写入许可");
         self.runtime.handle().spawn(async move {
+            let queued = std::time::Instant::now();
             let turn = mutation_turn.enter().await?;
+            tracing::debug!(
+                target: "ngy_library",
+                ticket,
+                waited_ms = queued.elapsed().as_millis() as u64,
+                "书库写入：已获准进入，等待共享书库锁"
+            );
             tokio::task::spawn_blocking(move || {
                 let _turn = turn;
+                let waiting = std::time::Instant::now();
                 let mut library = library
                     .lock()
                     .map_err(|_| anyhow::anyhow!("library service lock is poisoned"))?;
+                tracing::debug!(
+                    target: "ngy_library",
+                    ticket,
+                    waited_ms = waiting.elapsed().as_millis() as u64,
+                    "书库写入：已取得共享书库锁，开始执行"
+                );
+                let started = std::time::Instant::now();
                 let result = operation(&mut library);
+                match &result {
+                    Ok(_) => tracing::debug!(
+                        target: "ngy_library",
+                        ticket,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "书库写入：已提交"
+                    ),
+                    Err(error) => tracing::warn!(
+                        target: "ngy_library",
+                        ticket,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        error = %format!("{error:#}"),
+                        "书库写入：已失败"
+                    ),
+                }
                 if result.is_ok() {
                     library_generation.fetch_add(1, Ordering::AcqRel);
                     indexing.wake();
@@ -118,6 +155,9 @@ impl AppServices {
     /// mutex guard is still held. The generation reflects commit order, so a
     /// UI can merge only monotonically newer completions even when async tasks
     /// finish their GPUI callbacks out of order.
+    ///
+    /// Logging matches [`Self::spawn_library`]: each wait logs once before and
+    /// once after it returns.
     pub fn spawn_library_projected<T, F>(
         &self,
         operation: F,
@@ -129,15 +169,52 @@ impl AppServices {
         let library = Arc::clone(&self.library);
         let library_generation = Arc::clone(&self.library_generation);
         let mutation_turn = self.library_mutations.reserve();
+        let ticket = mutation_turn.ticket;
         let indexing = Arc::clone(&self.indexing);
+        tracing::debug!(target: "ngy_library", ticket, "书库写入：已排队，等待写入许可");
         self.runtime.handle().spawn(async move {
+            let queued = std::time::Instant::now();
             let turn = mutation_turn.enter().await?;
+            tracing::debug!(
+                target: "ngy_library",
+                ticket,
+                waited_ms = queued.elapsed().as_millis() as u64,
+                "书库写入：已获准进入，等待共享书库锁"
+            );
             tokio::task::spawn_blocking(move || {
                 let _turn = turn;
+                let waiting = std::time::Instant::now();
                 let mut library = library
                     .lock()
                     .map_err(|_| anyhow::anyhow!("library service lock is poisoned"))?;
-                let value = operation(&mut library)?;
+                tracing::debug!(
+                    target: "ngy_library",
+                    ticket,
+                    waited_ms = waiting.elapsed().as_millis() as u64,
+                    "书库写入：已取得共享书库锁，开始执行"
+                );
+                let started = std::time::Instant::now();
+                let value = match operation(&mut library) {
+                    Ok(value) => {
+                        tracing::debug!(
+                            target: "ngy_library",
+                            ticket,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "书库写入：已提交"
+                        );
+                        value
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "ngy_library",
+                            ticket,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            error = %format!("{error:#}"),
+                            "书库写入：已失败"
+                        );
+                        return Err(error);
+                    }
+                };
                 let generation = library_generation.fetch_add(1, Ordering::AcqRel) + 1;
                 let snapshot = library.clone();
                 drop(library);
@@ -312,6 +389,7 @@ impl AppServices {
                             Arc::clone(&next.translation_provider),
                             next.settings.translation_model.clone(),
                             translation_identity,
+                            next.settings.translation_generation.clone(),
                             next.settings.default_language.clone(),
                             next.settings.auto_run_background_jobs,
                         )

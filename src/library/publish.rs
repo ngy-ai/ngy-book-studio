@@ -57,8 +57,24 @@ impl LibraryStore {
             Some(bytes) => Ok(bytes.as_ref().clone()),
             None => self.asset_bytes(&document.id, asset_id),
         };
+        tracing::debug!(
+            target: "ngy_library",
+            book_id = %document.id,
+            revision = current.revision,
+            units = document.units.len(),
+            assets = document.assets.len(),
+            "书库写入：开始生成规范化 EPUB"
+        );
+        let export_started = std::time::Instant::now();
         let new_bytes =
             BuiltinDocumentExporter.export_bytes(&document, ExportFormat::Epub, &resolver)?;
+        tracing::debug!(
+            target: "ngy_library",
+            book_id = %document.id,
+            epub_bytes = new_bytes.len(),
+            elapsed_ms = export_started.elapsed().as_millis() as u64,
+            "书库写入：规范化 EPUB 已生成，开始比对章节内容"
+        );
         let published = self.published_unit_content(&document.id, current.revision)?;
         document.revision = Revision::new(current.revision + 1);
         for unit in &mut document.units {
@@ -71,6 +87,7 @@ impl LibraryStore {
                 _ => document.revision,
             };
         }
+        let assets_started = std::time::Instant::now();
         let assets = document
             .assets
             .iter()
@@ -83,6 +100,17 @@ impl LibraryStore {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        tracing::debug!(
+            target: "ngy_library",
+            book_id = %document.id,
+            assets = assets.len(),
+            asset_bytes = assets
+                .iter()
+                .map(|asset| asset.bytes.len() as u64)
+                .sum::<u64>(),
+            elapsed_ms = assets_started.elapsed().as_millis() as u64,
+            "书库写入：资源已读取，开始提交文档版本"
+        );
         let book_id = document.id.clone();
         let title = document.title.clone();
         let unit_revisions = document
@@ -91,6 +119,7 @@ impl LibraryStore {
             .map(|unit| unit.revision)
             .collect::<Vec<_>>();
         let imported = ImportedBook { document, assets };
+        let commit_started = std::time::Instant::now();
         let updated = self.persist_document(
             imported,
             &new_bytes,
@@ -100,6 +129,14 @@ impl LibraryStore {
             Some(&current),
             None,
         )?;
+        tracing::info!(
+            target: "ngy_library",
+            book_id = %book_id,
+            revision = updated.revision,
+            unit_revisions = unit_revisions.len(),
+            elapsed_ms = commit_started.elapsed().as_millis() as u64,
+            "书库：文档版本已提交"
+        );
         self.books[position] = updated.clone();
         if let Err(error) = self.reload_cover(&book_id) {
             tracing::warn!(
@@ -212,6 +249,22 @@ impl LibraryStore {
         // durable import/save as failed and leave the UI projection stale.
         let committed_record = graph.book.clone();
         let auto_run_background_jobs = self.auto_run_background_jobs.load(Ordering::Acquire);
+        // A replaced revision (an edit) deletes and rebuilds every search chunk
+        // of the book inside this transaction, so these counts explain a slow
+        // or apparently frozen save: the FTS delete trigger scans the whole
+        // full-text table per deleted row.
+        tracing::debug!(
+            target: "ngy_library",
+            book_id = %graph.book.id,
+            revision = graph.book.revision,
+            replacing = previous.is_some(),
+            units = graph.units.len(),
+            toc_entries = graph.toc.len(),
+            search_chunks = graph.search_chunks.len(),
+            assets = graph.assets.len(),
+            "书库写入：开始提交文档图"
+        );
+        let transaction_started = std::time::Instant::now();
         let unreferenced = if previous.is_some() {
             db::transactions::install_document_revision(
                 &mut conn,
@@ -226,6 +279,14 @@ impl LibraryStore {
             )?;
             Vec::new()
         };
+        tracing::debug!(
+            target: "ngy_library",
+            book_id = %graph.book.id,
+            revision = graph.book.revision,
+            unreferenced_objects = unreferenced.len(),
+            elapsed_ms = transaction_started.elapsed().as_millis() as u64,
+            "书库写入：文档图已提交"
+        );
         drop(conn);
         drop(publication_guard);
         self.schedule_blob_deletions(unreferenced);

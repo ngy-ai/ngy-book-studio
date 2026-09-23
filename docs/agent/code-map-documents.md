@@ -81,6 +81,19 @@
   目标分组，“全部图书/未分组”返回 `None`；分组已从图书库消失时同样返回 `None`，
   不让一次本可成功的导入因为分组校验失败（`import_into_group` 收到不存在的分组会
   直接报错）。
+  改名与改作者（`rename_book` / `set_book_author`）只写 `books` 的 title/author 一行
+  （`update_catalog_metadata`），**不**推进文档版本：`BookDocument` 每次读取都从该行
+  取标题，规范投影本来就一致。走 `apply_document` 会为了一个字符串重导整本 EPUB、重读
+  并重哈希每个资源（含可能上 GB 的字节一致原件）、删掉并重建全书检索分块、丢掉全部
+  派生索引/视觉任务并重排整本译文。其中分块重建最致命：FTS 删除触发器按
+  `search_chunk_id`（FTS 的 UNINDEXED 列）逐行删除，每行都要全表扫描，块数上万时单次
+  改名实际不会结束（2026-09-23 现场：9 302 块的书改名耗时 75 s～110 s，元数据单行更新
+  后 12 ms）。因此元数据变更必须保持单行更新，`rename_book_only_updates_the_catalog_row`
+  用源版本/内容单元/分块/FTS/派生任务的行身份断言这一点。
+  同一个 FTS 陷阱对**任何**重发表文档的路径仍然存在：`install_document_revision` 会删掉
+  前一来源的全部分块再重建，编辑保存、封面替换等在有大量分块的书上同样会非常慢。彻底
+  修法是把删除改成按 FTS rowid 定位（触发器 DDL 变更 + `SCHEMA_VERSION` 递增，会按重建
+  策略清空现有书库），当前没有做，出现“保存一本书很久没反应”时先看这个原因。
 - `src/annotations.rs`、`src/db/annotations.rs`：三种划线、人工想法与 AI 想法统一使用
   `annotations` 一张表。宿主按实际阅读章节 body 文本（排除 script/style/noscript/template，
   移除 ECMAScript 空白）的 UTF-16 起止位置校验 quote、书/单元归属及打开时的版本。
