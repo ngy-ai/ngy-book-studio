@@ -59,8 +59,17 @@ pub(crate) fn settings_with_timeout(
     endpoint: &TranslationEndpoint,
     request_timeout_secs: u64,
 ) -> ProviderSettings {
+    settings_with_base_url(endpoint.url.clone(), request_timeout_secs)
+}
+
+/// 指向一个地址的翻译设置，不需要夹具服务器：「端点根本连不上」这类用例要的就是
+/// 一个没人监听的地址。
+pub(crate) fn settings_with_base_url(
+    base_url: String,
+    request_timeout_secs: u64,
+) -> ProviderSettings {
     ProviderSettings {
-        base_url: endpoint.url.clone(),
+        base_url,
         // 问答模型与翻译模型取两个不同的名字：翻译请求必须带翻译模型，所以夹具里
         // 的模型断言能发现「翻译误用问答模型」。
         chat_model: "same-chat-model".into(),

@@ -16,8 +16,10 @@ use crate::{
 /// Translates one text block. A block that cannot be produced in the required
 /// shape is otherwise skipped and left in the original language, so a whole
 /// round that fails is re-sent up to `TRANSLATION_BLOCK_RETRIES` times. Only a
-/// protocol failure is retried: a provider, database or cancellation error still
-/// fails the whole run, because re-sending the same request is not what fixes it.
+/// protocol failure is retried: a provider, database or cancellation error
+/// leaves this function at once, because re-sending the same request is not what
+/// fixes it. 这一块随后由 walk 决定：请求级失败按块跳过（连续若干块都失败才停），
+/// 数据库/取消类错误让整次运行失败（见 `block_skip_cause`）。
 ///
 /// 每次重发的第一发都带着上一轮的失败类别，所以重试不是逐字相同的请求；逐片段回退
 /// 只留给最后一轮，否则一个多片段块会把请求预算耗在重复的逐片段请求上。
@@ -207,6 +209,7 @@ pub(crate) async fn translate_block_round(
         // is never copied into the next prompt, and no partial result is saved.
         let request = translation_request(
             &translation.model,
+            &translation.generation,
             target_language,
             source_language,
             source,
@@ -236,7 +239,7 @@ pub(crate) async fn translate_block_round(
                 .unwrap_or(0),
             user_bytes = source.request_input(&context).len(),
             message_count = request.messages.len(),
-            max_tokens = TRANSLATION_MAX_OUTPUT_TOKENS,
+            max_tokens = translation.generation.max_output_tokens,
             "Translation attempt started"
         );
         let response = async {
@@ -246,10 +249,24 @@ pub(crate) async fn translate_block_round(
                 scope,
                 translation.provider.chat_stream(request),
             )
-            .await?
+            .await
             {
-                BlockStep::Value(stream) => stream,
-                BlockStep::Stopped(stop) => return Ok(BlockStep::Stopped(stop)),
+                Ok(BlockStep::Value(stream)) => stream,
+                Ok(BlockStep::Stopped(stop)) => return Ok(BlockStep::Stopped(stop)),
+                // 传输层失败（连接被拒、端点 4xx/5xx、流建立之前就到期的超时）没有响应
+                // 可以 dump，但请求体正是这种时候唯一能回答「我们发了什么」的读数，所以
+                // 用同一个开关打出来，reason 换成固定错误分类。
+                Err(error) => {
+                    dump_raw_translation_response(
+                        &span,
+                        scope.ordinal,
+                        attempt,
+                        &request_body,
+                        None,
+                        crate::ai::ai_diagnostics::error_kind(&error),
+                    );
+                    return Err(error);
+                }
             };
             collect_translation_response(
                 inner,
@@ -362,7 +379,7 @@ pub(crate) async fn translate_block_round(
                     scope.ordinal,
                     attempt,
                     &request_body,
-                    &response,
+                    Some(&response),
                     "accepted",
                 );
                 if attempt > 1 {
@@ -442,7 +459,7 @@ pub(crate) async fn translate_block_round(
                     scope.ordinal,
                     attempt,
                     &request_body,
-                    &response,
+                    Some(&response),
                     "protocol_rejected",
                 );
                 if !retry {

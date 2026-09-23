@@ -48,8 +48,9 @@ mod prelude {
         },
         ai::translation::{StoredTranslation, TranslationContext, TranslationSource},
         ai::{
-            ChatMessage, ChatRequest, ChatRole, ContentPart, EmbeddingRequest, ImageUrl,
-            MessageContent, OpenAiCompatibleProvider, ReasoningEffort,
+            ChatMessage, ChatRequest, ChatRole, ContentPart, DEFAULT_TRANSLATION_OUTPUT_TOKENS,
+            EmbeddingRequest, ImageUrl, MessageContent, OpenAiCompatibleProvider, ReasoningEffort,
+            TranslationGenerationSettings,
         },
         db,
         document::{
@@ -119,13 +120,17 @@ const MAX_TRANSLATION_BLOCKS: usize = 500_000;
 /// Display-only preview length of one block in the task window.
 const TRANSLATION_BLOCK_PREVIEW_CHARS: usize = 96;
 
-const TRANSLATION_MAX_OUTPUT_TOKENS: u32 = 4_096;
-
-/// Translation is deterministic on purpose: one block has exactly one accepted
-/// answer, so sampling would only add variance to a strict JSON protocol.
-const TRANSLATION_TEMPERATURE: f32 = 0.0;
-
 const TRANSLATION_RESPONSE_ATTEMPTS: usize = 2;
+
+/// 连续多少个文本块的**请求级**失败就停止本次运行。
+///
+/// 协议类跳过刻意没有连续上限（弱模型连续不合格是常态，现场 2026-09-15 已把那个上限
+/// 去掉），但「请求本身失败」是另一回事：偶尔一块连不上很常见，连续若干块都连不上
+/// 说明模型或端点已经不可用。没有这条上限，一本三千块的书会被逐块跳过、最后报「完成」
+/// 而一行译文都没有（每次都等超时的话还要跑几十小时）。5 是「个别抖动不会误判」与
+/// 「真的挂了就尽快停」之间的取值：单次失败率 5% 时，三千块里凑出连续 5 次的概率约
+/// 千分之一。
+const TRANSLATION_CONSECUTIVE_REQUEST_FAILURES: usize = 5;
 
 /// 一个文本块整轮失败后再重发的次数。一轮 = 两次严格尝试 + 一次协议纠正，最后一轮
 /// 还包含逐片段回退，所以一个块最多发出 `TRANSLATION_BLOCK_RETRIES + 1` 轮请求。

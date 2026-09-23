@@ -62,11 +62,11 @@ fn model_and_generation_drafts_survive_invalid_save_then_reset(cx: &mut TestAppC
     redraw(visual);
     let inputs = settings.read_with(visual, |view, _| {
         [
-            view.temperature_input.clone(),
-            view.top_p_input.clone(),
-            view.max_output_tokens_input.clone(),
-            view.presence_penalty_input.clone(),
-            view.frequency_penalty_input.clone(),
+            view.chat_generation.temperature.clone(),
+            view.chat_generation.top_p.clone(),
+            view.chat_generation.max_output_tokens.clone(),
+            view.chat_generation.presence_penalty.clone(),
+            view.chat_generation.frequency_penalty.clone(),
         ]
     });
     for (input, value) in inputs.iter().zip(["0.7", "0.8", "131072", "0.3", "-0.4"]) {
@@ -90,7 +90,14 @@ fn model_and_generation_drafts_survive_invalid_save_then_reset(cx: &mut TestAppC
     settings.read_with(visual, |view, cx| {
         assert_eq!(view.state.operation, PendingOperation::Idle);
         assert!(view.state.notice().is_some_and(|notice| notice.error));
-        assert_eq!(view.max_output_tokens_input.read(cx).value().as_ref(), "0");
+        assert_eq!(
+            view.chat_generation
+                .max_output_tokens
+                .read(cx)
+                .value()
+                .as_ref(),
+            "0"
+        );
         assert_eq!(
             view.services.provider_settings().unwrap().chat_generation,
             ChatGenerationSettings::default()
@@ -145,6 +152,63 @@ fn detected_models_fill_the_role_input(cx: &mut TestAppContext) {
             view.chat_model_input.read(cx).value().as_ref(),
             "qwen3.5:0.8b"
         );
+    });
+}
+
+/// 翻译 Tab 带自己的一组生成参数：默认温度 0（确定性，与问答的 0.1 不同），两组草稿
+/// 分别解析进 `chat_generation` / `translation_generation`，互不影响，「恢复默认」也
+/// 只动对应那一组。
+#[gpui::test]
+fn translation_generation_is_configured_separately_from_chat(cx: &mut TestAppContext) {
+    let (_directory, settings, visual) = open_window(cx);
+    visual.simulate_resize(size(px(1080.), px(2600.)));
+    redraw(visual);
+    click(visual, "ai-models-tab-translation");
+    let inputs = settings.read_with(visual, |view, _| {
+        [
+            view.translation_generation.temperature.clone(),
+            view.translation_generation.max_output_tokens.clone(),
+        ]
+    });
+    settings.read_with(visual, |view, cx| {
+        let entered = view.entered_settings(cx).unwrap();
+        assert_eq!(entered.translation_generation.temperature, Some(0.0));
+        assert_eq!(
+            entered.translation_generation.max_output_tokens,
+            DEFAULT_TRANSLATION_OUTPUT_TOKENS
+        );
+        assert_eq!(entered.chat_generation.temperature, Some(0.1));
+    });
+
+    edit_input(visual, &inputs[0], "0.6");
+    edit_input(visual, &inputs[1], "8192");
+    settings.read_with(visual, |view, cx| {
+        let entered = view.entered_settings(cx).unwrap();
+        assert_eq!(entered.translation_generation.temperature, Some(0.6));
+        assert_eq!(entered.translation_generation.max_output_tokens, 8192);
+        // 只改草稿：已存设置不动，问答那组也没被动过。
+        assert_eq!(
+            view.services
+                .provider_settings()
+                .unwrap()
+                .translation_generation,
+            TranslationGenerationSettings::default()
+        );
+        assert_eq!(entered.chat_generation, ChatGenerationSettings::default());
+    });
+
+    click(visual, "ai-reset-translation-generation");
+    settings.read_with(visual, |view, cx| {
+        assert_eq!(
+            view.entered_settings(cx).unwrap().translation_generation,
+            TranslationGenerationSettings::default()
+        );
+        assert_eq!(
+            view.translation_generation.temperature.read(cx).value(),
+            "0"
+        );
+        assert_eq!(view.chat_generation.temperature.read(cx).value(), "0.1");
+        assert!(!view.state.notice().unwrap().error);
     });
 }
 

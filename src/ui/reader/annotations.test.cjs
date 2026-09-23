@@ -7,7 +7,9 @@ const path = require("node:path");
 const { chromium } = require("playwright");
 
 const source = fs.readFileSync(path.join(__dirname, "annotations.js"), "utf8");
-const readerSource = fs.readFileSync(path.join(__dirname, "..", "reader.rs"), "utf8");
+// 初始化脚本住在 `reader/script.rs`（阅读器拆成目录模块之后，这里曾指着旧的
+// `reader.rs`，门禁在加载阶段 ENOENT；2026-09-22 修正）。
+const readerSource = fs.readFileSync(path.join(__dirname, "script.rs"), "utf8");
 const selectionBridgeMatch = readerSource.match(/const READER_INITIALIZATION_SCRIPT: &str = r#"([\s\S]*?)"#;/);
 assert.ok(selectionBridgeMatch, "The DOM gate must load the product's actual reader selection bridge");
 const selectionBridge = selectionBridgeMatch[1];

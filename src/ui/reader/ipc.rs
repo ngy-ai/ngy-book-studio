@@ -13,6 +13,10 @@ pub(crate) enum ReaderIpcMessage {
         #[serde(flatten)]
         request: ManualTranslationRequest,
     },
+    RetranslateBlock {
+        #[serde(flatten)]
+        request: RetranslateBlockRequest,
+    },
     SelectionChanged {
         selected_text: String,
     },
@@ -39,6 +43,10 @@ pub(crate) enum ReaderWebEvent {
     ManualTranslation {
         url: String,
         request: ManualTranslationRequest,
+    },
+    RetranslateBlock {
+        url: String,
+        request: RetranslateBlockRequest,
     },
     PageLoaded(String),
     ExplainSelection {

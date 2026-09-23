@@ -169,6 +169,9 @@ impl ReaderApp {
             ReaderWebEvent::ManualTranslation { url, request } => {
                 self.handle_manual_translation(&url, request, cx)
             }
+            ReaderWebEvent::RetranslateBlock { url, request } => {
+                self.handle_retranslate_block(&url, request, cx)
+            }
             ReaderWebEvent::PageLoaded(url) => self.sync_loaded_page(&url, cx),
             ReaderWebEvent::ExplainSelection { url, selected_text } => {
                 self.explain_selection(&url, &selected_text, cx);

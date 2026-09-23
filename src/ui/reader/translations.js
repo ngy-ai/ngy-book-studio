@@ -196,19 +196,66 @@
     return { source: normalize(text.join("")), leaves, lines: lines.join("") };
   };
 
-  const validatedLeaves = (entry, source) => {
-    if (!Array.isArray(entry.segments) || entry.segments.length !== source.leaves.length
-      || !entry.segments.length) return null;
+  const segmentShape = (segment) => !!segment
+    && typeof segment.source === "string"
+    && typeof segment.translated === "string"
+    && !!normalize(segment.translated);
+
+  /// The stored result exactly as it was written: one segment per leaf, in the
+  /// same order. Returns `{ translated, sources }` — the translation of every
+  /// leaf plus the stored source of each one, which is what a manual edit is
+  /// revalidated against in the host.
+  const alignedLeaves = (entry, source) => {
+    if (entry.segments.length !== source.leaves.length) return null;
     const translated = new Map();
+    const sources = [];
     for (let index = 0; index < source.leaves.length; index += 1) {
       const segment = entry.segments[index];
       const leaf = source.leaves[index];
-      if (!segment || typeof segment.source !== "string"
-        || normalize(segment.source) !== normalize(leaf.data)
-        || typeof segment.translated !== "string" || !normalize(segment.translated)) return null;
+      if (!segmentShape(segment) || normalize(segment.source) !== normalize(leaf.data)) return null;
       translated.set(leaf, segment.translated);
+      sources.push(segment.source);
     }
-    return translated;
+    return { translated, sources };
+  };
+
+  /// A stored split finer than the leaves the chapter has today. A row keeps the
+  /// inline structure of the source it was written for, and that structure can
+  /// change without changing the text: the reader's projection of a re-imported
+  /// source drops an inline wrapper (a custom element is merged back into the
+  /// paragraph), so a leaf the row split in three is now a single text node.
+  /// The text is still the same block, so the segments that tile whole leaves
+  /// are joined back together per leaf — every stored segment must lie inside
+  /// exactly one leaf, in order, and none may be left over. A stored segment
+  /// that would have to be cut apart cannot be mapped back to text, and a text
+  /// that no longer matches is not a tile either: both are stale rows and keep
+  /// the original.
+  const tiledLeaves = (entry, source) => {
+    const translated = new Map();
+    const sources = [];
+    let index = 0;
+    for (const leaf of source.leaves) {
+      let covered = "";
+      let text = "";
+      while (covered !== leaf.data) {
+        const segment = entry.segments[index];
+        if (!segmentShape(segment) || !segment.source
+          || !leaf.data.startsWith(covered + segment.source)) return null;
+        covered += segment.source;
+        text += segment.translated;
+        index += 1;
+      }
+      translated.set(leaf, text);
+      // The tiled leaf is the whole source of its translation: the host accepts
+      // an edit built from it even though the stored row is split finer.
+      sources.push(leaf.data);
+    }
+    return index === entry.segments.length ? { translated, sources } : null;
+  };
+
+  const validatedLeaves = (entry, source) => {
+    if (!Array.isArray(entry.segments) || !entry.segments.length || !source.leaves.length) return null;
+    return alignedLeaves(entry, source) ?? tiledLeaves(entry, source);
   };
 
   const rebuild = (node, translated, pairs) => {
@@ -279,8 +326,9 @@
     return element;
   };
 
-  /// What the editor offers for one applied block: nothing while a save is in
-  /// flight, save/cancel while editing, and edit plus the manual state otherwise.
+  /// What the editor offers for one applied block: nothing while a request is in
+  /// flight, save/cancel while editing, and the idle row otherwise — edit, ask the
+  /// model to translate this block again, and (for a manual block) restore.
   const renderControls = (state) => {
     const controls = state.controls;
     if (!controls) return;
@@ -301,7 +349,8 @@
     }
     if (state.request) {
       const busy = create("span");
-      busy.textContent = "保存中…";
+      // 两种请求的等待文案不同：一个是把读者的文字存起来，一个是把这一块交给模型重翻。
+      busy.textContent = state.requestKind === "retranslate" ? "正在提交重新翻译…" : "保存中…";
       controls.append(busy);
     } else if (state.editing) {
       controls.append(
@@ -310,14 +359,25 @@
       );
     } else {
       controls.append(button("编辑译文", () => beginEdit(state)));
+      // 重新翻译：把这一块再交给模型翻一次。按钮只负责提交，新译文要等后台任务跑完
+      // 那一块才会入库，届时宿主会重新推送本章（提示语就是这么写的）。
+      controls.append(button("重新翻译", () => submitRetranslate(state)));
       if (state.manual) {
         controls.append(button("恢复机器译文", () => {
           state.error = "";
+          state.notice = "";
           submit(state, "restore", []);
         }));
       }
     }
-    // Editing, saving and failures pin the row open; otherwise the pointer decides.
+    if (state.notice) {
+      const notice = create("span");
+      notice.className = "ngy-translation-notice";
+      notice.textContent = state.notice;
+      notice.style.setProperty("margin-left", "0.5em", "important");
+      controls.append(notice);
+    }
+    // Editing, requests and failures pin the row open; otherwise the pointer decides.
     state.showControls?.(state.hovering);
   };
 
@@ -328,6 +388,7 @@
     if (state.editing || state.request || !state.key) return;
     state.editing = true;
     state.error = "";
+    state.notice = "";
     for (const pair of state.pairs) {
       const editable = create("span");
       editable.className = "ngy-translation-editable";
@@ -424,7 +485,8 @@
     }
     requestId += 1;
     state.request = requestId;
-    state.requestManual = action === "update";
+    // 请求类别决定宿主回答之后怎么办：手工译文要落在编辑态上，重新翻译只留一句提示。
+    state.requestKind = action;
     pending.set(requestId, state);
     try {
       window.ipc.postMessage(JSON.stringify({
@@ -443,23 +505,65 @@
     renderControls(state);
   };
 
-  /// The host's answer to one manual translation request. A request id this page
-  /// never sent (an answer for a chapter that is already gone) is ignored.
+  /// Asks the host to translate this block again. The page names the block only:
+  /// which ordinal it has in the book's translation task is the host's business.
+  const submitRetranslate = (state) => {
+    if (state.request || state.editing || !state.key) return;
+    if (!window.ipc?.postMessage) {
+      state.error = "无法连接阅读窗口，无法重新翻译";
+      renderControls(state);
+      return;
+    }
+    state.error = "";
+    state.notice = "";
+    requestId += 1;
+    state.request = requestId;
+    state.requestKind = "retranslate";
+    pending.set(requestId, state);
+    try {
+      window.ipc.postMessage(JSON.stringify({
+        type: "retranslate_block",
+        revision,
+        request_id: state.request,
+        key: state.key,
+      }));
+    } catch {
+      pending.delete(state.request);
+      state.request = 0;
+      state.requestKind = null;
+      state.error = "无法发送重新翻译请求";
+    }
+    renderControls(state);
+  };
+
+  /// The host's answer to one request from this row. A request id this page never
+  /// sent (an answer for a chapter that is already gone) is ignored.
   const applyResult = (payload) => {
     if (!payload || typeof payload !== "object") return;
     const state = pending.get(payload.request_id);
     if (!state || state.request !== payload.request_id) return;
     pending.delete(payload.request_id);
     state.request = 0;
+    const kind = state.requestKind;
+    state.requestKind = null;
     if (payload.ok) {
-      state.manual = state.requestManual === true;
+      if (kind === "retranslate") {
+        // 重新翻译是后台任务的事：这一块翻完才会入库，本章由轮询重新推送，那时
+        // 这句提示随着新的一层一起消失。
+        state.error = "";
+        state.notice = "已提交重新翻译，完成后本章自动更新";
+        renderControls(state);
+        return;
+      }
+      state.manual = kind === "update";
       state.error = "";
+      state.notice = "";
       endEdit(state, false);
       return;
     }
     state.error = typeof payload.error === "string" && payload.error
       ? payload.error
-      : "译文未能保存";
+      : kind === "retranslate" ? "无法重新翻译该文本块" : "译文未能保存";
     renderControls(state);
   };
 
@@ -504,7 +608,7 @@
     renderReveal(state);
   };
 
-  const insert = (element, entry, translated, translateOnly) => {
+  const insert = (element, entry, validated, translateOnly) => {
     const inPlace = isCell(element) || tag(element) === "li";
     const layer = create("div");
     layer.setAttribute(MARK, "1");
@@ -521,7 +625,7 @@
     }
     const pairs = [];
     for (const child of element.childNodes) {
-      const result = rebuild(child, translated, pairs);
+      const result = rebuild(child, validated.translated, pairs);
       if (result) text.append(result);
     }
     const divider = create("div");
@@ -542,14 +646,12 @@
     }
     const state = {
       original, wrapper, layer, divider, pairs, hidden: false,
-      // The stored source of each leaf, in the same order as `pairs`. The host
-      // revalidates a manual edit against these exact strings.
-      sources: Array.isArray(entry.segments)
-        ? entry.segments.map((segment) => segment.source)
-        : [],
+      // The source of each translated leaf, in the same order as `pairs`. The
+      // host revalidates a manual edit against these exact strings.
+      sources: validated.sources,
       key: typeof entry.key === "string" ? entry.key : "",
       manual: entry.manual === true,
-      editing: false, request: 0, requestManual: false, error: "", hovering: false,
+      editing: false, request: 0, requestKind: null, error: "", notice: "", hovering: false,
       controls: null, showControls: null, reveal: null,
       display: original.style.getPropertyValue("display"),
       priority: original.style.getPropertyPriority("display"),
@@ -635,11 +737,11 @@
       const queue = queues.get(source.source);
       if (!queue?.length) continue;
       const entry = queue.shift();
-      const translated = validatedLeaves(entry, source);
+      const validated = validatedLeaves(entry, source);
       // A stale/invalid result never hides book text. Consume its position so
       // repeated source blocks cannot silently borrow a later block's result.
-      if (!translated || getComputedStyle(element).display === "none") continue;
-      insert(element, entry, translated, payload.displayMode === "translation-only");
+      if (!validated || getComputedStyle(element).display === "none") continue;
+      insert(element, entry, validated, payload.displayMode === "translation-only");
     }
   };
 

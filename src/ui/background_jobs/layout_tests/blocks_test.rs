@@ -101,6 +101,13 @@ pub(crate) fn translation_block_inspector_names_the_blocks_that_failed() {
             Some(58),
             Some(JobLogErrorKind::InvalidSchema),
         ),
+        // 请求级失败（端点/模型不可用）与协议跳过一样是「这一块没有译文」：它必须同
+        // 样出现在失败列表里，否则用户看不到哪一块该重试。
+        log_entry(
+            JobLogEvent::ProviderSkipped,
+            Some(59),
+            Some(JobLogErrorKind::Provider),
+        ),
         log_entry(
             JobLogEvent::ProtocolRejected,
             Some(61),
@@ -120,10 +127,12 @@ pub(crate) fn translation_block_inspector_names_the_blocks_that_failed() {
     ]);
     let inspector = BlockInspector::new(&job, blocks.total, Some(&logs));
 
-    assert_eq!(inspector.progress.failed, 2);
+    assert_eq!(inspector.progress.failed, 3);
     assert_eq!(inspector.state(58), BlockState::Failed);
+    assert_eq!(inspector.state(59), BlockState::Failed);
     assert_eq!(inspector.state(61), BlockState::Failed);
     assert_eq!(inspector.reason(58), Some("响应结构不符合分段协议"));
+    assert_eq!(inspector.reason(59), Some("模型服务返回错误"));
     assert_eq!(inspector.reason(61), Some("片段数量与原文不一致"));
     // A rejected attempt that was retried into a valid answer is not a failure.
     assert_eq!(inspector.reason(60), None);
@@ -135,7 +144,7 @@ pub(crate) fn translation_block_inspector_names_the_blocks_that_failed() {
     // still adds up to the number of blocks.
     let progress = &inspector.progress;
     assert_eq!(progress.cursor, 60);
-    assert_eq!(progress.done, 59);
+    assert_eq!(progress.done, 58);
     assert_eq!(
         progress.done + progress.processing.len() + progress.failed + progress.pending,
         progress.total
@@ -144,7 +153,7 @@ pub(crate) fn translation_block_inspector_names_the_blocks_that_failed() {
     // They can be filtered and jumped to on their own.
     assert_eq!(
         block_page_indices(&blocks, &inspector, Some(BlockState::Failed), 0),
-        vec![58, 61]
+        vec![58, 59, 61]
     );
     assert_eq!(
         anchor_page(&blocks, &inspector, Some(BlockState::Failed)),
@@ -156,7 +165,7 @@ pub(crate) fn translation_block_inspector_names_the_blocks_that_failed() {
     );
     assert_eq!(
         untranslated_summary(&inspector).as_deref(),
-        Some("本次执行未翻译的文本块：#58、#61")
+        Some("本次执行未翻译的文本块：#58、#59、#61")
     );
     // A failed task must explain itself in the inspector, not only in the log.
     assert!(failure_banner(&job, &inspector, Palette::LIGHT).is_some());

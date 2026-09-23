@@ -12,7 +12,8 @@
   `web_search.rs`、`background_jobs.rs`、`system.rs` 各自持有草稿、校验与面板；
   `endpoint_draft.rs` 是 Endpoint 与模型设置两个窗口共用的 Endpoint 草稿与模型检测。
   `models/` 里四个模型（问答、翻译、Embedding、视觉）**用一个 Tab 条切换**，一次只渲染
-  当前 Tab 的模型区域，问答生成参数只跟着问答模型。Tab 用分段按钮实现而不是
+  当前 Tab 的模型区域；问答与翻译各带一组生成参数（两份设置分开存储、分别随各自的请求
+  发送），因此生成参数面板只在对应的 Tab 里出现，向量与视觉没有。Tab 用分段按钮实现而不是
   `gpui_component::tab::TabBar`：`TabBar` 的子项不暴露 `debug_selector`，而本仓库的 GUI
   冒烟与 GPUI 测试都按选择器定位控件。Tab 的选择器是 `ai-models-tab-<role>`；`debug_bounds`
   不清理旧帧的选择器，因此测试只能断言「新 Tab 的控件出现」，不能靠它断言旧 Tab 消失。
@@ -59,8 +60,9 @@
   （`BackgroundJobSnapshot::cursor_json` 只留给失败任务和 `visual_render`），界面回去读那份
   永远缺失的游标就只会读到 0（现场 2026-09-20：并发 16 的翻译任务「已处理」一直在涨、
   「处理中」恒为 0，手工刷新也一样）。失败块必须来自该任务最新一次执行的
-  `ProtocolSkipped` 与带 ordinal 的 `StepFailed`
-  事件（回滚式失败只把游标退回第一个未翻译块，命名不了整批失败块）。失败块从游标给的状态
+  `ProtocolSkipped`、`ProviderSkipped` 与带 ordinal 的 `StepFailed`
+  事件（回滚式失败只把游标退回第一个未翻译块，命名不了整批失败块；两条跳过事件分别对应「模型
+  答得不对」与「请求根本没答上来」，用户据此判断该换模型还是该查端点）。失败块从游标给的状态
   里移出，四个计数必须恒等于块总数；筛选、跳到当前进度、复制都要按同一个视图计算。
   任务失败时明细页顶部必须给出持久化的失败原因与本次未翻译的块编号，`RunFailed` 也要带
   `error_kind`，否则头部失败行只剩位置。  `JobLogErrorKind::label()` 是闭合表的固定中文说明，
@@ -69,7 +71,9 @@
   持久化的请求副本——请求 body、系统提示与用户消息从不入库（见 `ai/job_diagnostics.rs` 的闭合
   事件约定），面板按被钉住的修订**重新解析文本块并按需重建** `translation_request`。
   因此 worker（`translate_block`）与检查器必须共用同一个 `translation_prompt()`，不得各写
-  一份；`translation_request` 的温度固定为 `TRANSLATION_TEMPERATURE = 0.0`，两边一起生效。
+  一份；生成参数（温度、Top P、最大输出、两种惩罚）也共用一条构造路径，取的是「模型设置」
+  窗口里翻译模型那一组（默认温度 0、上限 4096），两边一起生效。温度在设置里留空 = 请求体
+  里不带这个键，面板照实显示「未设置（服务端默认）」而不是 0。
   模型名取任务的持久游标（任务执行过就以它钉住的模型为准），只有从未执行的任务才回落到
   AI 设置里当前配置的翻译模型（「模型设置」窗口 → 翻译模型，可能为空）。读取路径与列表同为**只读**：不认领、
   不推进、不发布任务，也不写 `translations`；单块读取复用 `load_translation_blocks` 后按

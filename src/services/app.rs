@@ -96,6 +96,7 @@ impl AppServices {
             Arc::clone(&ai.translation_provider),
             ai.settings.translation_model.clone(),
             translation_execution_identity(&ai.settings)?,
+            ai.settings.translation_generation.clone(),
             ai.settings.default_language.clone(),
             ai.settings.auto_run_background_jobs,
         ))?;

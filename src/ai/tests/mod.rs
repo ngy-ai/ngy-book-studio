@@ -32,6 +32,67 @@ fn typed_http_rejection_preserves_display_and_exposes_only_numeric_diagnostics()
     assert!(!serialized.contains("secret"));
 }
 
+/// 翻译自己的生成参数：默认是确定性的（温度 0、输出上限 4096），边界与问答完全一致，
+/// 未知字段一律拒绝。
+#[test]
+fn translation_generation_settings_default_to_deterministic_sampling_and_validate() {
+    let defaults = TranslationGenerationSettings::default();
+    defaults.validate().unwrap();
+    assert_eq!(defaults.temperature, Some(0.0));
+    assert_eq!(defaults.top_p, None);
+    assert_eq!(defaults.presence_penalty, None);
+    assert_eq!(defaults.frequency_penalty, None);
+    assert_eq!(
+        defaults.max_output_tokens,
+        DEFAULT_TRANSLATION_OUTPUT_TOKENS
+    );
+
+    TranslationGenerationSettings {
+        temperature: Some(2.0),
+        top_p: Some(1.0),
+        max_output_tokens: u32::MAX,
+        presence_penalty: Some(2.0),
+        frequency_penalty: Some(-2.0),
+    }
+    .validate()
+    .unwrap();
+
+    for temperature in [2.1_f32, -0.1, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        assert!(
+            TranslationGenerationSettings {
+                temperature: Some(temperature),
+                ..defaults.clone()
+            }
+            .validate()
+            .is_err(),
+            "温度接受 {temperature}"
+        );
+    }
+    for top_p in [1.1_f32, -0.1, f32::NAN] {
+        assert!(
+            TranslationGenerationSettings {
+                top_p: Some(top_p),
+                ..defaults.clone()
+            }
+            .validate()
+            .is_err(),
+            "Top P 接受 {top_p}"
+        );
+    }
+    assert!(
+        TranslationGenerationSettings {
+            max_output_tokens: 0,
+            ..defaults
+        }
+        .validate()
+        .is_err()
+    );
+
+    let mut value = serde_json::to_value(TranslationGenerationSettings::default()).unwrap();
+    value["unsupported"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<TranslationGenerationSettings>(value).is_err());
+}
+
 #[test]
 fn chat_generation_settings_validate_boundaries_and_reject_non_finite_numbers() {
     ChatGenerationSettings::default().validate().unwrap();

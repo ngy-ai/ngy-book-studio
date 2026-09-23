@@ -51,7 +51,11 @@ pub(crate) fn block_detail_text(
                         .filter(|value| !value.trim().is_empty())
                         .unwrap_or("未设置")
                 ),
-                format!("temperature: {}", request.temperature),
+                match request.temperature {
+                    Some(temperature) => format!("temperature: {temperature}"),
+                    // 设置里留空 = 请求体里不带这个键，面板必须照实说，而不是显示 0。
+                    None => "temperature: 未设置（服务端默认）".to_string(),
+                },
                 format!("max_tokens: {}", request.max_tokens),
                 "reasoning_effort: none".to_string(),
                 "messages: 2（system + user）".to_string(),

@@ -7,8 +7,6 @@ use std::time::Instant;
 
 use anyhow::Result;
 
-use crate::ai::translation::{TranslationContext, TranslationSource};
-
 /// Constant-size diagnostics for one translation SSE response. Neither the
 /// prompt, the document text nor any provider field name is retained here.
 pub(crate) struct TranslationStreamStats {
@@ -203,6 +201,13 @@ pub(crate) fn unclosed_thinking_block(response: &str) -> bool {
 /// `request_body` is the whole serialized chat-completions body this attempt
 /// sends (system prompt, user message, model and sampling fields) and
 /// `response` is the model's answer, both byte for byte.
+///
+/// `response` is `None` on exactly one path: the transport refused the request
+/// (connection error, endpoint 4xx/5xx, deadline before any stream existed), so
+/// there is no answer to print. The request body is still the only evidence of
+/// what was sent — the case in which it matters most — and `reason` then carries
+/// the fixed error class instead of a verdict on an answer.
+///
 /// `reason` is the only free-form field and stays a fixed label chosen by the
 /// caller; the switch is never enabled in product runs.
 pub(crate) fn dump_raw_translation_response(
@@ -210,7 +215,7 @@ pub(crate) fn dump_raw_translation_response(
     block_ordinal: usize,
     attempt: usize,
     request_body: &str,
-    response: &str,
+    response: Option<&str>,
     reason: &'static str,
 ) {
     if std::env::var_os("NGY_DUMP_TRANSLATION_RAW").is_none() {
@@ -227,6 +232,9 @@ pub(crate) fn dump_raw_translation_response(
         body = %request_body,
         "Translation request body (NGY_DUMP_TRANSLATION_RAW)"
     );
+    let Some(response) = response else {
+        return;
+    };
     tracing::warn!(
         target: "ngy_ai",
         parent: span,

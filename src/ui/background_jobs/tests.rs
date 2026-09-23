@@ -177,7 +177,7 @@ fn detail_fixture(model: &str) -> TranslationBlockDetail {
             target_language: "zh-Hans".into(),
             source_language: Some("en".into()),
             max_tokens: 4_096,
-            temperature: 0.0,
+            temperature: Some(0.0),
             body: r#"{"model":"m"}"#.into(),
             system_prompt: "系统".into(),
             user_content: r#"{"source":"Hello world","segments":[]}"#.into(),

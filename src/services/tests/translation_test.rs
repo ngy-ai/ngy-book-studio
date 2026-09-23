@@ -246,6 +246,173 @@ fn a_manual_translation_is_shown_independently_of_the_machine_identity() {
     );
 }
 
+/// 手工译文请求与机器行的分段形状：机器行记录的是写入时的章节结构，来源被重新导入后
+/// 浏览器投影可能并掉内联包装，页面因此拿着更少的叶子来保存。请求只要把机器片段按顺序
+/// 整段铺满就接受，落库的原文始终取自机器行；切开机器片段、改写原文或留下没覆盖的片段
+/// 一律拒绝，一个字节都不写。
+#[test]
+fn manual_segments_tile_the_stored_split_without_ever_rewriting_it() {
+    let segment = |source: &str, translated: &str| crate::ai::translation::TranslationSegment {
+        source: source.to_string(),
+        translated: translated.to_string(),
+    };
+    let machine = crate::ai::translation::StoredTranslation {
+        execution_identity: "translation-v2:test".to_string(),
+        segments: vec![
+            segment(
+                "Grounding: trained on image-text pairs. “The cat is at ",
+                "定位：在图文对上训练。“猫在",
+            ),
+            segment("(112, 204)", "(112, 204)"),
+            segment("”.", "”。"),
+        ],
+    };
+    let leaf = "Grounding: trained on image-text pairs. “The cat is at (112, 204)”.";
+
+    // 页面的叶子比机器行更粗：三段拼回一段，原文取自机器行。
+    assert_eq!(
+        manual_translation_segments(
+            &machine,
+            &[segment(leaf, "定位：训练完成。“猫在(112, 204)”。")]
+        )
+        .unwrap(),
+        vec![segment(leaf, "定位：训练完成。“猫在(112, 204)”。")],
+        "a request that tiles the stored split keeps the machine sources"
+    );
+    // 一一对应照旧：只有译文被替换，首尾空白也照旧由机器行提供。
+    assert_eq!(
+        manual_translation_segments(
+            &machine,
+            &[
+                segment(
+                    "Grounding: trained on image-text pairs. “The cat is at",
+                    "甲 "
+                ),
+                segment("(112, 204)", "乙"),
+                segment("”.", "丙"),
+            ],
+        )
+        .unwrap(),
+        vec![
+            segment(
+                "Grounding: trained on image-text pairs. “The cat is at ",
+                "甲"
+            ),
+            segment("(112, 204)", "乙"),
+            segment("”.", "丙"),
+        ],
+        "a one-to-one request still takes every source from the stored row"
+    );
+    // 只覆盖了开头一段：后面的机器原文没有人覆盖，正文结构已经变过。
+    assert!(
+        manual_translation_segments(
+            &machine,
+            &[segment(
+                "Grounding: trained on image-text pairs. “The cat is at ",
+                "定位"
+            )],
+        )
+        .is_err(),
+        "an uncovered stored segment is refused"
+    );
+    // 切开了一段机器原文：它的文字无法再被分开保存。
+    assert!(
+        manual_translation_segments(
+            &machine,
+            &[
+                segment("Grounding: trained on image-text pairs. “", "定位"),
+                segment("The cat is at (112, 204)”,", "猫在"),
+            ],
+        )
+        .is_err(),
+        "a request cut inside a stored segment is refused"
+    );
+    // 原文被改写：页面只能描述改动，不能替换它依附的正文。
+    assert!(
+        manual_translation_segments(&machine, &[segment("Rewritten", "定位")]).is_err(),
+        "a rewritten source is refused"
+    );
+}
+
+/// 阅读端的「重新翻译」：服务层按当前显示语言找到那本书的翻译任务，再由索引层把
+/// **块标识**换成任务里的序号重跑那一块。块标识在正文里找不到时明确报错，绝不换一块
+/// 重跑（那会写下另一块的译文）。
+#[test]
+fn retranslating_one_reader_block_requeues_that_block_of_the_display_language_task() {
+    let temp = tempfile::tempdir().unwrap();
+    let services =
+        AppServices::open_with_credentials(temp.path(), Arc::new(MemoryCredentialStore::default()))
+            .unwrap();
+    let runtime = services.runtime();
+
+    // 先关掉翻译，把图书建出来，再打开：这条路径与
+    // `configuring_a_default_language_enqueues_translation_for_existing_books` 相同，
+    // 因此这里测的是「任务真的存在」之后的重跑，而不是任务怎么来的。
+    let mut settings = services.provider_settings().unwrap();
+    settings.default_language = None;
+    block_on_without_tokio(services.configure_provider(settings, ApiKeyUpdate::Keep)).unwrap();
+    let book_id = runtime
+        .block_on(async {
+            services
+                .spawn_library(|library| Ok(library.create_book("Retranslate book", "Author")?.id))
+                .await
+                .context("library test worker stopped")?
+        })
+        .unwrap();
+    let source_id = {
+        let conn = db::open_conn(services.database_path()).unwrap();
+        db::book_sources::list_for_book(&conn, &book_id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .context("the created book has no source")
+            .unwrap()
+            .id
+    };
+    let mut settings = services.provider_settings().unwrap();
+    settings.default_language = Some("zh-Hans".to_string());
+    block_on_without_tokio(services.configure_provider(settings, ApiKeyUpdate::Keep)).unwrap();
+    let job_id = format!("translation:{source_id}:zh-Hans");
+    assert!(
+        db::index_jobs::get(&db::open_conn(&services.db_path).unwrap(), &job_id)
+            .unwrap()
+            .is_some(),
+        "配置译文语言之后这本书必须有翻译任务"
+    );
+
+    // 「标题 + 一段」的模板里，段落是第二块（序号 1）。块标识与阅读端拿到的完全一致
+    // （同一个读取路径），所以这里直接向它要，而不是照文档规则自己拼一个。
+    let detail = block_on_without_tokio(services.background_job_translation_block_detail(
+        job_id.clone(),
+        1,
+        vec![book_id.clone()],
+    ))
+    .unwrap();
+    assert_eq!(detail.ordinal, 1);
+    block_on_without_tokio(services.retranslate_reader_translation_block(
+        book_id.clone(),
+        detail.unit_id.clone(),
+        detail.block_id.clone(),
+    ))
+    .unwrap();
+    let job = db::index_jobs::get(&db::open_conn(&services.db_path).unwrap(), &job_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.status, db::index_jobs::IndexJobStatus::Queued);
+    let cursor: serde_json::Value = serde_json::from_str(&job.cursor_json).unwrap();
+    assert_eq!(cursor["retry_ordinals"], serde_json::json!([1]));
+    assert_eq!(cursor["next_ordinal"], serde_json::json!(1));
+
+    // 不属于这本书的块标识：报错，而不是挑一块重跑。
+    let error = block_on_without_tokio(services.retranslate_reader_translation_block(
+        book_id,
+        detail.unit_id,
+        "not-a-block".to_string(),
+    ))
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("找不到文本块"), "{error:#}");
+}
+
 #[test]
 fn per_book_translation_display_override_beats_the_global_preference_and_leaves_with_the_book() {
     let temp = tempfile::tempdir().unwrap();

@@ -97,6 +97,12 @@ pub(crate) fn reader_ipc_event(
                 request,
             })
         }
+        ReaderIpcMessage::RetranslateBlock { request } => {
+            request.valid().then(|| ReaderWebEvent::RetranslateBlock {
+                url: uri.to_string(),
+                request,
+            })
+        }
         ReaderIpcMessage::SelectionChanged { selected_text } => {
             let selected_text = normalize_reader_selection(&selected_text)?;
             Some(ReaderWebEvent::SelectionChanged {

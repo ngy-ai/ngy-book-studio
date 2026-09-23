@@ -125,6 +125,9 @@ pub(crate) fn reconcile_current_embedding_job_in_transaction(
         next_ordinal: donor
             .and_then(|job| valid_embedding_cursor(job, source))
             .map_or(0, |cursor| cursor.next_ordinal),
+        // 位置从同一身份的捐赠游标继承，块版本只对整本翻译有意义（见
+        // `PersistedIndexCursor::blocks_version`），这里没有要带的东西。
+        blocks_version: 0,
     };
     let cursor_json = serde_json::to_string(&cursor).context("无法序列化 embedding 任务游标")?;
     let mut row = donor

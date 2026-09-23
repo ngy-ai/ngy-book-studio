@@ -32,6 +32,36 @@ fn malformed_or_invalid_saved_generation_is_reported_and_preserved() {
 }
 
 #[test]
+fn malformed_or_invalid_saved_translation_generation_is_reported_and_preserved() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join(db::DATABASE_FILE);
+    let conn = db::open_or_recreate(&db_path).unwrap();
+    // 翻译的温度上限是 2（问答一样），0 个输出 token 同样不接受。
+    let mut out_of_bounds = serde_json::to_value(TranslationGenerationSettings::default()).unwrap();
+    out_of_bounds["temperature"] = serde_json::json!(2.5);
+    let mut zero_output = serde_json::to_value(TranslationGenerationSettings::default()).unwrap();
+    zero_output["max_output_tokens"] = serde_json::json!(0);
+    for value_json in [
+        "{".to_string(),
+        "{}".to_string(),
+        out_of_bounds.to_string(),
+        zero_output.to_string(),
+    ] {
+        let row = db::settings::Setting {
+            key: TRANSLATION_GENERATION_SETTINGS_KEY.into(),
+            value_json,
+            updated_at: 1,
+        };
+        db::settings::upsert(&conn, &row).unwrap();
+        assert!(load_provider_settings(&db_path).is_err());
+        assert_eq!(
+            db::settings::get(&conn, TRANSLATION_GENERATION_SETTINGS_KEY).unwrap(),
+            Some(row)
+        );
+    }
+}
+
+#[test]
 fn malformed_saved_background_job_setting_is_reported_and_preserved() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join(db::DATABASE_FILE);

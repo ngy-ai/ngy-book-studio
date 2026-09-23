@@ -28,6 +28,14 @@ pub(crate) fn load_provider_settings(db_path: &Path) -> Result<ProviderSettings>
             .context("保存的问答生成参数无效")?,
         None => ChatGenerationSettings::default(),
     };
+    // 翻译的生成参数也是后加的行。缺失时用翻译自己的默认值（温度 0、输出上限
+    // 4096），与这次改动之前写死的取值逐字相同，所以升级不会改变老库的翻译请求。
+    settings.translation_generation =
+        match db::settings::get(&tx, TRANSLATION_GENERATION_SETTINGS_KEY)? {
+            Some(row) => serde_json::from_str::<TranslationGenerationSettings>(&row.value_json)
+                .context("保存的翻译生成参数无效")?,
+            None => TranslationGenerationSettings::default(),
+        };
     settings.endpoint_routing = match db::settings::get(&tx, ENDPOINT_ROUTING_SETTINGS_KEY)? {
         Some(row) => {
             let value = serde_json::from_str::<serde_json::Value>(&row.value_json)
@@ -122,6 +130,12 @@ pub(crate) fn save_provider_settings(db_path: &Path, settings: &ProviderSettings
             .context("无法序列化问答生成参数")?,
         updated_at,
     };
+    let translation_generation = db::settings::Setting {
+        key: TRANSLATION_GENERATION_SETTINGS_KEY.to_string(),
+        value_json: serde_json::to_string(&settings.translation_generation)
+            .context("无法序列化翻译生成参数")?,
+        updated_at,
+    };
     let background_jobs = db::settings::Setting {
         key: BACKGROUND_JOB_SETTINGS_KEY.to_string(),
         value_json: serde_json::to_string(&PersistedBackgroundJobSettings {
@@ -180,6 +194,10 @@ pub(crate) fn save_provider_settings(db_path: &Path, settings: &ProviderSettings
     ensure!(
         db::settings::upsert(&tx, &generation)? == 1,
         "问答生成参数未能保存"
+    );
+    ensure!(
+        db::settings::upsert(&tx, &translation_generation)? == 1,
+        "翻译生成参数未能保存"
     );
     ensure!(
         db::settings::upsert(&tx, &background_jobs)? == 1,

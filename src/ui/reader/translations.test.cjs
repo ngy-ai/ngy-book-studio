@@ -8,7 +8,9 @@ const { chromium } = require("playwright");
 
 const translationsSource = fs.readFileSync(path.join(__dirname, "translations.js"), "utf8");
 const annotationsSource = fs.readFileSync(path.join(__dirname, "annotations.js"), "utf8");
-const readerSource = fs.readFileSync(path.join(__dirname, "..", "reader.rs"), "utf8");
+// 选区桥与初始化脚本现在住在 `reader/script.rs`：阅读器拆成目录模块之后，这里还指着
+// 旧的 `reader.rs`，门禁因此在加载阶段就 ENOENT（2026-09-22 修正）。
+const readerSource = fs.readFileSync(path.join(__dirname, "script.rs"), "utf8");
 const selectionBridgeMatch = readerSource.match(/const READER_INITIALIZATION_SCRIPT: &str = r#"([\s\S]*?)"#;/);
 assert.ok(selectionBridgeMatch, "The DOM gate must load the product's actual reader selection bridge");
 const selectionBridge = selectionBridgeMatch[1];
@@ -116,6 +118,88 @@ test("translated blocks render bilingual above each matched paragraph", async ()
     assert.equal(state.cellFirstIsMark, true, "table cells receive the translation inside the cell");
   } finally { await page.close(); }
 });
+
+// 存下的分段属于写入时的章节结构。来源被重新导入后，阅读投影可能把内联包装并回正文，
+// 同一个文本块在页面里只剩一个叶子：更细的分段按边界拼回当前叶子，这一块照常显示译文
+// （含「译文」模式的图标与编辑控制行），不再整块悄悄丢掉。拼不回的分段不是拼接目标，
+// 文本对不上的行仍保留原文。
+for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; charset=utf-8"]) {
+  const mode = contentType.startsWith("application") ? "XHTML" : "HTML";
+  test(`${mode}: a stored split finer than the current leaves is joined back onto them`, async () => {
+    const source = "Grounding: trained on image-text pairs. “The cat is at (112, 204)”.";
+    const html = '<!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><style>'
+      + "body{font:22px/1.8 Arial;margin:50px}p{margin:15px 0}</style></head><body>"
+      + `<p id="merged">${source}</p>`
+      + '<p id="mixed">Alpha <em>Beta</em> Gamma</p>'
+      + '<p id="stale">Stale row</p>'
+      + "</body></html>";
+    const page = await pageWithFixture(html, contentType);
+    try {
+      await page.evaluate((value) => window.ngyTranslations.configure(value), {
+        session: "tiled-session", revision: 1, displayMode: "translation-only",
+        blocks: [
+          {
+            key: "merged", source,
+            segments: [
+              { source: "Grounding: trained on image-text pairs. “The cat is at ", translated: "在图像-文本对上训练。“猫在" },
+              { source: "(112, 204)", translated: "(112, 204)" },
+              { source: "”.", translated: "”。" },
+            ],
+          },
+          {
+            key: "mixed", source: "Alpha Beta Gamma",
+            segments: [
+              { source: "Alpha ", translated: "甲 " },
+              { source: "Beta", translated: "乙" },
+              { source: " Gamma", translated: " 丙" },
+            ],
+          },
+          {
+            key: "stale", source: "Stale row",
+            // 分段的文字拼不回这一块：不能换文本显示，只能整块保留原文。
+            segments: [
+              { source: "Stale ", translated: "旧 " },
+              { source: "different", translated: "行" },
+            ],
+          },
+        ],
+      });
+      const state = await page.evaluate(() => {
+        const layer = document.getElementById("merged").previousElementSibling;
+        return {
+          layers: document.querySelectorAll("[data-ngy-translation]").length,
+          mergedHidden: document.getElementById("merged").style.display,
+          mergedIcon: !!layer.querySelector("[data-ngy-translation-reveal]"),
+          mergedButtons: [...layer.querySelector("[data-ngy-translation-controls]").shadowRoot
+            .querySelectorAll("button")].map((element) => element.textContent),
+          staleLayer: document.getElementById("stale").previousElementSibling
+            ?.hasAttribute("data-ngy-translation") ?? false,
+          staleText: document.getElementById("stale").textContent,
+        };
+      });
+      assert.equal(state.layers, 2, "只有拼得起来的两块得到译文层");
+      assert.equal(await translationText(page, "merged"), "在图像-文本对上训练。“猫在(112, 204)”。",
+        "更细的分段按边界拼回这一个叶子");
+      assert.equal(state.mergedHidden, "none", "拼接后的块在译文模式照常隐藏原文");
+      assert.equal(state.mergedIcon, true, "拼接后的块同样有显示原文的图标");
+      assert.deepEqual(state.mergedButtons, ["编辑译文", "重新翻译"], "拼接后的块有完整的编辑控制行");
+      assert.equal(await translationText(page, "mixed"), "甲 乙 丙", "一一对应的分段不受影响");
+      assert.equal(state.staleLayer, false, "拼不回的分段不显示译文");
+      assert.equal(state.staleText, "Stale row", "拼不回的分段保留原文");
+
+      // 页面提交的原文是它自己这一层的叶子：宿主按「整段铺满」把请求对回机器行，
+      // 因此拼接显示出来的块仍然可以手工改写。
+      await clickControl(page, "merged", "编辑译文");
+      await page.keyboard.type("！");
+      await clickControl(page, "merged", "保存");
+      const sent = (await manualMessages(page)).at(-1);
+      assert.deepEqual(sent, {
+        type: "manual_translation", action: "update", revision: 1, request_id: sent.request_id,
+        key: "merged", segments: [{ source, translated: "在图像-文本对上训练。“猫在(112, 204)”。！" }],
+      }, "拼接后的块用整叶的原文提交手工译文");
+    } finally { await page.close(); }
+  });
+}
 
 test("the trailing icon is the only toggle between translation-only and bilingual", async () => {
   const page = await pageWithFixture();
@@ -723,6 +807,12 @@ const manualMessages = (page) => page.evaluate(() =>
 
 // The control row is chrome inside the layer's shadow root: its labels must not
 // join the block's text, so every lookup goes through that boundary.
+const noticeText = (page, id) => page.evaluate((id) => {
+  const layer = document.getElementById(id).previousElementSibling;
+  return layer.querySelector("[data-ngy-translation-controls]").shadowRoot
+    .querySelector(".ngy-translation-notice")?.textContent ?? null;
+}, id);
+
 const clickControl = (page, id, label) => page.evaluate(({ id, label }) => {
   const layer = document.getElementById(id).previousElementSibling;
   const button = [...layer.querySelector("[data-ngy-translation-controls]").shadowRoot
@@ -768,7 +858,8 @@ test("a manual edit is posted for the displayed block and survives the host's an
         // carry the button labels.
         layerText: layer.textContent,
       };
-    }), { buttons: ["编辑译文"], faded: "0", clickable: "none", tabbable: 7, layerText: "乙" },
+      // 七个可寻址的文本块各有一行控制条，每行两个按钮：都能用键盘到达。
+    }), { buttons: ["编辑译文", "重新翻译"], faded: "0", clickable: "none", tabbable: 14, layerText: "乙" },
     "every applied block offers an edit affordance that stays out of the way until it is used");
 
     // Revealing happens on hover or on keyboard focus, and settling the row back
@@ -811,7 +902,7 @@ test("a manual edit is posted for the displayed block and survives the host's an
       sent.request_id);
     assert.deepEqual(await manualState(page, "c"), {
       translated: "乙！", editing: false, editableText: null, focused: false,
-      manual: true, error: null, buttons: ["编辑译文", "恢复机器译文"], bookText: "Beta", bookHidden: "",
+      manual: true, error: null, buttons: ["编辑译文", "重新翻译", "恢复机器译文"], bookText: "Beta", bookHidden: "",
     }, "a saved edit keeps the reader's text, is marked as manual and can be restored");
 
     await clickControl(page, "c", "恢复机器译文");
@@ -822,8 +913,43 @@ test("a manual edit is posted for the displayed block and survives the host's an
     });
     await page.evaluate((request_id) => window.ngyTranslations.result({ request_id, ok: true }),
       restore.request_id);
-    assert.deepEqual((await manualState(page, "c")).buttons, ["编辑译文"],
+    assert.deepEqual((await manualState(page, "c")).buttons, ["编辑译文", "重新翻译"],
       "restoring drops the manual marker until the host republishes the model text");
+  } finally { await page.close(); }
+});
+
+// 重新翻译：页面只提交「这一块」，序号由宿主在任务自己的文本块列表里查出来；翻译在
+// 后台任务里重跑，所以页面收下一句提示就够，本章由轮询在新译文落库时重新推送。
+test("retranslating one block posts its key and waits for the host's answer", async () => {
+  const page = await pageWithFixture();
+  try {
+    await configure(page);
+    await clickControl(page, "c", "重新翻译");
+    const sent = await page.evaluate(() =>
+      window.__messages.filter((item) => item.type === "retranslate_block").at(-1));
+    assert.deepEqual(sent, {
+      type: "retranslate_block", revision: 1, request_id: sent.request_id, key: "c",
+    }, "只有块标识、修订与请求序号：页面不知道、也不猜块序号");
+    assert.deepEqual((await manualState(page, "c")).buttons, [],
+      "the row is busy until the host answers");
+
+    await page.evaluate((request_id) => window.ngyTranslations.result({ request_id, ok: true }),
+      sent.request_id);
+    const state = await manualState(page, "c");
+    assert.equal(state.manual, false, "重新翻译不改手工标记");
+    assert.deepEqual(state.buttons, ["编辑译文", "重新翻译"]);
+    assert.equal(await noticeText(page, "c"), "已提交重新翻译，完成后本章自动更新");
+
+    // 失败：显示宿主给的原因，按钮回到原位，读者可以再点一次。
+    await clickControl(page, "c", "重新翻译");
+    const failed = await page.evaluate(() =>
+      window.__messages.filter((item) => item.type === "retranslate_block").at(-1));
+    assert.notEqual(failed.request_id, sent.request_id, "每次提交都有自己的请求序号");
+    await page.evaluate((request_id) => window.ngyTranslations.result(
+      { request_id, ok: false, error: "这本书还没有对应的翻译任务" }), failed.request_id);
+    const after = await manualState(page, "c");
+    assert.equal(after.error, "这本书还没有对应的翻译任务");
+    assert.deepEqual(after.buttons, ["编辑译文", "重新翻译"]);
   } finally { await page.close(); }
 });
 
@@ -861,7 +987,7 @@ test("a failed manual edit keeps the typed text, a republish waits and cancel re
     await clickControl(page, "c", "取消");
     assert.deepEqual(await manualState(page, "c"), {
       translated: "新乙", editing: false, editableText: null, focused: false,
-      manual: false, error: null, buttons: ["编辑译文"], bookText: "Beta", bookHidden: "",
+      manual: false, error: null, buttons: ["编辑译文", "重新翻译"], bookText: "Beta", bookHidden: "",
     }, "cancel restores the model text and the deferred payload is applied");
     assert.equal(await page.evaluate(() => window.ngyTranslations.applied()), 1,
       "the waiting payload is the one that took effect");
@@ -928,7 +1054,7 @@ for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; c
       const state = await manualState(page, "a");
       assert.equal(state.translated, "人工甲");
       assert.equal(state.manual, true);
-      assert.deepEqual(state.buttons, ["编辑译文", "恢复机器译文"]);
+      assert.deepEqual(state.buttons, ["编辑译文", "重新翻译", "恢复机器译文"]);
       assert.equal((await manualState(page, "c")).manual, false, "the marker is per block");
       await clickControl(page, "a", "编辑译文");
       await page.keyboard.type("改");

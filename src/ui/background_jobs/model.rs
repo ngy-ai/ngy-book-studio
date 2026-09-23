@@ -85,9 +85,13 @@ impl BlockFailures {
             if entry.event == JobLogEvent::RunStarted {
                 break;
             }
+            // 两条跳过事件都要算：一条是「模型答得不对」，一条是「请求根本失败」，
+            // 用户看到的都是「这一块没有译文，可以重试」。
             if !matches!(
                 entry.event,
-                JobLogEvent::ProtocolSkipped | JobLogEvent::StepFailed
+                JobLogEvent::ProtocolSkipped
+                    | JobLogEvent::ProviderSkipped
+                    | JobLogEvent::StepFailed
             ) {
                 continue;
             }

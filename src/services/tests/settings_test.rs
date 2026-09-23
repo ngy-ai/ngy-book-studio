@@ -73,6 +73,13 @@ fn provider_settings_survive_restart_without_persisting_the_api_key() {
             presence_penalty: Some(0.3),
             frequency_penalty: Some(-0.4),
         },
+        translation_generation: TranslationGenerationSettings {
+            temperature: Some(0.7),
+            top_p: None,
+            max_output_tokens: 8192,
+            presence_penalty: None,
+            frequency_penalty: Some(0.2),
+        },
         auto_run_background_jobs: false,
         background_job_concurrency: 3,
         background_job_interval_ms: 250,
@@ -125,6 +132,20 @@ fn provider_settings_survive_restart_without_persisting_the_api_key() {
     assert_eq!(
         serde_json::from_str::<ChatGenerationSettings>(&generation_row.value_json).unwrap(),
         settings.chat_generation
+    );
+    // 翻译的生成参数有自己的行，两组不会互相覆盖。
+    let translation_generation_row = db::settings::get(
+        &db::open_conn(services.database_path()).unwrap(),
+        TRANSLATION_GENERATION_SETTINGS_KEY,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        serde_json::from_str::<TranslationGenerationSettings>(
+            &translation_generation_row.value_json
+        )
+        .unwrap(),
+        settings.translation_generation
     );
     let background_job_row = db::settings::get(
         &db::open_conn(services.database_path()).unwrap(),
@@ -566,12 +587,25 @@ fn existing_provider_settings_start_with_unconfigured_generation_defaults() {
             .unwrap()
             .is_none()
     );
+    assert!(
+        db::settings::get(&conn, TRANSLATION_GENERATION_SETTINGS_KEY)
+            .unwrap()
+            .is_none()
+    );
     drop(conn);
 
     let services =
         AppServices::open_with_credentials(temp.path(), Arc::new(MemoryCredentialStore::default()))
             .unwrap();
     assert_eq!(services.provider_settings().unwrap(), settings);
+    // 缺失的翻译生成参数用翻译自己的默认值补齐：温度 0、输出上限 4096，与这次改动
+    // 之前写死的取值逐字相同，所以升级不会改变老库发出的翻译请求。
+    let generation = services.provider_settings().unwrap().translation_generation;
+    assert_eq!(generation.temperature, Some(0.0));
+    assert_eq!(
+        generation.max_output_tokens,
+        TranslationGenerationSettings::default().max_output_tokens
+    );
     assert!(
         !services
             .provider_settings()
@@ -588,6 +622,11 @@ fn existing_provider_settings_start_with_unconfigured_generation_defaults() {
     );
     assert!(
         db::settings::get(&conn, CHAT_GENERATION_SETTINGS_KEY)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        db::settings::get(&conn, TRANSLATION_GENERATION_SETTINGS_KEY)
             .unwrap()
             .is_none()
     );

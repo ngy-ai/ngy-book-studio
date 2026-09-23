@@ -119,6 +119,49 @@ fn fingerprint_only_moves_with_the_pushed_payload() {
 }
 
 #[test]
+fn retranslate_ipc_accepts_only_a_bounded_block_reference() {
+    let own_uri = "epubreader://book/Text/one.xhtml".parse().unwrap();
+    let accepted = reader_ipc_event(
+        &own_uri,
+        r#"{"type":"retranslate_block","revision":3,"request_id":9,"key":"block-1"}"#,
+    );
+    let Some(ReaderWebEvent::RetranslateBlock { url, request }) = accepted else {
+        panic!("一个合法的重新翻译请求必须被接受");
+    };
+    assert_eq!(url, "epubreader://book/Text/one.xhtml");
+    assert_eq!(request.revision, 3);
+    assert_eq!(request.request_id, 9);
+    assert_eq!(request.key, "block-1");
+
+    // 多出来的字段一概不进入宿主：请求里根本没有「第几块」这个概念，序号由宿主在
+    // 任务自己的文本块列表里查出来，页面伪造一个也不会被采用。
+    let with_extra = reader_ipc_event(
+        &own_uri,
+        r#"{"type":"retranslate_block","revision":3,"request_id":7,"key":"block-1","ordinal":2}"#,
+    );
+    assert!(matches!(
+        with_extra,
+        Some(ReaderWebEvent::RetranslateBlock { request, .. })
+            if request.key == "block-1" && request.request_id == 7
+    ));
+
+    for forged in [
+        // 没有块标识：宿主无从知道要重跑哪一块
+        r#"{"type":"retranslate_block","revision":3,"request_id":1,"key":""}"#,
+        // 请求序号 0 永远不是一个真实的请求
+        r#"{"type":"retranslate_block","revision":3,"request_id":0,"key":"block-1"}"#,
+    ] {
+        assert!(reader_ipc_event(&own_uri, forged).is_none(), "{forged}");
+    }
+    // 超长标识在同一条流水线上被拒绝，而不是传进服务层。
+    let oversized_key = format!(
+        r#"{{"type":"retranslate_block","revision":1,"request_id":1,"key":"{}"}}"#,
+        "k".repeat(MAX_MANUAL_TRANSLATION_KEY_BYTES + 1)
+    );
+    assert!(reader_ipc_event(&own_uri, &oversized_key).is_none());
+}
+
+#[test]
 fn manual_translation_ipc_bounds_the_edit_before_the_host_reads_the_database() {
     let own_uri = "epubreader://book/Text/one.xhtml".parse().unwrap();
     let accepted = reader_ipc_event(

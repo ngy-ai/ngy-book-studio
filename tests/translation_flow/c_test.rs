@@ -326,6 +326,71 @@ pub(crate) fn failed_cursor_publication_settles_the_owned_execution_and_retry_re
     });
 }
 
+/// 端点彻底联系不上时，连续若干个块的请求失败就停下来并说明原因 —— 而不是把整本书逐块
+/// 跳过、最后报一个「完成」却一行译文都没有。
+///
+/// 现场 2026-09-22：端点配错（地址没人监听）时，用户期望「跳过这一块继续翻」，但整天都
+/// 连不上时必须停：否则一本三千块的书会被逐块跳过，任务显示完成、内容还是原文。
+#[test]
+pub(crate) fn consecutive_failed_requests_stop_the_translation_instead_of_skipping_the_book() {
+    // 绑一个端口再放掉：地址确实存在，但没有人监听，连接会立刻被拒。
+    let dead = TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_url = format!("http://{}/v1/", dead.local_addr().unwrap());
+    drop(dead);
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("dead-endpoint.epub");
+    write_epub(
+        &path,
+        "<p>One</p><p>Two</p><p>Three</p><p>Four</p><p>Five</p><p>Six</p><p>Seven</p><p>Eight</p>",
+    );
+    let services = AppServices::open_with_credentials(
+        temp.path().join("library"),
+        Arc::new(MemoryCredentialStore::default()),
+    )
+    .unwrap();
+    services.runtime().block_on(async {
+        services
+            .configure_providers(settings_with_base_url(dead_url, 10), BTreeMap::new())
+            .await
+            .unwrap();
+        let (book_id, _unit_id) = import(&services, &path).await;
+        let job = wait_translation(&services, &book_id, BackgroundJobStatus::Paused).await;
+        assert!(
+            services
+                .control_background_job(job.id.clone(), BackgroundJobAction::Resume)
+                .await
+                .unwrap()
+        );
+        let failed = wait_translation(&services, &book_id, BackgroundJobStatus::Failed).await;
+        let error = failed.error.unwrap_or_default();
+        assert!(
+            error.contains("连续"),
+            "停止的原因必须说清楚是「连续失败」而不是随便一条错误：{error}"
+        );
+        // 上限是 lib 内部的 `TRANSLATION_CONSECUTIVE_REQUEST_FAILURES`（= 5）：约定是
+        // 「偶尔一块失败照常继续，连续五块都失败就停」，这里按同一份规则断言读数。
+        assert_eq!(
+            failed.progress.completed, 5,
+            "恰好停在连续失败的第 5 块之后：前面的块都提交过（游标前进），后面的块没动"
+        );
+        assert_eq!(row_count(&services), 0, "一块都没翻出来");
+        // 每一个失败块都留下「请求失败、已跳过」的记录，任务窗口据此列出「重试失败块」。
+        let logs = services
+            .background_job_logs(job.id, vec![book_id])
+            .await
+            .unwrap();
+        assert_eq!(
+            logs.entries
+                .iter()
+                .filter(|entry| entry.event == JobLogEvent::ProviderSkipped)
+                .count(),
+            5,
+            "五个被跳过的块各自留下一条记录"
+        );
+    });
+}
+
 #[test]
 pub(crate) fn opening_a_legacy_plain_text_cache_requires_fresh_structured_translation() {
     let endpoint = TranslationEndpoint::start("新：", ReplyMode::ReverseIds);

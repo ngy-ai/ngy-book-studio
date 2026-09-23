@@ -6,6 +6,10 @@ use super::*;
 pub(crate) const OBJECT_DIRECTORY: &str = "objects";
 pub(crate) const PROVIDER_SETTINGS_KEY: &str = "ai.openai_compatible.provider.v1";
 pub(crate) const CHAT_GENERATION_SETTINGS_KEY: &str = "ai.openai_compatible.chat_generation.v1";
+/// 翻译模型自己的生成参数。与问答参数分开：两者的默认值不同（翻译默认温度 0），
+/// 老版本没有这一行，缺失时用翻译的默认值补齐。
+pub(crate) const TRANSLATION_GENERATION_SETTINGS_KEY: &str =
+    "ai.openai_compatible.translation_generation.v1";
 pub(crate) const ENDPOINT_ROUTING_SETTINGS_KEY: &str = "ai.openai_compatible.endpoint_routing.v1";
 pub(crate) const BACKGROUND_JOB_SETTINGS_KEY: &str = "background_jobs.preferences.v1";
 pub(crate) const PDF_READER_SETTINGS_KEY: &str = "pdf.reader.preferences.v1";
@@ -414,6 +418,10 @@ pub struct ProviderSettings {
     /// Stored under its own settings key and combined here for the UI/runtime.
     #[serde(skip)]
     pub chat_generation: ChatGenerationSettings,
+    /// 翻译请求自己的生成参数。与问答参数分开存储；它不进翻译执行身份，因此改这里
+    /// 不会让已翻好的译文失效、也不会让翻译任务重跑。
+    #[serde(skip)]
+    pub translation_generation: TranslationGenerationSettings,
     /// Stored under its own settings key so the established provider JSON
     /// contract remains unchanged.
     #[serde(skip, default = "default_auto_run_background_jobs")]
@@ -512,6 +520,7 @@ impl Default for ProviderSettings {
             chat_model: DEFAULT_CHAT_MODEL.to_string(),
             translation_model: default_translation_model(),
             chat_generation: ChatGenerationSettings::default(),
+            translation_generation: TranslationGenerationSettings::default(),
             auto_run_background_jobs: default_auto_run_background_jobs(),
             background_job_concurrency: default_background_job_concurrency(),
             background_job_interval_ms: default_background_job_interval_ms(),
@@ -554,6 +563,7 @@ impl ProviderSettings {
             crate::ai::MAX_EMBEDDING_DIMENSIONS
         );
         self.chat_generation.validate()?;
+        self.translation_generation.validate()?;
         if let Some(language) = &self.default_language {
             ensure!(
                 TRANSLATION_LANGUAGES

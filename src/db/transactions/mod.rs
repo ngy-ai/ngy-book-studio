@@ -108,6 +108,17 @@ pub(crate) struct PersistedIndexCursor {
     pub(crate) input_execution_identity: Option<String>,
     #[serde(default)]
     pub(crate) next_ordinal: usize,
+    /// 这个位置是用哪一版文本块提取规则算出来的。只有整本翻译比较它：它的序号是块
+    /// 序号，规则一变（例如「这一块是源代码」的判定变严）同一个序号就指向别处的文字，
+    /// 执行器（`JobCursor::from_job`）据此把任务退回书首重扫。
+    ///
+    /// 本结构只是完整块级游标的一个子集，**重建既有游标时必须把原游标里的值原样带
+    /// 过去**（见 `translation_cursor_json`）：缺省 0 的含义正是「这个位置的来源未知」，
+    /// 而重配置（换模型/端点）并不改块列表。把一次换模型写成来源未知的位置，执行器
+    /// 就会把重建读成「块列表变过」而退回书首（现场 2026-09-22：暂停在三千多块的任务
+    /// 换模型后「已处理」归零并从头重扫）。
+    #[serde(default)]
+    pub(crate) blocks_version: u32,
 }
 
 /// All SQLite metadata produced from one immutable source revision. Object

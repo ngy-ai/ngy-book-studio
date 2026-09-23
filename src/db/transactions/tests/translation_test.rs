@@ -62,7 +62,7 @@ fn translation_jobs_track_target_language_and_model_identity() {
         .unwrap(),
         0
     );
-    // A changed model restarts the job from the first block.
+    // A changed model keeps the durable position (0 here: nothing committed yet).
     assert_eq!(
         reconfigure_translation_jobs(
             &mut conn,
@@ -177,6 +177,10 @@ fn translation_identity_change_keeps_translated_blocks_and_the_durable_cursor() 
                 execution_identity: Some("translation-v2:old".to_string()),
                 input_execution_identity: None,
                 next_ordinal: 3,
+                // 执行器写下的块版本。这条测试只要求重配置把它原样带回：具体是几由
+                // `ai::indexing::TRANSLATION_BLOCKS_VERSION` 决定，db 层不认识它，
+                // 所以这里用一个任意的非零值来区分「带回来了」和「丢了」。
+                blocks_version: 2,
             })
             .unwrap(),
             error: None,
@@ -214,6 +218,10 @@ fn translation_identity_change_keeps_translated_blocks_and_the_durable_cursor() 
     assert_eq!(
         cursor.next_ordinal, 3,
         "an engine change keeps the durable position"
+    );
+    assert_eq!(
+        cursor.blocks_version, 2,
+        "重建的游标必须带着原位置的块版本：丢下它，执行器按「块列表变过」退回书首"
     );
     let rows = translations::list_for_unit(&conn, "unit-1", "en").unwrap();
     assert_eq!(rows.len(), 1, "already translated blocks are kept");

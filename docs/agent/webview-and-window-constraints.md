@@ -51,6 +51,11 @@
     AST；其附带的是展示壳，重新解析会把正文变成 RawHtml 并丢失结构化媒体引用。
     若前次正文解析失败，回执仍携带未接纳正文，必须重试校验并继续阻止保存和切章，
     直到正文修复；不能把前端的 unchanged 标记当作宿主已经接纳该快照的证据。
+12. PDF.js viewer 的可见字形画在 canvas 上，`.textLayer` 的 span 是
+    `color: transparent` 的覆盖层。宿主注入的皮肤覆盖规则（`PDF_APPEARANCE_RULES`，
+    见 `src/ui/pdf_reader/viewer.rs`）只能画半透明层：不透明的底色会画在 canvas 之上，
+    把正文整块盖住（选中一段文字后那里只剩一块纯色）。选中底色因此是叠了 alpha 的
+    强调色，与 `Palette::selection()` 同一档，不要写回不透明的 `--ngy-accent-soft`。
 
 ## 不可破坏的内容安全约束
 

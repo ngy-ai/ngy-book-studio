@@ -17,6 +17,10 @@ pub enum JobLogEvent {
     ProtocolRejected,
     ProtocolCorrection,
     ProtocolSkipped,
+    /// 模型请求本身失败（传输、超时、流协议、上下文超限）：这一块按跳过处理并保留
+    /// 原文。与 `ProtocolSkipped` 分开，是因为两者要说的话不一样 —— 一个是「模型答得
+    /// 不对」，一个是「根本没答上来」，用户据此判断该换模型还是该查端点。
+    ProviderSkipped,
     /// 多片段文本块在两次严格尝试后改用逐片段请求重新翻译。
     SegmentFallback,
     /// 整个文本块在协议纠正后仍不合格，按冻结输入重发一轮（最后一轮才带逐片段回退）。
@@ -58,6 +62,11 @@ impl JobLogEvent {
                 Warning,
                 "protocol",
                 "模型响应在自动纠正后仍不符合分段协议，已跳过当前文本块并保留原文",
+            ),
+            Self::ProviderSkipped => (
+                Warning,
+                "model",
+                "模型请求失败（端点或模型不可用），已跳过当前文本块并保留原文",
             ),
             Self::SegmentFallback => (
                 Info,

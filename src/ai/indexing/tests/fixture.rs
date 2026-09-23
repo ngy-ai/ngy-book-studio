@@ -97,6 +97,41 @@ impl Fixture {
         }
     }
 
+    /// 把第一章的正文换成给定 HTML，并把 fixture 的来源指到新修订上。
+    ///
+    /// 默认模板只有「标题 + 一段」，而有些用例需要更多文本块（例如「连续 N 块失败就
+    /// 停」）。编辑会带来一个新的来源修订、旧的派生任务随之作废，所以这里同时刷新
+    /// `source_id` 与 `revision`，后续照常按当前来源建任务。
+    pub(crate) fn rewrite_first_unit(&mut self, html: &str) {
+        let data_dir = self
+            .db_path
+            .parent()
+            .expect("fixture database lives in the temporary data directory")
+            .to_path_buf();
+        let mut library =
+            LibraryStore::load_from_with_runtime(data_dir, self.runtime.clone()).unwrap();
+        library
+            .update_content_unit_source(&self.book_id, &self.unit_id, html)
+            .unwrap();
+        drop(library);
+        let conn = db::open_conn(&self.db_path).unwrap();
+        // 打开第二个 `LibraryStore` 会触发启动语言回填：这份模板生成的 EPUB 声明
+        // `zh-CN`，于是这本书被补上一个与翻译目标 `zh-Hans` 同主语言的语言，整本翻译
+        // 任务就再也不会被创建（`language_matches_source` 直接跳过它）。fixture 里的
+        // 图书本来是「没有声明语言」，这里恢复成那个状态。
+        conn.execute(
+            "UPDATE books SET language = NULL WHERE id = ?1",
+            [&self.book_id],
+        )
+        .unwrap();
+        let book = db::books::get(&conn, &self.book_id).unwrap().unwrap();
+        let source = db::book_sources::get_revision(&conn, &self.book_id, book.revision)
+            .unwrap()
+            .unwrap();
+        self.source_id = source.id;
+        self.revision = book.revision;
+    }
+
     pub(crate) fn coordinator_with_providers(
         &self,
         embedding_provider: Arc<dyn OpenAiCompatibleProvider>,
@@ -228,12 +263,18 @@ impl Fixture {
 /// Puts one job in the terminal state a finished run leaves: succeeded with a
 /// durable cursor at `next_ordinal`. Used by the retry tests, which care about
 /// where the cursor starts rather than about how a run gets there.
+///
+/// 一次跑完留下的游标一定是执行器的形状，**包括当前块版本**：位置只有在执行器写过
+/// 之后才可能非零。重配置路径写下的「较小形状」缺这一项（缺省 0 = 位置来源未知），
+/// 照它做成一个非零位置等于伪造了一个生产上不可能出现的状态 —— `from_job` 会把
+/// 那一次伪造读成「块列表变过」而退回书首（`translation_test::changing_the_translation_model_resumes_at_the_same_block`）。
 pub(crate) fn finish_job_at(fixture: &Fixture, job_id: &str, next_ordinal: usize) {
     let conn = db::open_conn(&fixture.db_path).unwrap();
     let job = db::index_jobs::get(&conn, job_id).unwrap().unwrap();
     let mut cursor: JobCursor = serde_json::from_str(&job.cursor_json).unwrap();
     cursor.next_ordinal = next_ordinal;
     cursor.retry_ordinals.clear();
+    cursor.blocks_version = TRANSLATION_BLOCKS_VERSION;
     db::index_jobs::update_state(
         &conn,
         job_id,

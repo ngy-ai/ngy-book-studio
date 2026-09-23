@@ -29,6 +29,10 @@ pub(crate) struct MockMergeProvider {
     pub(crate) reject_requests: AtomicUsize,
     /// provider 直接失败（HTTP/连接类，不是协议失败），用于固定「非协议失败不重试」。
     pub(crate) fail_provider: AtomicBool,
+    /// 只让接下来 N 次请求失败，之后照常回答：用于固定「个别块的请求失败只跳过这一块、
+    /// 后面的块照常翻」。与 `fail_provider` 分开，是因为两者的用例关心的东西不同：
+    /// 一个看整块放弃，一个看整次运行还能不能走完。
+    pub(crate) fail_requests: AtomicUsize,
     /// 每个请求都声明「不需要翻译」：`{"id":N,"text":"","keep":true}`。
     pub(crate) keep_segments: AtomicBool,
     /// 每个请求的开始时刻，用于固定「请求之间必须休眠任务间隔」——
@@ -91,8 +95,16 @@ impl OpenAiCompatibleProvider for MockMergeProvider {
                     .unwrap_or_else(|error| error.into_inner())
                     .push(std::time::Instant::now());
                 if self.fail_provider.load(Ordering::SeqCst) {
-                    // provider 级别的失败：重发同一个请求解决不了，整次运行必须失败。
+                    // provider 级别的失败：重发同一个请求解决不了，整块立刻放弃。
                     anyhow::bail!("mock provider is unavailable");
+                }
+                if self
+                    .fail_requests
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
+                    .is_ok()
+                {
+                    // 暂时性失败：只这一发不行，下一块照常回答。
+                    anyhow::bail!("mock provider is temporarily unavailable");
                 }
                 if delay_ms > 0 {
                     // 窗口的读数必须在请求「打开」的时候取：这里记下同时打开的请求数，

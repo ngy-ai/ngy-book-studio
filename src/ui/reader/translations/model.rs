@@ -38,6 +38,25 @@ pub(crate) struct ManualTranslationRequest {
     pub(crate) segments: Vec<TranslationSegment>,
 }
 
+/// 阅读端对单个文本块发起的「重新翻译」请求。
+///
+/// 与手工译文一样，它只能说出「哪一个块」：这一块是否属于当前修订、在任务里的序号
+/// 是多少，全部由宿主从任务自己的文本块列表里判定（阅读端不知道序号，也不该猜）。
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub(crate) struct RetranslateBlockRequest {
+    pub(crate) revision: u64,
+    pub(crate) request_id: u64,
+    pub(crate) key: String,
+}
+
+impl RetranslateBlockRequest {
+    pub(crate) fn valid(&self) -> bool {
+        !self.key.is_empty()
+            && self.key.len() <= MAX_MANUAL_TRANSLATION_KEY_BYTES
+            && (1..=(1_u64 << 53) - 1).contains(&self.request_id)
+    }
+}
+
 impl ManualTranslationRequest {
     pub(crate) fn valid(&self) -> bool {
         let mut total = 0;

@@ -84,20 +84,22 @@ impl IndexingCoordinator {
 
         // The configured model is only a fallback: a task that already ran
         // records the model it was pinned to, and the body must describe that
-        // execution rather than today's settings.
-        let model = context.model.clone().unwrap_or_else(|| {
-            self.inner
-                .models
-                .read()
-                .map(|models| {
-                    models
-                        .translation
-                        .as_ref()
-                        .map(|translation| translation.model.clone())
-                        .unwrap_or_default()
-                })
-                .unwrap_or_default()
-        });
+        // execution rather than today's settings. 生成参数没有这种记录 —— 它不是执行
+        // 身份的一部分，所以展示当天配置的那一份，与旁边「重试」「重新请求」实际会
+        // 发出的请求一致。
+        let (configured_model, generation) = self
+            .inner
+            .models
+            .read()
+            .map(|models| {
+                models
+                    .translation
+                    .as_ref()
+                    .map(|translation| (translation.model.clone(), translation.generation.clone()))
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let model = context.model.clone().unwrap_or(configured_model);
         let system_prompt = translation_prompt(
             &context.target_language,
             context.source_language.as_deref(),
@@ -108,6 +110,7 @@ impl IndexingCoordinator {
         let user_content = block.source.request_input(&block_context);
         let request = translation_request(
             &model,
+            &generation,
             &context.target_language,
             context.source_language.as_deref(),
             &block.source,
@@ -129,8 +132,8 @@ impl IndexingCoordinator {
                 model,
                 target_language: context.target_language,
                 source_language: context.source_language,
-                max_tokens: TRANSLATION_MAX_OUTPUT_TOKENS,
-                temperature: TRANSLATION_TEMPERATURE,
+                max_tokens: generation.max_output_tokens,
+                temperature: generation.temperature,
                 body,
                 system_prompt,
                 user_content,
@@ -194,6 +197,7 @@ impl IndexingCoordinator {
 
         let request = translation_request(
             &translation.model,
+            &translation.generation,
             &context.target_language,
             context.source_language.as_deref(),
             &block.source,

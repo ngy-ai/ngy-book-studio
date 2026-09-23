@@ -133,6 +133,8 @@ pub(crate) fn reconcile_current_vision_job_in_transaction(
         execution_identity: Some(execution_identity.to_string()),
         input_execution_identity: None,
         next_ordinal: 0,
+        // 视觉任务的序号是页面序号，与文本块提取规则无关。
+        blocks_version: 0,
     };
     let replacement = IndexJob {
         id: canonical_id,

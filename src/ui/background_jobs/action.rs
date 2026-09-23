@@ -99,11 +99,12 @@ impl BackgroundJobsWindow {
                                 text: format!("已请求重试 {count} 个文本块。"),
                                 error: false,
                             },
-                            // Every requested block already has a translation (or
-                            // the task moved on): the caller's list is stale and
-                            // there is nothing worth re-sending.
+                            // The task moved on (finished, replaced, or no longer a
+                            // translation task): there is nothing to requeue. Blocks
+                            // that already have a translation are no longer filtered
+                            // out here — the walk decides that by content.
                             Ok(false) => JobsNotice {
-                                text: "这些文本块已有译文或任务状态已变化，未重试。".into(),
+                                text: "任务状态已变化，未重试。".into(),
                                 error: false,
                             },
                             Err(error) => JobsNotice {

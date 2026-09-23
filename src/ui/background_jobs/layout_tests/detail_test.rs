@@ -46,7 +46,7 @@ pub(crate) fn block_detail_panel_shows_every_payload_and_stays_inside_the_window
             target_language: "zh-Hans".into(),
             source_language: Some("en".into()),
             max_tokens: 4_096,
-            temperature: 0.0,
+            temperature: Some(0.0),
             body: serde_json::json!({
                 "model": "chat-test",
                 "messages": [

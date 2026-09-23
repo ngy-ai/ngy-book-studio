@@ -82,6 +82,155 @@ pub(crate) fn a_translation_run_keeps_the_configured_number_of_blocks_in_flight(
     assert!(finished.inflight.is_empty());
 }
 
+/// 个别文本块的请求失败不再让整次运行失败：这一块被跳过（原文保留、游标照常前进），
+/// 后面的块继续翻完，任务按 `Succeeded` 收尾。
+///
+/// 现场 2026-09-22：一块的请求撞上端点抖动，整本图书的翻译立刻失败，已经翻好的部分
+/// 停在半路 —— 用户要的是「跳过这一块，继续翻下一个」。
+#[test]
+pub(crate) fn a_failed_block_request_is_skipped_and_the_run_finishes() {
+    let provider = Arc::new(MockMergeProvider::default());
+    // 只让第一发请求失败：并发 1，请求严格按序号发出，所以它就是序号 0 那一块。
+    provider.fail_requests.store(1, Ordering::SeqCst);
+    let (fixture, job, mut cursor, translation) =
+        translation_block_fixture(&provider, "translation-v2:chat-test");
+    let inner = fixture.indexing_inner();
+    IndexingCoordinator {
+        inner: Arc::clone(&inner),
+        workers: Mutex::new(Vec::new()),
+    }
+    .configure_scheduling(1, Duration::ZERO);
+    let blocks = {
+        let conn = db::open_conn(&fixture.db_path).unwrap();
+        translation_blocks(&conn, &fixture.book_id, &fixture.source_id).unwrap()
+    };
+    assert!(
+        blocks.len() >= 2,
+        "这条用例需要至少两个文本块，实际 {}",
+        blocks.len()
+    );
+    let mut stats = TranslationRunStats::default();
+
+    let outcome = fixture
+        .runtime
+        .block_on(run_translation_blocks_inner(
+            &inner,
+            &job,
+            &translation,
+            "zh-Hans",
+            &mut cursor,
+            &mut stats,
+        ))
+        .expect("个别块的请求失败不得让整次运行失败");
+    let RunOutcome::Succeeded(finished) = outcome else {
+        panic!("跳过一个块之后运行必须走完并按 Succeeded 收尾");
+    };
+    assert_eq!(finished.next_ordinal, blocks.len());
+    assert_eq!(stats.untranslated, 1);
+    assert_eq!(stats.saved, blocks.len() - 1);
+
+    // 失败的那一块没有译文，其余块都有：跳过不等于整本停下。
+    let conn = db::open_conn(&fixture.db_path).unwrap();
+    let rows = db::translations::list_for_unit(&conn, &fixture.unit_id, "zh-Hans").unwrap();
+    assert_eq!(rows.len(), blocks.len() - 1);
+
+    // 日志里必须留下可读记录，块号指向失败的那一块，任务窗口据此把它列进「失败」。
+    let events = recorded_events(&fixture, &job.id);
+    let skipped: Vec<_> = events
+        .iter()
+        .filter(|entry| entry.event == JobLogEvent::ProviderSkipped)
+        .collect();
+    assert_eq!(skipped.len(), 1, "跳过必须留下记录：{events:#?}");
+    assert_eq!(skipped[0].metrics.ordinal, Some(0));
+    assert_eq!(
+        skipped[0].metrics.error_kind,
+        Some(JobLogErrorKind::Unknown),
+        "mock 的 provider 失败没有更细的分类"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|entry| entry.event == JobLogEvent::ProtocolSkipped),
+        "请求级失败不是协议失败，两者不能混记"
+    );
+}
+
+/// 端点彻底联系不上时，连续若干个块的请求失败就必须停下并说明原因：把整本书逐块
+/// 跳过、最后报「完成」是更糟的结果（书还是原文，用户却以为翻完了）。
+#[test]
+pub(crate) fn consecutive_failed_block_requests_stop_the_run() {
+    let provider = Arc::new(MockMergeProvider::default());
+    provider.fail_provider.store(true, Ordering::SeqCst);
+    let mut fixture = Fixture::new();
+    // 默认模板只有两个文本块，而这条用例要凑到连续 5 次失败。
+    fixture.rewrite_first_unit(
+        "<p>One</p><p>Two</p><p>Three</p><p>Four</p><p>Five</p><p>Six</p><p>Seven</p>",
+    );
+
+    let (fixture, job, mut cursor, translation) =
+        translation_block_fixture_in(fixture, &provider, "translation-v2:chat-test");
+    let inner = fixture.indexing_inner();
+    IndexingCoordinator {
+        inner: Arc::clone(&inner),
+        workers: Mutex::new(Vec::new()),
+    }
+    .configure_scheduling(1, Duration::ZERO);
+    let mut stats = TranslationRunStats::default();
+
+    let error = fixture
+        .runtime
+        .block_on(run_translation_blocks_inner(
+            &inner,
+            &job,
+            &translation,
+            "zh-Hans",
+            &mut cursor,
+            &mut stats,
+        ))
+        .err()
+        .expect("连续请求失败必须让运行停下来，而不是把整本书逐块跳过");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("连续")
+            && message.contains(&TRANSLATION_CONSECUTIVE_REQUEST_FAILURES.to_string()),
+        "停止的原因必须说清是连续失败：{message}"
+    );
+
+    // 恰好停在连续失败的上限那一块之后：前面的块都提交过（游标前进、各自记一条跳过），
+    // 后面的块一个请求都没发。
+    assert_eq!(
+        stats.untranslated, TRANSLATION_CONSECUTIVE_REQUEST_FAILURES,
+        "每一块都按跳过提交过"
+    );
+    assert_eq!(
+        provider.requests.load(Ordering::SeqCst),
+        TRANSLATION_CONSECUTIVE_REQUEST_FAILURES,
+        "停下之后不再开新请求"
+    );
+    let conn = db::open_conn(&fixture.db_path).unwrap();
+    let row = db::index_jobs::get(&conn, &job.id).unwrap().unwrap();
+    let saved: serde_json::Value = serde_json::from_str(&row.cursor_json).unwrap();
+    assert_eq!(
+        saved["next_ordinal"],
+        serde_json::json!(TRANSLATION_CONSECUTIVE_REQUEST_FAILURES)
+    );
+    assert_eq!(
+        db::translations::list_for_unit(&conn, &fixture.unit_id, "zh-Hans")
+            .unwrap()
+            .len(),
+        0,
+        "一块都没翻出来"
+    );
+    assert_eq!(
+        recorded_events(&fixture, &job.id)
+            .iter()
+            .filter(|entry| entry.event == JobLogEvent::ProviderSkipped)
+            .count(),
+        TRANSLATION_CONSECUTIVE_REQUEST_FAILURES,
+        "每个被跳过的块都要留下记录，任务窗口据此列出「重试失败块」"
+    );
+}
+
 /// 并发数就是窗口上限：设成 1 时一次只有一个块在飞（同一个设置既限任务也限块）。
 #[test]
 pub(crate) fn a_concurrency_of_one_keeps_the_translation_serial() {
@@ -205,10 +354,12 @@ pub(crate) fn a_window_resolved_from_the_cache_still_commits_in_ordinal_order() 
     assert!(finished.inflight.is_empty());
 }
 
-/// 重配置路径写出的持久游标是「较小的形状」，而领取后的每次比较都是 JSON 字符串
-/// 相等。领取时必须先把它重写成规范编码，否则任务第一次运行立刻判成 `Abandoned`：
-/// 行留在 `running`、`attempts` 已加一、没有任何执行者 —— 现场 2026-09-17，新导入
-/// 的图书点「恢复」后一直显示运行中，已处理 0、处理中 0，刷新也不动。
+/// 重配置路径写出的持久游标是「较小的形状」（没有 `inflight`/`retry_ordinals`），
+/// 而领取后的每次比较都是 JSON 字符串相等。领取时必须先把它重写成规范编码，否则任务
+/// 第一次运行立刻判成 `Abandoned`：行留在 `running`、`attempts` 已加一、没有任何执行者
+/// —— 现场 2026-09-17，新导入的图书点「恢复」后一直显示运行中，已处理 0、处理中 0，
+/// 刷新也不动。重写只补运行态字段，**不得改动 `next_ordinal`**：那条路径已经把位置和
+/// 它的 `blocks_version` 一起带过来了（见 `translation_cursor_json`）。
 #[test]
 pub(crate) fn a_reconfigured_translation_job_runs_instead_of_abandoning_its_first_execution() {
     let provider = Arc::new(MockMergeProvider::default());
@@ -225,6 +376,7 @@ pub(crate) fn a_reconfigured_translation_job_runs_instead_of_abandoning_its_firs
             provider,
             "chat-test".to_string(),
             "translation-v2:chat-test".to_string(),
+            TranslationGenerationSettings::default(),
             Some("zh-Hans".to_string()),
             false,
         ))
@@ -235,8 +387,8 @@ pub(crate) fn a_reconfigured_translation_job_runs_instead_of_abandoning_its_firs
     assert_eq!(row.status, db::index_jobs::IndexJobStatus::Paused);
     let persisted: serde_json::Value = serde_json::from_str(&row.cursor_json).unwrap();
     assert!(
-        persisted.get("inflight").is_none() && persisted.get("blocks_version").is_none(),
-        "重配置路径写的持久游标没有块级字段：{}",
+        persisted.get("inflight").is_none() && persisted.get("retry_ordinals").is_none(),
+        "重配置路径写的持久游标没有运行态字段：{}",
         row.cursor_json
     );
     let blocks = translation_blocks(&conn, &fixture.book_id, &fixture.source_id).unwrap();
@@ -363,6 +515,7 @@ pub(crate) fn a_narrowed_retry_stops_at_an_untranslated_block_outside_its_target
             provider.clone(),
             "chat-test".to_string(),
             "translation-v2:chat-test".to_string(),
+            TranslationGenerationSettings::default(),
             Some("zh-Hans".to_string()),
             false,
         ))
@@ -476,6 +629,7 @@ pub(crate) fn a_narrowed_retry_republishes_cached_blocks_beyond_its_targets() {
             provider.clone(),
             "chat-test".to_string(),
             "translation-v2:chat-test".to_string(),
+            TranslationGenerationSettings::default(),
             Some("zh-Hans".to_string()),
             false,
         ))

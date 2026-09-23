@@ -3,9 +3,12 @@
 
 use super::*;
 
-pub(crate) const AI_SETTINGS_KEYS: [&str; 8] = [
+/// 一次 AI 设置保存会写到的所有行。回滚按这份清单逐键恢复（缺过的行重新删掉），
+/// 所以**每个新设置键都必须加进来**，否则失败保存会留下一个半新半旧的行。
+pub(crate) const AI_SETTINGS_KEYS: [&str; 9] = [
     PROVIDER_SETTINGS_KEY,
     CHAT_GENERATION_SETTINGS_KEY,
+    TRANSLATION_GENERATION_SETTINGS_KEY,
     ENDPOINT_ROUTING_SETTINGS_KEY,
     BACKGROUND_JOB_SETTINGS_KEY,
     PDF_READER_SETTINGS_KEY,
@@ -89,33 +92,47 @@ pub(crate) fn validate_manual_translation_segments(
 }
 
 /// Pairs the request's translated text with the **stored** segment sources: the
-/// reading window may replace the translation, never the segment shape or the
-/// original text a translation is attached to.
+/// reading window may replace the translation, never the original text a
+/// translation is attached to.
+///
+/// The request usually carries the stored split one to one. It can carry fewer
+/// segments than the row when the chapter's inline structure changed after the
+/// row was written: a re-imported source without the inline wrapper the row was
+/// split by gives the page fewer leaves for the same text. A request that tiles
+/// whole stored segments, in order and without leaving one unused, is accepted
+/// as it is; the stored sources still come from the machine row, so only the
+/// translated text can ever change. A stored segment the request would have to
+/// cut apart, or one that nothing covers, is a changed original text and is
+/// refused.
 pub(crate) fn manual_translation_segments(
     machine: &crate::ai::translation::StoredTranslation,
     submitted: &[crate::ai::translation::TranslationSegment],
 ) -> Result<Vec<crate::ai::translation::TranslationSegment>> {
     ensure!(
-        machine.segments.len() == submitted.len(),
+        submitted.len() <= machine.segments.len(),
         "该文本块的原文结构已改变，无法保存手工译文"
     );
-    machine
-        .segments
-        .iter()
-        .zip(submitted)
-        .enumerate()
-        .map(|(index, (stored, submitted))| {
-            ensure!(
-                stored.source.trim() == submitted.source.trim(),
-                "第 {} 段译文的原文已改变，无法保存手工译文",
-                index + 1
-            );
-            Ok(crate::ai::translation::TranslationSegment {
-                source: stored.source.clone(),
-                translated: submitted.translated.trim().to_string(),
-            })
-        })
-        .collect()
+    let mut segments = Vec::with_capacity(submitted.len());
+    let mut next = 0usize;
+    for (position, request) in submitted.iter().enumerate() {
+        let mut source = String::new();
+        while source.trim() != request.source.trim() {
+            let Some(stored) = machine.segments.get(next) else {
+                anyhow::bail!("第 {} 段译文的原文已改变，无法保存手工译文", position + 1);
+            };
+            source.push_str(&stored.source);
+            next += 1;
+        }
+        segments.push(crate::ai::translation::TranslationSegment {
+            source,
+            translated: request.translated.trim().to_string(),
+        });
+    }
+    ensure!(
+        next == machine.segments.len(),
+        "该文本块的原文结构已改变，无法保存手工译文"
+    );
+    Ok(segments)
 }
 
 /// Non-secret identity for deciding whether persisted whole-book translations

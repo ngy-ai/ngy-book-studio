@@ -50,6 +50,21 @@ pub(crate) fn compact_reading_script_toggles_the_same_document_attribute() {
     assert!(disabled.contains("document.documentElement"));
 }
 
+/// PDF 的可见字形画在 canvas 上，`.textLayer` 只是 `color: transparent` 的覆盖层。
+/// 选中底色一旦不透明就会把正文整块盖住（选中区域只剩一块纯色），所以这条规则必须是
+/// 半透明的强调色，不能退回不透明的皮肤色 `--ngy-accent-soft`。
+#[test]
+pub(crate) fn the_pdf_selection_tint_never_hides_the_page_text() {
+    let rule = PDF_APPEARANCE_RULES
+        .lines()
+        .find(|line| line.trim_start().starts_with(".textLayer ::selection"))
+        .expect("the viewer must style its own selection");
+    assert!(
+        rule.contains("transparent") && !rule.contains("--ngy-accent-soft"),
+        "选中底色必须带 alpha，否则不透明的皮肤色会盖住 canvas 上的正文: {rule}"
+    );
+}
+
 #[test]
 pub(crate) fn ipc_page_change_is_typed() {
     let message = serde_json::from_str::<PdfIpcMessage>(

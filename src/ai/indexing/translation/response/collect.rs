@@ -29,7 +29,9 @@ pub(crate) async fn collect_translation_response(
     scope: &TranslationBlockScope,
     request_attempt: usize,
     source: &TranslationSource,
-    context: &TranslationContext<'_>,
+    // 收集阶段只用 `request_body` 与冻结的 `source`：上下文已经进了那一份 body，
+    // 这里不再解包它（调用方照旧传进来，因为它与 source 一起构成这次请求的身份）。
+    _context: &TranslationContext<'_>,
     request_body: &str,
     identity: &str,
     mut stream: crate::ai::ChatEventStream,
@@ -263,7 +265,7 @@ pub(crate) async fn collect_translation_response(
                 scope.ordinal,
                 request_attempt,
                 request_body,
-                &response,
+                Some(&response),
                 stats.end,
             );
             // 流没有正常结束，但已经收到的字节可能包含一个完整、能通过全部片段校验的

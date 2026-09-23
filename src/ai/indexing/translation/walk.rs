@@ -60,7 +60,7 @@ pub(crate) async fn walk_translation_blocks(
         total_blocks = blocks.len(),
         next_ordinal = run.cursor.next_ordinal,
         document_revision = revision,
-        max_output_tokens = TRANSLATION_MAX_OUTPUT_TOKENS,
+        max_output_tokens = translation.generation.max_output_tokens,
         source_language = %source_language
             .as_deref()
             .map(crate::ai::ai_diagnostics::safe_label)
@@ -95,15 +95,18 @@ pub(crate) async fn walk_translation_blocks(
     let mut resolved: BTreeMap<usize, BlockSlot> = BTreeMap::new();
     let mut in_flight: FuturesUnordered<BoxFuture<'_, (usize, Result<BlockWalk>)>> =
         FuturesUnordered::new();
-    // A block whose model response never passed the protocol is left untranslated
-    // and the run continues: one pathological block must not block a whole book,
-    // and neither must any number of them in a row. Every skip commits like a
-    // cache hit, so the run always reaches the end of the book and reports
-    // `Succeeded`; the blocks it could not translate are listed by the block
-    // inspector, which is where the user retries them after switching to a better
-    // model.
+    // A block the model never answered in the required shape — or whose request
+    // failed outright — is left untranslated and the run continues: one
+    // pathological block must not block a whole book, and neither must any number
+    // of them in a row. Every skip commits like a cache hit, so the run reaches
+    // the end of the book and reports `Succeeded`; the blocks it could not
+    // translate are listed by the block inspector, which is where the user retries
+    // them after switching to a better model.
     let mut saved_blocks = 0usize;
     let mut untranslated_blocks = 0usize;
+    // 连续多少个块的**请求级**失败就停下（见 `TRANSLATION_CONSECUTIVE_REQUEST_FAILURES`）。
+    // 协议类跳过不计入：弱模型连续不合格是常态，那条语义刻意没有上限。
+    let mut consecutive_request_failures = 0usize;
     // 收窄的重试在范围之外撞上一个还没翻译的块：运行停在这里，任务留在可继续的状态。
     let mut retry_stopped = false;
     loop {
@@ -120,7 +123,7 @@ pub(crate) async fn walk_translation_blocks(
                 let outcome = run.stopped(StopRequest::SourceChanged);
                 return run.interrupt(inner, job, outcome).await;
             }
-            commit_translation_slot(
+            let committed = commit_translation_slot(
                 inner,
                 job,
                 translation,
@@ -136,6 +139,22 @@ pub(crate) async fn walk_translation_blocks(
                 &mut untranslated_blocks,
             )
             .await?;
+            match committed {
+                CommittedBlock::Skipped(SkipCause::Request, kind) => {
+                    consecutive_request_failures += 1;
+                    ensure!(
+                        consecutive_request_failures < TRANSLATION_CONSECUTIVE_REQUEST_FAILURES,
+                        "连续 {consecutive_request_failures} 个文本块的模型请求都失败（{}）：\
+                         翻译已停止，以免把整本书逐块跳过。请到 AI 设置的「模型设置」里检查\
+                         翻译模型与 Endpoint，修好后点「重试」继续；已经翻好的块不会重做，\
+                         失败的块可用「重试失败块」重跑。",
+                        kind.label()
+                    );
+                }
+                CommittedBlock::Skipped(SkipCause::Protocol, _) => {}
+                CommittedBlock::Translated => consecutive_request_failures = 0,
+                CommittedBlock::Untouched => {}
+            }
         }
         // 2) Fill the window. The configured concurrency is re-read every round, so
         //    a saved change applies to a run that is already going — raising it does
@@ -252,18 +271,12 @@ pub(crate) async fn walk_translation_blocks(
                 return Ok(run.stopped(stop));
             }
             Ok(BlockWalk::Stored(stored, block)) => BlockSlot::Translated(stored, block),
-            // Only a response that already spent the correction budget leaves its
-            // block untranslated. Provider, database, source and cancellation
-            // failures keep failing the whole run.
-            Err(error) => {
-                if error
-                    .downcast_ref::<crate::ai::translation::ResponseError>()
-                    .is_none()
-                {
-                    return Err(error);
-                }
-                BlockSlot::Untranslated(classify_error(&error))
-            }
+            // 个别的失败（协议不合，或这一发请求本身失败）只跳过这一块，后面的块照常
+            // 翻；数据库、IO、取消类错误不是某一块的毛病，照旧让整次运行失败。
+            Err(error) => match block_skip_cause(&error) {
+                Some((cause, kind)) => BlockSlot::Untranslated(cause, kind),
+                None => return Err(error),
+            },
         };
         resolved.insert(ordinal, slot);
     }
@@ -337,6 +350,33 @@ pub(crate) fn keep_in_unit_cache(
 
 pub(crate) fn block_cache_key(source: &TranslationSource) -> String {
     translation_cache_key(&source.text, source.segments.iter().map(String::as_str))
+}
+
+/// 一个块的失败该跳过还是该让整次运行失败。
+///
+/// `Some(..)` 表示这一块按跳过处理，原文保留、游标前进、后面的块照常翻：
+///
+/// - `SkipCause::Protocol`：模型答了、但形状不合格（`ResponseError`）；
+/// - `SkipCause::Request`：这一发请求/这一份响应不行 —— 传输、超时、流协议、上下文
+///   超限，以及「响应超过大小上限」这类没有更细分类的响应级错误。
+///
+/// `None` 表示不是某一块的毛病，照旧让整次运行失败：数据库、IO 与取消类错误跳过只会
+/// 把损坏的结果铺满整本书，重试或换模型也解决不了它们。
+pub(crate) fn block_skip_cause(error: &anyhow::Error) -> Option<(SkipCause, JobLogErrorKind)> {
+    if error
+        .downcast_ref::<crate::ai::translation::ResponseError>()
+        .is_some()
+    {
+        return Some((SkipCause::Protocol, classify_error(error)));
+    }
+    let kind = classify_error(error);
+    if matches!(
+        kind,
+        JobLogErrorKind::Database | JobLogErrorKind::Io | JobLogErrorKind::Cancelled
+    ) {
+        return None;
+    }
+    Some((SkipCause::Request, kind))
 }
 
 /// Decides what one ordinal of the window needs.

@@ -30,6 +30,7 @@ pub(crate) fn retrying_named_blocks_rewinds_the_cursor_and_narrows_the_walk() {
             provider,
             "chat-test".to_string(),
             "translation-v1:chat-test".to_string(),
+            TranslationGenerationSettings::default(),
             Some("zh-Hans".to_string()),
             false,
         ))
@@ -85,12 +86,11 @@ pub(crate) fn retrying_named_blocks_rewinds_the_cursor_and_narrows_the_walk() {
     );
 }
 
-/// A requested ordinal whose block already has a translation must be dropped
-/// from the set: retrying would otherwise overwrite good output. When every
-/// requested block is already translated the task is not requeued at all,
-/// because a run over the same set would send nothing.
+/// 重试请求按原样排队，**不做前置过滤**：已有译文的块由 walk 按内容缓存键命中、不发
+/// 请求，所以「不用重发」这件事本来就由 walk 判定。用 ordinal 预先剔除会与 walk 的判定
+/// 不一致 —— 剔除错了的后果是用户点了「重试」而一个请求都不发（现场 2026-09-22）。
 #[test]
-pub(crate) fn retrying_skips_blocks_that_already_have_a_translation() {
+pub(crate) fn retrying_queues_the_requested_blocks_and_leaves_the_decision_to_the_walk() {
     let fixture = Fixture::new();
     let coordinator = IndexingCoordinator {
         inner: fixture.indexing_inner(),
@@ -104,6 +104,7 @@ pub(crate) fn retrying_skips_blocks_that_already_have_a_translation() {
             provider,
             "chat-test".to_string(),
             "translation-v1:chat-test".to_string(),
+            TranslationGenerationSettings::default(),
             Some("zh-Hans".to_string()),
             false,
         ))
@@ -160,7 +161,7 @@ pub(crate) fn retrying_skips_blocks_that_already_have_a_translation() {
     }
     finish_job_at(&fixture, &job_id, total);
 
-    // The already translated block drops out; the other one is retried.
+    // 两块都进集合：已有译文的那一块由 walk 判成缓存命中，不会重发。
     assert!(
         fixture
             .runtime
@@ -172,22 +173,123 @@ pub(crate) fn retrying_skips_blocks_that_already_have_a_translation() {
         db::index_jobs::get(&conn, &job_id).unwrap().unwrap()
     };
     let cursor: JobCursor = serde_json::from_str(&retrying.cursor_json).unwrap();
-    assert_eq!(cursor.retry_ordinals, vec![untranslated]);
-    assert_eq!(cursor.next_ordinal, untranslated);
+    assert_eq!(cursor.retry_ordinals, vec![translated, untranslated]);
+    assert_eq!(cursor.next_ordinal, translated);
 
-    // Naming only the translated block is a no-op, not a requeue.
+    // 只点名已有译文的那一块也照样排队：要不要发请求不是这里说了算。
     finish_job_at(&fixture, &job_id, total);
     assert!(
-        !fixture
+        fixture
             .runtime
             .block_on(coordinator.retry_translation_blocks(&job_id, vec![translated]))
             .unwrap()
     );
-    let untouched = {
+    let queued = {
         let conn = db::open_conn(&fixture.db_path).unwrap();
         db::index_jobs::get(&conn, &job_id).unwrap().unwrap()
     };
-    assert_eq!(untouched.status, db::index_jobs::IndexJobStatus::Succeeded);
+    assert_eq!(queued.status, db::index_jobs::IndexJobStatus::Queued);
+    let cursor: JobCursor = serde_json::from_str(&queued.cursor_json).unwrap();
+    assert_eq!(cursor.retry_ordinals, vec![translated]);
+}
+
+/// 重试必须真的把请求发出去：一块只有「阅读端看不到」的译文行（别的模型与执行身份写的）
+/// 时，按 ordinal 预先剔除会把它整掉，用户点了「重试」也没有任何请求 —— 日志里既没有
+/// 请求体也没有响应（现场 2026-09-22）。这条用例跑到请求计数，钉住「请求确实发了」。
+#[test]
+pub(crate) fn retrying_sends_a_request_for_a_block_whose_stored_row_is_not_displayable() {
+    let fixture = Fixture::new();
+    let coordinator = IndexingCoordinator {
+        inner: fixture.indexing_inner(),
+        workers: Mutex::new(Vec::new()),
+    };
+    // 带请求计数的 mock：这条用例要证明的就是「真的发了请求」。
+    let provider = Arc::new(MockMergeProvider::default());
+    let translation_provider: Arc<dyn OpenAiCompatibleProvider> = provider.clone();
+    let job_id = format!("translation:{}:zh-Hans", fixture.source_id);
+    fixture
+        .runtime
+        .block_on(coordinator.configure_translation(
+            translation_provider,
+            "chat-test".to_string(),
+            "translation-v1:chat-test".to_string(),
+            TranslationGenerationSettings::default(),
+            Some("zh-Hans".to_string()),
+            false,
+        ))
+        .unwrap();
+
+    let total = fixture
+        .runtime
+        .block_on(coordinator.translation_blocks(&job_id))
+        .unwrap()
+        .total;
+    assert!(total >= 2, "fixture needs two blocks: {total}");
+    let unit_revision = {
+        let conn = db::open_conn(&fixture.db_path).unwrap();
+        db::content_units::list_for_source(&conn, &fixture.source_id)
+            .unwrap()
+            .into_iter()
+            .find(|unit| unit.id == fixture.unit_id)
+            .expect("fixture unit must exist")
+            .revision
+    };
+    let now = unix_timestamp().unwrap();
+    // 第 0 块有一行译文，但属于另一套模型与执行身份：阅读端不会显示它。
+    {
+        let conn = db::open_conn(&fixture.db_path).unwrap();
+        db::translations::upsert(
+            &conn,
+            &db::translations::NewTranslation {
+                book_id: fixture.book_id.clone(),
+                content_unit_id: fixture.unit_id.clone(),
+                block_id: format!("{}:block", fixture.unit_id),
+                ordinal: 0,
+                document_revision: fixture.revision,
+                unit_revision,
+                target_language: "zh-Hans".to_string(),
+                source_language: Some("en".to_string()),
+                model: "other-model".to_string(),
+                source_text: "block".to_string(),
+                translated_text: serde_json::to_string(&StoredTranslation {
+                    execution_identity: "translation-v1:other-model".to_string(),
+                    segments: vec![crate::ai::translation::TranslationSegment {
+                        source: "block".to_string(),
+                        translated: "别的模型写的译文".to_string(),
+                    }],
+                })
+                .unwrap(),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .unwrap();
+    }
+    finish_job_at(&fixture, &job_id, total);
+
+    assert!(
+        fixture
+            .runtime
+            .block_on(coordinator.retry_translation_blocks(&job_id, vec![0]))
+            .unwrap(),
+        "这一块没有阅读端能显示的译文，重试必须排队"
+    );
+    let queued = {
+        let conn = db::open_conn(&fixture.db_path).unwrap();
+        db::index_jobs::list_queued(&conn, 8)
+            .unwrap()
+            .into_iter()
+            .find(|job| job.id == job_id)
+            .expect("重试之后的任务必须回到队列")
+    };
+    fixture
+        .runtime
+        .block_on(run_queued_job(&coordinator.inner, queued))
+        .unwrap();
+    assert!(
+        provider.requests.load(Ordering::SeqCst) > 0,
+        "重试必须真的发请求，否则用户看不到任何请求体与响应"
+    );
 }
 
 /// New translation jobs start paused, and repairing a failed block before
@@ -209,6 +311,7 @@ pub(crate) fn retrying_works_on_a_paused_task_and_refuses_a_running_one() {
             provider,
             "chat-test".to_string(),
             "translation-v1:chat-test".to_string(),
+            TranslationGenerationSettings::default(),
             Some("zh-Hans".to_string()),
             false,
         ))
@@ -416,6 +519,76 @@ pub(crate) fn a_block_that_keeps_failing_is_skipped_after_the_retry_budget() {
             .count(),
         TRANSLATION_BLOCK_RETRIES,
         "第一轮之后每一轮都要留下一次重发记录"
+    );
+}
+
+/// 阅读端只说得出块标识：`retranslate_translation_block` 负责把它换成任务里的序号，
+/// 换成不出来的就明确报错，绝不随手挑一块重跑（那会写下另一块的译文）。
+#[test]
+pub(crate) fn retranslating_by_block_id_requeues_exactly_that_blocks_ordinal() {
+    let fixture = Fixture::new();
+    let provider = Arc::new(MockMergeProvider::default());
+    let coordinator = IndexingCoordinator {
+        inner: fixture.indexing_inner(),
+        workers: Mutex::new(Vec::new()),
+    };
+    let job_id = format!("translation:{}:zh-Hans", fixture.source_id);
+    fixture
+        .runtime
+        .block_on(coordinator.configure_translation(
+            provider,
+            "chat-test".to_string(),
+            "translation-v2:chat-test".to_string(),
+            TranslationGenerationSettings::default(),
+            Some("zh-Hans".to_string()),
+            false,
+        ))
+        .unwrap();
+    let conn = db::open_conn(&fixture.db_path).unwrap();
+    let blocks = translation_blocks(&conn, &fixture.book_id, &fixture.source_id).unwrap();
+    assert!(
+        blocks.len() >= 2,
+        "这条用例需要至少两个文本块，实际 {}",
+        blocks.len()
+    );
+    let total = blocks.len();
+    // 阅读端拿到的是块标识：这里故意挑**第二块**，证明映射没有退化成「总是第 0 块」。
+    let (unit_id, block_id, ordinal) = (
+        blocks[1].unit_id.clone(),
+        blocks[1].block_id.clone(),
+        blocks[1].ordinal,
+    );
+    assert_ne!(ordinal, 0, "第二块的序号不能是 0，否则这条用例证明不了映射");
+    drop(conn);
+    // 任务先按「跑完」停在书末：重试要能把它重新排队。
+    finish_job_at(&fixture, &job_id, total);
+
+    assert!(
+        fixture
+            .runtime
+            .block_on(coordinator.retranslate_translation_block(&job_id, &unit_id, &block_id))
+            .unwrap()
+    );
+    let queued = {
+        let conn = db::open_conn(&fixture.db_path).unwrap();
+        db::index_jobs::get(&conn, &job_id).unwrap().unwrap()
+    };
+    assert_eq!(queued.status, db::index_jobs::IndexJobStatus::Queued);
+    let cursor: JobCursor = serde_json::from_str(&queued.cursor_json).unwrap();
+    assert_eq!(cursor.retry_ordinals, vec![ordinal]);
+    assert_eq!(cursor.next_ordinal, ordinal);
+
+    // 找不到的块标识、以及不属于这一章的块标识，都必须报错而不是换一块重跑。
+    let error = fixture
+        .runtime
+        .block_on(coordinator.retranslate_translation_block(&job_id, &unit_id, "no-such-block"))
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("找不到文本块"), "{error:#}");
+    assert!(
+        fixture
+            .runtime
+            .block_on(coordinator.retranslate_translation_block(&job_id, "other-unit", &block_id))
+            .is_err()
     );
 }
 

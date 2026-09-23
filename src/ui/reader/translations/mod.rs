@@ -25,6 +25,8 @@ mod manual;
 
 mod model;
 
+mod retranslate;
+
 mod state;
 
 pub(crate) use helpers::*;

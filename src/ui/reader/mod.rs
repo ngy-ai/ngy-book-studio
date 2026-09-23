@@ -25,7 +25,7 @@ mod annotations;
 use annotations::{AnnotationAction, ReaderAnnotations};
 
 mod translations;
-use translations::{ManualTranslationRequest, ReaderTranslations};
+use translations::{ManualTranslationRequest, ReaderTranslations, RetranslateBlockRequest};
 
 #[cfg(target_os = "windows")]
 pub(crate) mod selection_menu;

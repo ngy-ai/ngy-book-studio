@@ -22,10 +22,10 @@ pub(crate) async fn commit_translation_slot(
     stats: &mut TranslationRunStats,
     saved_blocks: &mut usize,
     untranslated_blocks: &mut usize,
-) -> Result<()> {
+) -> Result<CommittedBlock> {
     let block = &blocks[ordinal];
-    match slot {
-        BlockSlot::Pass => {}
+    let committed = match slot {
+        BlockSlot::Pass => CommittedBlock::Untouched,
         BlockSlot::Cached(stored) => {
             publish_translation(
                 inner,
@@ -50,6 +50,7 @@ pub(crate) async fn commit_translation_slot(
                     ..JobLogMetrics::default()
                 },
             );
+            CommittedBlock::Translated
         }
         BlockSlot::Translated(stored, block_stats) => {
             publish_translation(
@@ -92,27 +93,47 @@ pub(crate) async fn commit_translation_slot(
                 untranslated_blocks = *untranslated_blocks,
                 "Translation block saved"
             );
+            CommittedBlock::Translated
         }
-        BlockSlot::Untranslated(error_kind) => {
+        BlockSlot::Untranslated(cause, error_kind) => {
             *untranslated_blocks += 1;
             stats.untranslated += 1;
+            // 事件按原因分开：协议失败与「请求根本没答上来」是两句不同的话，用户据此
+            // 判断该换模型还是该查端点。块号与固定分类两者都记，任务窗口据此把这一块
+            // 列进「失败」，用户点「重试」时重发的就是它。
+            let (event, stage) = match cause {
+                SkipCause::Protocol => (
+                    JobLogEvent::ProtocolSkipped,
+                    "translation_block_untranslated",
+                ),
+                SkipCause::Request => (
+                    JobLogEvent::ProviderSkipped,
+                    "translation_block_untranslated_request",
+                ),
+            };
             record_index_event(
                 inner,
                 job,
-                JobLogEvent::ProtocolSkipped,
+                event,
                 JobLogMetrics {
                     ordinal: Some(block.ordinal as u64),
                     total: Some(blocks.len() as u64),
-                    request_attempt: Some(TRANSLATION_RESPONSE_ATTEMPTS as u64),
+                    // 协议失败用满了一整块的尝试预算；请求级失败在第一发就放弃了。
+                    request_attempt: (cause == SkipCause::Protocol)
+                        .then_some(TRANSLATION_RESPONSE_ATTEMPTS as u64),
                     error_kind: Some(error_kind),
                     ..JobLogMetrics::default()
                 },
             );
             tracing::warn!(
                 target: "ngy_ai",
-                stage = "translation_block_untranslated",
+                stage = stage,
                 block_ordinal = block.ordinal,
                 total_blocks = blocks.len(),
+                cause = match cause {
+                    SkipCause::Protocol => "protocol",
+                    SkipCause::Request => "request",
+                },
                 error_kind = error_kind.label(),
                 untranslated = *untranslated_blocks,
                 "Translation block left untranslated"
@@ -121,10 +142,14 @@ pub(crate) async fn commit_translation_slot(
             // past it: the whole book has to reach the end even if every block
             // fails, because the per-block "重试" button is the repair path, not a
             // second attempt at the whole run. Stopping early here would also
-            // strand every later block.
+            // strand every later block. 唯一的例外是请求级失败连续太多次：那不是
+            // 「某一块不行」，而是模型/端点联系不上，由 walk 停下来报警
+            // （`TRANSLATION_CONSECUTIVE_REQUEST_FAILURES`）。
+            CommittedBlock::Skipped(cause, error_kind)
         }
-    }
-    run.commit(inner, job, ordinal).await
+    };
+    run.commit(inner, job, ordinal).await?;
+    Ok(committed)
 }
 
 /// Writes one block's translation row. The stored text is republished under the

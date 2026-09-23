@@ -112,6 +112,7 @@ pub(crate) async fn translate_block_by_fragment(
         };
         let request = translation_request(
             &translation.model,
+            &translation.generation,
             target_language,
             source_language,
             &fragment,
@@ -133,10 +134,22 @@ pub(crate) async fn translate_block_by_fragment(
             scope,
             translation.provider.chat_stream(request),
         )
-        .await?
+        .await
         {
-            BlockStep::Value(stream) => stream,
-            BlockStep::Stopped(stop) => return Ok(BlockWalk::Stopped(stop)),
+            Ok(BlockStep::Value(stream)) => stream,
+            Ok(BlockStep::Stopped(stop)) => return Ok(BlockWalk::Stopped(stop)),
+            // 与主路径同一条规则：传输层失败没有响应，但请求体仍要打出来。
+            Err(error) => {
+                dump_raw_translation_response(
+                    &span,
+                    scope.ordinal,
+                    index + 1,
+                    &request_body,
+                    None,
+                    crate::ai::ai_diagnostics::error_kind(&error),
+                );
+                return Err(error);
+            }
         };
         let response = match collect_translation_response(
             inner,
@@ -189,7 +202,7 @@ pub(crate) async fn translate_block_by_fragment(
                     scope.ordinal,
                     index + 1,
                     &request_body,
-                    &response,
+                    Some(&response),
                     "fragment_rejected",
                 );
                 return Err(error.context(format!(
@@ -216,7 +229,7 @@ pub(crate) async fn translate_block_by_fragment(
             scope.ordinal,
             index + 1,
             &request_body,
-            &response,
+            Some(&response),
             "fragment_accepted",
         );
         translated.push(stored.translated);

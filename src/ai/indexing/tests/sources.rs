@@ -12,7 +12,21 @@ pub(crate) fn translation_block_fixture(
     JobCursor,
     TranslationServices,
 ) {
-    let fixture = Fixture::new();
+    translation_block_fixture_in(Fixture::new(), provider, identity)
+}
+
+/// 同上，但复用调用方已经准备好的 fixture（例如先改过正文、需要更多文本块的用例）。
+pub(crate) fn translation_block_fixture_in(
+    fixture: Fixture,
+    provider: &Arc<MockMergeProvider>,
+    identity: &str,
+) -> (
+    Fixture,
+    db::index_jobs::IndexJob,
+    JobCursor,
+    TranslationServices,
+) {
+    let fixture = fixture;
     let coordinator = IndexingCoordinator {
         inner: fixture.indexing_inner(),
         workers: Mutex::new(Vec::new()),
@@ -24,6 +38,7 @@ pub(crate) fn translation_block_fixture(
             provider.clone(),
             "chat-test".to_string(),
             identity.to_string(),
+            TranslationGenerationSettings::default(),
             Some("zh-Hans".to_string()),
             false,
         ))
@@ -50,6 +65,7 @@ pub(crate) fn translation_block_fixture(
         provider: provider.clone(),
         model: "chat-test".to_string(),
         execution_identity: identity.to_string(),
+        generation: TranslationGenerationSettings::default(),
         target_language: Some("zh-Hans".to_string()),
         auto_run: false,
     };

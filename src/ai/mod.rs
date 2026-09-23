@@ -82,6 +82,9 @@ pub const DEFAULT_AI_REQUEST_TIMEOUT_SECS: u64 = 120;
 pub const MIN_AI_REQUEST_TIMEOUT_SECS: u64 = 1;
 pub const MAX_AI_REQUEST_TIMEOUT_SECS: u64 = 600;
 pub const DEFAULT_CHAT_OUTPUT_TOKENS: u32 = 4096;
+/// 整本翻译的默认输出上限。与问答分开：一个文本块的输出规模由它的片段数决定，这个
+/// 值就是翻译任务一直使用的量（`TranslationGenerationSettings` 的默认值）。
+pub const DEFAULT_TRANSLATION_OUTPUT_TOKENS: u32 = 4_096;
 /// Whether AI and web-search requests honour the system proxy
 /// (`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`) by default. reqwest reads those
 /// variables on its own, so "on" preserves the behaviour of a machine that

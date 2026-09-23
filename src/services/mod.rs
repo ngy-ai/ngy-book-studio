@@ -41,7 +41,7 @@ use crate::{
     ai::{
         ChatGenerationSettings, DEFAULT_AI_REQUEST_TIMEOUT_SECS, DEFAULT_AI_USE_PROXY,
         DEFAULT_OLLAMA_OPENAI_BASE_URL, ModelInfo, OpenAiCompatibleProvider, OpenAiHttpProvider,
-        ProviderConfig, normalize_provider_base_url,
+        ProviderConfig, TranslationGenerationSettings, normalize_provider_base_url,
     },
     db,
     formats::FormatRegistry,

@@ -162,7 +162,9 @@ pub struct TranslationBlockRequest {
     pub target_language: String,
     pub source_language: Option<String>,
     pub max_tokens: u32,
-    pub temperature: f32,
+    /// 采样温度。`None` 表示设置里留空、由服务端默认值决定，与请求体里没有这个键
+    /// 是同一件事。
+    pub temperature: Option<f32>,
     /// Serialized chat-completions body, including the system and user message.
     pub body: String,
     pub system_prompt: String,

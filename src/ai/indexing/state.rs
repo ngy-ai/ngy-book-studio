@@ -40,6 +40,9 @@ pub(crate) struct TranslationServices {
     pub(crate) provider: Arc<dyn OpenAiCompatibleProvider>,
     pub(crate) model: String,
     pub(crate) execution_identity: String,
+    /// 翻译请求的生成参数（温度、采样、输出上限…）。它随每次请求发送，但**不进执行
+    /// 身份**：调它不会让已翻好的译文失效，也不会让任务重跑。
+    pub(crate) generation: TranslationGenerationSettings,
     pub(crate) target_language: Option<String>,
     pub(crate) auto_run: bool,
 }

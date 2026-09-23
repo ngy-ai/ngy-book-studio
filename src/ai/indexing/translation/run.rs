@@ -48,9 +48,31 @@ pub(crate) enum BlockSlot {
     Cached(StoredTranslation),
     /// A fresh translation, plus the counters its own walk contributed.
     Translated(StoredTranslation, BlockStats),
-    /// The model never answered in the required shape. The block keeps its
-    /// original text and the run goes on; the task window lists it under 失败.
-    Untranslated(JobLogErrorKind),
+    /// 这一块没有译文。原文保留、运行继续，任务窗口把它列进「失败」。
+    Untranslated(SkipCause, JobLogErrorKind),
+}
+
+/// 一个文本块被跳过的原因。它决定记哪条事件，也决定这次跳过是否计入「模型不可用」的
+/// 连续计数（见 `TRANSLATION_CONSECUTIVE_REQUEST_FAILURES`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SkipCause {
+    /// 模型答了、但形状不合格（`ResponseError`）。弱模型连续不合格是常态，那条语义
+    /// 刻意没有连续上限。
+    Protocol,
+    /// 请求本身失败：传输、超时、流协议、上下文超限、响应过大。偶尔一块失败很正常，
+    /// 连续若干块都失败说明模型或端点联系不上。
+    Request,
+}
+
+/// 一个槽位提交之后的结果，供 walk 统计「连续多少个块的请求失败」。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommittedBlock {
+    /// 译出来了，或复用了已有译文。
+    Translated,
+    /// 这一块被跳过，附上原因与固定分类。
+    Skipped(SkipCause, JobLogErrorKind),
+    /// 本次不处理（重试范围之外），或这一块没有可翻译的片段。
+    Untouched,
 }
 
 /// One block's provider walk: either a translation with the counters that walk
@@ -277,7 +299,8 @@ pub(crate) async fn run_translation(
         execution_identity = %crate::ai::ai_diagnostics::safe_label(&translation.execution_identity),
         attempts = job.attempts,
         next_ordinal = cursor.next_ordinal,
-        max_output_tokens = TRANSLATION_MAX_OUTPUT_TOKENS,
+        max_output_tokens = translation.generation.max_output_tokens,
+        temperature = ?translation.generation.temperature,
         response_attempts = TRANSLATION_RESPONSE_ATTEMPTS,
         "Translation run started"
     );

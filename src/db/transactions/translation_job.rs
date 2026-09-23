@@ -3,10 +3,13 @@
 use super::*;
 
 /// Reconciles the durable whole-book translation jobs with the active target
-/// language, chat model and execution identity. One job per current source and
-/// target language is retained; jobs for a superseded language/source are
-/// cancelled, and jobs whose model identity changed restart from the first
-/// block. Passing `None` disables translation and cancels every active job.
+/// language, translation model and execution identity. One job per current
+/// source and target language is retained; jobs for a superseded
+/// language/source are cancelled. A changed engine keeps the durable position:
+/// the rows that are already translated are restamped with the active identity
+/// and the run continues from the first block that is still missing, so a
+/// half-read book neither loses its译文 nor pays for the finished part twice.
+/// Passing `None` disables translation and cancels every active job.
 pub(crate) fn reconfigure_translation_jobs(
     conn: &mut Connection,
     target_language: Option<&str>,
@@ -92,8 +95,17 @@ pub(crate) fn reconfigure_translation_jobs(
                     }
                     0
                 };
-                let cursor_json =
-                    translation_cursor_json(source, model, execution_identity, next_ordinal)?;
+                // 位置必须连着它的「出处」一起走：`blocks_version` 是这一版块提取规则
+                // 的记号，丢下它等于告诉执行器这个位置来自另一套规则（缺省 0 → 退回
+                // 书首）。重配置不改块列表，所以这里只搬运原游标的那个值。
+                let blocks_version = cursor.as_ref().map_or(0, |cursor| cursor.blocks_version);
+                let cursor_json = translation_cursor_json(
+                    source,
+                    model,
+                    execution_identity,
+                    next_ordinal,
+                    blocks_version,
+                )?;
                 let status = translation_initial_status(auto_run);
                 if index_jobs::reset_reconfigured(&tx, &job.id, status, &cursor_json, now)? == 1 {
                     changed += 1;
@@ -115,7 +127,9 @@ pub(crate) fn reconfigure_translation_jobs(
         if existing_ids.contains(id.as_str()) {
             continue;
         }
-        let cursor_json = translation_cursor_json(source, model, execution_identity, 0)?;
+        // 全新任务停在书首，位置与块版本都对不上任何已有译文：写 0（来源未知），
+        // 执行器第一次领取时按当前版本规范化这一行。
+        let cursor_json = translation_cursor_json(source, model, execution_identity, 0, 0)?;
         index_jobs::insert(
             &tx,
             &IndexJob {
@@ -150,11 +164,20 @@ pub(crate) fn translation_initial_status(auto_run: bool) -> IndexJobStatus {
     }
 }
 
+/// Encodes one translation job's cursor.
+///
+/// `blocks_version` 是 `next_ordinal` 的出处：这个位置是用哪一版文本块提取规则算出
+/// 来的，只有执行器能判断它是否还指向同一段文字（`JobCursor::from_job`）。因此
+/// **重建既有游标时必须传原游标里的那个值**，不能在这里写当前版本、更不能写缺省值
+/// —— 重配置（换模型/端点）不改块列表，把它写成「来源未知」会让执行器把一次换模型
+/// 读成「块列表变过」而把任务退回书首重扫（现场 2026-09-22：暂停在三千多块的任务
+/// 换模型后「已处理」归零）。全新任务停在书首，位置与任何译文都对不上，写 0 即可。
 pub(crate) fn translation_cursor_json(
     source: &BookSource,
     model: &str,
     execution_identity: &str,
     next_ordinal: usize,
+    blocks_version: u32,
 ) -> Result<String> {
     let cursor = PersistedIndexCursor {
         schema_version: 1,
@@ -166,6 +189,7 @@ pub(crate) fn translation_cursor_json(
         execution_identity: Some(execution_identity.to_string()),
         input_execution_identity: None,
         next_ordinal,
+        blocks_version,
     };
     serde_json::to_string(&cursor).context("无法序列化翻译任务游标")
 }

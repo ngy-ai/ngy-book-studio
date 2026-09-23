@@ -4,20 +4,26 @@
 use super::*;
 
 impl IndexingCoordinator {
-    /// Binds the chat provider used for whole-book translation and reconciles
-    /// the durable translation jobs with the active target language and model.
+    /// Binds the provider used for whole-book translation and reconciles the
+    /// durable translation jobs with the active target language and model.
     /// Passing `None` as the target language disables translation and cancels
     /// every active job without touching persisted rows.
+    ///
+    /// `generation` 是翻译请求自己的生成参数（默认温度 0）。它随每次请求发送，但**不是
+    /// 执行身份的一部分**：调整它不会重建任务、不会让已翻好的译文失效，也不会把游标
+    /// 退回书首。
     pub async fn configure_translation(
         &self,
         provider: Arc<dyn OpenAiCompatibleProvider>,
         model: String,
         execution_identity: String,
+        generation: TranslationGenerationSettings,
         target_language: Option<String>,
         auto_run: bool,
     ) -> Result<()> {
         let model = validated_model(model, "translation")?;
         let execution_identity = validated_execution_identity(execution_identity, "translation")?;
+        generation.validate()?;
         if let Some(language) = &target_language {
             ensure!(
                 !language.trim().is_empty()
@@ -30,6 +36,7 @@ impl IndexingCoordinator {
             provider,
             model,
             execution_identity,
+            generation,
             target_language,
             auto_run,
         };
@@ -176,6 +183,44 @@ impl IndexingCoordinator {
         Ok(changed == 1)
     }
 
+    /// Re-runs one block named by its **block id** instead of its ordinal.
+    ///
+    /// 阅读端只知道块标识，而重试路径按序号工作，所以这里用与 worker 同一份提取规则
+    /// 重新枚举当前修订的文本块，把标识换成序号再走 [`Self::retry_translation_blocks`]。
+    /// 标识在当前正文里找不到（正文已改动、块被合并，或这一块本来就不在任务里）就明确
+    /// 报错：随手挑一块重跑会写出另一块的译文。
+    pub async fn retranslate_translation_block(
+        &self,
+        job_id: &str,
+        content_unit_id: &str,
+        block_id: &str,
+    ) -> Result<bool> {
+        ensure!(!content_unit_id.trim().is_empty(), "内容单元 ID 不能为空");
+        ensure!(!block_id.trim().is_empty(), "文本块 ID 不能为空");
+        let job_id = job_id.to_string();
+        let db_path = self.inner.db_path.clone();
+        let lookup_id = job_id.clone();
+        let (book_id, source_id, revision) =
+            run_db_on(self.inner.runtime.clone(), db_path, move |conn| {
+                let job = db::index_jobs::get(&conn, &lookup_id)?.context("翻译任务已不存在")?;
+                ensure!(job.kind == TRANSLATION_JOB_KIND, "该任务不是整本翻译");
+                let source_id = job.source_id.clone().context("翻译任务缺少来源")?;
+                let source =
+                    db::book_sources::get(&conn, &source_id)?.context("翻译任务来源不存在")?;
+                Ok((job.book_id.clone(), source_id, source.revision))
+            })
+            .await?;
+        let blocks = load_translation_blocks(&self.inner, &book_id, &source_id, revision).await?;
+        let ordinal = blocks
+            .iter()
+            .find(|block| block.unit_id == content_unit_id && block.block_id == block_id)
+            .map(|block| block.ordinal)
+            .with_context(|| {
+                format!("当前正文里找不到文本块 {block_id}，无法重新翻译（它可能已被改动）")
+            })?;
+        self.retry_translation_blocks(&job_id, vec![ordinal]).await
+    }
+
     /// Re-runs only the requested blocks of a translation job.
     ///
     /// This is the repair path after a model failed a block: the run that
@@ -185,11 +230,15 @@ impl IndexingCoordinator {
     /// and re-pay for all of them; retrying just the failed ones preserves them
     /// and lets the user switch to a better model first.
     ///
-    /// The blocks are pinned by their ordinal in the current revision and the
-    /// request is only forwarded when the block actually has no stored
-    /// translation right now, so a stale list cannot overwrite a good
-    /// translation or a hand-edited one. An empty set is rejected — the caller
-    /// has to name at least one block.
+    /// The blocks are pinned by their ordinal in the current revision and handed
+    /// to the walk **unchanged**: whether one of them still needs a request is
+    /// decided there, by the same content + model + execution identity rule the
+    /// run itself uses. Guessing「已有译文」from the ordinal here makes a retry
+    /// send nothing whenever that guess disagrees with the run (a row the reader
+    /// cannot display, or one whose ordinal shifted after the block list
+    /// changed). A block that does have a displayable translation is republished
+    /// as a cache hit instead of being re-sent. An empty set is rejected — the
+    /// caller has to name at least one block.
     pub async fn retry_translation_blocks(
         &self,
         job_id: &str,
@@ -223,14 +272,17 @@ impl IndexingCoordinator {
             if job.kind != TRANSLATION_JOB_KIND {
                 return Ok(0);
             }
-            let language = translation_target_language(&job)?;
+            // 语言本身在这一路径上用不到：重试集合原样交给 walk，由它重新解析语言与
+            // 缓存规则。保留这次解析，是因为任务 ID 里的语言属于任务身份的一部分，
+            // 非法就该在这里拒绝，而不是留到 walk 里才失败。
+            translation_target_language(&job)?;
             let source_id = job.source_id.as_deref().context("翻译任务缺少来源")?;
             let source = db::book_sources::get(&conn, source_id)?.context("翻译任务来源不存在")?;
             let book = db::books::get(&conn, &job.book_id)?.context("翻译任务图书不存在")?;
             if book.revision != source.revision {
                 return Ok(0);
             }
-            let mut cursor = JobCursor {
+            let cursor = JobCursor {
                 schema_version: 1,
                 book_id: job.book_id.clone(),
                 source_id: source_id.to_string(),
@@ -244,27 +296,23 @@ impl IndexingCoordinator {
                 inflight: Vec::new(),
                 blocks_version: TRANSLATION_BLOCKS_VERSION,
             };
-            // Only blocks with no stored translation are really retried. A block
-            // that already has one (translated by an earlier attempt, or edited
-            // by hand) is dropped from the set instead of being overwritten.
-            // The check is by ordinal at the pinned revision, because the worker
-            // resolves a cache hit by content and would otherwise re-send a block
-            // whose text happens to differ from the cached key.
-            let stored =
-                db::translations::list_for_source(&conn, &job.book_id, &language, source.revision)?;
-            let mut present: HashSet<usize> = HashSet::new();
-            for row in &stored {
-                present.insert(row.ordinal as usize);
-            }
-            cursor
-                .retry_ordinals
-                .retain(|ordinal| !present.contains(ordinal));
-            // Everything already translated: nothing to do, and the task must not
-            // be requeued for a no-op run.
-            let Some(next) = cursor.retry_ordinals.first().copied() else {
-                return Ok(0);
-            };
-            cursor.next_ordinal = next;
+            // 重试集合原样交给 walk，**不做前置过滤**：判定「这一块已经有译文」必须与
+            // worker 的缓存规则完全一致（单元内容键 + 模型 + 执行身份），而这里只有
+            // ordinal 和译文行，凭它判定会把阅读端其实看不到的行、或 ordinal 已经错位
+            // （块列表变过）的行当成「已有译文」，于是用户点了「重试」却一个请求都不发
+            // —— 日志里既没有请求体也没有响应（现场 2026-09-22）。
+            //
+            // 交给 walk 之后两种情形都不会被误判：已有译文的块按缓存命中重挂到当前块，
+            // 其余块正常发请求；`retranslate`（整本重做）保留原来的删除语义。
+            tracing::info!(
+                target: "ngy_ai",
+                stage = "translation_retry_plan",
+                job_id = %job_id,
+                requested = cursor.retry_ordinals.len(),
+                next_ordinal = first,
+                last_ordinal = cursor.retry_ordinals.last().copied().unwrap_or(first),
+                "Planned a per-block translation retry"
+            );
             let now = unix_timestamp()?;
             db::index_jobs::reset_for_translation_block_retry(
                 &conn,

@@ -21,6 +21,70 @@ fn model_role_text(role: ModelRole) -> (&'static str, &'static str, &'static str
     }
 }
 
+/// 一组生成参数输入框的构造、读取与写回。问答与翻译共用这一份实现，差别只在默认值
+/// （与最大输出的占位值）上。
+impl GenerationInputs {
+    pub(crate) fn new(
+        values: GenerationValues,
+        default_output_tokens: u32,
+        window: &mut Window,
+        cx: &mut Context<ModelsSettingsWindow>,
+    ) -> Self {
+        Self {
+            temperature: optional_parameter_input(values.temperature, window, cx),
+            top_p: optional_parameter_input(values.top_p, window, cx),
+            max_output_tokens: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .default_value(values.max_output_tokens.to_string())
+                    .placeholder(default_output_tokens.to_string())
+            }),
+            presence_penalty: optional_parameter_input(values.presence_penalty, window, cx),
+            frequency_penalty: optional_parameter_input(values.frequency_penalty, window, cx),
+        }
+    }
+
+    /// 五个输入框的当前文本，顺序与 `GenerationValues::from_inputs` 一致。
+    pub(crate) fn values(&self, cx: &App) -> [SharedString; 5] {
+        [
+            self.temperature.read(cx).value(),
+            self.top_p.read(cx).value(),
+            self.max_output_tokens.read(cx).value(),
+            self.presence_penalty.read(cx).value(),
+            self.frequency_penalty.read(cx).value(),
+        ]
+    }
+
+    /// 把一组取值写回输入框（「恢复默认」用）。
+    pub(crate) fn set_values(
+        &self,
+        values: &GenerationValues,
+        window: &mut Window,
+        cx: &mut Context<ModelsSettingsWindow>,
+    ) {
+        for (input, text) in [
+            (
+                &self.temperature,
+                optional_parameter_text(values.temperature),
+            ),
+            (&self.top_p, optional_parameter_text(values.top_p)),
+            (
+                &self.max_output_tokens,
+                values.max_output_tokens.to_string(),
+            ),
+            (
+                &self.presence_penalty,
+                optional_parameter_text(values.presence_penalty),
+            ),
+            (
+                &self.frequency_penalty,
+                optional_parameter_text(values.frequency_penalty),
+            ),
+        ] {
+            input.update(cx, |input, cx| input.set_value(text, window, cx));
+        }
+    }
+}
+
 impl ModelsSettingsWindow {
     pub(crate) fn new(
         services: Arc<AppServices>,
@@ -43,18 +107,18 @@ impl ModelsSettingsWindow {
                 .default_value(settings.translation_model.clone())
                 .placeholder(DEFAULT_TRANSLATION_MODEL)
         });
-        let generation = &settings.chat_generation;
-        let temperature_input = optional_parameter_input(generation.temperature, window, cx);
-        let top_p_input = optional_parameter_input(generation.top_p, window, cx);
-        let max_output_tokens_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .default_value(generation.max_output_tokens.to_string())
-                .placeholder(DEFAULT_CHAT_OUTPUT_TOKENS.to_string())
-        });
-        let presence_penalty_input =
-            optional_parameter_input(generation.presence_penalty, window, cx);
-        let frequency_penalty_input =
-            optional_parameter_input(generation.frequency_penalty, window, cx);
+        let chat_generation = GenerationInputs::new(
+            GenerationValues::from(&settings.chat_generation),
+            DEFAULT_CHAT_OUTPUT_TOKENS,
+            window,
+            cx,
+        );
+        let translation_generation = GenerationInputs::new(
+            GenerationValues::from(&settings.translation_generation),
+            DEFAULT_TRANSLATION_OUTPUT_TOKENS,
+            window,
+            cx,
+        );
         let embedding_model_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .default_value(settings.embedding_model.clone())
@@ -80,11 +144,8 @@ impl ModelsSettingsWindow {
             vision_endpoint_id: settings.endpoint_routing.vision_endpoint_id,
             chat_model_input,
             translation_model_input,
-            temperature_input,
-            top_p_input,
-            max_output_tokens_input,
-            presence_penalty_input,
-            frequency_penalty_input,
+            chat_generation,
+            translation_generation,
             embedding_model_input,
             embedding_dimensions_input,
             vision_model_input,
@@ -103,13 +164,10 @@ impl ModelsSettingsWindow {
             .value()
             .trim()
             .to_string();
-        settings.chat_generation = parse_chat_generation(
-            self.temperature_input.read(cx).value().as_ref(),
-            self.top_p_input.read(cx).value().as_ref(),
-            self.max_output_tokens_input.read(cx).value().as_ref(),
-            self.presence_penalty_input.read(cx).value().as_ref(),
-            self.frequency_penalty_input.read(cx).value().as_ref(),
-        )?;
+        settings.chat_generation =
+            GenerationValues::from_inputs(&self.chat_generation, cx)?.chat()?;
+        settings.translation_generation =
+            GenerationValues::from_inputs(&self.translation_generation, cx)?.translation()?;
         settings.embedding_model = self
             .embedding_model_input
             .read(cx)
@@ -168,42 +226,42 @@ impl ModelsSettingsWindow {
         cx.notify();
     }
 
-    pub(crate) fn reset_chat_generation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// 恢复某一组生成参数的默认值。两组的默认值不同：问答 0.1，翻译 0（确定性）。
+    pub(crate) fn reset_generation(
+        &mut self,
+        role: ModelRole,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.state.busy() {
             return;
         }
-        let defaults = ChatGenerationSettings::default();
-        for (input, value) in [
-            (
-                &self.temperature_input,
-                optional_parameter_text(defaults.temperature),
+        let (defaults, label) = match role {
+            ModelRole::Translation => (
+                GenerationValues::from(&TranslationGenerationSettings::default()),
+                "翻译生成参数",
             ),
-            (&self.top_p_input, optional_parameter_text(defaults.top_p)),
-            (
-                &self.max_output_tokens_input,
-                defaults.max_output_tokens.to_string(),
+            _ => (
+                GenerationValues::from(&ChatGenerationSettings::default()),
+                "问答生成参数",
             ),
-            (
-                &self.presence_penalty_input,
-                optional_parameter_text(defaults.presence_penalty),
-            ),
-            (
-                &self.frequency_penalty_input,
-                optional_parameter_text(defaults.frequency_penalty),
-            ),
-        ] {
-            input.update(cx, |input, cx| input.set_value(value, window, cx));
-        }
+        };
+        let inputs = match role {
+            ModelRole::Translation => &self.translation_generation,
+            _ => &self.chat_generation,
+        };
+        inputs.set_values(&defaults, window, cx);
         self.state
-            .report("问答生成参数已恢复默认，点击“保存设置”后生效。", false);
+            .report(format!("{label}已恢复默认，点击“保存设置”后生效。"), false);
         cx.notify();
     }
 
     #[inline(never)]
     pub(crate) fn render_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = palette(cx);
-        // 一个 Tab 只显示一个模型的配置；问答生成参数只属于问答模型，所以只在它的
-        // Tab 里出现 —— 它随问答请求一起发送，翻译请求不使用它。
+        // 一个 Tab 只显示一个模型的配置。问答与翻译各带一组生成参数：两份设置分开
+        // 存储、分别随各自的请求发送，所以各自只在对应的 Tab 里出现。向量与视觉没有
+        // 采样参数可调。
         let mut children = vec![
             card_note(
                 theme,
@@ -213,8 +271,11 @@ impl ModelsSettingsWindow {
             self.render_model_tabs(cx),
             self.render_role_panel(self.active_model_tab, cx),
         ];
-        if self.active_model_tab == ModelRole::Chat {
-            children.push(self.render_generation_panel(cx));
+        if matches!(
+            self.active_model_tab,
+            ModelRole::Chat | ModelRole::Translation
+        ) {
+            children.push(self.render_generation_panel(self.active_model_tab, cx));
         }
         panel(theme, children)
     }
@@ -328,10 +389,36 @@ impl ModelsSettingsWindow {
             .into_any_element()
     }
 
+    /// 生成参数面板。问答与翻译各一份：字段、取值范围与说明几乎相同，只有默认值、
+    /// 温度那一句解释与「恢复默认」的选择器不同，所以面板本身只有一个实现。
     #[inline(never)]
-    pub(crate) fn render_generation_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(crate) fn render_generation_panel(
+        &self,
+        role: ModelRole,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let theme = palette(cx);
         let busy = self.state.busy();
+        let (title, note, temperature_help, reset_selector, inputs) = match role {
+            ModelRole::Translation => (
+                "翻译生成参数",
+                "保存后用于新的翻译请求（整本翻译、单块重试与「重新请求」共用这一份）。\
+                 默认温度 0 是刻意的：一个文本块只有一个可接受的答案，采样只会增加方差。\
+                 改动它不影响已翻好的译文，也不会让翻译任务重跑。除最大输出外，其余参数\
+                 可留空，使用服务端默认值。",
+                "0–2；默认 0（确定性）。一个文本块只有一个可接受的答案，调高只会引入方差。",
+                "ai-reset-translation-generation",
+                &self.translation_generation,
+            ),
+            _ => (
+                "问答生成参数",
+                "保存后用于新的问答请求。除最大输出外，其余参数可留空，使用服务端默认值；\
+                 具体支持以所选模型为准。",
+                "0–2；默认 0.1。越低越集中，越高越随机。通常与 Top P 选择一项调整。",
+                "ai-reset-chat-generation",
+                &self.chat_generation,
+            ),
+        };
         div()
             .v_flex()
             .gap_4()
@@ -343,56 +430,52 @@ impl ModelsSettingsWindow {
                     .h_flex()
                     .justify_between()
                     .gap_3()
-                    .child(card_title(theme, "问答生成参数"))
+                    .child(card_title(theme, title))
                     .child(
-                        Button::new("ai-reset-chat-generation")
+                        Button::new(reset_selector)
                             .label("恢复默认")
                             .disabled(busy)
-                            .debug_selector(|| "ai-reset-chat-generation".into())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.reset_chat_generation(window, cx);
+                            .debug_selector(move || reset_selector.to_string())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.reset_generation(role, window, cx);
                             })),
                     ),
             )
-            .child(card_note(
-                theme,
-                "保存后用于新的问答请求；翻译任务不使用这些参数。\
-                 除最大输出外，其余参数可留空，使用服务端默认值；具体支持以所选模型为准。",
-            ))
+            .child(card_note(theme, note))
             .child(render_input_field(
                 theme,
                 busy,
                 "温度（Temperature）",
-                "0–2；默认 0.1。越低越集中，越高越随机。通常与 Top P 选择一项调整。",
-                &self.temperature_input,
+                temperature_help,
+                &inputs.temperature,
             ))
             .child(render_input_field(
                 theme,
                 busy,
                 "核采样（Top P）",
                 "0–1；控制候选词的累计概率范围，越小越集中。",
-                &self.top_p_input,
+                &inputs.top_p,
             ))
             .child(render_input_field(
                 theme,
                 busy,
                 "最大输出 token 数",
                 "正整数，默认 4096；请按所选模型设置，墨页不设固定上限。上下文不足时可能进一步降低。",
-                &self.max_output_tokens_input,
+                &inputs.max_output_tokens,
             ))
             .child(render_input_field(
                 theme,
                 busy,
                 "出现惩罚（Presence Penalty）",
                 "−2–2；正值降低已出现词的再次使用倾向，负值提高。",
-                &self.presence_penalty_input,
+                &inputs.presence_penalty,
             ))
             .child(render_input_field(
                 theme,
                 busy,
                 "频率惩罚（Frequency Penalty）",
                 "−2–2；正值按出现次数抑制重复，负值鼓励重复。",
-                &self.frequency_penalty_input,
+                &inputs.frequency_penalty,
             ))
             .child(card_note(
                 theme,

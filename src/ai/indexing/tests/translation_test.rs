@@ -172,6 +172,7 @@ pub(crate) fn retranslating_a_translation_job_resets_it_and_clears_its_rows() {
             provider,
             "chat-test".to_string(),
             "translation-v1:chat-test".to_string(),
+            TranslationGenerationSettings::default(),
             Some("zh-Hans".to_string()),
             false,
         ))
@@ -258,6 +259,7 @@ pub(crate) fn retranslating_a_translation_job_keeps_a_manual_edit_and_clears_the
             provider,
             "chat-test".to_string(),
             "translation-v1:chat-test".to_string(),
+            TranslationGenerationSettings::default(),
             Some("zh-Hans".to_string()),
             false,
         ))
@@ -325,6 +327,100 @@ pub(crate) fn retranslating_a_translation_job_keeps_a_manual_edit_and_clears_the
 }
 
 #[test]
+pub(crate) fn changing_the_translation_model_resumes_at_the_same_block() {
+    // 现场 2026-09-22：暂停在「已处理三千多」的任务，改翻译模型后变成三百多 —— 重配置
+    // 刻意保留了位置，但它重建的游标漏了 `blocks_version`，执行器于是把这次重建读成
+    // 「块列表变过」而把任务退回书首重扫。用户只想要后者：换模型从原来的位置继续。
+    let fixture = Fixture::new();
+    let coordinator = IndexingCoordinator {
+        inner: fixture.indexing_inner(),
+        workers: Mutex::new(Vec::new()),
+    };
+    let provider: Arc<dyn OpenAiCompatibleProvider> = Arc::new(MockProvider::default());
+    let job_id = format!("translation:{}:zh-Hans", fixture.source_id);
+    fixture
+        .runtime
+        .block_on(coordinator.configure_translation(
+            provider.clone(),
+            "chat-one".to_string(),
+            "translation-v1:chat-one".to_string(),
+            TranslationGenerationSettings::default(),
+            Some("zh-Hans".to_string()),
+            false,
+        ))
+        .unwrap();
+    // 把任务推到一个「已经翻过若干块」的位置：这道题只关心位置本身。
+    finish_job_at(&fixture, &job_id, 7);
+
+    // 换模型（模型设置里保存新的「翻译模型」走的就是这一条）。
+    fixture
+        .runtime
+        .block_on(coordinator.configure_translation(
+            provider,
+            "chat-two".to_string(),
+            "translation-v1:chat-two".to_string(),
+            TranslationGenerationSettings::default(),
+            Some("zh-Hans".to_string()),
+            false,
+        ))
+        .unwrap();
+
+    let conn = db::open_conn(&fixture.db_path).unwrap();
+    let job = db::index_jobs::get(&conn, &job_id).unwrap().unwrap();
+    assert_eq!(job.status, db::index_jobs::IndexJobStatus::Paused);
+    let stored = serde_json::from_str::<JobCursor>(&job.cursor_json).unwrap();
+    assert_eq!(stored.model.as_deref(), Some("chat-two"));
+    assert_eq!(stored.next_ordinal, 7);
+    assert_eq!(stored.blocks_version, TRANSLATION_BLOCKS_VERSION);
+    // 执行器领取前会把这一行重写成规范编码，那个读数才是任务窗口的「已处理」。
+    let bound = JobCursor::from_job(&job, "chat-two", Some("translation-v1:chat-two")).unwrap();
+    assert_eq!(bound.next_ordinal, 7, "换模型必须从原来的位置继续");
+}
+
+/// 配置的翻译生成参数必须真的进请求体。检查器展示的就是工作线程会发出的那一份（同一条
+/// `translation_request`），所以在这里断言端到端一致：设置里改温度/采样/上限，请求体
+/// 跟着变；关闭推理仍是固定项。
+#[test]
+pub(crate) fn translation_block_inspection_shows_the_configured_generation_parameters() {
+    let fixture = Fixture::new();
+    let coordinator = IndexingCoordinator {
+        inner: fixture.indexing_inner(),
+        workers: Mutex::new(Vec::new()),
+    };
+    let provider: Arc<dyn OpenAiCompatibleProvider> = Arc::new(MockProvider::default());
+    let job_id = format!("translation:{}:zh-Hans", fixture.source_id);
+    fixture
+        .runtime
+        .block_on(coordinator.configure_translation(
+            provider,
+            "chat-test".to_string(),
+            "translation-v1:chat-test".to_string(),
+            TranslationGenerationSettings {
+                temperature: Some(0.6),
+                top_p: Some(0.9),
+                max_output_tokens: 8192,
+                presence_penalty: None,
+                frequency_penalty: None,
+            },
+            Some("zh-Hans".to_string()),
+            false,
+        ))
+        .unwrap();
+
+    let detail = fixture
+        .runtime
+        .block_on(coordinator.translation_block_detail(&job_id, 0))
+        .unwrap();
+    assert_eq!(detail.request.temperature, Some(0.6));
+    assert_eq!(detail.request.max_tokens, 8192);
+    let body: serde_json::Value = serde_json::from_str(&detail.request.body).unwrap();
+    assert_eq!(body["temperature"], 0.6);
+    assert_eq!(body["top_p"], 0.9);
+    assert_eq!(body["max_tokens"], 8192);
+    assert_eq!(body["reasoning_effort"], "none");
+}
+
+#[test]
 pub(crate) fn translation_block_inspection_is_revision_pinned_and_read_only() {
     let fixture = Fixture::new();
     let coordinator = IndexingCoordinator {
@@ -339,6 +435,7 @@ pub(crate) fn translation_block_inspection_is_revision_pinned_and_read_only() {
             provider,
             "chat-test".to_string(),
             "translation-v1:chat-test".to_string(),
+            TranslationGenerationSettings::default(),
             Some("zh-Hans".to_string()),
             false,
         ))
@@ -415,6 +512,7 @@ pub(crate) fn translation_block_detail_rebuilds_the_worker_request_and_stays_rea
             provider,
             "chat-test".to_string(),
             "translation-v1:chat-test".to_string(),
+            TranslationGenerationSettings::default(),
             Some("zh-Hans".to_string()),
             false,
         ))
@@ -466,7 +564,7 @@ pub(crate) fn translation_block_detail_rebuilds_the_worker_request_and_stays_rea
     );
     assert_eq!(
         parsed["max_tokens"],
-        serde_json::json!(TRANSLATION_MAX_OUTPUT_TOKENS)
+        serde_json::json!(DEFAULT_TRANSLATION_OUTPUT_TOKENS)
     );
     // The worker's prompt carries the format contract; a body without it
     // would not be the request the task actually sends.
@@ -532,6 +630,7 @@ pub(crate) fn replaying_a_failed_block_returns_the_raw_answer_and_changes_nothin
             provider.clone(),
             "chat-test".to_string(),
             "translation-v1:chat-test".to_string(),
+            TranslationGenerationSettings::default(),
             Some("zh-Hans".to_string()),
             false,
         ))

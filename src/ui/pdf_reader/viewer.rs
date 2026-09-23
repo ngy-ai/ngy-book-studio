@@ -40,12 +40,19 @@ pub(crate) fn pdf_compact_reading_script(compact_reading: bool) -> &'static str 
 /// viewer 的样式表是随 PDF.js 一起发布的产物（`assets/pdfjs/viewer.html`），它的
 /// 外壳写死成深色，宿主改不了产物源码，只能在运行时覆盖根元素与占位页。页面卡片
 /// 本身**不跟着变色**：纸张是白的，两套皮肤下染白页都会让正文对比度变差。
+///
+/// 覆盖规则只能画半透明层。正文的字形画在 canvas 上，`.textLayer` 的 span 是
+/// `color: transparent` 的覆盖层，任何不透明的底色都画在 canvas 之上、把正文连同
+/// 选中区域一起盖住：选中一段文字后那里只剩一块纯色。选中底色因此是叠了 alpha 的
+/// 强调色（与 `Palette::selection()` 同一档 40%），浅色与深色皮肤落在白纸上都读得清；
+/// 万一 WebView 不认识 `color-mix`，这条声明会被整条丢弃，产物自带的半透明蓝底
+/// （`rgb(52 104 255 / 0.35)`）仍是可读的兜底。
 pub(crate) const PDF_APPEARANCE_RULES: &str = r#"
 #status { color: var(--ngy-muted); }
 .pdf-page[data-rendered="false"] { background: var(--ngy-sidebar); }
 .page-placeholder { color: var(--ngy-muted); }
 .page-placeholder.error { color: var(--ngy-danger); }
-.textLayer ::selection { background: var(--ngy-accent-soft); }
+.textLayer ::selection { background: color-mix(in srgb, var(--ngy-accent) 40%, transparent); }
 "#;
 
 /// 把当前皮肤写进 PDF.js viewer。

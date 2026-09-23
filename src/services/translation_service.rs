@@ -174,6 +174,62 @@ impl AppServices {
             .context("手工译文保存线程异常退出")?
     }
 
+    /// Re-runs the model translation of one text block the reading window shows.
+    ///
+    /// 阅读端只说得出块标识（`TranslatedBlock::key`），序号由任务自己的文本块列表判定
+    /// （见 `IndexingCoordinator::retranslate_translation_block`）；重跑的是当前显示
+    /// 语言对应的那个任务 —— 同一本书可以有多语言任务，各自独立。
+    ///
+    /// 只影响机器译文：读者手工改过的那一块仍然显示读者的文字（手工列不被机器发布
+    /// 覆盖），想看到新的机器文本要用「恢复机器译文」。
+    pub async fn retranslate_reader_translation_block(
+        &self,
+        book_id: String,
+        content_unit_id: String,
+        block_key: String,
+    ) -> Result<()> {
+        ensure!(!book_id.trim().is_empty(), "图书 ID 不能为空");
+        ensure!(!content_unit_id.trim().is_empty(), "内容单元 ID 不能为空");
+        ensure!(!block_key.trim().is_empty(), "文本块 ID 不能为空");
+        let Some(target_language) = self.provider_settings()?.default_language.clone() else {
+            anyhow::bail!("尚未配置默认译文语言，无法重新翻译");
+        };
+        let db_path = self.db_path.clone();
+        let job_id = {
+            let book_id = book_id.clone();
+            let db_path = db_path.clone();
+            self.runtime
+                .handle()
+                .spawn_blocking(move || -> anyhow::Result<String> {
+                    let conn = db::open_conn(&db_path)?;
+                    let book = db::books::get(&conn, &book_id)?.context("图书不存在")?;
+                    let source = db::book_sources::get_revision(&conn, &book_id, book.revision)?
+                        .context("图书来源不存在")?;
+                    Ok(format!("translation:{}:{target_language}", source.id))
+                })
+                .await
+                .context("翻译任务查询线程异常退出")??
+        };
+        let indexing = Arc::clone(&self.indexing);
+        let retried = self
+            .runtime
+            .spawn(async move {
+                indexing
+                    .retranslate_translation_block(&job_id, &content_unit_id, &block_key)
+                    .await
+            })
+            .await
+            .context("翻译重试线程异常退出")??;
+        // 拒绝的三种情形都说清楚：这本书没有翻译任务、重跑的那一块在正文里找不到、
+        // 或者任务此刻正在运行（重试路径不打断执行器，得先把任务暂停）。
+        ensure!(
+            retried,
+            "无法重新翻译该文本块：这本书没有可重试的翻译任务（尚未配置翻译，或任务正在运行，\
+             请先暂停任务）"
+        );
+        Ok(())
+    }
+
     /// One book's own translation display choice, written by the reading window.
     /// `None` means the book still follows the global preference, which is also
     /// what an unreadable row falls back to: a corrupt display preference must
