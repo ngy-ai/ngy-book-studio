@@ -41,6 +41,20 @@ impl AnnotationKind {
             Self::AiComment => "ai_comment",
         }
     }
+
+    /// Parses the persisted spelling. Shared content and database rows both use
+    /// [`Self::as_str`]; an unknown name is rejected rather than mapped onto a
+    /// neighbouring kind.
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "highlight" => Some(Self::Highlight),
+            "wavy" => Some(Self::Wavy),
+            "underline" => Some(Self::Underline),
+            "human_comment" => Some(Self::HumanComment),
+            "ai_comment" => Some(Self::AiComment),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

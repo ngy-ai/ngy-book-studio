@@ -31,6 +31,24 @@ impl LibraryStore {
                     "图书库：导入解析失败"
                 );
             })?;
+        self.import_parsed(imported, group_id, &source_path.display().to_string())
+    }
+
+    /// Publishes an already parsed import.
+    ///
+    /// Split out of [`Self::import_into_group`] so a share package can hand in
+    /// the book projection it carries without inventing a file on disk first.
+    /// The content-hash check, the immutable-original requirement and the
+    /// in-memory projection update are identical on both paths.
+    pub(crate) fn import_parsed(
+        &mut self,
+        imported: ImportedBook,
+        group_id: Option<&str>,
+        origin: &str,
+    ) -> Result<ImportOutcome> {
+        if let Some(group_id) = group_id {
+            ensure!(self.group(group_id).is_some(), "分组不存在");
+        }
         if let Some(existing) = self
             .books
             .iter()
@@ -73,7 +91,7 @@ impl LibraryStore {
             .inspect_err(|error| {
                 tracing::error!(
                     target: "ngy_import",
-                    path = %source_path.display(),
+                    path = %origin,
                     error = %format!("{error:#}"),
                     "图书库：持久化失败"
                 );

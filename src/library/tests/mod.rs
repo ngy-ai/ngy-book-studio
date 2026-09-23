@@ -27,6 +27,8 @@ mod media_test;
 
 mod progress_test;
 
+mod share_test;
+
 mod store_test;
 
 /// Writes an EPUB produced by this build to `directory` and returns its path.

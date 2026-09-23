@@ -254,6 +254,18 @@ impl EpubReaderApp {
                         );
                     }
 
+                    let share_view = menu_view.clone();
+                    let share_book_id = menu_book_id.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new("导出分享包…")
+                            .icon(Icon::new(IconName::ExternalLink))
+                            .on_click(move |_, window, cx| {
+                                share_view.update(cx, |this, cx| {
+                                    this.export_share_package(share_book_id.clone(), window, cx);
+                                });
+                            }),
+                    );
+
                     let delete_view = menu_view.clone();
                     let delete_book_id = menu_book_id.clone();
                     menu.separator()

@@ -101,6 +101,28 @@
   同书/单元/双版本/精确起止范围的三种标记由部分唯一索引约束，改样式在事务中替换，
   不创建多条标记。删除划线只删除该范围的标记，人工与 AI 想法保持不变。
   当前开发结构版本为 14，遵循重建策略，不编写迁移。
+- `src/share/`、`src/library/share.rs`、`src/db/transactions/share.rs`：朋友间分享用的
+  `.ngyshare` 包，一个文件同时带一本书和它的笔记、AI 问答会话与整本译文。
+  `share/` 只负责格式：`manifest.json` + `book.epub`（规范化阅读投影）+ `notes.json` /
+  `chats.json` / `translations.json`，`read_share_package` 逐条限额，条目数与清单不符、
+  版本不受支持或不是 ZIP 都明确拒绝；`is_share_package` 只读清单做内容签名判定，导入
+  对话框据此路由，扩展名不参与判断。
+  **分区条目只按「章节序号 + 原文引用」定位，绝不写发送方的图书、内容单元或文本块 ID**：
+  book id 由导入原件的内容哈希派生、unit id 由 book id + 序号 + href 派生、
+  `{unit}::h{index}` 的块标识又由 unit id 派生，接收方重新导入同一份文本也必然得到
+  另一套 ID。因此导入按序重锚：笔记用接收方阅读章节的正文 UTF-16 范围复验
+  （`reader_body_text` + `validate_anchor`），会话引用重建为章级 `DocumentLocator`
+  并丢掉发送方的 `search_chunk_id`（接收方索引是本地派生的），译文按接收方
+  `{unit}::h{index}` 形状重挂；对不上的条目逐条跳过并在结果里计数，不按引文搜索重定位。
+  只导出当前可显示的数据（失效笔记、过期译文、内部 system/tool 消息不写入），
+  笔记用 `insert_if_absent`、会话用确定性 ID 跳过已存在的行，所以重复导入不会产生重复。
+  **接收方已在同一选区划的线不会被分享包改色**：同锚点已有划线时只在样式相同时按无操作
+  成功，样式不同按跳过处理，绝不把别人的书签改成分享方的样式。
+  译文按接收方当前翻译模型与 `translation_execution_identity` 重新署名（
+  `AppServices::share_translation_stamp`），否则阅读端按模型/身份过滤会把分享来的机器译文
+  全部隐藏；接收方未配置翻译模型时保留发送方身份并等设置对齐。分享包以规范化 EPUB 投影
+  为载体，因此 PDF/DjVu 页面笔记（锚在 PDF.js 页面文字层上）无法在接收方章节正文上复验，
+  会被跳过。
 - `src/db/`：SQLite 连接、当前结构、单表 CRUD/查询映射和跨表事务。每张表对应一个
   文件：`books.rs`、`book_sources.rs`、`content_units.rs`、`toc_entries.rs`、
   `blobs.rs`、`assets.rs`、`asset_refs.rs`、`progress.rs`、`search_chunks.rs`、

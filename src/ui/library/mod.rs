@@ -54,6 +54,8 @@ mod request;
 
 mod search;
 
+mod share_ops;
+
 mod state;
 
 pub(crate) use annotations::*;
@@ -67,6 +69,8 @@ pub(crate) use pdf_window::*;
 pub(crate) use render::*;
 
 pub(crate) use search::*;
+
+pub(crate) use share_ops::*;
 
 pub(crate) use state::*;
 

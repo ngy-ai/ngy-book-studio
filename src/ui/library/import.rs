@@ -13,12 +13,22 @@ impl EpubReaderApp {
         // App borrow makes every requested frame fail with BorrowMutError.
         let dialog = DialogBuilder::file()
             .set_owner(window)
-            .set_title("导入图书或文档")
+            .set_title("导入图书、文档或分享包")
             .add_filter(
-                "支持的图书与文档",
+                "支持的图书、文档与分享包",
                 [
-                    "epub", "pdf", "doc", "docx", "pptx", "xlsx", "mobi", "azw", "azw3", "kfx",
+                    "epub",
+                    "pdf",
+                    "doc",
+                    "docx",
+                    "pptx",
+                    "xlsx",
+                    "mobi",
+                    "azw",
+                    "azw3",
+                    "kfx",
                     "djvu",
+                    ngy_book_studio::share::SHARE_EXTENSION,
                 ],
             )
             .open_single_file();
@@ -94,20 +104,44 @@ impl EpubReaderApp {
                 path = %selected_path.display(),
                 "图书库界面：已选择文件，开始导入"
             );
-            let task = services.spawn_library_projected(move |library| {
-                library.import_into_group(&path, target_group.as_deref())
-            });
-            let outcome = task.await;
+            // A share package is a ZIP whose manifest names this format; the
+            // book projection inside it is not the file itself, so the ordinary
+            // importer would refuse it. The signature is checked on the
+            // background executor instead of by extension, so renaming the file
+            // changes nothing.
+            let probe = path.clone();
+            let is_share = cx
+                .background_spawn(async move { share::is_share_package(&probe) })
+                .await;
+            let outcome = if is_share {
+                let stamp = services.share_translation_stamp();
+                let task = services.spawn_library_projected(move |library| {
+                    library
+                        .import_share_package(&path, target_group.as_deref(), stamp.as_ref())
+                        .map(|outcome| LibraryImportResult::Share(Box::new(outcome)))
+                });
+                task.await
+            } else {
+                let task = services.spawn_library_projected(move |library| {
+                    library
+                        .import_into_group(&path, target_group.as_deref())
+                        .map(LibraryImportResult::Book)
+                });
+                task.await
+            };
             let close_window = view.update_in(cx, |this, _window, cx| {
                 this.is_importing = false;
                 match outcome {
                     Ok(Ok(mutation)) => {
                         let (message, book_id) = match &mutation.value {
-                            ImportOutcome::Added(book) => {
+                            LibraryImportResult::Book(ImportOutcome::Added(book)) => {
                                 (format!("《{}》已加入图书库", book.title), book.id.clone())
                             }
-                            ImportOutcome::AlreadyExists(book) => {
+                            LibraryImportResult::Book(ImportOutcome::AlreadyExists(book)) => {
                                 (format!("《{}》已经在图书库中", book.title), book.id.clone())
+                            }
+                            LibraryImportResult::Share(outcome) => {
+                                (share_import_message(outcome), outcome.record.id.clone())
                             }
                         };
                         tracing::info!(

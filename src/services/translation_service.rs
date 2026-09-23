@@ -358,4 +358,28 @@ impl AppServices {
             .await
             .context("阅读页面大小保存线程异常退出")?
     }
+
+    /// The translation engine a share import stamps shared machine译文 with.
+    ///
+    /// The reader hides machine译文 unless their model and execution identity
+    /// match the active settings, so a package would otherwise only be visible
+    /// to a friend running the exact same endpoint and model. Importing a
+    /// package is an explicit adoption, so the receiving side re-stamps the
+    /// shared rows with its own engine.
+    ///
+    /// `None` when no translation model is configured: the shared rows then keep
+    /// the sender's identity and stay hidden until the receiving settings line
+    /// up, which is honest rather than inventing an engine that produced them.
+    pub fn share_translation_stamp(&self) -> Option<crate::share::ShareTranslationStamp> {
+        let settings = self.provider_settings().ok()?;
+        if settings.translation_model.trim().is_empty() {
+            return None;
+        }
+        let execution_identity = translation_execution_identity(&settings).ok()?;
+        Some(crate::share::ShareTranslationStamp {
+            model: settings.translation_model.clone(),
+            execution_identity,
+            target_language: settings.default_language.clone(),
+        })
+    }
 }

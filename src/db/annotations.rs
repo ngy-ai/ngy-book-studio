@@ -66,6 +66,21 @@ pub(crate) fn insert(conn: &Connection, note: &Annotation) -> Result<()> {
     Ok(())
 }
 
+/// Inserts a note unless its derived ID is already stored, so re-importing the
+/// same share package cannot duplicate thoughts. Returns `false` when the row
+/// already existed.
+pub(crate) fn insert_if_absent(conn: &Connection, note: &Annotation) -> Result<bool> {
+    let changed = conn
+        .execute(
+            "INSERT OR IGNORE INTO annotations (id, book_id, content_unit_id, document_revision, unit_revision, quote, start_offset, end_offset, kind, comment, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![note.id, note.book_id, note.content_unit_id, note.document_revision as i64, note.unit_revision as i64, note.anchor.quote,
+                note.anchor.start, note.anchor.end, note.kind.as_str(), note.comment, note.created_at as i64, note.updated_at as i64],
+        )
+        .context("无法保存笔记")?;
+    Ok(changed == 1)
+}
+
 pub(crate) fn mark_at_anchor(
     conn: &Connection,
     book_id: &str,

@@ -21,6 +21,7 @@ pub mod preview;
 pub mod reader;
 pub mod runtime;
 pub mod services;
+pub mod share;
 pub mod startup;
 pub mod storage;
 pub mod theme;

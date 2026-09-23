@@ -42,8 +42,59 @@ pub(crate) struct NewTranslation {
     pub updated_at: u64,
 }
 
+/// One译文 row including the scope columns the share package needs. The reader
+/// only ever asks for one unit of one language, so the narrower [`Translation`]
+/// stays the shape of that path; exporting a book needs the whole book, every
+/// language, and the unit each row belongs to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TranslationRow {
+    pub content_unit_id: String,
+    pub block_id: String,
+    pub ordinal: u64,
+    pub document_revision: u64,
+    pub unit_revision: u64,
+    pub target_language: String,
+    pub source_language: Option<String>,
+    pub model: String,
+    pub source_text: String,
+    pub translated_text: String,
+    pub manual_text: Option<String>,
+}
+
 const SELECT: &str = "SELECT block_id, ordinal, document_revision, unit_revision,
     model, source_text, translated_text, manual_text FROM translations";
+
+/// Every译文 row of one book, newest scope first. The share export walks these
+/// to write one portable section entry per row.
+pub(crate) fn list_for_book(conn: &Connection, book_id: &str) -> Result<Vec<TranslationRow>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT content_unit_id, block_id, ordinal, document_revision, unit_revision,
+                    target_language, source_language, model, source_text, translated_text,
+                    manual_text
+             FROM translations WHERE book_id = ?1
+             ORDER BY content_unit_id, target_language, ordinal, block_id",
+        )
+        .context("无法准备整本图书译文查询")?;
+    stmt.query_map(params![book_id], |row| {
+        Ok(TranslationRow {
+            content_unit_id: row.get(0)?,
+            block_id: row.get(1)?,
+            ordinal: row.get::<_, i64>(2)? as u64,
+            document_revision: row.get::<_, i64>(3)? as u64,
+            unit_revision: row.get::<_, i64>(4)? as u64,
+            target_language: row.get(5)?,
+            source_language: row.get(6)?,
+            model: row.get(7)?,
+            source_text: row.get(8)?,
+            translated_text: row.get(9)?,
+            manual_text: row.get(10)?,
+        })
+    })
+    .context("无法读取整本图书译文")?
+    .collect::<rusqlite::Result<Vec<_>>>()
+    .context("无法解析整本图书译文记录")
+}
 
 /// Stable surrogate key for one translation scope. Derived so an upsert can
 /// reuse the canonical row without churning the primary key.

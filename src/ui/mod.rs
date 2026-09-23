@@ -70,10 +70,14 @@ use ngy_book_studio::{
     ai::chat::ChatWindowKind,
     document::{BookDocument, BookFormat, BookSource as CanonicalBookSource, SourceLocator},
     export::ExportFormat,
-    library::{BookGroup, BookRecord, CoverDraft, ImportOutcome, LibraryStore, SearchHit},
+    library::{
+        BookGroup, BookRecord, CoverDraft, ImportOutcome, LibraryStore, SearchHit,
+        ShareExportSummary, ShareImportOutcome,
+    },
     preview::bundled_pdfjs_asset,
     reader::OpenedBook,
     services::AppServices,
+    share,
 };
 use serde::Deserialize;
 
