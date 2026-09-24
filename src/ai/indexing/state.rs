@@ -57,6 +57,10 @@ pub(crate) struct IndexingInner {
     pub(crate) models: RwLock<ModelServices>,
     /// User-configured concurrency and inter-job pause for the worker pool.
     pub(crate) scheduling: RwLock<JobScheduling>,
+    /// 连续请求失败后的冷却时长。生产恒为
+    /// `TRANSLATION_REQUEST_FAILURE_COOLDOWN`（60 秒）；单元测试把它调短，免得故意让
+    /// 一整本书失败的用例真的睡一分钟。
+    pub(crate) failure_cooldown: Duration,
     pub(crate) transitions: AsyncMutex<()>,
     pub(crate) wake: Notify,
     /// Set on every successful library mutation so the worker reconciles

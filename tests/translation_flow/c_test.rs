@@ -326,13 +326,16 @@ pub(crate) fn failed_cursor_publication_settles_the_owned_execution_and_retry_re
     });
 }
 
-/// 端点彻底联系不上时，连续若干个块的请求失败就停下来并说明原因 —— 而不是把整本书逐块
-/// 跳过、最后报一个「完成」却一行译文都没有。
+/// 端点彻底联系不上时，整本书的每一个块都按「请求失败、已跳过」处理：中间按设计冷却一次
+/// （连续 5 块失败 → 等 60 秒 → 重新计数），任务照旧走到书末并按「已完成」收尾 ——
+/// 不许因为连续失败多少个块就中止整次翻译。
 ///
-/// 现场 2026-09-22：端点配错（地址没人监听）时，用户期望「跳过这一块继续翻」，但整天都
-/// 连不上时必须停：否则一本三千块的书会被逐块跳过，任务显示完成、内容还是原文。
+/// 2026-09-24 用户裁定：块级失败只影响那一块。现场一次端点抖动让任务在连续 5 块失败之后
+/// 按 `Failed` 收尾（已处理 3045 块、还有 4921 块没翻），已经翻好的部分停在半路，剩下的
+/// 块再也没人翻。现在每个失败块各自留下一条 `ProviderSkipped`，用户在「文本块明细」里
+/// 点「重试失败块」重跑它们。
 #[test]
-pub(crate) fn consecutive_failed_requests_stop_the_translation_instead_of_skipping_the_book() {
+pub(crate) fn a_dead_endpoint_skips_every_block_and_the_translation_still_finishes() {
     // 绑一个端口再放掉：地址确实存在，但没有人监听，连接会立刻被拒。
     let dead = TcpListener::bind("127.0.0.1:0").unwrap();
     let dead_url = format!("http://{}/v1/", dead.local_addr().unwrap());
@@ -362,17 +365,41 @@ pub(crate) fn consecutive_failed_requests_stop_the_translation_instead_of_skippi
                 .await
                 .unwrap()
         );
-        let failed = wait_translation(&services, &book_id, BackgroundJobStatus::Failed).await;
-        let error = failed.error.unwrap_or_default();
+        // 连续 5 块失败之后按设计要冷却 60 秒（lib 内部的
+        // `TRANSLATION_REQUEST_FAILURE_COOLDOWN`，这里按同一份规则断言读数）：冷却期间
+        // 游标一动不动，所以这次等待要给停滞预算留出余量，同时确认它真的等了那么久。
+        let cooldown = Duration::from_secs(60);
+        let waiting = Instant::now();
+        let finished = wait_translation_allowing_stall(
+            &services,
+            &book_id,
+            BackgroundJobStatus::Succeeded,
+            cooldown + Duration::from_secs(30),
+        )
+        .await;
         assert!(
-            error.contains("连续"),
-            "停止的原因必须说清楚是「连续失败」而不是随便一条错误：{error}"
+            waiting.elapsed() >= cooldown,
+            "连续 5 块失败之后必须先冷却 {cooldown:?} 再继续翻：实测等了 {:?}",
+            waiting.elapsed()
         );
-        // 上限是 lib 内部的 `TRANSLATION_CONSECUTIVE_REQUEST_FAILURES`（= 5）：约定是
-        // 「偶尔一块失败照常继续，连续五块都失败就停」，这里按同一份规则断言读数。
+        assert!(
+            finished.error.is_none(),
+            "块级请求失败不许把任务判成失败：{:?}",
+            finished.error
+        );
+        // 份数以任务窗口读到的块清单为准：它和 worker 用的是同一份抽取。
+        let total = services
+            .background_job_translation_blocks(job.id.clone(), vec![book_id.clone()])
+            .await
+            .unwrap()
+            .total;
+        assert!(
+            total > 5,
+            "这条用例要越过原来的「连续 5 块就停」上限，实际 {total}"
+        );
         assert_eq!(
-            failed.progress.completed, 5,
-            "恰好停在连续失败的第 5 块之后：前面的块都提交过（游标前进），后面的块没动"
+            finished.progress.completed, total,
+            "跳过也按处理提交：游标一直走到书末，而不是停在原来那条上限上"
         );
         assert_eq!(row_count(&services), 0, "一块都没翻出来");
         // 每一个失败块都留下「请求失败、已跳过」的记录，任务窗口据此列出「重试失败块」。
@@ -385,8 +412,8 @@ pub(crate) fn consecutive_failed_requests_stop_the_translation_instead_of_skippi
                 .iter()
                 .filter(|entry| entry.event == JobLogEvent::ProviderSkipped)
                 .count(),
-            5,
-            "五个被跳过的块各自留下一条记录"
+            total,
+            "每个被跳过的块各自留下一条记录"
         );
     });
 }

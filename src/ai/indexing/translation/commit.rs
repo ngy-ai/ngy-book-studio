@@ -141,10 +141,10 @@ pub(crate) async fn commit_translation_slot(
             // A block the model never answered leaves no row and the walk goes
             // past it: the whole book has to reach the end even if every block
             // fails, because the per-block "重试" button is the repair path, not a
-            // second attempt at the whole run. Stopping early here would also
-            // strand every later block. 唯一的例外是请求级失败连续太多次：那不是
-            // 「某一块不行」，而是模型/端点联系不上，由 walk 停下来报警
-            // （`TRANSLATION_CONSECUTIVE_REQUEST_FAILURES`）。
+            // second attempt at the whole run. Stopping early would strand every
+            // later block —— 请求级失败也一样，连续多少个都不停（2026-09-24 用户
+            // 裁定，中止条件已删除；连续失败凑满
+            // `TRANSLATION_REQUEST_FAILURE_STREAK_LIMIT` 只告警并冷却一次）。
             CommittedBlock::Skipped(cause, error_kind)
         }
     };

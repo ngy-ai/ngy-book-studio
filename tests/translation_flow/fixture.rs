@@ -126,6 +126,19 @@ pub(crate) async fn wait_translation(
     book_id: &str,
     expected: BackgroundJobStatus,
 ) -> BackgroundJobSnapshot {
+    wait_translation_allowing_stall(services, book_id, expected, TRANSLATION_STALL).await
+}
+
+/// 同 [`wait_translation`]，但允许调用方放宽「多久没有进展算卡住」的预算。
+///
+/// 故意触发「连续失败冷却」的用例必须放宽它：冷却期间游标按设计一动不动，默认的 30 秒
+/// 停滞预算会把这次等待误判成卡死。
+pub(crate) async fn wait_translation_allowing_stall(
+    services: &AppServices,
+    book_id: &str,
+    expected: BackgroundJobStatus,
+    stall: Duration,
+) -> BackgroundJobSnapshot {
     let started = Instant::now();
     let mut observed: Option<(BackgroundJobStatus, usize)> = None;
     let mut progressed_at = Instant::now();
@@ -147,7 +160,7 @@ pub(crate) async fn wait_translation(
         }
         let silent = progressed_at.elapsed();
         assert!(
-            silent < TRANSLATION_STALL && started.elapsed() < TRANSLATION_WAIT,
+            silent < stall && started.elapsed() < TRANSLATION_WAIT,
             "translation did not reach {expected:?}: no progress for {}s (last {:?}, waited {}s): {jobs:?}{}",
             silent.as_secs(),
             observed,

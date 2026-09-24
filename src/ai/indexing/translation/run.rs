@@ -52,19 +52,17 @@ pub(crate) enum BlockSlot {
     Untranslated(SkipCause, JobLogErrorKind),
 }
 
-/// 一个文本块被跳过的原因。它决定记哪条事件，也决定这次跳过是否计入「模型不可用」的
-/// 连续计数（见 `TRANSLATION_CONSECUTIVE_REQUEST_FAILURES`）。
+/// 一个文本块被跳过的原因。它决定记哪条事件（`ProtocolSkipped` / `ProviderSkipped`），
+/// 也决定 walk 的连续失败诊断读数；两者都不中止运行。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SkipCause {
-    /// 模型答了、但形状不合格（`ResponseError`）。弱模型连续不合格是常态，那条语义
-    /// 刻意没有连续上限。
+    /// 模型答了、但形状不合格（`ResponseError`）。
     Protocol,
-    /// 请求本身失败：传输、超时、流协议、上下文超限、响应过大。偶尔一块失败很正常，
-    /// 连续若干块都失败说明模型或端点联系不上。
+    /// 请求本身失败：传输、超时、流协议、上下文超限、响应过大。
     Request,
 }
 
-/// 一个槽位提交之后的结果，供 walk 统计「连续多少个块的请求失败」。
+/// 一个槽位提交之后的结果，供 walk 统计「连续多少个块的请求失败」这类诊断读数。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CommittedBlock {
     /// 译出来了，或复用了已有译文。
@@ -376,6 +374,7 @@ pub(crate) async fn run_translation_blocks(
         untranslated = stats.untranslated,
         fragment_fallback_blocks = stats.fragment_fallback_blocks,
         fragment_fallback_requests = stats.fragment_fallback_requests,
+        cooldowns = stats.cooldowns,
         next_ordinal = cursor.next_ordinal,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "Translation run statistics"

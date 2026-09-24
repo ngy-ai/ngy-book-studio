@@ -104,9 +104,12 @@ pub(crate) async fn walk_translation_blocks(
     // them after switching to a better model.
     let mut saved_blocks = 0usize;
     let mut untranslated_blocks = 0usize;
-    // 连续多少个块的**请求级**失败就停下（见 `TRANSLATION_CONSECUTIVE_REQUEST_FAILURES`）。
-    // 协议类跳过不计入：弱模型连续不合格是常态，那条语义刻意没有上限。
+    // 连续多少个块的**请求级**失败就告警并冷却一次（见
+    // `TRANSLATION_REQUEST_FAILURE_STREAK_LIMIT`）。两者都**不中止运行**：连续失败多少个
+    // 块，这个 walk 都要一直翻到书末。
     let mut consecutive_request_failures = 0usize;
+    // 凑满阈值：提交完手上这批槽位之后先冷却，再继续开新请求。
+    let mut streak_cooldown = false;
     // 收窄的重试在范围之外撞上一个还没翻译的块：运行停在这里，任务留在可继续的状态。
     let mut retry_stopped = false;
     loop {
@@ -140,20 +143,48 @@ pub(crate) async fn walk_translation_blocks(
             )
             .await?;
             match committed {
+                // 请求级失败只跳过这一块，运行一直翻到书末 —— 连续失败多少个都一样
+                // （2026-09-24 用户裁定：连续失败就中止整次翻译是错的，现场一次端点
+                // 抖动让任务在翻完 3045 块后按 Failed 收尾，剩下 4921 块再也没人翻）。
+                // 凑满阈值只告警并标记一次冷却，冷却本身在提交循环之外进行。
                 CommittedBlock::Skipped(SkipCause::Request, kind) => {
                     consecutive_request_failures += 1;
-                    ensure!(
-                        consecutive_request_failures < TRANSLATION_CONSECUTIVE_REQUEST_FAILURES,
-                        "连续 {consecutive_request_failures} 个文本块的模型请求都失败（{}）：\
-                         翻译已停止，以免把整本书逐块跳过。请到 AI 设置的「模型设置」里检查\
-                         翻译模型与 Endpoint，修好后点「重试」继续；已经翻好的块不会重做，\
-                         失败的块可用「重试失败块」重跑。",
-                        kind.label()
-                    );
+                    if !streak_cooldown
+                        && consecutive_request_failures >= TRANSLATION_REQUEST_FAILURE_STREAK_LIMIT
+                    {
+                        streak_cooldown = true;
+                        tracing::warn!(
+                            target: "ngy_ai",
+                            stage = "translation_request_failure_streak",
+                            ordinal,
+                            consecutive = consecutive_request_failures,
+                            error_kind = kind.label(),
+                            cooldown_secs = inner.failure_cooldown.as_secs(),
+                            "Consecutive model request failures; cooling down before continuing"
+                        );
+                    }
                 }
                 CommittedBlock::Skipped(SkipCause::Protocol, _) => {}
                 CommittedBlock::Translated => consecutive_request_failures = 0,
                 CommittedBlock::Untouched => {}
+            }
+        }
+        // 连续请求失败凑满阈值：先冷却再继续开新请求，冷却结束把连续计数清零（下一组连续
+        // 失败重新累计、再冷却一次）。冷却绝不能在提交循环里进行 —— 那条路径持有
+        // `transitions` 门闩，睡一分钟等于把保存设置一起卡住。
+        if streak_cooldown {
+            streak_cooldown = false;
+            // 书末已经没有新请求要发时不必再等：那只会让用户在任务最后一分钟里盯着一个
+            // 不动的进度，等一个根本不会发出的请求。
+            if frontier < total {
+                let cooldown = inner.failure_cooldown;
+                if let Some(outcome) =
+                    cool_down_after_request_failure_streak(inner, job, run, cooldown).await?
+                {
+                    return Ok(outcome);
+                }
+                stats.cooldowns += 1;
+                consecutive_request_failures = 0;
             }
         }
         // 2) Fill the window. The configured concurrency is re-read every round, so
@@ -333,6 +364,54 @@ async fn pause_after_translation_request(inner: &Arc<IndexingInner>, walk: &Resu
     if !interval.is_zero() {
         tokio::time::sleep(interval).await;
     }
+}
+
+/// 连续请求失败凑满阈值后的一次冷却：等一段时间再继续开新请求。
+///
+/// 端点临时不可用（本机模型重启、网关限流、地址暂时不通）时，停一下往往就能继续翻完
+/// 后面的块；这段时间一个请求都不发，但暂停、取消与换版本照常生效 —— 按
+/// `CONTROL_POLL_INTERVAL` 醒来复查控制请求，命中就立刻把控制权交回 walk（返回
+/// `Some(outcome)`，由调用方按终态返回），不睡满整段冷却。
+///
+/// 冷却结束返回 `None`，调用方随即把连续失败计数清零：下一组连续失败重新累计，
+/// 再凑满阈值就再冷却一次。
+async fn cool_down_after_request_failure_streak(
+    inner: &Arc<IndexingInner>,
+    job: &db::index_jobs::IndexJob,
+    run: &mut TranslationRun,
+    cooldown: Duration,
+) -> Result<Option<RunOutcome>> {
+    if cooldown.is_zero() {
+        return Ok(None);
+    }
+    tracing::info!(
+        target: "ngy_ai",
+        stage = "translation_failure_cooldown_start",
+        cooldown_ms = cooldown.as_millis() as u64,
+        next_ordinal = run.cursor.next_ordinal,
+        "Cooling down after consecutive model request failures"
+    );
+    let mut remaining = cooldown;
+    while !remaining.is_zero() {
+        let step = remaining.min(CONTROL_POLL_INTERVAL);
+        tokio::time::sleep(step).await;
+        remaining = remaining.saturating_sub(step);
+        let _transition = inner.transitions.lock().await;
+        if let Some(outcome) = requested_outcome(inner, job, &run.cursor).await? {
+            return Ok(Some(run.interrupt(inner, job, outcome).await?));
+        }
+        if !source_is_current(inner, job, run.cursor.revision).await? {
+            let outcome = run.stopped(StopRequest::SourceChanged);
+            return Ok(Some(run.interrupt(inner, job, outcome).await?));
+        }
+    }
+    tracing::info!(
+        target: "ngy_ai",
+        stage = "translation_failure_cooldown_end",
+        next_ordinal = run.cursor.next_ordinal,
+        "Translation failure cooldown finished; continuing"
+    );
+    Ok(None)
 }
 
 /// Remembers one committed translation so a later block with the same text hits it

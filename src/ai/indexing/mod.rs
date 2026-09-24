@@ -122,15 +122,21 @@ const TRANSLATION_BLOCK_PREVIEW_CHARS: usize = 96;
 
 const TRANSLATION_RESPONSE_ATTEMPTS: usize = 2;
 
-/// 连续多少个文本块的**请求级**失败就停止本次运行。
+/// 连续多少个文本块的**请求级**失败就告警并进入一次冷却。
 ///
-/// 协议类跳过刻意没有连续上限（弱模型连续不合格是常态，现场 2026-09-15 已把那个上限
-/// 去掉），但「请求本身失败」是另一回事：偶尔一块连不上很常见，连续若干块都连不上
-/// 说明模型或端点已经不可用。没有这条上限，一本三千块的书会被逐块跳过、最后报「完成」
-/// 而一行译文都没有（每次都等超时的话还要跑几十小时）。5 是「个别抖动不会误判」与
-/// 「真的挂了就尽快停」之间的取值：单次失败率 5% 时，三千块里凑出连续 5 次的概率约
-/// 千分之一。
-const TRANSLATION_CONSECUTIVE_REQUEST_FAILURES: usize = 5;
+/// 告警与冷却都**不中止运行**：2026-09-24 用户裁定，块级失败不管多少个都必须继续翻完
+/// 剩下的块（现场：连续 5 块失败后任务按 `Failed` 收尾，已处理 3045 块、剩下 4921 个
+/// 文本块再也没人翻）。凑满这个数先等 [`TRANSLATION_REQUEST_FAILURE_COOLDOWN`]，等完
+/// 把连续计数清零 —— 下一组连续失败重新累计、再冷却一次；每块自己的 `ProviderSkipped`
+/// 记录与任务窗口的「重试失败块」仍是失败块的修复路径。
+const TRANSLATION_REQUEST_FAILURE_STREAK_LIMIT: usize = 5;
+
+/// 连续请求失败凑满 [`TRANSLATION_REQUEST_FAILURE_STREAK_LIMIT`] 后的冷却时长。
+///
+/// 端点临时不可用（本机模型重启、网关限流、地址暂时不通）时，停一下往往就能继续翻完
+/// 后面的块。冷却期间不开新请求，但暂停、取消与换版本照常生效：冷却按
+/// `CONTROL_POLL_INTERVAL` 醒来复查控制请求，命中就立刻按终态发布，不睡满整段时间。
+const TRANSLATION_REQUEST_FAILURE_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// 一个文本块整轮失败后再重发的次数。一轮 = 两次严格尝试 + 一次协议纠正，最后一轮
 /// 还包含逐片段回退，所以一个块最多发出 `TRANSLATION_BLOCK_RETRIES + 1` 轮请求。

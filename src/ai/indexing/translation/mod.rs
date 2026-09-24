@@ -229,7 +229,7 @@ pub(crate) fn translation_job_context(
 }
 
 /// 一次翻译运行的计数，用于收尾汇总：一行说明翻了多少、复用了多少、跳过多少，
-/// 以及有多少文本块走了逐片段回退，不必再通读整段运行日志。
+/// 有多少文本块走了逐片段回退，以及为连续请求失败冷却过几次，不必再通读整段运行日志。
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct TranslationRunStats {
     pub(crate) saved: usize,
@@ -238,4 +238,6 @@ pub(crate) struct TranslationRunStats {
     pub(crate) untranslated: usize,
     pub(crate) fragment_fallback_blocks: usize,
     pub(crate) fragment_fallback_requests: usize,
+    /// 真正等过的冷却次数（书末没有新请求要发时那次不算）。
+    pub(crate) cooldowns: usize,
 }

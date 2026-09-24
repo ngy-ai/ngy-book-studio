@@ -159,16 +159,28 @@ pub(crate) fn a_failed_block_request_is_skipped_and_the_run_finishes() {
     );
 }
 
-/// 端点彻底联系不上时，连续若干个块的请求失败就必须停下并说明原因：把整本书逐块
-/// 跳过、最后报「完成」是更糟的结果（书还是原文，用户却以为翻完了）。
+/// 端点彻底联系不上时，整本书的每一个块都失败：运行必须一路走到书末，每连续
+/// `TRANSLATION_REQUEST_FAILURE_STREAK_LIMIT` 块失败只冷却一次，冷却之后连续计数清零、
+/// 下一组重新累计。任务按 `Succeeded` 收尾，每个失败块各自留一条 `ProviderSkipped`，
+/// 用户在模型或端点修好之后用「重试失败块」重跑它们。
+///
+/// 2026-09-24 用户裁定：原来「连续 5 块请求失败就中止整次运行」是错的。现场一次端点抖动
+/// 让任务在连续 5 块失败之后按 `Failed` 收尾（已处理 3045 块、还有 4921 块没翻），已经
+/// 翻好的部分停在半路，剩下的块再也没人翻。
+///
+/// 这里只固定「冷却触发与计数清零」的语义，冷却时长用 fixture 的短值
+/// （`TEST_TRANSLATION_FAILURE_COOLDOWN`）；生产那 60 秒真的等满一次，由
+/// `translation_flow` 的端到端用例断言。
 #[test]
-pub(crate) fn consecutive_failed_block_requests_stop_the_run() {
+pub(crate) fn consecutive_failed_block_requests_cool_down_and_do_not_stop_the_run() {
     let provider = Arc::new(MockMergeProvider::default());
     provider.fail_provider.store(true, Ordering::SeqCst);
     let mut fixture = Fixture::new();
-    // 默认模板只有两个文本块，而这条用例要凑到连续 5 次失败。
+    // 默认模板只有两个文本块；这条用例要凑出两次冷却，所以正文要够长。
     fixture.rewrite_first_unit(
-        "<p>One</p><p>Two</p><p>Three</p><p>Four</p><p>Five</p><p>Six</p><p>Seven</p>",
+        "<p>One</p><p>Two</p><p>Three</p><p>Four</p><p>Five</p><p>Six</p><p>Seven</p>\
+         <p>Eight</p><p>Nine</p><p>Ten</p><p>Eleven</p><p>Twelve</p><p>Thirteen</p>\
+         <p>Fourteen</p>",
     );
 
     let (fixture, job, mut cursor, translation) =
@@ -181,7 +193,7 @@ pub(crate) fn consecutive_failed_block_requests_stop_the_run() {
     .configure_scheduling(1, Duration::ZERO);
     let mut stats = TranslationRunStats::default();
 
-    let error = fixture
+    let outcome = fixture
         .runtime
         .block_on(run_translation_blocks_inner(
             &inner,
@@ -191,33 +203,42 @@ pub(crate) fn consecutive_failed_block_requests_stop_the_run() {
             &mut cursor,
             &mut stats,
         ))
-        .err()
-        .expect("连续请求失败必须让运行停下来，而不是把整本书逐块跳过");
-    let message = format!("{error:#}");
+        .expect("块级请求失败不许让整次运行失败");
+    let RunOutcome::Succeeded(finished) = outcome else {
+        panic!("整本书逐块跳过之后必须按 Succeeded 收尾");
+    };
+
+    // 份数以任务窗口读到的块清单为准：walk 按 EPUB 投影枚举文本块，与只查库的那份抽取
+    // 在编辑过的来源上差一块。
+    let coordinator = IndexingCoordinator {
+        inner: Arc::clone(&inner),
+        workers: Mutex::new(Vec::new()),
+    };
+    let total = fixture
+        .runtime
+        .block_on(coordinator.translation_blocks(&job.id))
+        .unwrap()
+        .total;
     assert!(
-        message.contains("连续")
-            && message.contains(&TRANSLATION_CONSECUTIVE_REQUEST_FAILURES.to_string()),
-        "停止的原因必须说清是连续失败：{message}"
+        total > TRANSLATION_REQUEST_FAILURE_STREAK_LIMIT,
+        "这条用例要越过原来的「连续若干块就停」上限，实际 {total}"
     );
 
-    // 恰好停在连续失败的上限那一块之后：前面的块都提交过（游标前进、各自记一条跳过），
-    // 后面的块一个请求都没发。
-    assert_eq!(
-        stats.untranslated, TRANSLATION_CONSECUTIVE_REQUEST_FAILURES,
-        "每一块都按跳过提交过"
-    );
+    // 每一块都真的发过请求、都被跳过、都提交过：游标一路走到书末。
     assert_eq!(
         provider.requests.load(Ordering::SeqCst),
-        TRANSLATION_CONSECUTIVE_REQUEST_FAILURES,
-        "停下之后不再开新请求"
+        total,
+        "跳过一块之后照旧给后面的块发请求"
     );
+    assert_eq!(stats.untranslated, total, "每一块都按跳过提交过");
+    assert_eq!(stats.saved, 0, "一块都没翻出来");
+    assert_eq!(finished.next_ordinal, total);
+    assert!(finished.inflight.is_empty());
     let conn = db::open_conn(&fixture.db_path).unwrap();
     let row = db::index_jobs::get(&conn, &job.id).unwrap().unwrap();
     let saved: serde_json::Value = serde_json::from_str(&row.cursor_json).unwrap();
-    assert_eq!(
-        saved["next_ordinal"],
-        serde_json::json!(TRANSLATION_CONSECUTIVE_REQUEST_FAILURES)
-    );
+    assert_eq!(saved["next_ordinal"], serde_json::json!(total));
+    assert_eq!(saved["inflight"], serde_json::json!([]));
     assert_eq!(
         db::translations::list_for_unit(&conn, &fixture.unit_id, "zh-Hans")
             .unwrap()
@@ -230,8 +251,20 @@ pub(crate) fn consecutive_failed_block_requests_stop_the_run() {
             .iter()
             .filter(|entry| entry.event == JobLogEvent::ProviderSkipped)
             .count(),
-        TRANSLATION_CONSECUTIVE_REQUEST_FAILURES,
+        total,
         "每个被跳过的块都要留下记录，任务窗口据此列出「重试失败块」"
+    );
+
+    // 每连续 5 块失败冷却一次，冷却之后连续计数清零：冷却次数 = floor((块数 - 1) / 阈值)。
+    // 减一是因为凑满阈值的那一块如果是最后一块，就没有下一个请求要发了，那次冷却按设计
+    // 不等待；而「清零后重新累计」意味着第 11、12 块不会在第 10 块的冷却之后再触发一次。
+    // 冷却真的等满 60 秒由 `translation_flow` 的端到端用例断言（这条用例用 fixture 的短
+    // 冷却，只为固定触发与计数语义，不拖长单元测试）。
+    assert_eq!(
+        stats.cooldowns,
+        (total - 1) / TRANSLATION_REQUEST_FAILURE_STREAK_LIMIT,
+        "每连续 {} 块失败冷却一次，冷却后连续计数清零",
+        TRANSLATION_REQUEST_FAILURE_STREAK_LIMIT
     );
 }
 

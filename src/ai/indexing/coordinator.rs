@@ -70,6 +70,7 @@ impl IndexingCoordinator {
                     translation: None,
                 }),
                 scheduling: RwLock::new(JobScheduling::default()),
+                failure_cooldown: TRANSLATION_REQUEST_FAILURE_COOLDOWN,
                 transitions: AsyncMutex::new(()),
                 wake: Notify::new(),
                 reconcile_translations: AtomicBool::new(false),

@@ -754,3 +754,28 @@ LangGraph 依赖。CLI 课程验证与桌面接入的验证分别列出。
   两个 Playwright 门禁新增用例（`src/ui/reader/annotations.test.cjs`、
   `src/ui/pdf_reader/viewer.test.cjs`）因本机未安装 Playwright **未执行**；
   真实 Windows GUI 中的实际滚轮、触控板与不同鼠标设备仍需人工复验。
+- [x] 2026-09-24 文本块翻译失败不再中止整本翻译：删除「连续 5 个文本块的模型请求失败就停止整次
+  运行」这条中止条件（原 `TRANSLATION_CONSECUTIVE_REQUEST_FAILURES`）—— 现场一次端点抖动让任务
+  在连续 5 块失败后按 `Failed` 收尾，已处理 3045 块、剩下 4921 个文本块再也没人翻。请求级失败
+  （传输、超时、流协议、上下文超限、响应过大）与协议类跳过一样只跳过这一块并继续翻后面的块，
+  整本翻译一定走到书末并按「已完成」收尾，失败块留在「文本块明细」的失败列表里，用户可点
+  「重试失败块」重跑；数据库、IO 与取消类错误仍让整次运行失败。
+- [x] 2026-09-24 连续失败的冷却（同一次现场的用户追加要求）：连续失败凑满
+  `TRANSLATION_REQUEST_FAILURE_STREAK_LIMIT`（= 5）块时先等 `TRANSLATION_REQUEST_FAILURE_COOLDOWN`
+  （= 60 秒）再继续，等完把连续计数清零，让端点有机会恢复；冷却期间不开新请求，按
+  `CONTROL_POLL_INTERVAL` 醒来复查控制请求，所以暂停/取消/换版本照常立刻生效（不等满 60 秒）；
+  冷却在提交循环之外进行，不持有 `transitions` 门闩；书末已经没有新请求要发时不再等待。真的
+  等过的冷却计入 `TranslationRunStats.cooldowns` 并进收尾汇总日志。
+  回归：`cargo fmt --all --check`、`cargo check --all-targets --locked`、`cargo clippy
+  --all-targets --locked`（触及范围无新增告警）与 `cargo test --all-targets --locked
+  --no-fail-fast` 全通过 —— lib 673、产品二进制 310、translation_flow 19（新增
+  `a_dead_endpoint_skips_every_block_and_the_translation_still_finishes`：死端点下整本书逐块跳过、
+  真的等满一次 60 秒冷却、任务按 Succeeded 收尾、游标停在书末、每块各留一条 `ProviderSkipped`；
+  该用例含冷却等待约 62 秒）、lib 的
+  `consecutive_failed_block_requests_cool_down_and_do_not_stop_the_run`（全部块失败仍走完并逐块
+  提交，每连续 5 块冷却一次、冷却后计数清零、书末那次不等待）、epub_flow 6、multi_format_flow 4、
+  multi_endpoint_flow 1、openai_compatible_flow 22。因产品二进制正在运行、占用 `target/debug`，
+  全目标测试在独立 target 目录（`target/verify`）中执行。未做人工 GUI 验证：失败块清单与
+  「重试失败块」沿用原有界面路径，未在真实窗口复验；冷却只在日志文件里留
+  `translation_failure_cooldown_start/end` 与 `translation_failure_streak` 记录，任务窗口的
+  「运行日志」页看不到它（失败块本身照旧列在失败列表里）。

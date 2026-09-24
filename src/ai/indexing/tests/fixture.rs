@@ -2,6 +2,12 @@
 
 use super::*;
 
+/// 单元测试里的连续失败冷却时长。
+///
+/// 故意让整本书的请求都失败的用例必须真的等完冷却，所以这个值要短到不拖长用例；同时要
+/// 明显长于一次正常请求的往返，用例才能按「两次请求之间隔了至少这么久」数出冷却次数。
+pub(crate) const TEST_TRANSLATION_FAILURE_COOLDOWN: Duration = Duration::from_millis(500);
+
 pub(crate) struct Fixture {
     pub(crate) _temp: tempfile::TempDir,
     pub(crate) runtime: IoRuntime,
@@ -172,6 +178,7 @@ impl Fixture {
                 translation: None,
             }),
             scheduling: RwLock::new(JobScheduling::default()),
+            failure_cooldown: TEST_TRANSLATION_FAILURE_COOLDOWN,
             transitions: AsyncMutex::new(()),
             wake: Notify::new(),
             reconcile_translations: AtomicBool::new(false),
