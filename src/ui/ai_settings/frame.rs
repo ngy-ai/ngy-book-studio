@@ -86,13 +86,11 @@ pub(crate) fn settings_frame<V: SettingsWindowView>(
                 .child(div().p_6().child(body)),
         )
         .when_some(notice, |this, notice| {
-            this.child(
-                div()
-                    .flex_none()
-                    .px_6()
-                    .py_2()
-                    .child(render_notice(&notice, palette(cx))),
-            )
+            this.child(div().flex_none().px_6().py_2().child(render_notice(
+                &notice,
+                palette(cx),
+                section.debug_selector("notice-text"),
+            )))
         })
         .child(
             div()

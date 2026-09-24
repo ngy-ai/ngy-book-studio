@@ -30,7 +30,13 @@ pub(crate) fn render_input_field(
         .into_any_element()
 }
 
-pub(crate) fn render_notice(notice: &SettingsNotice, theme: Palette) -> gpui::AnyElement {
+/// `selector` 是提示文字区域的调试选择器（由 `AiSettingsSection::selector` 生成），
+/// 测试用它断言长提示的折行。
+pub(crate) fn render_notice(
+    notice: &SettingsNotice,
+    theme: Palette,
+    selector: impl Fn() -> String + 'static,
+) -> gpui::AnyElement {
     let (background, foreground, icon) = if notice.error {
         (
             rgb(theme.danger_soft),
@@ -54,9 +60,14 @@ pub(crate) fn render_notice(notice: &SettingsNotice, theme: Palette) -> gpui::An
         .text_sm()
         .text_color(foreground)
         .child(Icon::new(icon).small())
+        // 模型检测失败的提示会带上很长的请求地址。提示文字作为主轴子项时，自动最小
+        // 尺寸按整段文字计算，flex 收缩不生效，文字会溢出提示条而不是换行；显式把最小
+        // 宽度设为 0，它才能收缩到可用宽度并按宽度折行（与图书库提示条同一处理）。
         .child(
             div()
+                .debug_selector(selector)
                 .flex_1()
+                .min_w(px(0.))
                 .line_height(gpui::relative(1.5))
                 .child(notice.text.clone()),
         )
