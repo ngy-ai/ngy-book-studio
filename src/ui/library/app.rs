@@ -88,6 +88,9 @@ impl EpubReaderApp {
             _office_state_task: office_state_task,
             group_filter: GroupFilter::All,
             collapsed_groups: HashSet::new(),
+            book_sort: BookSortField::default(),
+            book_sort_direction: BookSortField::default().default_direction(),
+            book_view: BookViewMode::default(),
             group_modal: None,
         }
     }

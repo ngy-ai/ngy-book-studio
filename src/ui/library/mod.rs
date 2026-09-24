@@ -18,6 +18,8 @@ mod app;
 
 mod book_author;
 
+mod book_menu;
+
 mod book_ops;
 
 mod book_rename;
@@ -43,6 +45,8 @@ mod render;
 mod render_books;
 
 mod render_library;
+
+mod render_list;
 
 mod render_picker;
 
@@ -79,6 +83,10 @@ pub use render::wrap_root;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod ui_test;
+
 const LIBRARY_SEARCH_LIMIT: usize = 200;
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(180);
 const OFFICE_PREVIEW_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
@@ -114,5 +122,8 @@ pub struct EpubReaderApp {
     _office_state_task: Task<()>,
     group_filter: GroupFilter,
     collapsed_groups: HashSet<String>,
+    book_sort: BookSortField,
+    book_sort_direction: BookSortDirection,
+    book_view: BookViewMode,
     group_modal: Option<GroupModal>,
 }

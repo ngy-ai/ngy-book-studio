@@ -1,5 +1,5 @@
-//! In-memory view state: the group filter, the modal stack and the library
-//! mutation lifecycle.
+//! In-memory view state: the group filter, the sort order, the display mode,
+//! the modal stack and the library mutation lifecycle.
 
 use super::*;
 
@@ -10,6 +10,122 @@ pub(crate) enum GroupFilter {
     All,
     Ungrouped,
     Group(String),
+}
+
+/// The field the visible books are sorted by. The default keeps the catalog
+/// order (newest import first) until the user picks one of the others.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum BookSortField {
+    Title,
+    Author,
+    #[default]
+    AddedAt,
+}
+
+impl BookSortField {
+    /// Menu label; the sort button reuses it as "按名称" and friends.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Title => "名称",
+            Self::Author => "作者",
+            Self::AddedAt => "创建时间",
+        }
+    }
+
+    /// Direction a field starts in when it is picked: text reads top-down,
+    /// time reads newest-first.
+    pub(crate) fn default_direction(self) -> BookSortDirection {
+        match self {
+            Self::Title | Self::Author => BookSortDirection::Ascending,
+            Self::AddedAt => BookSortDirection::Descending,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BookSortDirection {
+    Ascending,
+    Descending,
+}
+
+impl BookSortDirection {
+    pub(crate) fn is_ascending(self) -> bool {
+        matches!(self, Self::Ascending)
+    }
+}
+
+/// How the visible books are laid out: cover cards in a grid, or one book per
+/// row with its metadata in columns.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum BookViewMode {
+    #[default]
+    Cards,
+    List,
+}
+
+/// Sorts the visible indices in place. Sorting is stable, so books that share
+/// a key (same author, same import timestamp) keep the catalog's relative
+/// order instead of jumping between renders.
+pub(crate) fn sort_book_indices(
+    books: &[BookRecord],
+    indices: &mut [usize],
+    field: BookSortField,
+    direction: BookSortDirection,
+) {
+    // Text keys are lowercased so "ai engineering" and "AI Engineering" do not
+    // split the list. Chinese titles sort by code point, not by pinyin.
+    match field {
+        BookSortField::Title => {
+            sort_indices_by_key(indices, direction, |index| {
+                books[*index].title.to_lowercase()
+            });
+        }
+        BookSortField::Author => {
+            sort_indices_by_key(indices, direction, |index| {
+                (
+                    books[*index].author.to_lowercase(),
+                    books[*index].title.to_lowercase(),
+                )
+            });
+        }
+        BookSortField::AddedAt => {
+            sort_indices_by_key(indices, direction, |index| books[*index].added_at);
+        }
+    }
+}
+
+fn sort_indices_by_key<K: Ord>(
+    indices: &mut [usize],
+    direction: BookSortDirection,
+    key: impl Fn(&usize) -> K,
+) {
+    match direction {
+        BookSortDirection::Ascending => indices.sort_by_cached_key(key),
+        BookSortDirection::Descending => {
+            indices.sort_by_cached_key(|index| std::cmp::Reverse(key(index)));
+        }
+    }
+}
+
+/// `BookRecord::added_at` is stored in nanoseconds; the list only shows the
+/// day, rendered in UTC like the rest of the app's timestamps.
+pub(crate) fn format_added_date(added_at_nanos: u64) -> String {
+    let seconds = added_at_nanos / 1_000_000_000;
+    let days = (seconds / 86_400) as i64;
+    // Civil date conversion from Unix days, independent of local timezone and
+    // platform date APIs. Same algorithm as the job diagnostics formatter.
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 impl GroupFilter {

@@ -3,10 +3,11 @@
 use super::*;
 
 impl EpubReaderApp {
-    /// Indices into `library.books()` for the currently selected shelf. A group
-    /// shows its own books plus everything filed under its descendants.
+    /// Indices into `library.books()` for the currently selected shelf, in the
+    /// order the user picked (name, author or import time). A group shows its
+    /// own books plus everything filed under its descendants.
     pub(super) fn visible_book_indices(&self) -> Vec<usize> {
-        match &self.group_filter {
+        let mut indices: Vec<usize> = match &self.group_filter {
             GroupFilter::All => (0..self.library.books().len()).collect(),
             GroupFilter::Ungrouped => self
                 .library
@@ -31,7 +32,14 @@ impl EpubReaderApp {
                     .map(|(index, _)| index)
                     .collect()
             }
-        }
+        };
+        sort_book_indices(
+            self.library.books(),
+            &mut indices,
+            self.book_sort,
+            self.book_sort_direction,
+        );
+        indices
     }
 
     pub(super) fn render_empty_library(&self, cx: &mut Context<Self>) -> gpui::AnyElement {

@@ -309,6 +309,131 @@ fn group_picker_without_a_current_group_expands_nothing() {
     assert!(picker_expanded_groups(&[test_group("root", None)]).is_empty());
 }
 
+fn test_book(id: &str, title: &str, author: &str, added_at: u64) -> BookRecord {
+    BookRecord {
+        id: id.to_string(),
+        title: title.to_string(),
+        author: author.to_string(),
+        language: None,
+        description: None,
+        format: "epub".to_string(),
+        revision: 1,
+        source_object_key: format!("source/{id}"),
+        cover_asset_id: None,
+        cover_object_key: None,
+        cover_mime: None,
+        added_at,
+        updated_at: added_at,
+        last_spine: 0,
+        group_id: None,
+    }
+}
+
+#[test]
+fn book_sort_orders_by_the_selected_field_and_direction() {
+    let books = vec![
+        test_book("book-1", "Zeta", "王五", 300),
+        test_book("book-2", "alpha", "李四", 100),
+        test_book("book-3", "Beta", "赵六", 200),
+    ];
+    let mut indices = vec![0, 1, 2];
+
+    sort_book_indices(
+        &books,
+        &mut indices,
+        BookSortField::Title,
+        BookSortDirection::Ascending,
+    );
+    assert_eq!(
+        indices,
+        vec![1, 2, 0],
+        "title ascending ignores letter case: alpha < Beta < Zeta"
+    );
+
+    sort_book_indices(
+        &books,
+        &mut indices,
+        BookSortField::Title,
+        BookSortDirection::Descending,
+    );
+    assert_eq!(indices, vec![0, 2, 1], "descending reverses the same order");
+
+    sort_book_indices(
+        &books,
+        &mut indices,
+        BookSortField::Author,
+        BookSortDirection::Ascending,
+    );
+    assert_eq!(
+        indices,
+        vec![1, 0, 2],
+        "authors sort by code point: 李四 < 王五 < 赵六"
+    );
+
+    sort_book_indices(
+        &books,
+        &mut indices,
+        BookSortField::AddedAt,
+        BookSortDirection::Descending,
+    );
+    assert_eq!(indices, vec![0, 2, 1], "newest import first");
+}
+
+#[test]
+fn shared_sort_keys_keep_the_catalog_order() {
+    let books = vec![
+        test_book("book-1", "同名图书", "同一作者", 300),
+        test_book("book-2", "同名图书", "同一作者", 100),
+        test_book("book-3", "乙书", "张三", 200),
+    ];
+    let mut indices = vec![0, 1, 2];
+
+    sort_book_indices(
+        &books,
+        &mut indices,
+        BookSortField::Author,
+        BookSortDirection::Ascending,
+    );
+    assert_eq!(
+        indices,
+        vec![0, 1, 2],
+        "books that share a key keep the catalog order (book-1 before book-2) \
+         instead of being reshuffled by their import time"
+    );
+}
+
+#[test]
+fn sort_fields_start_in_the_direction_that_matches_their_content() {
+    assert_eq!(
+        BookSortField::Title.default_direction(),
+        BookSortDirection::Ascending
+    );
+    assert_eq!(
+        BookSortField::Author.default_direction(),
+        BookSortDirection::Ascending
+    );
+    assert_eq!(
+        BookSortField::AddedAt.default_direction(),
+        BookSortDirection::Descending,
+        "a fresh library shows the newest import first"
+    );
+    assert!(BookSortDirection::Ascending.is_ascending());
+    assert!(!BookSortDirection::Descending.is_ascending());
+    assert_eq!(BookViewMode::default(), BookViewMode::Cards);
+}
+
+#[test]
+fn added_date_renders_as_a_utc_calendar_day() {
+    assert_eq!(format_added_date(0), "1970-01-01");
+    assert_eq!(format_added_date(1_704_067_200_000_000_000), "2024-01-01");
+    assert_eq!(format_added_date(1_790_208_000_000_000_000), "2026-09-24");
+    assert_eq!(
+        format_added_date(1_790_208_000_000_000_000 + 86_399_999_999_999),
+        "2026-09-24",
+        "the last nanosecond of the day still belongs to that day"
+    );
+}
+
 #[test]
 fn only_a_concrete_existing_group_files_an_import() {
     let temp = tempfile::tempdir().unwrap();

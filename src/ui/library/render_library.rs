@@ -1,6 +1,7 @@
-//! The library list itself and its status bar.
+//! The library list itself, its sort/view controls and its status bar.
 
 use super::*;
+use gpui_component::Selectable as _;
 
 impl EpubReaderApp {
     pub(super) fn set_error(&mut self, text: String, cx: &mut Context<Self>) {
@@ -218,9 +219,20 @@ impl EpubReaderApp {
                     ),
             )
             .when(!searching, |this| {
-                this.when_some(self.group_filter.group_id(), |this, group_id| {
-                    this.child(self.render_group_actions(group_id, cx))
-                })
+                // Sort and display mode are properties of the shelf, not of a
+                // search: results keep their own relevance order and always
+                // render as rows.
+                this.child(
+                    div()
+                        .h_flex()
+                        .flex_none()
+                        .gap_2()
+                        .child(self.render_book_sort_button(cx))
+                        .child(self.render_book_view_toggle(cx))
+                        .when_some(self.group_filter.group_id(), |this, group_id| {
+                            this.child(self.render_group_actions(group_id, cx))
+                        }),
+                )
             });
 
         let content = if searching {
@@ -230,7 +242,10 @@ impl EpubReaderApp {
         } else if visible.is_empty() {
             self.render_empty_group(cx)
         } else {
-            self.render_book_grid(&visible, cx)
+            match self.book_view {
+                BookViewMode::Cards => self.render_book_grid(&visible, cx),
+                BookViewMode::List => self.render_book_list(&visible, cx),
+            }
         };
 
         div()
@@ -323,6 +338,163 @@ impl EpubReaderApp {
             scope,
             palette(cx),
         )
+    }
+
+    /// The sort menu of the shelf: pick the field, then the direction. Both the
+    /// card grid and the list reorder through this one choice.
+    pub(super) fn render_book_sort_button(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let view = cx.entity().clone();
+        let field = self.book_sort;
+        let direction = self.book_sort_direction;
+        let ascending = direction.is_ascending();
+
+        Button::new("library-sort")
+            .ghost()
+            .small()
+            .icon(if ascending {
+                IconName::SortAscending
+            } else {
+                IconName::SortDescending
+            })
+            .label(format!("按{}", field.label()))
+            .tooltip("排序方式")
+            .debug_selector(|| "library-sort".into())
+            .dropdown_menu({
+                let menu_view = view.clone();
+                move |menu, _, _| {
+                    let mut menu = menu;
+                    for candidate in [
+                        BookSortField::Title,
+                        BookSortField::Author,
+                        BookSortField::AddedAt,
+                    ] {
+                        let item_view = menu_view.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(candidate.label())
+                                .checked(candidate == field)
+                                .on_click(move |_, _, cx| {
+                                    item_view.update(cx, |this, cx| {
+                                        this.set_book_sort_field(candidate, cx)
+                                    });
+                                }),
+                        );
+                    }
+                    let ascending_view = menu_view.clone();
+                    let descending_view = menu_view.clone();
+                    menu.separator()
+                        .item(
+                            PopupMenuItem::new("升序")
+                                .icon(Icon::new(IconName::SortAscending))
+                                .checked(ascending)
+                                .on_click(move |_, _, cx| {
+                                    ascending_view.update(cx, |this, cx| {
+                                        this.set_book_sort_direction(
+                                            BookSortDirection::Ascending,
+                                            cx,
+                                        )
+                                    });
+                                }),
+                        )
+                        .item(
+                            PopupMenuItem::new("降序")
+                                .icon(Icon::new(IconName::SortDescending))
+                                .checked(!ascending)
+                                .on_click(move |_, _, cx| {
+                                    descending_view.update(cx, |this, cx| {
+                                        this.set_book_sort_direction(
+                                            BookSortDirection::Descending,
+                                            cx,
+                                        )
+                                    });
+                                }),
+                        )
+                }
+            })
+            .into_any_element()
+    }
+
+    /// Card grid or one-book-per-row list. Built as segmented buttons instead
+    /// of a `TabBar`: its tabs do not expose `debug_selector`, and the GUI
+    /// smoke runs and GPUI tests locate controls through selectors.
+    pub(super) fn render_book_view_toggle(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let view = cx.entity().clone();
+        let current = self.book_view;
+        let mut tabs = Vec::new();
+        for (mode, selector, icon, label, tooltip) in [
+            (
+                BookViewMode::Cards,
+                "library-view-cards",
+                IconName::LayoutDashboard,
+                "卡片",
+                "封面卡片",
+            ),
+            (
+                BookViewMode::List,
+                "library-view-list",
+                IconName::Menu,
+                "列表",
+                "一行一本",
+            ),
+        ] {
+            let tab_view = view.clone();
+            tabs.push(
+                Button::new(selector)
+                    .ghost()
+                    .small()
+                    .icon(icon)
+                    .label(label)
+                    .tooltip(tooltip)
+                    .selected(mode == current)
+                    .debug_selector(move || selector.to_string())
+                    .on_click(move |_, _, cx| {
+                        tab_view.update(cx, |this, cx| this.set_book_view(mode, cx));
+                    })
+                    .into_any_element(),
+            );
+        }
+
+        div()
+            .h_flex()
+            .flex_none()
+            .gap_0p5()
+            .p_0p5()
+            .rounded(px(9.))
+            .border_1()
+            .border_color(rgb(palette(cx).border))
+            .bg(rgb(palette(cx).surface))
+            .children(tabs)
+            .into_any_element()
+    }
+
+    /// Picking a field applies that field's default direction; the direction
+    /// items in the menu then toggle it without changing the field.
+    pub(super) fn set_book_sort_field(&mut self, field: BookSortField, cx: &mut Context<Self>) {
+        if self.book_sort == field {
+            return;
+        }
+        self.book_sort = field;
+        self.book_sort_direction = field.default_direction();
+        cx.notify();
+    }
+
+    pub(super) fn set_book_sort_direction(
+        &mut self,
+        direction: BookSortDirection,
+        cx: &mut Context<Self>,
+    ) {
+        if self.book_sort_direction == direction {
+            return;
+        }
+        self.book_sort_direction = direction;
+        cx.notify();
+    }
+
+    pub(super) fn set_book_view(&mut self, view: BookViewMode, cx: &mut Context<Self>) {
+        if self.book_view == view {
+            return;
+        }
+        self.book_view = view;
+        cx.notify();
     }
 
     pub(super) fn group_heading(&self, visible: usize) -> (String, String) {

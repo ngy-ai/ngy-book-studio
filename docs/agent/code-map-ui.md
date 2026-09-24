@@ -110,6 +110,12 @@
   宿主引用校验。TextView 在 flex 消息列内必须获得扣除 padding、边框和复制按钮后的
   明确像素宽度；仅用 `w_full()` 会使 Windows 上的短列表正文被裁掉，测试字体不一定
   复现。`src/ui/ai_sidebar/` 保存展示清洗和 GPUI 选择、流式更新回归。
+  图书库的视图状态（分组筛选、排序字段与方向、卡片 / 列表）和它们的纯函数都在
+  `ui/library/state.rs`；排序只在 `visible_book_indices()` 的出口按当前选择应用一次，
+  卡片与列表因此共用同一顺序、同一份右键菜单（`book_menu.rs`）和同一套行级操作，
+  布局差异只在 `render_books.rs` 与 `render_list.rs`。排序与展示方式是窗口内的视图
+  选择，不写入 settings；列表行与卡片一样双击打开，行的纵向顺序可以用
+  `book-row-<id>` 选择器断言。
   编辑器导航按独立 `TocNode` 树显示，节点 ID 与正文单元 ID 分开保存，不能用目录
   序号定位线性正文，也不能将同一单元的多个目录项合并。`src/ui/editor/navigation.rs`
   提供树展平和按节点缩进/提升；正文保存仅在章名实际改变时更新同名目录，保留
