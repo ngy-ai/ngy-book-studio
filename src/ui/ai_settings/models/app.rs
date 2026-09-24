@@ -135,7 +135,7 @@ impl ModelsSettingsWindow {
                 .default_value(settings.vision_model.clone())
                 .placeholder(DEFAULT_VISION_MODEL)
         });
-        Self {
+        let mut this = Self {
             services,
             endpoints,
             chat_endpoint_id: settings.endpoint_routing.chat_endpoint_id,
@@ -151,7 +151,54 @@ impl ModelsSettingsWindow {
             vision_model_input,
             active_model_tab: MODEL_TABS[0],
             state: SettingsWindowState::new(window),
+            activation_subscription: None,
+        };
+        // Endpoint 列表由「Endpoint」窗口维护。本窗口只在打开时读一次那份设置，所以窗口
+        // 没关的时候那边保存的新增、改名或删除都要靠这里跟上，否则新 Endpoint 在模型设置
+        // 里根本选不到（见 `refresh_endpoints`）。
+        this.activation_subscription =
+            Some(cx.observe_window_activation(window, |this, window, cx| {
+                if window.is_window_active() {
+                    this.refresh_endpoints(window, cx);
+                }
+            }));
+        this
+    }
+
+    /// 按当前已保存的 Endpoint 列表刷新 Endpoint 选择项。
+    ///
+    /// 只刷新这份列表与它带来的连带结果：各模型名、生成参数与角色绑定都是本窗口的草稿，
+    /// 不在刷新范围内。所以「Endpoint」窗口里未保存的输入不会漏进来，本窗口没提交的输入
+    /// 也不会被覆盖。
+    pub(crate) fn refresh_endpoints(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.busy() {
+            return;
         }
+        let Ok(settings) = self.services.provider_settings() else {
+            return;
+        };
+        if !refresh_endpoint_drafts(self, settings.endpoints(), window, cx) {
+            return;
+        }
+        // 被删掉的 Endpoint 可能还是某个角色在本窗口里的选择（那边的删除只按已保存绑定
+        // 拦截）。留着它会变成一个界面上选不中、直到保存才报错的绑定，所以退回默认 Endpoint。
+        let stale: Vec<ModelRole> = MODEL_TABS
+            .into_iter()
+            .filter(|role| {
+                let id = self.endpoint_id_for(*role);
+                !self.endpoints.iter().any(|endpoint| endpoint.id == id)
+            })
+            .collect();
+        if !stale.is_empty() {
+            for role in stale {
+                self.assign_endpoint(role, DEFAULT_ENDPOINT_ID, cx);
+            }
+            self.state.report(
+                "有模型之前选择的 Endpoint 已不存在，已改回「默认 Endpoint」；点击“保存设置”后生效。",
+                false,
+            );
+        }
+        cx.notify();
     }
 
     /// 以已保存设置为底，只覆盖本窗口负责的字段。Endpoint 列表由 Endpoint 窗口维护。
@@ -265,8 +312,8 @@ impl ModelsSettingsWindow {
         let mut children = vec![
             card_note(
                 theme,
-                "Endpoint 名称与地址在「Endpoint」窗口里编辑；这里的选择在打开本窗口时读取，\
-                 那边新增或改名后重新打开本窗口即可看到。",
+                "Endpoint 名称与地址在「Endpoint」窗口里编辑；那边保存后，回到本窗口时会自动\
+                 刷新这份列表（窗口不必关掉重开）。",
             ),
             self.render_model_tabs(cx),
             self.render_role_panel(self.active_model_tab, cx),

@@ -3,7 +3,8 @@
 use super::super::tests_support::*;
 use super::*;
 use gpui::{Modifiers, TestAppContext, VisualTestContext};
-use ngy_book_studio::services::{DEFAULT_ENDPOINT_ID, DEFAULT_TRANSLATION_MODEL};
+use ngy_book_studio::ai::DEFAULT_AI_REQUEST_TIMEOUT_SECS;
+use ngy_book_studio::services::{DEFAULT_ENDPOINT_ID, DEFAULT_TRANSLATION_MODEL, EndpointSettings};
 
 fn open_window(
     cx: &mut TestAppContext,
@@ -13,6 +14,37 @@ fn open_window(
     &mut VisualTestContext,
 ) {
     open_settings_view::<ModelsSettingsWindow>(cx, ModelsSettingsWindow::new)
+}
+
+fn endpoint_fixture(name: &str, port: u16) -> EndpointSettings {
+    EndpointSettings {
+        id: format!("endpoint-{name}"),
+        name: name.to_string(),
+        base_url: format!("http://127.0.0.1:{port}/v1"),
+        remote_content_confirmed: false,
+        allow_insecure_remote_http: false,
+        confirmed_remote_endpoint: String::new(),
+        request_timeout_secs: DEFAULT_AI_REQUEST_TIMEOUT_SECS,
+    }
+}
+
+/// 走服务层保存一份新的 Endpoint 列表，等价于在「Endpoint」窗口里保存。
+fn save_endpoints(services: &Arc<AppServices>, endpoints: Vec<EndpointSettings>) {
+    services
+        .runtime()
+        .block_on(async {
+            let mut saved = services.provider_settings().unwrap();
+            saved.endpoint_routing.additional_endpoints = endpoints;
+            services.configure_providers(saved, BTreeMap::new()).await
+        })
+        .unwrap();
+}
+
+/// 模拟用户离开本窗口又回到本窗口。
+fn refocus(visual: &mut VisualTestContext) {
+    visual.deactivate_window();
+    visual.update(|window, _| window.activate_window());
+    redraw(visual);
 }
 
 #[gpui::test]
@@ -306,5 +338,77 @@ fn model_tabs_switch_the_visible_role_and_keep_translation_independent(cx: &mut 
             view.translation_model_input.read(cx).value().as_ref(),
             "translation-only-model"
         );
+    });
+}
+
+/// Endpoint 列表由「Endpoint」窗口维护：那边保存之后，模型设置窗口重新获得焦点时必须
+/// 跟上。否则新加的 Endpoint 在这里根本选不到（此前只能关掉本窗口再打开）。
+#[gpui::test]
+fn endpoint_choices_follow_the_saved_list_when_the_window_regains_focus(cx: &mut TestAppContext) {
+    let (_directory, settings, visual) = open_window(cx);
+    visual.simulate_resize(size(px(1080.), px(1600.)));
+    redraw(visual);
+    assert!(visual.debug_bounds("ai-chat-endpoint-0").is_some());
+    assert!(
+        visual.debug_bounds("ai-chat-endpoint-1").is_none(),
+        "只有一个 Endpoint 时不该有第二个选择项"
+    );
+
+    let services = settings.read_with(visual, |view, _| Arc::clone(&view.services));
+    save_endpoints(
+        &services,
+        vec![
+            endpoint_fixture("second", 21441),
+            endpoint_fixture("third", 21442),
+        ],
+    );
+
+    // 窗口一直没关，只是切走又切回来：列表按已保存的 Endpoint 刷新。
+    refocus(visual);
+    settings.read_with(visual, |view, _| {
+        let ids: Vec<&str> = view
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![DEFAULT_ENDPOINT_ID, "endpoint-second", "endpoint-third"]
+        );
+    });
+    click(visual, "ai-chat-endpoint-2");
+    settings.read_with(visual, |view, _| {
+        assert_eq!(view.chat_endpoint_id, "endpoint-third");
+    });
+
+    // 那边改名、改地址后同样跟上：草稿按新的已保存值重建。
+    let mut renamed = endpoint_fixture("second", 21443);
+    renamed.name = "second-renamed".into();
+    save_endpoints(&services, vec![renamed, endpoint_fixture("third", 21442)]);
+    refocus(visual);
+    settings.read_with(visual, |view, cx| {
+        let draft = view
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.id == "endpoint-second")
+            .expect("改名后的 Endpoint 仍在列表里");
+        assert_eq!(draft.name_input.read(cx).value().as_ref(), "second-renamed");
+        assert_eq!(
+            draft.base_url_input.read(cx).value().as_ref(),
+            "http://127.0.0.1:21443/v1"
+        );
+        // 其它模型的草稿不受影响。
+        assert_eq!(view.chat_endpoint_id, "endpoint-third");
+    });
+
+    // 那边删掉本窗口里选中、但还没保存的 Endpoint（删除只按已保存绑定拦截）：选择退回
+    // 默认 Endpoint，保存不再报「绑定的 Endpoint 不存在」。
+    save_endpoints(&services, vec![endpoint_fixture("second", 21443)]);
+    refocus(visual);
+    settings.read_with(visual, |view, cx| {
+        assert_eq!(view.endpoints.len(), 2);
+        assert_eq!(view.chat_endpoint_id, DEFAULT_ENDPOINT_ID);
+        assert!(!view.state.notice().unwrap().error);
+        assert!(view.entered_settings(cx).is_ok());
     });
 }

@@ -196,6 +196,70 @@ pub(crate) fn set_delete_endpoint_key<V: EndpointBackedWindow>(
     }
 }
 
+/// 用当前已保存的 Endpoint 列表刷新草稿列表，返回列表是否真的变了。
+///
+/// 模型设置窗口的 Endpoint 选择来自打开窗口时的一份快照，而 Endpoint 列表由「Endpoint」
+/// 窗口维护：那边新增、改名、改地址或删除并保存之后，这份快照必须跟上，否则新 Endpoint
+/// 在模型设置里根本选不到。同一个 id 且已保存取值逐字相同的草稿原样保留（输入内容与最近
+/// 一次检测结果都不丢）；取值变了或新增的按已保存值重建；消失的移除；顺序以已保存列表为准。
+///
+/// 只读已保存设置，不改写草稿里的未提交输入（模型设置窗口本来就不可编辑这些字段），
+/// 也不写数据库：提交仍由各窗口自己的保存路径负责。
+pub(crate) fn refresh_endpoint_drafts<V: EndpointBackedWindow>(
+    this: &mut V,
+    saved: Vec<EndpointSettings>,
+    window: &mut Window,
+    cx: &mut Context<V>,
+) -> bool {
+    let before: Vec<String> = this
+        .endpoints()
+        .iter()
+        .map(|draft| draft.id.clone())
+        .collect();
+    let mut existing = std::mem::take(this.endpoints_mut());
+    let mut refreshed = Vec::with_capacity(saved.len());
+    let mut changed = false;
+    for endpoint in saved {
+        match existing.iter().position(|draft| draft.id == endpoint.id) {
+            Some(index) => {
+                let draft = existing.remove(index);
+                if endpoint_matches_draft(&draft, &endpoint, cx) {
+                    refreshed.push(draft);
+                } else {
+                    // 已保存的名称、地址或授权变了：整个草稿重建，旧的检测结果随之作废。
+                    refreshed.push(new_endpoint_draft(endpoint, window, cx));
+                    changed = true;
+                }
+            }
+            None => {
+                refreshed.push(new_endpoint_draft(endpoint, window, cx));
+                changed = true;
+            }
+        }
+    }
+    // 已保存列表里已经没有的 Endpoint，草稿也一并去掉。
+    changed |= !existing.is_empty();
+    changed |= before.len() != refreshed.len()
+        || before
+            .iter()
+            .zip(refreshed.iter())
+            .any(|(id, draft)| *id != draft.id);
+    *this.endpoints_mut() = refreshed;
+    changed
+}
+
+/// 草稿的取值是否与已保存的 Endpoint 逐字相同。模型设置窗口不编辑 Endpoint 字段，所以
+/// 只有「那边保存过改动」才会返回 false。
+fn endpoint_matches_draft(draft: &EndpointDraft, saved: &EndpointSettings, cx: &App) -> bool {
+    draft.name_input.read(cx).value().as_ref() == saved.name.as_str()
+        && draft.base_url_input.read(cx).value().as_ref() == saved.base_url.as_str()
+        && draft.request_timeout_input.read(cx).value().as_ref()
+            == saved.request_timeout_secs.to_string().as_str()
+        && draft.remote_content_confirmed == saved.remote_content_confirmed
+        && draft.allow_insecure_remote_http == saved.allow_insecure_remote_http
+        && draft.confirmed_remote_endpoint == saved.confirmed_remote_endpoint
+}
+
 /// 读取某个 Endpoint 的模型列表。凭据与网络 I/O 都由 `AppServices` 派发到它自己的
 /// Tokio runtime 上，这个 GPUI 任务只负责等待与应用结果。
 pub(crate) fn detect_models<V: EndpointBackedWindow>(
