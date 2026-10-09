@@ -221,10 +221,27 @@ test("the trailing icon is the only toggle between translation-only and bilingua
       };
     });
     assert.equal(initial.display, "none", "translation-only mode hides the original");
-    assert.equal(initial.icons, 6, "one reveal icon per collapsible translated block: the table cell stays bilingual");
+    assert.equal(initial.icons, 7, "every collapsible translated block carries one reveal icon, the table cell included");
     assert.equal(initial.label, "显示原文", "the icon names the action it offers");
     assert.equal(initial.text, "甲一");
     assert.equal(initial.layerText, "甲一", "the icon adds no text to the layer it trails");
+
+    // A table cell is collapsible as well: 「译文」 mode hides the wrapped
+    // original inside the cell and keeps the cell box itself visible.
+    const cell = await page.evaluate(() => {
+      const element = document.getElementById("cell");
+      const layer = element.firstElementChild;
+      return {
+        cellDisplay: element.style.display,
+        wrapperDisplay: element.lastElementChild.style.display,
+        icon: !!layer.querySelector("[data-ngy-translation-reveal]"),
+        text: layer.querySelector(".ngy-translation-text").textContent,
+      };
+    });
+    assert.equal(cell.icon, true, "the table cell carries its own reveal icon");
+    assert.equal(cell.text, "单元格");
+    assert.equal(cell.wrapperDisplay, "none", "translation-only hides only the wrapped original inside the cell");
+    assert.equal(cell.cellDisplay, "", "the cell box stays visible, or the translation would vanish with it");
 
     // Clicking the translated text itself no longer toggles: that is where a
     // reader selects and copies, and a drag used to flip the paragraph.
@@ -591,6 +608,7 @@ for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; c
           cellDisplay: getComputedStyle(document.getElementById("table-cell")).display,
           cellText: translation("table-cell").textContent,
           cellCollapsed: translation("table-cell").parentElement.getAttribute("data-ngy-collapsed"),
+          cellOriginalHidden: document.getElementById("table-cell").lastElementChild.style.display,
           mediaVisible: getComputedStyle(document.getElementById("media")).display !== "none",
           imageIdentity: document.getElementById("original-image") === window.__originalImage,
           mediaCopies: document.querySelectorAll("img").length,
@@ -618,7 +636,8 @@ for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; c
       assert.equal(state.headerColumns, 2);
       assert.equal(state.cellDisplay, "table-cell");
       assert.equal(state.cellText, "单元格 内容");
-      assert.equal(state.cellCollapsed, "0", "table cells stay bilingual");
+      assert.equal(state.cellCollapsed, "1", "translation-only collapses the original inside a table cell too");
+      assert.equal(state.cellOriginalHidden, "none", "only the wrapped original is hidden, never the cell itself");
       assert.equal(state.mediaVisible, true, "translation-only preference never hides the original illustration");
       assert.equal(state.imageIdentity, true);
       assert.equal(state.mediaCopies, 1);

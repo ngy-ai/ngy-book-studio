@@ -635,9 +635,13 @@
 
     let original = element;
     let wrapper = null;
-    if (tag(element) === "li") {
-      // Keep the real LI and its marker. Moving its existing nodes into a
-      // reversible wrapper retains their identities and book-text order.
+    if (inPlace) {
+      // Keep the real LI/TD/TH and its box or marker. Moving its existing nodes
+      // into a reversible wrapper (instead of hiding the element itself)
+      // retains their identities and book-text order, and lets 「译文」 mode
+      // hide just the original: the translation layer sits beside the wrapper
+      // inside the same element, so hiding the element would hide it too.
+      // `display:contents` keeps the moved nodes in the original box.
       wrapper = create("span");
       wrapper.style.setProperty("display", "contents", "important");
       wrapper.append(...element.childNodes);
@@ -659,11 +663,11 @@
     };
     layerStates.set(layer, state);
     // 「译文」is the only mode that hides the original, so the reveal icon only
-    // exists there, and a block that may not be collapsed at all — a table cell
-    // or a paragraph carrying media — stays bilingual without one. Decided
-    // before any chrome is inserted: the icon is a `<button>` and `MEDIA`
-    // matches buttons, so a later check would disable itself.
-    const revealable = translateOnly && !isCell(element) && !element.querySelector(MEDIA);
+    // exists there, and a block that may not be collapsed at all — one carrying
+    // media — stays bilingual without one. Decided before any chrome is
+    // inserted: the icon is a `<button>` and `MEDIA` matches buttons, so a
+    // later check would disable itself.
+    const revealable = translateOnly && !element.querySelector(MEDIA);
     if (inPlace) element.insertBefore(layer, element.firstChild);
     else element.parentNode.insertBefore(layer, element);
     if (revealable) appendReveal(state, text);
