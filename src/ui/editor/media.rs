@@ -85,6 +85,7 @@ impl EditorApp {
             text: format!("正在读取{label}…"),
             error: false,
         });
+        let book_id = self.book_id.clone();
         cx.spawn_in(window, async move |view, cx| {
             let path = match dialog.show() {
                 Ok(Some(path)) => path,
@@ -130,7 +131,7 @@ impl EditorApp {
                     .unwrap_or(label)
                     .to_string();
                 MediaDraft::from_bytes(kind, media_type, file_name, bytes)
-                    .map(|draft| PreparedEditorMedia::new(draft.with_title(title)))
+                    .map(|draft| PreparedEditorMedia::new(&book_id, draft.with_title(title)))
             });
             let result = task.await;
             let _ = view.update_in(cx, |this, window, cx| {

@@ -7,7 +7,7 @@ use gpui::{
     MouseButton, ParentElement, Pixels, Point, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent,
     StatefulInteractiveElement, Styled, TestAppContext, VisualTestContext, Window, div, point, px,
 };
-use gpui_component::{Root, StyledExt, clipboard::Clipboard};
+use gpui_component::{Root, StyledExt};
 use std::time::Duration;
 
 const TEXT_ID: &str = "ai-markdown-message-regression";
@@ -23,8 +23,10 @@ struct BubbleProbe {
 
 impl Render for BubbleProbe {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Keep the production message card and clipboard sibling: testing an
-        // unconstrained TextView alone misses nested flex measurement defects.
+        // Keep the production message card: testing an unconstrained TextView
+        // alone misses nested flex measurement defects. The action row (copy,
+        // edit, regenerate) lives below the bubble in production, outside the
+        // text column, so the probe must not reserve a button column either.
         div().w(self.width).h(px(400.)).child(
             div()
                 .v_flex()
@@ -41,7 +43,6 @@ impl Render for BubbleProbe {
                         .h_flex()
                         .min_w(px(0.))
                         .items_start()
-                        .gap_1()
                         .line_height(gpui::relative(1.5))
                         .child(
                             div()
@@ -57,11 +58,6 @@ impl Render for BubbleProbe {
                                     window,
                                     cx,
                                 )),
-                        )
-                        .child(
-                            div().w(px(24.)).flex_shrink_0().child(
-                                Clipboard::new("ai-markdown-bubble-copy").value(LIST_MESSAGE),
-                            ),
                         ),
                 ),
         )
@@ -272,9 +268,9 @@ fn narrow_answer_bubble_keeps_short_and_wrapped_list_item_text_selectable(cx: &m
         assert!(bounds.size.height > px(60.), "{width}: {bounds:?}");
         assert!(bounds.bottom() < px(400.), "{width}: {bounds:?}");
 
-        // Drag only in the message's text column, never over Clipboard. The
-        // clipboard payload must come from painted, selectable list body text,
-        // rather than the separate full-message copy button's stored source.
+        // Drag only inside the message's text column. The clipboard payload
+        // must come from painted, selectable list body text, never from a
+        // message action button's stored source.
         select(
             visual,
             bounds.origin + point(px(1.), px(1.)),

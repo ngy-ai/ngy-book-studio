@@ -202,6 +202,7 @@ fn editor_protocol_separates_trusted_shell_from_canonical_content() {
 fn editor_protocol_rewrites_and_serves_new_media_from_the_private_origin() {
     let bytes = Arc::new(b"new-audio-bytes".to_vec());
     let asset = AssetRef::from_bytes(
+        "book-a",
         AssetRole::Audio,
         "audio/mpeg",
         Some("sample.mp3".to_string()),
@@ -321,7 +322,13 @@ fn editor_protocol_rewrites_and_serves_new_media_from_the_private_origin() {
 #[test]
 fn editor_media_protocol_supports_seek_ranges_and_unsatisfiable_ranges() {
     let bytes = Arc::new(b"0123456789".to_vec());
-    let asset = AssetRef::from_bytes(AssetRole::Audio, "audio/ogg", None, bytes.as_slice());
+    let asset = AssetRef::from_bytes(
+        "book-a",
+        AssetRole::Audio,
+        "audio/ogg",
+        None,
+        bytes.as_slice(),
+    );
     let document = document_with_audio("book-a", asset.clone());
     let state = EditorWebState::new(
         "book-a".to_string(),

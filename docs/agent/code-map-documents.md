@@ -107,22 +107,37 @@
   `chats.json` / `translations.json`，`read_share_package` 逐条限额，条目数与清单不符、
   版本不受支持或不是 ZIP 都明确拒绝；`is_share_package` 只读清单做内容签名判定，导入
   对话框据此路由，扩展名不参与判断。
+  **图书先按 ID 认领**：导入先查 `db::books::get(manifest.book.id)`。所有导入器的
+  book id 都是 `deterministic_id("book", 原件内容哈希)`，命中就等于对方手里是同一份
+  原件，于是直接复用那本书（`ShareBookOutcome::Reused`，不导入包里的投影，也不改分组）；
+  未命中才走 `FormatRegistry::import` 发布投影（`Added` / `AlreadyImported`）。复用路上
+  两侧 book/unit/块 ID 完全相同，是引用能精确到块的唯一情形（见 `docs/adr/`）。
   **分区条目只按「章节序号 + 原文引用」定位，绝不写发送方的图书、内容单元或文本块 ID**：
   book id 由导入原件的内容哈希派生、unit id 由 book id + 序号 + href 派生、
-  `{unit}::h{index}` 的块标识又由 unit id 派生，接收方重新导入同一份文本也必然得到
+  `{unit}::h{index}` 的块标识又由 unit id 派生，接收方若必须重新导入同一份文本就会得到
   另一套 ID。因此导入按序重锚：笔记用接收方阅读章节的正文 UTF-16 范围复验
-  （`reader_body_text` + `validate_anchor`），会话引用重建为章级 `DocumentLocator`
-  并丢掉发送方的 `search_chunk_id`（接收方索引是本地派生的），译文按接收方
+  （`reader_body_text` + `validate_anchor`；Page 单元按既有页面规则比对范围长度），
+  引用只在复用路上保留发送方的块级 `locator_json`（`preserve_locators`，经
+  `validate_current_chat_citation` 逐条复验），否则重建为章级 `DocumentLocator`；
+  两条路都丢掉发送方的 `search_chunk_id`（接收方索引是本地派生的），译文按接收方
   `{unit}::h{index}` 形状重挂；对不上的条目逐条跳过并在结果里计数，不按引文搜索重定位。
-  只导出当前可显示的数据（失效笔记、过期译文、内部 system/tool 消息不写入），
-  笔记用 `insert_if_absent`、会话用确定性 ID 跳过已存在的行，所以重复导入不会产生重复。
+  **章节数不一致（`manifest.book.units` ≠ 本地 `document.units.len()`）时整批放弃分区**，
+  只把书写进库，并在 `ShareImportOutcome::sections_note` 里说明——序号会指向别的章节；
+  这条闸门对复用路和落投影路都生效（复用命中的书可能被本地编辑过）。
+  只导出当前可显示的数据（失效笔记、过期译文、内部 system/tool 消息不写入）。
+  重复导入不会产生重复：笔记用确定性 ID + `insert_if_absent`，会话 ID 由
+  「标题 + 创建时间 + 首条消息的时间与内容哈希」决定（**不含它在列表里的位置**，否则
+  发送方在旧会话里追问一句就会让该会话换号并被重复导入），已存在的会话只**追加**缺失的
+  轮次，所以对方重新分享一次更新后的对话是补充而不是复制。
   **接收方已在同一选区划的线不会被分享包改色**：同锚点已有划线时只在样式相同时按无操作
   成功，样式不同按跳过处理，绝不把别人的书签改成分享方的样式。
   译文按接收方当前翻译模型与 `translation_execution_identity` 重新署名（
   `AppServices::share_translation_stamp`），否则阅读端按模型/身份过滤会把分享来的机器译文
-  全部隐藏；接收方未配置翻译模型时保留发送方身份并等设置对齐。分享包以规范化 EPUB 投影
-  为载体，因此 PDF/DjVu 页面笔记（锚在 PDF.js 页面文字层上）无法在接收方章节正文上复验，
-  会被跳过。
+  全部隐藏；接收方未配置翻译模型时保留发送方身份并等设置对齐。**只有整包单一目标语言
+  才连目标语言一起改写**：多种语言落到同一个
+  `(book, unit, block_id, target_language)` 上会互相覆盖。分享包以规范化 EPUB 投影为
+  载体，因此 PDF/DjVu 页面笔记（锚在 PDF.js 页面文字层上）在落投影路上无法复验、随分区
+  跳过，只有复用同一本书时才按页面规则导入。
 - `src/db/`：SQLite 连接、当前结构、单表 CRUD/查询映射和跨表事务。每张表对应一个
   文件：`books.rs`、`book_sources.rs`、`content_units.rs`、`toc_entries.rs`、
   `blobs.rs`、`assets.rs`、`asset_refs.rs`、`progress.rs`、`search_chunks.rs`、

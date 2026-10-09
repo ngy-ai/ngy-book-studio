@@ -54,7 +54,7 @@
   默认或关闭时，新导入、创建或保存编辑仍须在文档事务内创建 `visual_render`、`vision`、
   `embedding` 三类任务，但初始状态为 `Paused` 且未开始；已有任务不随设置切换改变状态，
   用户仍可在后台任务窗口逐项恢复。
-  同一 key 还保存后台任务调度（`concurrency` 1–1024 默认 1、`interval_ms` 0–60000 默认 10），
+  同一 key 还保存后台任务调度（`concurrency` 1–64 默认 1、`interval_ms` 0–60000 默认 10），
   读取时钳制而不是报错，坏行不得让图书库无法打开；两者不属于 Provider JSON，保存后经
   `configure_scheduling` 立即作用于后续任务，正在运行的任务不被打断。
 - PDF 紧凑阅读使用独立 settings key（`pdf.reader.preferences.v1`，默认关闭，AI 设置的

@@ -31,6 +31,9 @@ pub(crate) fn restored_messages(session: ChatSession) -> Vec<AiRestoredMessage> 
                     .filter_map(source_link_from_chat_citation)
                     .collect(),
                 source_status,
+                // Restored messages are stored messages: the anchor that a
+                // later edit or regeneration rewinds the thread to.
+                db_id: message.id,
             })
         })
         .collect()

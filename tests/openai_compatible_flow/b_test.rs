@@ -151,6 +151,7 @@ pub(crate) fn http_tool_budget_finishes_and_persists_a_reader_answer_after_six_c
                     allowed_book_ids: vec![book.id.clone()],
                     book_titles: vec![(book.id.clone(), book.title.clone())],
                     snapshots: Vec::new(),
+                    truncate_from: None,
                 },
                 None,
             )

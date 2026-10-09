@@ -44,6 +44,76 @@ impl AiSidebar {
         cx.notify();
     }
 
+    /// Starts editing one user message: its text moves back into the input
+    /// box, the message and everything after it leave the transcript, and the
+    /// stored thread rewinds to that message once the edit is submitted.
+    pub(super) fn edit_message(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.sessions.busy || self.pending_scope_sync {
+            return;
+        }
+        let Some(text) = self.conversation.begin_edit(index) else {
+            return;
+        };
+        self.input.update(cx, |input, cx| {
+            input.set_value(text, window, cx);
+            input.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Regenerates one answer: the question that produced it is asked again
+    /// and the stored thread rewinds to that question, so the replacement
+    /// answer takes the old turn's place.
+    pub(super) fn regenerate_message(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.sessions.busy || self.pending_scope_sync {
+            return;
+        }
+        let Some(question) = self.conversation.begin_regenerate(index) else {
+            return;
+        };
+        let Some(request) = self.conversation.begin(&question) else {
+            return;
+        };
+        cx.emit(AiSidebarEvent::Submit(request));
+        cx.notify();
+    }
+
+    /// Deletes one question and its answer.
+    ///
+    /// A question with a recorded stored ID is removed through the controller
+    /// and the sidebar waits for the reloaded transcript: a storage failure
+    /// must leave the displayed conversation untouched instead of showing a
+    /// deletion that never reached the database. A question that never reached
+    /// persistence (a failed or cancelled request) only leaves the local
+    /// transcript.
+    pub(super) fn delete_turn(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.sessions.busy || self.pending_scope_sync {
+            return;
+        }
+        let Some(deletion) = self.conversation.turn_deletion(index) else {
+            return;
+        };
+        match deletion {
+            TurnDeletion::LocalOnly => {
+                if self.conversation.discard_turn(index) {
+                    cx.notify();
+                }
+            }
+            TurnDeletion::Stored(user_db_id) => {
+                if !self.sessions.begin() {
+                    return;
+                }
+                cx.emit(AiSidebarEvent::DeleteTurn { user_db_id });
+                cx.notify();
+            }
+        }
+    }
+
     pub(super) fn cancel(&mut self, cx: &mut Context<Self>) {
         let Some(request_id) = self.conversation.cancel() else {
             return;

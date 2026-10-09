@@ -527,6 +527,7 @@ impl EpubReaderApp {
             .right_6()
             .bottom(px(STATUS_BAR_HEIGHT + 16.))
             .h_flex()
+            .items_start()
             .max_w(px(520.))
             .gap_2()
             .px_4()
@@ -542,7 +543,15 @@ impl EpubReaderApp {
             .text_sm()
             .text_color(foreground)
             .child(Icon::new(icon).small())
-            .child(notice.text.clone())
+            // 分享包导入这类提示可以很长。提示文字作为行的主轴子项时，自动最小尺寸
+            // 按整段文字计算，flex 收缩不生效，文字会溢出提示框而不是换行；显式把最小
+            // 宽度设为 0 才能让它在 `max_w` 内收缩并按可用宽度折行。
+            .child(
+                div()
+                    .min_w(px(0.))
+                    .line_height(gpui::relative(1.4))
+                    .child(notice.text.clone()),
+            )
             .into_any_element()
     }
 }

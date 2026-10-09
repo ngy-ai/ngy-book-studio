@@ -56,6 +56,15 @@ impl PdfReaderApp {
                     });
                 }
             }
+            AiSidebarEvent::DeleteTurn { user_db_id } => {
+                if let Some(controller) = self.ai_controller.as_mut() {
+                    controller.delete_turn(user_db_id.clone(), sidebar.clone(), cx);
+                } else {
+                    sidebar.update(cx, |sidebar, cx| {
+                        sidebar.fail_session_operation("AI 会话尚未初始化，请稍后重试。", cx);
+                    });
+                }
+            }
             AiSidebarEvent::ScopeChanged { book_ids } => {
                 if let Some(controller) = self.ai_controller.as_mut() {
                     controller.reconcile_scope(book_ids.clone(), sidebar.clone(), cx);

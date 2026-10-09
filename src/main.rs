@@ -6,7 +6,6 @@ use gpui::{
     AnyWindowHandle, App, AppContext as _, Application, Bounds, WeakEntity, Window, WindowBounds,
     WindowOptions, px, size,
 };
-use gpui_component_assets::Assets;
 use native_dialog::{DialogBuilder, MessageLevel};
 use ngy_book_studio::{
     library::LibraryStore,
@@ -21,7 +20,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
-use ui::{DataDirSetupWindow, EpubReaderApp, open_data_dir_setup_window, wrap_root};
+use ui::{AppAssets, DataDirSetupWindow, EpubReaderApp, open_data_dir_setup_window, wrap_root};
 
 #[cfg(target_os = "windows")]
 const WEBVIEW2_DOWNLOAD_URL: &str =
@@ -59,7 +58,7 @@ fn main() {
     };
 
     Application::new()
-        .with_assets(Assets)
+        .with_assets(AppAssets)
         .run(move |cx: &mut App| {
             gpui_component::init(cx);
             match plan {

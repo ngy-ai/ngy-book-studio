@@ -156,6 +156,7 @@ impl EditorApp {
             clear_editor_cover_assignment(&mut document);
             if let Some(cover) = self.cover.clone() {
                 let mut asset = AssetRef::from_bytes(
+                    &document.id,
                     AssetRole::Cover,
                     cover.mime(),
                     None,

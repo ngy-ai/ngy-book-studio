@@ -4,12 +4,21 @@
 //! data domains that make a library feel like the reader's own: notes,
 //! conversations and whole-book translations.
 //!
-//! Sections are keyed by **content-unit ordinal**, never by the sender's IDs.
-//! Unit IDs are derived from the importing file's content hash and block IDs
-//! from the unit ID, so the receiver's own import of the same text produces
-//! different identifiers. Every item is therefore re-anchored against the
-//! receiving document and dropped — with a count reported back — when it no
-//! longer describes that text.
+//! Two things decide how faithfully a package lands.
+//!
+//! **Whose book is it.** Import first asks whether the sender's own book id is
+//! already in the library. Every importer derives that id from the original
+//! file's content hash, so a hit means the receiver owns the very same original
+//! — the same units, the same blocks, the same ids. Reusing that copy is both
+//! the friendly outcome (no duplicate book) and the exact one (citations keep
+//! their block, page notes keep their page rule). Only on a miss is the
+//! canonical projection published as a new book.
+//!
+//! **Where each item sits.** Sections are keyed by content-unit ordinal, never
+//! by the sender's IDs, because a receiver that had to import the projection
+//! derives different unit and block ids from the same text. Every item is
+//! re-anchored against the receiving document and dropped — with a count
+//! reported back — when it no longer describes that text.
 
 use super::*;
 
@@ -35,19 +44,35 @@ pub struct ShareExportSummary {
     pub target_language: Option<String>,
 }
 
+/// How the package's book ended up in the library.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShareBookOutcome {
+    /// The projection was published as a new book.
+    Added,
+    /// The library already held the sender's own book, so the shared sections
+    /// were applied to that copy and no second copy was created.
+    Reused,
+    /// The very same projection was already published here by an earlier
+    /// import; only the sections were applied.
+    AlreadyImported,
+}
+
 /// What one import actually restored.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShareImportOutcome {
     pub record: BookRecord,
-    /// `false` when the same book projection was already in the library and only
-    /// the shared sections were applied to it.
-    pub added: bool,
+    pub book: ShareBookOutcome,
+    /// Set when no section at all was applied, with the reason.
+    pub sections_note: Option<String>,
     pub notes_imported: usize,
     pub notes_skipped: usize,
+    /// Threads created by this import; re-importing only appends new messages.
     pub chat_threads: usize,
     pub chat_messages: usize,
     pub translations_imported: usize,
     pub translations_skipped: usize,
+    /// The language the imported machine译文 are stored under.
+    pub translations_language: Option<String>,
 }
 
 impl LibraryStore {
@@ -137,11 +162,9 @@ impl LibraryStore {
 
     /// Imports an already parsed package.
     ///
-    /// The book goes through the ordinary publish path, so a package whose
-    /// projection is already in the library is reported as a duplicate and only
-    /// its sections are applied. Sections are written in one transaction after
-    /// the book is visible; a failure there leaves the book imported and the
-    /// library otherwise untouched.
+    /// The book lands first and the sections are written in one transaction
+    /// afterwards, so a failure there leaves the book imported and the library
+    /// otherwise untouched.
     pub fn import_share_package_contents(
         &mut self,
         package: share::SharePackage,
@@ -164,27 +187,75 @@ impl LibraryStore {
             translations = translations.len(),
             "分享包：开始导入"
         );
-        let source = ImportSource {
-            file_name: Some(format!("{}.epub", share_book_stem(&manifest.book.title))),
-            bytes: Arc::new(book_epub),
+        // The sender's own book id is the content hash of the file they
+        // imported. A hit means this library holds that very same file, so its
+        // ids are the sender's and reusing it is both friendlier and more exact
+        // than publishing a second copy of the same text.
+        let owned = {
+            let conn = db::open_conn(&self.db_path)?;
+            db::books::get(&conn, &manifest.book.id)?
         };
-        let imported = self
-            .registry
-            .import(&source, &ImportLimits::default())
-            .context("分享包中的图书无法解析")?;
-        let (record, added) = match self.import_parsed(
-            imported,
-            group_id,
-            &format!("分享包《{}》", manifest.book.title),
-        )? {
-            ImportOutcome::Added(record) => (record, true),
-            ImportOutcome::AlreadyExists(record) => (record, false),
+        let (record, book) = match owned {
+            Some(record) => {
+                tracing::info!(
+                    target: "ngy_share",
+                    book_id = %record.id,
+                    "分享包：复用图书库中已有的同一本图书"
+                );
+                (record, ShareBookOutcome::Reused)
+            }
+            None => {
+                let source = ImportSource {
+                    file_name: Some(format!("{}.epub", share_book_stem(&manifest.book.title))),
+                    bytes: Arc::new(book_epub),
+                };
+                let imported = self
+                    .registry
+                    .import(&source, &ImportLimits::default())
+                    .context("分享包中的图书无法解析")?;
+                match self.import_parsed(
+                    imported,
+                    group_id,
+                    &format!("分享包《{}》", manifest.book.title),
+                )? {
+                    ImportOutcome::Added(record) => (record, ShareBookOutcome::Added),
+                    ImportOutcome::AlreadyExists(record) => {
+                        (record, ShareBookOutcome::AlreadyImported)
+                    }
+                }
+            }
         };
-        let report = self.apply_shared_sections(&record, &notes, &chats, &translations, stamp)?;
+        // Only a reused book is literally the sender's document, so only there
+        // may a citation keep the sender's block-level locator. A reused book
+        // also keeps its group: the receiver filed it, not the sender.
+        let preserve_locators = book == ShareBookOutcome::Reused;
+        let restamp_language = match (
+            stamp.and_then(|stamp| stamp.target_language.as_deref()),
+            manifest.translations.target_language.as_deref(),
+        ) {
+            // One shared language can adopt the receiver's reading language.
+            // Several cannot: they would all collapse onto one translation
+            // scope key and silently overwrite each other.
+            (Some(target), Some(_)) => Some(target),
+            _ => None,
+        };
+        let translations_language = restamp_language
+            .map(str::to_string)
+            .or_else(|| manifest.translations.target_language.clone());
+        let (report, sections_note) = self.apply_shared_sections(
+            &record,
+            &manifest,
+            &notes,
+            &chats,
+            &translations,
+            stamp,
+            restamp_language,
+            preserve_locators,
+        )?;
         tracing::info!(
             target: "ngy_share",
             book_id = %record.id,
-            added,
+            reused = preserve_locators,
             notes = report.notes_imported,
             notes_skipped = report.notes_skipped,
             threads = report.chat_threads,
@@ -195,26 +266,53 @@ impl LibraryStore {
         );
         Ok(ShareImportOutcome {
             record,
-            added,
+            book,
+            sections_note,
             notes_imported: report.notes_imported,
             notes_skipped: report.notes_skipped,
             chat_threads: report.chat_threads,
             chat_messages: report.chat_messages,
             translations_imported: report.translations_imported,
             translations_skipped: report.translations_skipped,
+            translations_language,
         })
     }
 
     /// Re-anchors and stores the package sections against the published book.
+    ///
+    /// Returns the report plus, when nothing could be applied, the reason.
+    #[allow(clippy::too_many_arguments)]
     fn apply_shared_sections(
         &self,
         record: &BookRecord,
+        manifest: &ShareManifest,
         notes: &[SharedNote],
         chats: &[SharedChatThread],
         translations: &[SharedTranslation],
         stamp: Option<&ShareTranslationStamp>,
-    ) -> Result<db::transactions::ShareApplyReport> {
+        restamp_language: Option<&str>,
+        preserve_locators: bool,
+    ) -> Result<(db::transactions::ShareApplyReport, Option<String>)> {
         let document = self.document(&record.id)?;
+        // Sections address chapters by position, so a document with a different
+        // number of chapters would attach somebody's note to the wrong text.
+        // The receiver still gets the book; only the sections are refused.
+        if document.units.len() != manifest.book.units {
+            let note = format!(
+                "分享包按 {} 章打包，图书库中的《{}》现在是 {} 章，章节对不上，其中的笔记、问答与译文都没有导入",
+                manifest.book.units,
+                record.title,
+                document.units.len()
+            );
+            tracing::warn!(
+                target: "ngy_share",
+                book_id = %record.id,
+                package_units = manifest.book.units,
+                local_units = document.units.len(),
+                "分享包：章节数不一致，跳过分区"
+            );
+            return Ok((db::transactions::ShareApplyReport::default(), Some(note)));
+        }
         let units = document
             .units
             .iter()
@@ -228,7 +326,7 @@ impl LibraryStore {
             .collect::<Vec<_>>();
         let unit_texts = self.shared_unit_texts(record, notes, &document)?;
         let mut conn = db::open_conn(&self.db_path)?;
-        db::transactions::apply_shared_sections(
+        let report = db::transactions::apply_shared_sections(
             &mut conn,
             &db::transactions::ShareApplyRequest {
                 book_id: &record.id,
@@ -239,9 +337,12 @@ impl LibraryStore {
                 chats,
                 translations,
                 stamp,
+                restamp_language,
+                preserve_locators,
                 now: now_secs(),
             },
-        )
+        )?;
+        Ok((report, None))
     }
 
     /// Reads the reading projection's body text for every chapter an incoming
@@ -350,6 +451,7 @@ fn export_chats(
                     quote: citation.quote,
                     url: citation.url,
                     source_title: citation.source_title,
+                    locator_json: citation.locator_json,
                 });
             }
             shared_messages.push(SharedChatMessage {
@@ -365,8 +467,7 @@ fn export_chats(
                 citations,
             });
         }
-        // The final turn is often still streaming its text on the sender's side;
-        // an empty thread has nothing to share.
+        // A thread whose turns were all filtered out has nothing to share.
         if shared_messages.is_empty() {
             continue;
         }
@@ -416,13 +517,15 @@ fn export_translations(
     Ok(translations)
 }
 
+/// The single language a package's译文 share, or `None` when it carries several
+/// (and `None` for an empty section).
 fn shared_target_language(translations: &[SharedTranslation]) -> Option<String> {
-    let mut languages = translations
+    let languages = translations
         .iter()
         .map(|translation| translation.target_language.clone())
         .collect::<HashSet<_>>();
     if languages.len() == 1 {
-        languages.drain().next()
+        languages.into_iter().next()
     } else {
         None
     }

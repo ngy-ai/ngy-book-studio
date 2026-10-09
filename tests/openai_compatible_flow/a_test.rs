@@ -130,6 +130,7 @@ pub(crate) fn conversation_freezes_persisted_chat_parameters_before_saved_change
                 allowed_book_ids: Vec::new(),
                 book_titles: Vec::new(),
                 snapshots: Vec::new(),
+                truncate_from: None,
             };
             let result = match prepared.take() {
                 Some(prepared) => conversation.ask_prepared(question, None, prepared).await,

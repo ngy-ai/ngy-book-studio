@@ -101,11 +101,20 @@ pub(crate) fn share_export_message(
 /// re-anchored: silently dropping shared notes would look like data loss.
 pub(crate) fn share_import_message(outcome: &ShareImportOutcome) -> String {
     let title = &outcome.record.title;
-    let mut parts = vec![if outcome.added {
-        format!("《{title}》已加入图书库")
-    } else {
-        format!("《{title}》已经在图书库中，已补充分享内容")
+    let mut parts = vec![match outcome.book {
+        ShareBookOutcome::Added => format!("《{title}》已加入图书库"),
+        ShareBookOutcome::Reused => {
+            format!("已复用图书库中的《{title}》，没有重复导入一本")
+        }
+        ShareBookOutcome::AlreadyImported => {
+            format!("《{title}》已经在图书库中，已补充分享内容")
+        }
     }];
+    // A refused section set is the whole story; the counts would only be zeroes.
+    if let Some(note) = outcome.sections_note.as_deref() {
+        parts.push(note.to_string());
+        return parts.join("；");
+    }
     match shared_items(
         outcome.notes_imported,
         outcome.chat_messages,
@@ -113,6 +122,11 @@ pub(crate) fn share_import_message(outcome: &ShareImportOutcome) -> String {
     ) {
         Some(shared) => parts.push(format!("导入{shared}")),
         None => parts.push("这个分享包没有笔记、AI 问答或译文".to_string()),
+    }
+    if outcome.translations_imported > 0
+        && let Some(language) = outcome.translations_language.as_deref()
+    {
+        parts.push(format!("译文按「{language}」保存"));
     }
     let skipped = outcome.notes_skipped + outcome.translations_skipped;
     if skipped > 0 {

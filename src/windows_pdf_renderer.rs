@@ -587,6 +587,7 @@ mod tests {
 
     fn test_document(bytes: &[u8], page_count: u32) -> BookDocument {
         let original = AssetRef::from_bytes(
+            "book-pdf",
             AssetRole::OriginalSource,
             "application/pdf",
             Some("sample.pdf".to_string()),

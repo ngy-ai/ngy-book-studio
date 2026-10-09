@@ -27,7 +27,7 @@ fn media_document(book_id: &str) -> (BookDocument, HashMap<String, Arc<Vec<u8>>>
         (AssetRole::Audio, "audio/ogg", b"OggS-fixture".as_slice()),
         (AssetRole::Video, "video/mp4", b"fixture-mp4".as_slice()),
     ] {
-        let asset = AssetRef::from_bytes(role, mime, None, bytes);
+        let asset = AssetRef::from_bytes(book_id, role, mime, None, bytes);
         asset_bytes.insert(asset.id.clone(), Arc::new(bytes.to_vec()));
         assets.push(asset);
     }

@@ -9,6 +9,10 @@ pub struct ConversationQuestion {
     pub allowed_book_ids: Vec<String>,
     pub book_titles: Vec<(String, String)>,
     pub snapshots: Vec<SelectionSnapshot>,
+    /// Persisted message ID the stored thread must be rewound to before this
+    /// question is appended. `None` asks normally; `Some` replaces the turn
+    /// that starts at that message (the UI's edit/regenerate).
+    pub truncate_from: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -16,6 +20,9 @@ pub struct ConversationAnswer {
     pub thread_id: String,
     pub answer: AgentAnswer,
     pub stored_message: StoredChatMessage,
+    /// Persisted ID of the user question that produced this answer, so the UI
+    /// can anchor a later edit or regeneration on the exact stored turn.
+    pub user_message_id: String,
 }
 
 /// A host-owned request lease registered before any asynchronous preparation.

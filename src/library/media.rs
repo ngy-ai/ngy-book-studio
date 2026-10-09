@@ -92,6 +92,7 @@ impl LibraryStore {
     ) -> Result<BookRecord> {
         let mut document = self.document(book_id)?;
         let asset = DocumentAsset::from_bytes(
+            book_id,
             draft.kind.role(),
             draft.media_type.clone(),
             draft.original_file_name.clone(),
@@ -127,6 +128,7 @@ impl LibraryStore {
     ) -> Result<BookRecord> {
         let mut document = self.document(book_id)?;
         let asset = DocumentAsset::from_bytes(
+            book_id,
             draft.kind.role(),
             draft.media_type.clone(),
             draft.original_file_name.clone(),
@@ -173,6 +175,7 @@ impl LibraryStore {
     pub fn set_cover(&mut self, book_id: &str, cover: CoverDraft) -> Result<BookRecord> {
         let mut document = self.document(book_id)?;
         let mut asset = DocumentAsset::from_bytes(
+            book_id,
             AssetRole::Cover,
             cover.mime.clone(),
             None,

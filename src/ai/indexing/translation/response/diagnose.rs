@@ -210,10 +210,18 @@ pub(crate) fn unclosed_thinking_block(response: &str) -> bool {
 ///
 /// `reason` is the only free-form field and stays a fixed label chosen by the
 /// caller; the switch is never enabled in product runs.
+///
+/// `endpoint` is where this attempt was actually sent, as
+/// `scheme://host[:port]` (see `endpoint_origin_label`) — the path is left out
+/// because it can carry tenant names. The persisted execution identity is only a
+/// hash, so this is the one field in a dump that says which endpoint of that
+/// identity answered a block; a provider that cannot name one (mocks) passes
+/// `None` and the line prints `endpoint=-`.
 pub(crate) fn dump_raw_translation_response(
     span: &tracing::Span,
     block_ordinal: usize,
     attempt: usize,
+    endpoint: Option<&str>,
     request_body: &str,
     response: Option<&str>,
     reason: &'static str,
@@ -227,6 +235,7 @@ pub(crate) fn dump_raw_translation_response(
         stage = "translation_request_dump",
         block_ordinal,
         attempt,
+        endpoint = endpoint.unwrap_or("-"),
         reason,
         request_bytes = request_body.len(),
         body = %request_body,
@@ -241,6 +250,7 @@ pub(crate) fn dump_raw_translation_response(
         stage = "translation_response_dump",
         block_ordinal,
         attempt,
+        endpoint = endpoint.unwrap_or("-"),
         reason,
         response_bytes = response.len(),
         response = %response,

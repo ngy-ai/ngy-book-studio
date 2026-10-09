@@ -29,9 +29,10 @@ pub struct ShareBookInfo {
     pub author: String,
     pub language: Option<String>,
     pub format: String,
-    /// Content units in the exported document; the receiving side maps sections
-    /// by this ordinal space and refuses a package whose book has a different
-    /// unit count than the manifest declares.
+    /// Content units in the exported document. Sections are mapped by this
+    /// ordinal space, so the receiving side compares it against its own unit
+    /// count and applies no section at all when the two disagree: a shifted
+    /// ordinal would attach somebody's note to the wrong chapter.
     pub units: usize,
 }
 

@@ -118,7 +118,7 @@ impl BackgroundJobsSettingsWindow {
                         theme,
                         busy,
                         "任务并发",
-                        "同时运行的模型任务数量，1–1024，默认 1；整本翻译也按它同时翻译多个文本块。并发越高占用的内存与网络越多；配置较低的机器建议保持 1。",
+                        "同时运行的模型任务数量，1–64，默认 1；整本翻译也按它同时翻译多个文本块。并发越高占用的内存与网络越多；配置较低的机器建议保持 1。",
                         &self.background_job_concurrency_input,
                     ))
                     .child(render_input_field(

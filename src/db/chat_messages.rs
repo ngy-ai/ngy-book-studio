@@ -75,6 +75,49 @@ pub(crate) fn delete(conn: &Connection, message_id: &str) -> Result<usize> {
         .context("无法删除对话消息")
 }
 
+/// Renumbers one stored message. Used after removing a middle turn so
+/// `ordinal` stays a contiguous sequence: appends take the current length.
+pub(crate) fn set_ordinal(conn: &Connection, message_id: &str, ordinal: usize) -> Result<usize> {
+    conn.execute(
+        "UPDATE chat_messages SET ordinal = ?2 WHERE id = ?1",
+        params![message_id, ordinal as i64],
+    )
+    .context("无法重排对话消息")
+}
+
+/// Repoints one stored message at another parent after its own parent was
+/// removed, keeping the retained tail attached to the surviving chain.
+pub(crate) fn set_parent(
+    conn: &Connection,
+    message_id: &str,
+    parent_id: Option<&str>,
+) -> Result<usize> {
+    conn.execute(
+        "UPDATE chat_messages SET parent_id = ?2 WHERE id = ?1",
+        params![message_id, parent_id],
+    )
+    .context("无法更新对话消息的父消息")
+}
+
+/// Removes one message and every later message of the same thread.
+///
+/// This is the persistence side of editing a question or regenerating an
+/// answer: the stored thread is rewound to the anchor so the replacement is
+/// appended to the same prefix, instead of leaving the replaced turn behind.
+/// Citations follow through the `chat_citations.message_id` cascade, which the
+/// single DELETE statement commits atomically.
+pub(crate) fn delete_from_ordinal(
+    conn: &Connection,
+    thread_id: &str,
+    ordinal: usize,
+) -> Result<usize> {
+    conn.execute(
+        "DELETE FROM chat_messages WHERE thread_id = ?1 AND ordinal >= ?2",
+        params![thread_id, ordinal as i64],
+    )
+    .context("无法截断对话消息")
+}
+
 fn message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatMessage> {
     Ok(ChatMessage {
         id: row.get(0)?,

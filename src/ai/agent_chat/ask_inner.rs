@@ -49,11 +49,46 @@ impl AgentConversation {
         ensure_request_not_cancelled(&cancellation)?;
 
         let repository = self.services.chat();
-        let (thread_id, previous) = conversation_stage(
+        let (thread_id, mut previous) = conversation_stage(
             "load_thread_history",
             self.thread_and_history(&repository, &request.question, scope.clone()),
         )
         .await?;
+        ensure_request_not_cancelled(&cancellation)?;
+        if let Some(anchor) = request.truncate_from.as_deref() {
+            // Editing a question or regenerating an answer rewinds the stored
+            // thread first: the replacement turn then extends the same prefix
+            // instead of duplicating the one it replaces. The anchor comes
+            // from the UI's own persisted-ID bookkeeping; an anchor that no
+            // longer exists (another window rewrote the thread) is skipped
+            // rather than guessed at.
+            let cutoff = conversation_stage("rewind_answer_branch", async {
+                repository
+                    .truncate_from(&thread_id, anchor)
+                    .await
+                    .context("failed to rewind the replaced answer branch")
+            })
+            .await?;
+            match cutoff {
+                Some(cutoff) => {
+                    previous.retain(|message| message.ordinal < cutoff);
+                    tracing::debug!(
+                        target: "ngy_ai",
+                        stage = "rewind_answer_branch",
+                        history_messages = previous.len(),
+                        "AI conversation history rewound for the replacement question"
+                    );
+                }
+                None => {
+                    tracing::warn!(
+                        target: "ngy_ai",
+                        stage = "rewind_answer_branch",
+                        error_kind = "stale_anchor",
+                        "replaced answer anchor is gone; keeping the stored history"
+                    );
+                }
+            }
+        }
         tracing::debug!(target: "ngy_ai", history_messages = previous.len(), "AI conversation history loaded");
         ensure_request_not_cancelled(&cancellation)?;
         let mut user_draft = NewChatMessage::text(ChatRole::User, request.question.clone());
@@ -129,7 +164,7 @@ impl AgentConversation {
                 .append_message(
                     &thread_id,
                     NewChatMessage {
-                        parent_id: Some(user_message.id),
+                        parent_id: Some(user_message.id.clone()),
                         role: ChatRole::Assistant,
                         content: answer.markdown.clone(),
                         model: Some(settings.chat_model),
@@ -145,6 +180,7 @@ impl AgentConversation {
             thread_id,
             answer,
             stored_message,
+            user_message_id: user_message.id,
         })
     }
 

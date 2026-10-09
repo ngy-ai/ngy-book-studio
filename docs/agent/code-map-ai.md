@@ -51,6 +51,21 @@
   两个字段是后加的键：`load_provider_settings` 读不到 `translation_model` /
   `translation_endpoint_id` 时按当时保存的问答模型与问答端点补齐，所以升级不会改变既有
   翻译执行身份、也不会触发整本重译。
+  **保存设置后，正在跑的整本翻译每一轮都重读 `models.translation`**
+  （`walk::refreshed_translation_services`）：同引擎下换 provider 或换生成参数（改 Endpoint
+  密钥、超时；温度等）从下一块起生效，不必重启任务，已翻好的块照旧复用 —— 现场 2026-09-24：
+  改完 Endpoint 与 API key 之后，正在跑的任务用领取时的快照把旧值用到书末。只有模型、执行
+  身份与目标语言都一致才允许换：那三项里任何一项变了都是一次会重置任务行的重配置（改地址、
+  换模型、换目标语言），本次运行会在下一个控制检查里被判成已被替换（`Abandoned`），重新领取
+  时才按新引擎继续，绝不能半路换身份、把两种来源的译文混进同一次运行。改地址或换模型后任务
+  回到配置的初始状态（`translation_initial_status`：自动运行开着就排队，否则暂停等待恢复），
+  已存译文经 `adopt_execution_identity` 重盖身份后继续复用。
+  **同一套规则也适用于 embedding 与 vision 的运行**：`embedding.rs` 每一批、`vision/run.rs`
+  每一页都重读 `IndexingInner::models_snapshot()`（`embedding_provider_refreshed` /
+  `vision_provider_refreshed` 记一条日志），引擎一致（embedding 另加维度）就换用新的
+  `embedding_provider` / `vision_provider`（换 key、超时、代理等从下一批/下一页起生效），
+  不一致则保持领取时的快照，由 `reconfigure` 的任务行重置接手。两条运行都只换 provider：
+  模型、维度与执行身份始终取自领取时的快照，落库的模型列与执行身份因此不会在一次运行里漂移。
  凡是只认 `content` 里严格 JSON 的调用（翻译、vision、Agent）都固定发送
  `reasoning_effort="none"`：思考模型会把整段输出预算和请求超时全花在推理上，Ollama 的
  OpenAI 兼容端点对思考模型只回空 `content` 增量，表现为整段超时里 0 字节正文（本机 9B
@@ -267,7 +282,11 @@
   `chat_request_body` 构造，因此是**完整**的 chat-completions 请求体（系统提示 + 用户消息 +
   模型与生成参数 + `stream`/`stream_options`），不是只把用户消息那一小段再抄一遍；
   `translation_response_dump` 打 `response=`，是模型原样回答。两处共用同一个构造函数，
-  转储才等于网线上的字节。开关默认关闭，产品运行永远不打开。收流还有一条自己的**静默**上限
+  转储才等于网线上的字节。两条转储行都带 `endpoint=`：这一发**实际**发给的端点来源
+  （`scheme://host[:port]`，由 `endpoint_origin_label` 从 provider 自己的 `base_url` 现取，
+  因此运行中保存设置换端点后下一发立刻改标新地址；路径不进日志，与 `ai_http` span 同一条
+  规则）。翻译执行身份只是哈希，同一个模型名绑在多个端点上时，只有这个字段能说明转储行
+  属于谁；mock 等不标注地址的实现打 `endpoint=-`。开关默认关闭，产品运行永远不打开。收流还有一条自己的**静默**上限
   （`TRANSLATION_STREAM_SILENCE_LIMIT`，与 `PROVIDER_STEP_TIMEOUT` 同值）：provider 层的
   静默计时兜不住「流不再产生任何事件」——现场 2026-09-17 的整本翻译在开出 8 个块请求后
   彻底静默（job-logs 无写入、进程没有任何 TCP 连接、`await_translation_step` 的 180 秒
@@ -365,3 +384,17 @@
   时重建，开关对已发出的请求无效。
 - `src/ai/agent.rs`、`src/ai/agent_runtime.rs`、`src/ai/agent_chat.rs`、`src/ai/chat.rs`：只读 Agent
   工具、SSE/tool-call 循环、窗口授权范围、会话/消息/引用持久化与对话编排。
+  `ConversationQuestion::truncate_from` 是界面的「修改提问 / 重新生成回答」入口：
+  `ask_inner` 在加载历史之后、写入新问题之前调用 `ChatRepository::truncate_from`
+  删除锚点消息及其后的所有消息（引用经 `chat_citations` 级联在同一 DELETE 里移除），
+  替换的问答对因此占同一位置而不是再追加一份。锚点已不存在或属于别的会话（另一个
+  窗口重写过该线程）时记 `stale_anchor` 警告并保留原历史，绝不猜位置；
+  `ConversationAnswer::user_message_id` 与 `stored_message.id` 回给界面，供之后的
+  编辑/重新生成定位。`truncate_from` 只作用于本窗口自己的会话：宿主范围仍先经
+  `ChatScope` 授权，截断不改变权限判定。
+  `ChatRepository::delete_question_and_answer` 是界面「删除这条问答」的存储侧：删除
+  该问题与其回答（引用随 `chat_citations` 级联），把后续消息重新挂到问题的前驱并
+  重排序号，使 `ordinal` 保持从零连续的序列（新消息按当前长度取号），一个事务完成；
+  锚点不是本会话的问题时一行都不写。会话层（`AgentConversation::delete_turn`）在
+  删除前完成 scope 校验与锚点检查，返回重新加载后的会话；删掉整个会话仍是另一条
+  路径（`AgentConversation::delete_session`），两者粒度不同，不要混用。

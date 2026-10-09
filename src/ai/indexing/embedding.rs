@@ -34,6 +34,9 @@ pub(crate) async fn run_embedding(
             Some("图书已发布更新版本，任务结果已丢弃".to_string()),
         ));
     }
+    // 本次运行实际使用的 provider：默认是领取时的那份快照，用户保存过新配置之后换成新的
+    // （见下面每一批的重读）。
+    let mut provider = Arc::clone(&models.embedding_provider);
     loop {
         if let Some(outcome) = requested_outcome(inner, job, &cursor).await? {
             return Ok(outcome);
@@ -94,7 +97,26 @@ pub(crate) async fn run_embedding(
                 ..JobLogMetrics::default()
             },
         );
-        let request = models.embedding_provider.embeddings(EmbeddingRequest {
+        // 用户在这次运行期间保存过 Endpoint/密钥时，`inner.models` 已经是新的，而这次运行
+        // 手里还是领取时的快照（现场 2026-09-24：只换 key 时任务行不会被重置，运行中的执行
+        // 器会一直用旧值）。本批起换用新的 provider：模型、执行身份与维度都一致才换 —— 换了
+        // 身份的那次重配置会把任务行整个重置，本次运行随后会被判成已被替换。
+        let live = inner.models_snapshot();
+        let same_engine = live.config.embedding_model == models.config.embedding_model
+            && live.config.embedding_execution_identity
+                == models.config.embedding_execution_identity
+            && live.config.embedding_dimensions == models.config.embedding_dimensions;
+        if same_engine && !Arc::ptr_eq(&live.embedding_provider, &provider) {
+            tracing::info!(
+                target: "ngy_ai",
+                stage = "embedding_provider_refreshed",
+                next_ordinal = cursor.next_ordinal,
+                model = %crate::ai::ai_diagnostics::safe_label(&models.config.embedding_model),
+                "Embedding requests will use the reconfigured endpoint and key"
+            );
+            provider = Arc::clone(&live.embedding_provider);
+        }
+        let request = provider.embeddings(EmbeddingRequest {
             model: models.config.embedding_model.clone(),
             input: inputs,
             dimensions: Some(models.config.embedding_dimensions),

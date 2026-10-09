@@ -3,42 +3,14 @@
 use super::*;
 
 use crate::{
-    ai::translation::{StoredTranslation, TranslationSegment},
-    annotations::{AnnotationDraft, AnnotationKind, TextAnchor},
+    annotations::{AnnotationDraft, AnnotationKind},
     db::{
         chat_citations::ChatCitation, chat_messages::ChatMessage, chat_threads::ChatThread,
         translations::NewTranslation,
     },
     document::DocumentLocator,
+    share::ShareTranslationStamp,
 };
-
-/// A selection the sender's own host accepts: the tail of the first chapter's
-/// reader body text, so the offsets are those of the reading projection rather
-/// than of an edited copy.
-fn first_chapter_anchor(library: &LibraryStore, book_id: &str) -> (String, u64, u64, TextAnchor) {
-    let record = library.book_record(book_id).unwrap();
-    let document = library.document(book_id).unwrap();
-    let unit = &document.units[0];
-    let opened =
-        crate::reader::OpenedBook::open_bytes(library.reader_epub_bytes(book_id).unwrap()).unwrap();
-    let response = crate::reader::load_resource(&opened.epub, &opened.spine[0].href).unwrap();
-    let html = std::str::from_utf8(&response.bytes).unwrap();
-    let text = crate::annotations::reader_body_text(html);
-    let start = text.chars().take(3).map(char::len_utf16).sum::<usize>() as u32;
-    let end = text.encode_utf16().count() as u32;
-    assert!(end > start, "the fixture chapter must have selectable text");
-    let anchor = TextAnchor {
-        quote: text.chars().skip(3).collect(),
-        start,
-        end,
-    };
-    (
-        unit.id.clone(),
-        record.revision,
-        unit.revision.get(),
-        anchor,
-    )
-}
 
 #[test]
 fn a_share_package_restores_notes_conversations_and_translations() {
@@ -62,13 +34,6 @@ fn a_share_package_restores_notes_conversations_and_translations() {
         )
         .unwrap();
 
-    let stored = StoredTranslation {
-        execution_identity: "translation-v2:sender".into(),
-        segments: vec![TranslationSegment {
-            source: "开始写作……".into(),
-            translated: "Start writing…".into(),
-        }],
-    };
     let conn = crate::db::open_conn(&sender.database_path()).unwrap();
     crate::db::translations::upsert(
         &conn,
@@ -83,7 +48,7 @@ fn a_share_package_restores_notes_conversations_and_translations() {
             source_language: Some("zh".into()),
             model: "sender-model".into(),
             source_text: "开始写作……".into(),
-            translated_text: serde_json::to_string(&stored).unwrap(),
+            translated_text: stored_translation_payload("translation-v2:sender", "Start writing…"),
             created_at: 10,
             updated_at: 10,
         },
@@ -150,7 +115,8 @@ fn a_share_package_restores_notes_conversations_and_translations() {
 
     let mut receiver = LibraryStore::load_from(temp.path().join("receiver")).unwrap();
     let outcome = receiver.import_share_package(&target, None, None).unwrap();
-    assert!(outcome.added);
+    assert_eq!(outcome.book, ShareBookOutcome::Added);
+    assert_eq!(outcome.sections_note, None);
     assert_eq!(outcome.notes_imported, 1);
     assert_eq!(outcome.notes_skipped, 0);
     assert_eq!(outcome.translations_imported, 1);
@@ -178,7 +144,8 @@ fn a_share_package_restores_notes_conversations_and_translations() {
     assert_eq!(rows[0].model, "sender-model");
     assert_eq!(rows[0].source_text, "开始写作……");
     assert_eq!(rows[0].unit_revision, receiver_unit.revision.get());
-    let restored: StoredTranslation = serde_json::from_str(&rows[0].translated_text).unwrap();
+    let restored: crate::ai::translation::StoredTranslation =
+        serde_json::from_str(&rows[0].translated_text).unwrap();
     assert_eq!(restored.execution_identity, "translation-v2:sender");
     assert_eq!(restored.segments[0].translated, "Start writing…");
 
@@ -200,9 +167,11 @@ fn a_share_package_restores_notes_conversations_and_translations() {
         "the receiving search index is rebuilt locally, never imported"
     );
 
-    // Re-importing the same package must not duplicate what already landed.
+    // Re-importing the same package changes nothing a second time.
     let again = receiver.import_share_package(&target, None, None).unwrap();
-    assert!(!again.added, "the projection is already in the library");
+    assert_eq!(again.book, ShareBookOutcome::AlreadyImported);
+    assert_eq!(again.chat_threads, 0, "the conversation is already here");
+    assert_eq!(again.chat_messages, 0);
     assert_eq!(
         receiver
             .list_annotations(&again.record.id, None)
@@ -322,5 +291,161 @@ fn a_note_whose_offsets_do_not_match_the_receiving_text_is_skipped() {
             .list_annotations(&outcome.record.id, None)
             .unwrap()
             .is_empty()
+    );
+}
+
+#[test]
+fn a_package_whose_chapter_count_disagrees_applies_no_section() {
+    let temp = tempfile::tempdir().unwrap();
+    let epub = epub_source_file(&temp.path().join("source"), "章数之书");
+    let mut sender = LibraryStore::load_from(temp.path().join("sender")).unwrap();
+    let sender_book = match sender.import(&epub).unwrap() {
+        ImportOutcome::Added(record) | ImportOutcome::AlreadyExists(record) => record,
+    };
+    let (unit_id, document_revision, unit_revision, anchor) =
+        first_chapter_anchor(&sender, &sender_book.id);
+    sender
+        .create_annotation(
+            &sender_book.id,
+            &AnnotationDraft {
+                content_unit_id: unit_id,
+                document_revision,
+                unit_revision,
+                anchor,
+                kind: AnnotationKind::Highlight,
+                comment: None,
+            },
+        )
+        .unwrap();
+    let target = temp.path().join("shared.ngyshare");
+    let summary = sender
+        .export_share_package(&sender_book.id, &target)
+        .unwrap();
+    assert_eq!(summary.notes, 1);
+
+    // The receiver owns the very same original and then edits it. Sections
+    // address chapters by position, and the positions moved.
+    let mut receiver = LibraryStore::load_from(temp.path().join("receiver")).unwrap();
+    let receiver_book = match receiver.import(&epub).unwrap() {
+        ImportOutcome::Added(record) | ImportOutcome::AlreadyExists(record) => record,
+    };
+    assert_eq!(
+        receiver_book.id, sender_book.id,
+        "the same original is the same book"
+    );
+    let document = receiver.document(&receiver_book.id).unwrap();
+    let mut editor = DocumentEditor::new(document).unwrap();
+    editor
+        .add_unit(NewContentUnit::html_chapter("新增章节", 1))
+        .unwrap();
+    receiver.apply_document(editor.into_document()).unwrap();
+
+    let outcome = receiver.import_share_package(&target, None, None).unwrap();
+    assert_eq!(outcome.book, ShareBookOutcome::Reused);
+    let note = outcome.sections_note.clone().unwrap_or_default();
+    assert!(note.contains("章节对不上"), "unexpected note: {note}");
+    assert_eq!(outcome.notes_imported, 0);
+    assert_eq!(outcome.translations_imported, 0);
+    assert!(
+        receiver
+            .list_annotations(&outcome.record.id, None)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A sender library whose first chapter carries machine译文 in each language.
+fn sender_with_translations(root: &Path, languages: &[&str]) -> PathBuf {
+    let mut library = LibraryStore::load_from(root.join("sender")).unwrap();
+    let book = library.create_book("译文之书", "作者").unwrap();
+    let (unit_id, document_revision, unit_revision, _) = first_chapter_anchor(&library, &book.id);
+    let conn = crate::db::open_conn(&library.database_path()).unwrap();
+    for language in languages {
+        crate::db::translations::upsert(
+            &conn,
+            &NewTranslation {
+                book_id: book.id.clone(),
+                content_unit_id: unit_id.clone(),
+                block_id: format!("{unit_id}::h0"),
+                ordinal: 0,
+                document_revision,
+                unit_revision,
+                target_language: (*language).to_string(),
+                source_language: Some("zh".into()),
+                model: "sender-model".into(),
+                source_text: "开始写作……".into(),
+                translated_text: stored_translation_payload(
+                    "translation-v2:sender",
+                    "Start writing…",
+                ),
+                created_at: 10,
+                updated_at: 10,
+            },
+        )
+        .unwrap();
+    }
+    drop(conn);
+    let target = root.join(format!("shared-{}.ngyshare", languages.join("-")));
+    library.export_share_package(&book.id, &target).unwrap();
+    target
+}
+
+#[test]
+fn shared_translations_adopt_the_receiving_language_only_when_the_package_has_one() {
+    let temp = tempfile::tempdir().unwrap();
+    let stamp = ShareTranslationStamp {
+        model: "receiver-model".into(),
+        execution_identity: "translation-v2:receiver".into(),
+        target_language: Some("en".into()),
+    };
+
+    // One shared language adopts the receiver's reading language, so the
+    // receiver sees the friend's译文 without running the same engine.
+    let single = sender_with_translations(&temp.path().join("one"), &["zh-Hans"]);
+    let mut receiver = LibraryStore::load_from(temp.path().join("one-receiver")).unwrap();
+    let outcome = receiver
+        .import_share_package(&single, None, Some(&stamp))
+        .unwrap();
+    assert_eq!(outcome.translations_imported, 1);
+    assert_eq!(outcome.translations_language.as_deref(), Some("en"));
+    let document = receiver.document(&outcome.record.id).unwrap();
+    let conn = crate::db::open_conn(&receiver.database_path()).unwrap();
+    let rows = crate::db::translations::list_for_unit(&conn, &document.units[0].id, "en").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].model, "receiver-model");
+    let adopted: crate::ai::translation::StoredTranslation =
+        serde_json::from_str(&rows[0].translated_text).unwrap();
+    assert_eq!(adopted.execution_identity, "translation-v2:receiver");
+    drop(conn);
+
+    // Several shared languages must not collapse onto one translation scope
+    // key: that would overwrite one friend's译文 with the other's.
+    let both = sender_with_translations(&temp.path().join("two"), &["zh-Hans", "ja"]);
+    let mut receiver = LibraryStore::load_from(temp.path().join("two-receiver")).unwrap();
+    let outcome = receiver
+        .import_share_package(&both, None, Some(&stamp))
+        .unwrap();
+    assert_eq!(outcome.translations_imported, 2);
+    assert_eq!(
+        outcome.translations_language, None,
+        "a package with several languages has no single one to report"
+    );
+    let document = receiver.document(&outcome.record.id).unwrap();
+    let conn = crate::db::open_conn(&receiver.database_path()).unwrap();
+    let counted = ["zh-Hans", "ja", "en"]
+        .into_iter()
+        .map(|language| {
+            (
+                language,
+                crate::db::translations::list_for_unit(&conn, &document.units[0].id, language)
+                    .unwrap()
+                    .len(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        counted,
+        vec![("zh-Hans", 1), ("ja", 1), ("en", 0)],
+        "each shared language stays its own row"
     );
 }

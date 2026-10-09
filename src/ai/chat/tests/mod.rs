@@ -1,6 +1,10 @@
 //! Shared fixtures for the chat repository tests.
 
+mod delete_turn_test;
+
 mod persist_test;
+
+mod truncate_test;
 
 pub(crate) use super::*;
 pub(crate) use crate::{

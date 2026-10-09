@@ -72,6 +72,7 @@ fn source_basis_badge_names_the_knowledge_the_answer_used() {
             sources: Vec::new(),
             source_status: Some(status),
             request_id: None,
+            db_id: None,
         }
     }
     assert_eq!(
@@ -208,6 +209,7 @@ fn changing_persisted_threads_keeps_only_the_in_flight_request_projection() {
         sources: Vec::new(),
         source_status: Some(AgentAnswerSourceStatus::NoVerifiedSources),
         request_id: None,
+        db_id: None,
     });
     let request = conversation.begin("new question").unwrap();
     assert!(conversation.append_delta(request.request_id, "new answer"));

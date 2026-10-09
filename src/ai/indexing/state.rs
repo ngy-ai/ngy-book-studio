@@ -78,4 +78,14 @@ impl IndexingInner {
             .read()
             .unwrap_or_else(|error| error.into_inner())
     }
+
+    /// 当前模型句柄。一次运行手里握的是**领取时**的快照，拿这一份和它比，就能看出用户
+    /// 在这次运行期间是否保存过新的 Endpoint、密钥或生成参数（进程里只有这两个持有者）。
+    /// 中毒的锁照旧交出最后发布的值，不因此让运行失败。
+    pub(crate) fn models_snapshot(&self) -> ModelServices {
+        self.models
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
 }

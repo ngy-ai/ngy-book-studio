@@ -21,7 +21,8 @@ impl Render for AiSidebar {
             .conversation
             .messages
             .iter()
-            .map(|message| self.render_message(message, window, cx))
+            .enumerate()
+            .map(|(index, message)| self.render_message(index, message, window, cx))
             .collect::<Vec<_>>();
         let send_view = view.clone();
         let cancel_view = view.clone();

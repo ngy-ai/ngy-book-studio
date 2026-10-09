@@ -1,5 +1,9 @@
 //! Shared fixtures for the sidebar tests.
 
+mod actions_test;
+
+mod actions_ui_test;
+
 mod citation_test;
 
 mod explanation_test;

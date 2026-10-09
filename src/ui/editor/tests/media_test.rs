@@ -8,7 +8,13 @@ fn pending_media_range_is_served_on_the_background_runtime() {
     let services = Arc::new(AppServices::open(data_dir.path()).unwrap());
     let runtime = services.runtime();
     let bytes = Arc::new(b"0123456789".to_vec());
-    let asset = AssetRef::from_bytes(AssetRole::Audio, "audio/ogg", None, bytes.as_slice());
+    let asset = AssetRef::from_bytes(
+        "book-a",
+        AssetRole::Audio,
+        "audio/ogg",
+        None,
+        bytes.as_slice(),
+    );
     let document = document_with_audio("book-a", asset.clone());
     let state = EditorWebState::new(
         "book-a".to_string(),
@@ -46,9 +52,21 @@ fn pending_media_range_is_served_on_the_background_runtime() {
 #[test]
 fn pending_asset_bytes_drop_unreferenced_replacements() {
     let keep_bytes = Arc::new(b"keep".to_vec());
-    let keep = AssetRef::from_bytes(AssetRole::Audio, "audio/ogg", None, keep_bytes.as_slice());
+    let keep = AssetRef::from_bytes(
+        "book-a",
+        AssetRole::Audio,
+        "audio/ogg",
+        None,
+        keep_bytes.as_slice(),
+    );
     let orphan_bytes = Arc::new(b"orphan".to_vec());
-    let orphan = AssetRef::from_bytes(AssetRole::Audio, "audio/ogg", None, orphan_bytes.as_slice());
+    let orphan = AssetRef::from_bytes(
+        "book-a",
+        AssetRole::Audio,
+        "audio/ogg",
+        None,
+        orphan_bytes.as_slice(),
+    );
     let document = document_with_audio("book-a", keep.clone());
     let mut pending = HashMap::from([
         (keep.id.clone(), keep_bytes),
@@ -67,19 +85,19 @@ fn persisted_editor_media_is_authorized_without_hydration_and_read_by_range() {
     let services = Arc::new(AppServices::open(data_dir.path()).unwrap());
     let runtime = services.runtime();
     let bytes = Arc::new(b"0123456789-persisted-audio".to_vec());
-    let asset = AssetRef::from_bytes(
-        AssetRole::Audio,
-        "audio/ogg",
-        Some("persisted.ogg".to_string()),
-        bytes.as_slice(),
-    );
-    let stored_document = runtime.block_on(async {
+    let (stored_document, asset) = runtime.block_on(async {
         let bytes = Arc::clone(&bytes);
-        let asset = asset.clone();
         services
             .spawn_library(move |library| {
                 let record = library.create_book("按需媒体", "测试")?;
                 let mut document = library.document(&record.id)?;
+                let asset = AssetRef::from_bytes(
+                    &record.id,
+                    AssetRole::Audio,
+                    "audio/ogg",
+                    Some("persisted.ogg".to_string()),
+                    bytes.as_slice(),
+                );
                 let unit = document.units.first_mut().context("default unit")?;
                 unit.document.blocks.push(Block::Audio {
                     id: "persisted-audio".to_string(),
@@ -98,7 +116,7 @@ fn persisted_editor_media_is_authorized_without_hydration_and_read_by_range() {
                     document,
                     HashMap::from([(asset.id.clone(), bytes)]),
                 )?;
-                library.document(&record.id)
+                Ok((library.document(&record.id)?, asset))
             })
             .await
             .unwrap()
@@ -190,7 +208,13 @@ fn persisted_editor_media_is_authorized_without_hydration_and_read_by_range() {
 #[test]
 fn editor_media_snapshot_rejects_wrong_book_and_illegal_or_unknown_ids() {
     let bytes = Arc::new(b"owned".to_vec());
-    let asset = AssetRef::from_bytes(AssetRole::Audio, "audio/mpeg", None, bytes.as_slice());
+    let asset = AssetRef::from_bytes(
+        "book-a",
+        AssetRole::Audio,
+        "audio/mpeg",
+        None,
+        bytes.as_slice(),
+    );
     let foreign_document = document_with_audio("book-b", asset.clone());
     let state = EditorWebState::new(
         "book-a".to_string(),
@@ -222,8 +246,13 @@ fn editor_media_snapshot_rejects_wrong_book_and_illegal_or_unknown_ids() {
 #[test]
 fn replacing_media_atomically_revokes_the_old_preview_resource() {
     let old_bytes = Arc::new(b"old-media".to_vec());
-    let old_asset =
-        AssetRef::from_bytes(AssetRole::Audio, "audio/mpeg", None, old_bytes.as_slice());
+    let old_asset = AssetRef::from_bytes(
+        "book-a",
+        AssetRole::Audio,
+        "audio/mpeg",
+        None,
+        old_bytes.as_slice(),
+    );
     let old_document = document_with_audio("book-a", old_asset.clone());
     let state = EditorWebState::new(
         "book-a".to_string(),
@@ -235,8 +264,13 @@ fn replacing_media_atomically_revokes_the_old_preview_resource() {
         .unwrap();
 
     let new_bytes = Arc::new(b"new-media".to_vec());
-    let new_asset =
-        AssetRef::from_bytes(AssetRole::Audio, "audio/mpeg", None, new_bytes.as_slice());
+    let new_asset = AssetRef::from_bytes(
+        "book-a",
+        AssetRole::Audio,
+        "audio/mpeg",
+        None,
+        new_bytes.as_slice(),
+    );
     let new_document = document_with_audio("book-a", new_asset.clone());
     state
         .sync_media(&new_document, Some((&new_asset, Arc::clone(&new_bytes))))

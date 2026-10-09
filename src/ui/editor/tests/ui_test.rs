@@ -34,7 +34,7 @@ fn empty_cover_placeholder_uses_the_document_format() {
 #[test]
 fn clearing_cover_removes_the_assignment_and_only_retains_content_use() {
     let bytes = b"cover-bytes";
-    let mut cover = AssetRef::from_bytes(AssetRole::Cover, "image/png", None, bytes);
+    let mut cover = AssetRef::from_bytes("book-a", AssetRole::Cover, "image/png", None, bytes);
     cover.add_role(AssetRole::ContentImage);
     let cover_id = cover.id.clone();
     let mut document = BookDocument::created("book-a", "封面测试");
@@ -47,7 +47,7 @@ fn clearing_cover_removes_the_assignment_and_only_retains_content_use() {
     assert!(document.assets.is_empty());
     document.validate().unwrap();
 
-    let mut referenced = AssetRef::from_bytes(AssetRole::Cover, "image/png", None, bytes);
+    let mut referenced = AssetRef::from_bytes("book-a", AssetRole::Cover, "image/png", None, bytes);
     referenced.add_role(AssetRole::ContentImage);
     let referenced_id = referenced.id.clone();
     document.cover_asset_id = Some(referenced_id.clone());

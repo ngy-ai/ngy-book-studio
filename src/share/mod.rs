@@ -53,13 +53,18 @@ pub(crate) const CHATS_ENTRY: &str = "chats.json";
 pub(crate) const TRANSLATIONS_ENTRY: &str = "translations.json";
 
 /// Largest package this build reads or writes.
-pub(crate) const MAX_SHARE_PACKAGE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+///
+/// A package is read into memory whole and then parsed, so this is a peak-RAM
+/// bound as much as a file-size one. Notes, conversations and译文 of one book
+/// are tens of megabytes at most; two gigabytes leaves ample room while keeping
+/// the worst case survivable on a normal machine.
+pub(crate) const MAX_SHARE_PACKAGE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Largest single JSON section inside a package.
-pub(crate) const MAX_SHARE_SECTION_BYTES: u64 = 512 * 1024 * 1024;
+pub(crate) const MAX_SHARE_SECTION_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Largest book projection inside a package.
-pub(crate) const MAX_SHARE_BOOK_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+pub(crate) const MAX_SHARE_BOOK_BYTES: u64 = MAX_SHARE_PACKAGE_BYTES;
 
 /// Entries a package may contain. The format defines five; the slack lets a
 /// future revision add one without an older reader treating the file as hostile.

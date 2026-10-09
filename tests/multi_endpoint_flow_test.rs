@@ -294,6 +294,7 @@ fn independent_endpoints_route_chat_search_and_background_jobs_after_restart() {
             allowed_book_ids: vec![],
             book_titles: vec![],
             snapshots: vec![],
+            truncate_from: None,
         };
         let old_answer = conversation
             .ask_prepared(question(1), None, prepared)

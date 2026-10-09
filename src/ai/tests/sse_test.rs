@@ -129,6 +129,37 @@ fn rejects_credentials_in_endpoint_url() {
     assert!(config.validated_base_url().is_err());
 }
 
+/// 诊断用的端点来源只到 `scheme://host:port`：路径可能带租户名，不能进日志；端口必须
+/// 保留，否则同一台机器上的多个 OpenAI-compatible 服务无法区分（翻译转储行靠它说明
+/// 这一发发给了谁）。
+#[test]
+fn endpoint_origin_label_drops_the_path_and_keeps_the_port() {
+    let tenant = normalize_provider_base_url("https://tenant.example.test/v1/").unwrap();
+    assert_eq!(
+        endpoint_origin_label(&tenant),
+        "https://tenant.example.test"
+    );
+
+    let local = normalize_provider_base_url("http://127.0.0.1:11434/v1/").unwrap();
+    assert_eq!(endpoint_origin_label(&local), "http://127.0.0.1:11434");
+}
+
+/// HTTP provider 报出的就是它自己的 `base_url` 来源；翻译转储行的 `endpoint=` 取自这里，
+/// 因此它必须与真正发请求的端点同源，而不是另一份可能过期的副本。
+#[test]
+fn http_provider_reports_the_origin_of_the_endpoint_it_sends_to() {
+    let provider = OpenAiHttpProvider::new(ProviderConfig {
+        base_url: "https://tenant.example.test/v1/".to_string(),
+        remote_content_confirmed: true,
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(
+        provider.endpoint_origin().as_deref(),
+        Some("https://tenant.example.test")
+    );
+}
+
 #[tokio::test]
 async fn successful_body_limit_accepts_exact_size_and_rejects_one_more_byte() {
     let exact = stream::iter(vec![

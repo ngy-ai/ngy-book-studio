@@ -36,7 +36,7 @@ pub use crate::db::book_search::SearchHit;
 pub use crate::db::books::BookRecord;
 pub use crate::db::groups::BookGroup;
 pub use repair::RepairReport;
-pub use share::{ShareExportSummary, ShareImportOutcome};
+pub use share::{ShareBookOutcome, ShareExportSummary, ShareImportOutcome};
 
 mod annotations;
 

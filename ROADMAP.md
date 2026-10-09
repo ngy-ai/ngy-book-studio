@@ -186,23 +186,30 @@
   - [x] 导入图书可导出字节一致的原件
   - [x] 统一模型可规范化导出 EPUB/PDF，不承诺复刻原 Office/PDF/Kindle 复杂版式
   - [x] 同目录临时文件同步后原子替换目标
-- [x] 分享包（`src/share/`、`library/share.rs`、`db/transactions/share.rs`）
+- [x] 分享包（`src/share/`、`library/share.rs`、`db/transactions/share.rs`，取舍见 `docs/adr/`）
   - [x] `.ngyshare` ZIP 容器：`manifest.json`（格式标识、版本、图书信息与分区计数）、
-    规范化 EPUB 投影、`notes.json` / `chats.json` / `translations.json`；读取逐条限额，
-    条目数与清单不符、版本不受支持或不是压缩包都明确拒绝
-  - [x] 分区条目只用**章节序号 + 原文引用**定位，不写发送方的图书、单元或文本块 ID
-    （它们由导入内容哈希派生，接收方重新导入同一份文本也必然得到不同的 ID）
-  - [x] 笔记按接收方正文章节的 UTF-16 范围逐条复验；会话消息保留角色、正文、模型与
-    时间，引用重建为章级 `DocumentLocator` 并丢弃发送方的搜索分块引用；译文按接收方
-    文本块形状 `{unit}::h{index}` 重挂。任一条目对不上就跳过并计数，不按引文搜索重定位
-  - [x] 译文按接收方当前翻译模型与翻译端点执行身份、默认译文语言重新署名；未配置翻译
-    模型时保留发送方身份，等接收方设置对齐后再显示
-  - [x] 只导出当前可显示的数据：失效笔记、过期译文与内部 system/tool 消息不写入；
-    重复导入同一分享包不产生重复笔记、会话或译文
+    规范化 EPUB 投影、`notes.json` / `chats.json` / `translations.json`；读取逐条限额
+    （包 2 GiB / 分区 64 MiB），条目数与清单不符、版本不受支持或不是压缩包都明确拒绝
+  - [x] 图书先按发送方 ID 认领：命中（同一份原件，`deterministic_id("book", 原件哈希)`）
+    直接复用现有图书，不产生重复的书；此时两侧标识相同，引用保留发送方的块级 locator 并
+    经 `validate_current_chat_citation` 逐条复验。未命中才把投影发布成新书
+  - [x] 分区条目只用**章节序号 + 原文引用**定位；`manifest.book.units` 与本地章节数不符时
+    整批放弃分区并说明原因，笔记与引用绝不按引文搜索重定位
+  - [x] 笔记按接收方正文章节的 UTF-16 范围逐条复验（Page 单元按既有页面范围长度规则）；
+    译文按接收方文本块形状 `{unit}::h{index}` 重挂并丢弃发送方的搜索分块引用；任一条目
+    对不上就跳过并计数
+  - [x] 译文按接收方翻译模型与端点执行身份重新署名；**仅整包单一目标语言**时才连默认
+    译文语言一起改写，多语言按各自语言保留，避免落到同一 scope 键上互相覆盖
+  - [x] 重复导入不产生重复：笔记用确定性 ID + `insert_if_absent`；会话身份为「标题 +
+    创建时间 + 首条消息时间与内容哈希」（不含它在列表里的位置），已存在的会话只追加缺失
+    的轮次，重新分享更新后的对话不会复制整条会话
+  - [x] 只导出当前可显示的数据：失效笔记、过期译文与内部 system/tool 消息不写入
   - [x] 图书库右键“导出分享包…”；导入对话框接受分享包并按内容签名路由，不看扩展名
-  - [x] 回归：`src/share/tests/`（容器往返、空分区、清单与条目数校验、非压缩包拒绝）与
-    `library::tests::share_test`（导出→导入恢复笔记/会话/译文并重映射单元 ID、
-    重复导入不重复、错位笔记被跳过）
+  - [x] 回归：`src/share/tests/`（容器往返、空分区、清单与条目数校验、非压缩包拒绝）、
+    `library::tests::share_test`（导出→导入恢复笔记/会话/译文并重映射单元 ID、重复导入、
+    划线不被改色、错位笔记跳过、多语言不塌陷、章节数不符只跳分区）和
+    `library::tests::share_reuse_test`（同原件复用不新增图书且保留块级引用、旧会话追问后
+    重新导出不产生重复会话）
 - [x] 搜索与派生索引
   - [x] 稳定 chunk、FTS5 关键词搜索和图书范围硬过滤
   - [x] 静态集成 `sqlite-vec` 的精确 KNN
@@ -252,7 +259,7 @@
     `visual_render`、`vision`、`embedding` 任务，但初始为已暂停且不立即执行，可在后台
     任务窗口逐项恢复；开启“自动运行新创建的后台任务”后新任务才直接排队执行；设置变化
     不打断或改变此前已排队、正在运行的任务
-  - [x] 后台任务并发与任务间隔可配置（AI 设置「后台任务」窗口：并发 1–1024 默认 1，任务间隔
+  - [x] 后台任务并发与任务间隔可配置（AI 设置「后台任务」窗口：并发 1–64 默认 1，任务间隔
     0–60000 毫秒默认 10）；保存后对后续任务立即生效，不打断正在运行的任务；同一个并发值
     也限制一本图书翻译内部同时打开的文本块数（运行中的翻译在下一轮按新并发开窗）；
     任务间隔对整本翻译按**请求**生效（每个并发槽位每翻完一块休眠一次，
@@ -306,6 +313,11 @@
     问答生成参数只显示在问答模型 Tab 下。回归：`translation_identity_tracks_only_the_translation_model_and_its_endpoint`、
     `rows_written_before_translation_was_split_follow_the_question_model`、
     `model_tabs_switch_the_visible_role_and_keep_translation_independent`
+  - [x] 2026-09-24「模型设置」窗口重新获得焦点时按已保存设置刷新 Endpoint 列表：此前只在
+    打开窗口时读一次快照，窗口没关时在「Endpoint」窗口里新增或改名的 Endpoint 在这个窗口
+    里选不到（只能关掉重开）。刷新保留取值未变的草稿与检测结果，取值变了或新增的按新值
+    重建、消失的移除；失效的角色绑定退回默认 Endpoint 并给出提示。回归：
+    `endpoint_choices_follow_the_saved_list_when_the_window_regains_focus`
   - [x] API key 存 Windows Credential Manager
   - [x] 只读 `search_books`、`read_passages`、`get_outline` 工具和宿主范围硬过滤
   - [x] 按实际工具调用次数统一预算；多调用批次超出的部分回填未执行结果，额度用完后
@@ -313,15 +325,12 @@
   - [x] 图书库、Reader、PDF Reader、Editor 可折叠 AI 侧栏
   - [x] 每个窗口上下文可新建、列出和切换多个独立持久会话；空会话首次发送时才创建，
     切换时恢复对应消息和来源，流式请求期间阻止会话竞态
-  - [x] 2026-09-24「模型设置」窗口重新获得焦点时按已保存设置刷新 Endpoint 列表：此前只在
-    打开窗口时读一次快照，窗口没关时在「Endpoint」窗口里新增或改名的 Endpoint 在这个窗口
-    里选不到（只能关掉重开）。刷新保留取值未变的草稿与检测结果，取值变了或新增的按新值
-    重建、消失的移除；失效的角色绑定退回默认 Endpoint 并给出提示。回归：
-    `endpoint_choices_follow_the_saved_list_when_the_window_regains_focus`
   - [x] 会话经逐项确认后可删除，其问题、回答和引用同步永久移除；删除当前或最后一个
     会话后回到空白新会话，删除非当前会话保留当前内容，跨窗口正在使用的会话拒绝删除
-  - [x] 用户与 AI 历史消息支持文字选择和逐条原文复制；消息轨道占满侧栏可用宽度，
-    长消息使用稳定最大宽度
+  - [x] 用户与 AI 历史消息支持文字选择和逐条原文复制；用户问题可「修改」「删除」、
+    AI 回答可「重新生成」：修改与重新生成先把存储会话回卷到对应消息再写入替换的问答
+    （该轮之后的对话随之被替换），删除只移除该问答对并保留其它轮次；修改/删除在没有
+    持久锚点时只改本地投影；消息轨道占满侧栏可用宽度，长消息使用稳定最大宽度
   - [x] AI 流式回复和历史回答支持 Markdown 标题、强调、列表、引用、代码块和表格；
     保留原文复制，图片和正文链接仅展示文字，来源继续通过宿主校验后的引用按钮打开
   - [x] Office 增强页面窗口复用当前书 AI 范围；PPTX 逐张幻灯片保留精确 locator，
@@ -705,8 +714,8 @@ LangGraph 依赖。CLI 课程验证与桌面接入的验证分别列出。
 ## 明确不在当前范围
 
 - [ ] Office 独立幻灯片上的选段笔记，以及笔记导出
-- [ ] PDF/DjVu 页面笔记随分享包迁移：分享包以规范化 EPUB 投影为载体，页面文字层的
-  偏移无法在接收方的章节正文上复验，因此页面笔记按“与正文不再匹配”跳过
+- [ ] PDF/DjVu 页面笔记在「落投影」分享路上迁移：分享包以规范化 EPUB 投影为载体，页面
+  文字层的偏移无法在接收方的章节正文上复验（复用同一本原件的路径已支持，见上）
 - [ ] 分享包的端到端加密或访问口令：当前是普通 ZIP，任何拿到文件的人都能读取其中内容
 - [ ] PDF 页面与 Office 视觉预览页的段落翻译（两者使用 PDF.js 文本层/页面位图，不共享
   流式正文渲染，不在当前翻译范围内）
@@ -777,5 +786,40 @@ LangGraph 依赖。CLI 课程验证与桌面接入的验证分别列出。
   multi_endpoint_flow 1、openai_compatible_flow 22。因产品二进制正在运行、占用 `target/debug`，
   全目标测试在独立 target 目录（`target/verify`）中执行。未做人工 GUI 验证：失败块清单与
   「重试失败块」沿用原有界面路径，未在真实窗口复验；冷却只在日志文件里留
-  `translation_failure_cooldown_start/end` 与 `translation_failure_streak` 记录，任务窗口的
+  `translation_failure_cooldown_start/end` 与 `translation_request_failure_streak` 记录，任务窗口的
   「运行日志」页看不到它（失败块本身照旧列在失败列表里）。
+- [x] 2026-09-24 保存 Endpoint/密钥后，正在跑的整本翻译从下一块起换用新值：`configure_translation`
+  只把新 provider 写进 `models.translation`，而一次运行手里握的是**领取时的那份快照**，于是保存
+  之后正在跑的任务会继续拿旧 Endpoint/旧 key 翻完剩下的块（现场：改完 Endpoint 与 API key，任务
+  仍用旧值）。现在 walk 每一轮都重读一次当前服务（`walk::refreshed_translation_services`）：
+  **模型、执行身份与目标语言都一致**（同一套引擎）时换用新的 provider 与生成参数（密钥、超时、
+  温度等从下一块起生效，不重启任务，已翻好的块照旧复用），并在 `translation_services_refreshed`
+  记一条日志；其中任何一项不一致（改地址、换模型、换目标语言）都保持领取时的快照 —— 那次保存
+  本来就会重置任务行（任务回到暂停或排队，已存译文经 `adopt_execution_identity` 重盖身份继续
+  复用），本次运行会在下一个控制检查里被判成已被替换，重新领取时才按新引擎继续，不会把两种来源
+  的译文混进同一次运行。回归：lib 新增
+  `a_running_translation_switches_to_the_saved_endpoint_and_key`（运行中经真实入口
+  `configure_translation` 保存新 provider：只有换配置时已在飞的那一块走旧 provider，其余都走新的）
+  与 `a_running_translation_ignores_a_saved_service_with_another_identity`（另一套执行身份的服务
+  被忽略，全程仍用领取时的 provider）。验证：`cargo fmt --all --check`、
+  `cargo check --all-targets --locked`、`cargo clippy --all-targets --locked`（触及范围无新增
+  告警）与 `cargo test --all-targets --locked --no-fail-fast` 全通过 —— lib 675、产品二进制 310、
+  translation_flow 19、epub_flow 6、multi_format_flow 4、multi_endpoint_flow 1、
+  openai_compatible_flow 22。改 Endpoint 地址会清空密钥输入框（一个地址一套密钥），新地址的密钥
+  要在改完地址之后重新填入（README 已写明）。未做人工 GUI 验证。
+- [x] 2026-09-24 同类缺口一并修掉：运行中的 vision 与 embedding 任务在只换 API key（执行身份
+  不变、任务行不重置）时同样一直用领取时的快照。做法与翻译一致：`embedding.rs` 每一批、
+  `vision/run.rs` 每一页重读 `IndexingInner::models_snapshot()`，引擎一致（模型 + 执行身份，
+  embedding 另加维度）就换用新的 `embedding_provider` / `vision_provider`
+  （`embedding_provider_refreshed` / `vision_provider_refreshed` 各记一条日志），不一致则保持
+  领取时的快照、由 `reconfigure` 的任务行重置接手；只换 provider，模型、维度与执行身份始终取自
+  领取时的快照，落库的模型列不会在一次运行里漂移。回归：lib 新增
+  `a_running_embedding_uses_the_saved_provider_instead_of_its_claim_snapshot`、
+  `a_running_embedding_ignores_a_saved_provider_from_another_engine`、
+  `a_running_vision_uses_the_saved_provider_instead_of_its_claim_snapshot` 与
+  `a_running_vision_ignores_a_saved_provider_from_another_engine`（都按「运行手里是领取时的快照、
+  `inner.models` 已是保存后的那一份」构造，并用 mock 的向量标记 / 页面请求计数断言请求发给了谁）。
+  验证：`cargo fmt --all --check`、`cargo check --all-targets --locked`、`cargo clippy
+  --all-targets --locked`（触及范围无新增告警）与 `cargo test --all-targets --locked
+  --no-fail-fast` 全通过 —— lib 681、产品二进制 310、translation_flow 19、epub_flow 6、
+  multi_format_flow 4、multi_endpoint_flow 1、openai_compatible_flow 22。未做人工 GUI 验证。

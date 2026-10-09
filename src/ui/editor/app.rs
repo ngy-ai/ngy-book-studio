@@ -392,6 +392,10 @@ impl EditorApp {
                 self.ai_controller
                     .delete_session(thread_id.clone(), self.ai_sidebar.clone(), cx);
             }
+            AiSidebarEvent::DeleteTurn { user_db_id } => {
+                self.ai_controller
+                    .delete_turn(user_db_id.clone(), self.ai_sidebar.clone(), cx);
+            }
             AiSidebarEvent::ScopeChanged { book_ids } => {
                 self.ai_controller
                     .reconcile_scope(book_ids.clone(), self.ai_sidebar.clone(), cx)

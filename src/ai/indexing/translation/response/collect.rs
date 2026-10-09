@@ -33,6 +33,8 @@ pub(crate) async fn collect_translation_response(
     // 这里不再解包它（调用方照旧传进来，因为它与 source 一起构成这次请求的身份）。
     _context: &TranslationContext<'_>,
     request_body: &str,
+    // 这一发的端点来源，只进转储行（见 `dump_raw_translation_response`）。
+    endpoint: Option<&str>,
     identity: &str,
     mut stream: crate::ai::ChatEventStream,
 ) -> Result<BlockStep<String>> {
@@ -264,6 +266,7 @@ pub(crate) async fn collect_translation_response(
                 &span,
                 scope.ordinal,
                 request_attempt,
+                endpoint,
                 request_body,
                 Some(&response),
                 stats.end,

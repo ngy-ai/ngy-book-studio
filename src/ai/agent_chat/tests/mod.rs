@@ -98,6 +98,8 @@ fn frozen_selection_authorization_rejects_forged_and_preview_only_sources() {
     assert!(error.to_string().contains("preview-only"));
 }
 
+mod delete_test;
+
 mod request_test;
 
 mod scope_test;

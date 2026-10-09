@@ -103,6 +103,7 @@ fn canonical_edit_adds_a_cover_without_modifying_the_epub2_original() {
     };
     let mut document = library.document(&epub2.id).unwrap();
     let mut cover_asset = AssetRef::from_bytes(
+        &epub2.id,
         AssetRole::Cover,
         cover.mime(),
         Some("cover.png".to_string()),

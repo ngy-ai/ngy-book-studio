@@ -96,6 +96,8 @@ fn explanation_events_publish_only_current_persisted_answers_and_report_recovera
             "late failed answer".into(),
             Vec::new(),
             AgentAnswerSourceStatus::NoVerifiedSources,
+            None,
+            None,
             cx,
         ));
         request_id
@@ -119,6 +121,8 @@ fn explanation_events_publish_only_current_persisted_answers_and_report_recovera
             "old generation".into(),
             Vec::new(),
             AgentAnswerSourceStatus::NoVerifiedSources,
+            None,
+            None,
             cx,
         ));
         sidebar.append_answer_delta(request_id, "stream projection", cx);
@@ -127,6 +131,8 @@ fn explanation_events_publish_only_current_persisted_answers_and_report_recovera
             "## Final persisted Markdown\n\n**final answer**".into(),
             Vec::new(),
             AgentAnswerSourceStatus::NoVerifiedSources,
+            None,
+            None,
             cx,
         ));
         assert!(!sidebar.finish_persisted_answer(
@@ -134,6 +140,8 @@ fn explanation_events_publish_only_current_persisted_answers_and_report_recovera
             "duplicate result".into(),
             Vec::new(),
             AgentAnswerSourceStatus::NoVerifiedSources,
+            None,
+            None,
             cx,
         ));
         request_id

@@ -127,7 +127,11 @@ impl DocumentImporter for EpubImporter {
                 vec![role]
             };
             let asset = asset_from_bytes(
-                &format!("epub-resource\0{href}"),
+                // `assets.id` is the primary key of a library-wide table, so the
+                // seed must name the owning book: two books that carry the same
+                // resource at the same href — the six volumes of one series
+                // reusing a stylesheet, say — own separate asset rows.
+                &format!("{book_id}\0epub-resource\0{href}"),
                 roles,
                 if media_type.is_empty() {
                     "application/octet-stream"

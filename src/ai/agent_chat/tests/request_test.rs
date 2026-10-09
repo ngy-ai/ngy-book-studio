@@ -192,6 +192,7 @@ fn prepared_request_can_be_cancelled_before_ask_without_persistence() {
                 allowed_book_ids: Vec::new(),
                 book_titles: Vec::new(),
                 snapshots: Vec::new(),
+                truncate_from: None,
             },
             None,
             prepared,

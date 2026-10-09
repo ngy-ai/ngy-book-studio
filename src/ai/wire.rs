@@ -244,4 +244,13 @@ pub trait OpenAiCompatibleProvider: Send + Sync {
     fn models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>>>;
     fn chat_stream(&self, request: ChatRequest) -> BoxFuture<'_, Result<ChatEventStream>>;
     fn embeddings(&self, request: EmbeddingRequest) -> BoxFuture<'_, Result<EmbeddingBatch>>;
+
+    /// 这一发请求实际发给的端点来源（`scheme://host[:port]`），只用于诊断转储行。
+    ///
+    /// 默认 `None`：mock 与不标注地址的实现照旧按 `endpoint=-` 输出。实现必须每次从
+    /// 当前端点派生，不能缓存 —— 翻译运行期间保存设置会换掉 provider，缓存下来的地址
+    /// 会把旧端点标到新请求上。
+    fn endpoint_origin(&self) -> Option<String> {
+        None
+    }
 }

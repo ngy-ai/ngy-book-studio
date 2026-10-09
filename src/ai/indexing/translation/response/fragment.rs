@@ -120,6 +120,8 @@ pub(crate) async fn translate_block_by_fragment(
             None,
         );
         let request_body = translation_request_body(&request);
+        // 这一发发给谁，与主路径同一条规则（执行身份是哈希，端点地址必须自己记）。
+        let endpoint = translation.provider.endpoint_origin();
         tracing::debug!(
             target: "ngy_ai",
             parent: &span,
@@ -144,6 +146,7 @@ pub(crate) async fn translate_block_by_fragment(
                     &span,
                     scope.ordinal,
                     index + 1,
+                    endpoint.as_deref(),
                     &request_body,
                     None,
                     crate::ai::ai_diagnostics::error_kind(&error),
@@ -159,6 +162,7 @@ pub(crate) async fn translate_block_by_fragment(
             &fragment,
             &context,
             &request_body,
+            endpoint.as_deref(),
             &translation.execution_identity,
             stream,
         )
@@ -201,6 +205,7 @@ pub(crate) async fn translate_block_by_fragment(
                     &span,
                     scope.ordinal,
                     index + 1,
+                    endpoint.as_deref(),
                     &request_body,
                     Some(&response),
                     "fragment_rejected",
@@ -228,6 +233,7 @@ pub(crate) async fn translate_block_by_fragment(
             &span,
             scope.ordinal,
             index + 1,
+            endpoint.as_deref(),
             &request_body,
             Some(&response),
             "fragment_accepted",

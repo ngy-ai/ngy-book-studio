@@ -29,6 +29,7 @@ impl AssetResolver for MemoryAssets {
 fn sample() -> (BookDocument, MemoryAssets, Vec<u8>) {
     let original = b"byte-exact original document\0\xff".to_vec();
     let original_ref = AssetRef::from_bytes(
+        "book-1",
         AssetRole::OriginalSource,
         "application/octet-stream",
         Some("original.docx".to_string()),
@@ -40,6 +41,7 @@ fn sample() -> (BookDocument, MemoryAssets, Vec<u8>) {
         .expect("encode PNG fixture");
     let image_bytes = image_bytes.into_inner();
     let mut image_ref = AssetRef::from_bytes(
+        "book-1",
         AssetRole::Cover,
         "image/png",
         Some("cover.png".to_string()),

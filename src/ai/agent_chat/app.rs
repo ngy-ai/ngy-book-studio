@@ -192,6 +192,50 @@ impl AgentConversation {
         ))
     }
 
+    /// Removes one stored question together with its answer from the selected
+    /// conversation, keeping the later turns.
+    ///
+    /// The anchor is the sidebar's recorded `chat_messages.id` for that
+    /// question. Everything fallible — scope authorization, the stored
+    /// transcript read and the anchor check — happens before the deletion, and
+    /// a stale anchor returns `None` with the thread untouched.
+    pub async fn delete_turn(
+        &self,
+        user_message_id: &str,
+        allowed_book_ids: &[String],
+    ) -> Result<Option<ChatSession>> {
+        let host_scope = self.host_scope(allowed_book_ids)?;
+        let _transition = self.begin_session_transition()?;
+        let repository = self.services.chat();
+        let thread_id = {
+            let selection = self.selection.lock().await;
+            match selection.clone() {
+                ConversationSelection::Selected(thread_id) => thread_id,
+                ConversationSelection::Uninitialized | ConversationSelection::Fresh => {
+                    return Ok(None);
+                }
+            }
+        };
+        let Some(session) = repository.session(&thread_id).await? else {
+            let mut selection = self.selection.lock().await;
+            self.lease.clear_claim()?;
+            *selection = ConversationSelection::Fresh;
+            return Ok(None);
+        };
+        self.validate_session_context(&session.thread)?;
+        ensure!(
+            self.thread_scope_is_authorized(&session.thread, &host_scope),
+            "conversation scope exceeds the current host-authorized scope"
+        );
+        if !repository
+            .delete_question_and_answer(&thread_id, user_message_id)
+            .await?
+        {
+            return Ok(None);
+        }
+        Ok(repository.session(&thread_id).await?)
+    }
+
     /// Drops the selected conversation when its persisted authority exceeds
     /// the host's current authority. The session transition guard keeps this
     /// decision mutually exclusive with active requests and other session

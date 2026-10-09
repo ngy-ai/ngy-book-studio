@@ -172,8 +172,13 @@ pub(crate) fn open_unchanged_media_page(
     let (fixture, visual) = open_editor_with_prepared_assets(cx, false, |document| {
         prepare_toc_document(document);
         let bytes = Arc::new(b"unchanged-image-fixture".to_vec());
-        let image =
-            AssetRef::from_bytes(AssetRole::ContentImage, "image/png", None, bytes.as_slice());
+        let image = AssetRef::from_bytes(
+            &document.id,
+            AssetRole::ContentImage,
+            "image/png",
+            None,
+            bytes.as_slice(),
+        );
         let unit = &mut document.units[3];
         unit.document = BlockDocument::new(vec![
             Block::Paragraph {

@@ -29,6 +29,9 @@ impl AiSidebar {
         );
         self.conversation.included_references.clear();
         self.conversation.messages.clear();
+        // The transcript is replaced wholesale; an anchor left over from an
+        // edit in the discarded conversation belongs to that conversation.
+        self.conversation.pending_truncate_from = None;
         let selected_active = self.sessions.active_thread_id.as_deref();
         if requested_active.as_deref() == selected_active {
             for message in messages {
@@ -50,6 +53,7 @@ impl AiSidebar {
                         .collect(),
                     source_status: message.source_status,
                     request_id: None,
+                    db_id: Some(message.db_id),
                 });
             }
         }
@@ -120,17 +124,23 @@ impl AiSidebar {
     }
 
     /// The caller supplies the already-persisted final Markdown, never a
-    /// provisional stream buffer or an answer awaiting citation validation.
+    /// provisional stream buffer or an answer awaiting citation validation,
+    /// together with the persisted IDs of the stored question and answer, so
+    /// later edits and regenerations can anchor the exact stored turn.
     pub(crate) fn finish_persisted_answer(
         &mut self,
         request_id: u64,
         markdown: String,
         sources: Vec<AiSourceLink>,
         source_status: AgentAnswerSourceStatus,
+        user_db_id: Option<String>,
+        assistant_db_id: Option<String>,
         cx: &mut Context<Self>,
     ) -> bool {
         let changed = self.conversation.finish(request_id, sources, source_status);
         if changed {
+            self.conversation
+                .set_persisted_ids(request_id, user_db_id, assistant_db_id);
             if self.selection_explanation_request == Some(request_id) {
                 self.selection_explanation_request = None;
             }

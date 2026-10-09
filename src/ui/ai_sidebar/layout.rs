@@ -36,11 +36,13 @@ pub(crate) fn reference_list_max_height(reference_count: usize) -> Pixels {
 }
 
 pub(crate) fn message_text_width(sidebar_width: Pixels, rem_size: Pixels) -> Pixels {
-    // Two horizontal padding pairs (3 rem), the copy-button gap (0.25 rem),
-    // the 24 px copy column and 4 px for borders/rounding. TextView 0.5.1's
-    // clipped list rows lose short text on Windows when width is only a percent
-    // inside a flex item. Resolve it before laying out the Markdown tree.
-    (sidebar_width - rems(3.25).to_pixels(rem_size) - px(28.)).max(px(0.))
+    // Two horizontal padding pairs (3 rem: the scroll area and the message
+    // card) plus 4 px for borders/rounding. The action row (copy, edit,
+    // regenerate) sits under the bubble, so it no longer narrows the text
+    // column. TextView 0.5.1's clipped list rows lose short text on Windows
+    // when width is only a percent inside a flex item. Resolve it before
+    // laying out the Markdown tree.
+    (sidebar_width - rems(3.).to_pixels(rem_size) - px(4.)).max(px(0.))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

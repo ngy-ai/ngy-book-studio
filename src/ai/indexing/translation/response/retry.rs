@@ -218,6 +218,10 @@ pub(crate) async fn translate_block_round(
         );
         // 本次尝试真正要发出去的 body，供 NGY_DUMP_TRANSLATION_RAW 原样打印。
         let request_body = translation_request_body(&request);
+        // 这一发发给谁：转储行上的端点地址。执行身份只是哈希，同一个模型名绑在多个端点
+        // 上时只有它能说明这一发落在哪；每次都从当前 provider 取，运行中换端点后不会把
+        // 旧地址标到新请求上。
+        let endpoint = translation.provider.endpoint_origin();
         tracing::debug!(
             target: "ngy_ai",
             parent: &span,
@@ -261,6 +265,7 @@ pub(crate) async fn translate_block_round(
                         &span,
                         scope.ordinal,
                         attempt,
+                        endpoint.as_deref(),
                         &request_body,
                         None,
                         crate::ai::ai_diagnostics::error_kind(&error),
@@ -276,6 +281,7 @@ pub(crate) async fn translate_block_round(
                 source,
                 &context,
                 &request_body,
+                endpoint.as_deref(),
                 &translation.execution_identity,
                 stream,
             )
@@ -378,6 +384,7 @@ pub(crate) async fn translate_block_round(
                     &span,
                     scope.ordinal,
                     attempt,
+                    endpoint.as_deref(),
                     &request_body,
                     Some(&response),
                     "accepted",
@@ -458,6 +465,7 @@ pub(crate) async fn translate_block_round(
                     &span,
                     scope.ordinal,
                     attempt,
+                    endpoint.as_deref(),
                     &request_body,
                     Some(&response),
                     "protocol_rejected",

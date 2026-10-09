@@ -278,6 +278,7 @@ fn scope_change_drops_only_unauthorized_reference_selections() {
         ],
         source_status: Some(AgentAnswerSourceStatus::VerifiedKnowledgeBaseSources),
         request_id: None,
+        db_id: None,
     });
 
     state.set_scope(AiSidebarScope::library("Only B", vec![book("b")]));

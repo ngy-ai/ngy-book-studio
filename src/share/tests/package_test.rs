@@ -6,7 +6,6 @@ fn note() -> SharedNote {
     SharedNote {
         unit: SharedUnitRef {
             ordinal: 0,
-            href: Some("ch1.xhtml".into()),
             title: Some("第一章".into()),
         },
         kind: "highlight".into(),
@@ -47,13 +46,13 @@ fn a_package_round_trips_through_the_zip_container() {
                 quote: "被划线的文字".into(),
                 url: None,
                 source_title: None,
+                locator_json: Some(r#"{"book_id":"book-1","unit_id":"unit-1"}"#.into()),
             }],
         }],
     }];
     let translations = vec![SharedTranslation {
         unit: SharedUnitRef {
             ordinal: 0,
-            href: Some("ch1.xhtml".into()),
             title: Some("第一章".into()),
         },
         block_index: 2,

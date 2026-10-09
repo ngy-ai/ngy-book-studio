@@ -7,7 +7,7 @@
 //! dropped instead of being guessed at — a stale note must never be pinned onto
 //! text the sender never selected.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::*;
 
@@ -44,6 +44,18 @@ pub(crate) struct ShareApplyRequest<'a> {
     pub(crate) chats: &'a [SharedChatThread],
     pub(crate) translations: &'a [SharedTranslation],
     pub(crate) stamp: Option<&'a ShareTranslationStamp>,
+    /// The language the shared machine译文 should be stored under, or `None` to
+    /// keep each row's own language.
+    ///
+    /// Only set when the whole package is one language and the receiver has a
+    /// reading language of its own: writing several shared languages into one
+    /// would make them collide on the translation scope key and silently
+    /// overwrite each other.
+    pub(crate) restamp_language: Option<&'a str>,
+    /// Whether the receiving record *is* the sender's document. Only then do
+    /// the sender's book, unit and block ids mean anything here, and only then
+    /// may a citation keep the sender's block-level locator.
+    pub(crate) preserve_locators: bool,
     pub(crate) now: u64,
 }
 
@@ -82,9 +94,25 @@ fn import_notes(
             report.notes_imported += 1;
         } else {
             report.notes_skipped += 1;
+            tracing::debug!(
+                target: "ngy_share",
+                chapter = %shared_unit_label(&note.unit),
+                ordinal = note.unit.ordinal,
+                "分享包：笔记与接收方正文对不上，已跳过"
+            );
         }
     }
     Ok(())
+}
+
+/// Names the chapter an item belonged to, for diagnostics. The sender's title is
+/// the only human-readable handle that survives the transfer, because the
+/// chapter's own IDs do not.
+fn shared_unit_label(unit: &crate::share::SharedUnitRef) -> String {
+    match unit.title.as_deref() {
+        Some(title) if !title.trim().is_empty() => title.to_string(),
+        _ => format!("第 {} 章", unit.ordinal + 1),
+    }
 }
 
 /// Returns `false` when the note cannot describe this document. The receiver's
@@ -194,31 +222,54 @@ fn import_chats(
     request: &ShareApplyRequest<'_>,
     report: &mut ShareApplyReport,
 ) -> Result<()> {
-    for (index, thread) in request.chats.iter().enumerate() {
-        if import_shared_thread(conn, request, thread, index)? {
+    for thread in request.chats {
+        let (thread_id, created) = ensure_shared_thread(conn, request, thread)?;
+        if created {
             report.chat_threads += 1;
-            report.chat_messages += thread.messages.len();
         }
+        report.chat_messages += append_shared_messages(conn, request, &thread_id, thread)?;
     }
     Ok(())
 }
 
-/// Returns `false` when this thread was already imported from the same package.
-fn import_shared_thread(
+/// A shared conversation's identity: the sender's title, its creation instant
+/// and the first turn it carries.
+///
+/// Position in a list is deliberately *not* part of it. The sender's thread list
+/// is ordered by recent activity, so replying to an older conversation would
+/// renumber it and make the next export look like a brand new conversation. The
+/// first turn never changes (conversations are append-only here) and still
+/// distinguishes a thread that was recreated with the same title in the same
+/// second.
+fn shared_thread_id(book_id: &str, thread: &SharedChatThread) -> String {
+    let first = match thread.messages.first() {
+        Some(message) => format!(
+            "{}\0{}",
+            message.created_at,
+            blake3::hash(message.content.as_bytes()).to_hex()
+        ),
+        None => thread.created_at.to_string(),
+    };
+    deterministic_id(
+        "chat-thread",
+        format!(
+            "share\0{book_id}\0{}\0{}\0{first}",
+            thread.created_at, thread.title
+        ),
+    )
+}
+
+/// Inserts the conversation unless it is already here. An existing thread keeps
+/// the title and timestamps the receiver may have edited; whichever of its turns
+/// are missing are appended by [`append_shared_messages`].
+fn ensure_shared_thread(
     conn: &Connection,
     request: &ShareApplyRequest<'_>,
     thread: &SharedChatThread,
-    index: usize,
-) -> Result<bool> {
-    let thread_id = deterministic_id(
-        "chat-thread",
-        format!(
-            "share\0{}\0{}\0{}\0{}",
-            request.book_id, index, thread.created_at, thread.title
-        ),
-    );
+) -> Result<(String, bool)> {
+    let thread_id = shared_thread_id(request.book_id, thread);
     if super::super::chat_threads::get(conn, &thread_id)?.is_some() {
-        return Ok(false);
+        return Ok((thread_id, false));
     }
     let window_kind = match thread.window_kind.as_str() {
         "editor" => "editor",
@@ -240,18 +291,46 @@ fn import_shared_thread(
             updated_at: thread.updated_at.max(thread.created_at),
         },
     )?;
-    let mut message_ids = HashMap::new();
-    for message in &thread.messages {
-        let id = deterministic_id(
-            "chat-message",
-            format!("{thread_id}\0{}\0{}", message.ordinal, message.created_at),
-        );
-        message_ids.insert(message.ordinal, id.clone());
-    }
+    Ok((thread_id, true))
+}
+
+/// Appends the turns this thread does not have yet, so re-sharing an updated
+/// conversation adds what is new instead of duplicating the whole thing.
+///
+/// Returns how many messages were actually written.
+fn append_shared_messages(
+    conn: &Connection,
+    request: &ShareApplyRequest<'_>,
+    thread_id: &str,
+    thread: &SharedChatThread,
+) -> Result<usize> {
+    let stored = super::super::chat_messages::list_for_thread(conn, thread_id)?
+        .into_iter()
+        .map(|message| message.ordinal)
+        .collect::<HashSet<_>>();
+    let message_ids = thread
+        .messages
+        .iter()
+        .map(|message| {
+            (
+                message.ordinal,
+                deterministic_id(
+                    "chat-message",
+                    format!("{thread_id}\0{}\0{}", message.ordinal, message.created_at),
+                ),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut written = 0;
     for message in &thread.messages {
         let Some(id) = message_ids.get(&message.ordinal) else {
             continue;
         };
+        // Either already imported, or this ordinal holds a different turn of a
+        // thread that merely shares a name; neither may be displaced.
+        if stored.contains(&message.ordinal) {
+            continue;
+        }
         let parent_id = message
             .parent_ordinal
             .and_then(|ordinal| message_ids.get(&ordinal).cloned());
@@ -259,7 +338,7 @@ fn import_shared_thread(
             conn,
             &super::super::chat_messages::ChatMessage {
                 id: id.clone(),
-                thread_id: thread_id.clone(),
+                thread_id: thread_id.to_string(),
                 parent_id,
                 ordinal: message.ordinal,
                 role: normalize_chat_role(&message.role).to_string(),
@@ -274,14 +353,19 @@ fn import_shared_thread(
             };
             super::super::chat_citations::insert(conn, &stored)?;
         }
+        written += 1;
     }
-    Ok(true)
+    Ok(written)
 }
 
-/// Rebuilds one citation against the receiving document. A book citation keeps
-/// its quote and chapter; the exact block it pointed at on the sender's side is
-/// not reproducible, so the rebuilt locator names the chapter and the reader
-/// opens it there. Web citations carry no locator at all.
+/// Rebuilds one citation against the receiving document.
+///
+/// A receiver that owns the sender's own book keeps the sender's locator after
+/// revalidating it, so the citation still jumps to its block and its quote. Any
+/// other receiver gets a locator that names the chapter only: the exact block of
+/// a document this library published itself is not reproducible, and a locator
+/// that merely looks plausible would be worse than none. Web citations carry no
+/// locator at all.
 fn shared_citation(
     conn: &Connection,
     request: &ShareApplyRequest<'_>,
@@ -300,23 +384,6 @@ fn shared_citation(
     if !is_web && unit.is_none() {
         return Ok(None);
     }
-    let (content_unit_id, locator_json, document_revision, unit_revision) = match unit {
-        Some(unit) => (
-            Some(unit.id.clone()),
-            Some(
-                serde_json::to_string(&DocumentLocator::unit(request.book_id, unit.id.clone()))
-                    .context("无法序列化分享引用的定位信息")?,
-            ),
-            request.document_revision,
-            unit.revision,
-        ),
-        None => (
-            None,
-            None,
-            request.document_revision,
-            request.document_revision,
-        ),
-    };
     let id = deterministic_id(
         "chat-citation",
         format!("{message_id}\0{ordinal}\0{}", citation.quote),
@@ -324,23 +391,46 @@ fn shared_citation(
     if super::super::chat_citations::get(conn, &id)?.is_some() {
         return Ok(None);
     }
-    Ok(Some(super::super::chat_citations::ChatCitation {
+    let chapter_locator = match unit {
+        Some(unit) => Some(
+            serde_json::to_string(&DocumentLocator::unit(request.book_id, unit.id.clone()))
+                .context("无法序列化分享引用的定位信息")?,
+        ),
+        None => None,
+    };
+    let mut stored = super::super::chat_citations::ChatCitation {
         id,
         message_id: message_id.to_string(),
-        content_unit_id,
+        content_unit_id: unit.map(|unit| unit.id.clone()),
         // The receiving library's search index is derived and rebuilt locally;
         // an index chunk reference from the sender would be dangling.
         search_chunk_id: None,
         ordinal,
         quote: citation.quote.clone(),
-        document_revision,
-        unit_revision,
-        locator_json,
+        document_revision: request.document_revision,
+        unit_revision: unit
+            .map(|unit| unit.revision)
+            .unwrap_or(request.document_revision),
+        locator_json: chapter_locator.clone(),
         source_kind: if is_web { "web" } else { "book" }.to_string(),
         url: citation.url.clone(),
         source_title: citation.source_title.clone(),
         created_at: request.now,
-    }))
+    };
+    let sender_locator = citation
+        .locator_json
+        .as_deref()
+        .filter(|_| request.preserve_locators);
+    if let Some(sender_locator) = sender_locator {
+        stored.locator_json = Some(sender_locator.to_string());
+        // The locator was written against somebody else's database; it is kept
+        // only if it still describes this very document, block and all.
+        let allowed = [request.book_id.to_string()];
+        if super::validate_current_chat_citation(conn, &stored, &allowed).is_err() {
+            stored.locator_json = chapter_locator;
+        }
+    }
+    Ok(Some(stored))
 }
 
 fn normalize_chat_role(role: &str) -> &'static str {
@@ -362,6 +452,12 @@ fn import_translations(
             report.translations_imported += 1;
         } else {
             report.translations_skipped += 1;
+            tracing::debug!(
+                target: "ngy_share",
+                chapter = %shared_unit_label(&translation.unit),
+                ordinal = translation.unit.ordinal,
+                "分享包：译文与接收方文本块对不上，已跳过"
+            );
         }
     }
     Ok(())
@@ -421,10 +517,10 @@ fn insert_shared_translation(
             }
         }
     };
-    let target_language = request
-        .stamp
-        .and_then(|stamp| stamp.target_language.clone())
-        .unwrap_or_else(|| translation.target_language.clone());
+    let target_language = match request.restamp_language {
+        Some(language) => language.to_string(),
+        None => translation.target_language.clone(),
+    };
     let block_id = format!("{}::h{}", unit.id, translation.block_index);
     super::super::translations::upsert(
         conn,

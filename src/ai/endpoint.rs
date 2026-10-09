@@ -27,6 +27,16 @@ pub fn normalize_provider_base_url(base_url: &str) -> Result<Url> {
     Ok(url)
 }
 
+/// 诊断用的端点来源标签：`scheme://host[:port]`。
+///
+/// 只到**来源**，不含路径 —— 与 `OpenAiHttpProvider::chat_stream` 的 `ai_http` span
+/// 同一条规则：路径可能带租户名，查询串与 userinfo 则已在
+/// [`normalize_provider_base_url`] 里被禁止。因此它既够说明「这一发发给了谁」，又不把
+/// 端点路径写进日志。
+pub(crate) fn endpoint_origin_label(url: &Url) -> String {
+    url.origin().ascii_serialization()
+}
+
 pub(crate) fn endpoint_is_loopback(url: &Url) -> bool {
     match url.host_str().map(|host| host.trim_matches(['[', ']'])) {
         Some(host) if host.eq_ignore_ascii_case("localhost") => true,

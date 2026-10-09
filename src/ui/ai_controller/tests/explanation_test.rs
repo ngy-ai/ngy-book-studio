@@ -92,6 +92,7 @@ pub(crate) fn reader_selection_explanation_emits_once_after_fresh_session_callba
                 content: "Previous question".to_string(),
                 sources: Vec::new(),
                 source_status: None,
+                db_id: "stored-question".to_string(),
             }],
             cx,
         );

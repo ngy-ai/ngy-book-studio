@@ -1,6 +1,7 @@
 mod ai_controller;
 mod ai_settings;
 mod ai_sidebar;
+mod assets;
 mod background_jobs;
 mod data_dir_setup;
 mod editor;
@@ -14,6 +15,7 @@ mod reader;
 #[cfg(test)]
 mod application_exit_test;
 
+pub(crate) use assets::AppAssets;
 pub(crate) use data_dir_setup::{DataDirSetupWindow, open_data_dir_setup_window};
 pub(crate) use library::{EpubReaderApp, wrap_root};
 
@@ -72,7 +74,7 @@ use ngy_book_studio::{
     export::ExportFormat,
     library::{
         BookGroup, BookRecord, CoverDraft, ImportOutcome, LibraryStore, SearchHit,
-        ShareExportSummary, ShareImportOutcome,
+        ShareBookOutcome, ShareExportSummary, ShareImportOutcome,
     },
     preview::bundled_pdfjs_asset,
     reader::OpenedBook,

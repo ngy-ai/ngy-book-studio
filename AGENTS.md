@@ -54,6 +54,7 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
 | `docs/agent/ai-safety.md` | 搜索、视觉与 AI 安全约束（检索权限、后台任务、引用与模型参数） | 改检索、视觉派生数据或 AI 权限/引用时 |
 | `docs/agent/webview-and-window-constraints.md` | 不可破坏的 WebView 与窗口约束、不可破坏的内容安全约束 | 改 WebView、窗口生命周期、编辑器与 IPC 时 |
 | `docs/agent/gui-verification.md` | GUI 冒烟与完成标准 | 交付与验收前 |
+| `docs/adr/` | 难以回退的设计决定（分享包按章节序号定位分区、分享译文重署名、以规范化投影而非原件为载体、按 ID 复用已有图书） | 改分享包格式或导入策略前 |
 
 ## 工作边界
 

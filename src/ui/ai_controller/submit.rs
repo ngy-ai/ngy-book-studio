@@ -16,6 +16,7 @@ impl AiSidebarController {
             book_titles,
             reference_hints,
             reference,
+            truncate_from,
         } = request;
         let reference_hints = merge_editor_reference(reference_hints, reference);
         let services = Arc::clone(&self.services);
@@ -89,6 +90,7 @@ impl AiSidebarController {
                     allowed_book_ids: book_ids,
                     book_titles,
                     snapshots,
+                    truncate_from,
                 },
                 Some(agent_tx),
                 prepared,
@@ -247,6 +249,8 @@ impl AiSidebarController {
                                         answer.answer.stored_message.content,
                                         answer.sources,
                                         answer.source_status,
+                                        Some(answer.answer.user_message_id),
+                                        Some(answer.answer.stored_message.id),
                                         cx,
                                     )
                                 }

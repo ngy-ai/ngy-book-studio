@@ -46,7 +46,15 @@ impl AssetRef {
         }
     }
 
+    /// Metadata for bytes the caller just produced for one book.
+    ///
+    /// `book_id` is part of the derived id because `assets.id` is the primary
+    /// key of a library-wide table: the same cover image or media file may
+    /// legitimately exist in two books, and each one owns its own row. The id
+    /// stays deterministic, so the same bytes in the same book keep the id a
+    /// caller derived earlier.
     pub fn from_bytes(
+        book_id: &str,
         role: AssetRole,
         media_type: impl Into<String>,
         original_file_name: Option<String>,
@@ -54,7 +62,7 @@ impl AssetRef {
     ) -> Self {
         let content_hash = blake3::hash(bytes).to_hex().to_string();
         Self {
-            id: format!("asset-{content_hash}"),
+            id: deterministic_id("asset", format!("{book_id}\0{content_hash}").as_bytes()),
             roles: vec![role],
             media_type: media_type.into(),
             original_file_name,

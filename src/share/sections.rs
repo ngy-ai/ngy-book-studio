@@ -1,40 +1,36 @@
 //! The section payloads carried inside a share package.
 //!
 //! Every item locates its content unit by **ordinal** — the zero-based position
-//! in the exported document — plus a human-readable hint (`href`, `title`). The
-//! sender's IDs are deliberately absent: a receiver's own import derives
-//! different unit and block IDs from the same text, so an ID from the sender
-//! would only be a promise this side cannot keep.
+//! in the exported document. The sender's IDs are deliberately absent: a
+//! receiver's own import derives different unit and block IDs from the same
+//! text, so an ID from the sender would only be a promise this side cannot
+//! keep. The only exception is a conversation citation, which may carry the
+//! sender's own `locator_json` verbatim: when the receiver turns out to own the
+//! very same original, its IDs *are* the sender's and the locator can be kept
+//! as it is (see `library::share`).
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    annotations::AnnotationKind,
-    document::{ContentUnit, SourceLocator},
-};
+use crate::{annotations::AnnotationKind, document::ContentUnit};
 
 /// Where an item lives in the sender's document.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SharedUnitRef {
     pub ordinal: usize,
-    /// Native chapter path, when the sender's unit had one. Used as a
-    /// cross-check, never as the mapping key.
-    pub href: Option<String>,
+    /// The sender's chapter title. Not a mapping key and not a guard — the
+    /// receiving text is what decides — but it is the only human-readable
+    /// handle that survives the transfer, so the import log can name the
+    /// chapter whose items were dropped.
     pub title: Option<String>,
 }
 
 impl SharedUnitRef {
     /// Builds the reference for one unit of an exported document.
     pub fn from_unit(ordinal: usize, unit: &ContentUnit) -> Self {
-        let href = match unit.source_locator.as_ref() {
-            Some(SourceLocator::Epub { href }) => Some(href.clone()),
-            _ => None,
-        };
         let title = unit.title.trim();
         Self {
             ordinal,
-            href,
             title: (!title.is_empty()).then(|| title.to_string()),
         }
     }
@@ -71,6 +67,16 @@ pub struct SharedChatCitation {
     pub quote: String,
     pub url: Option<String>,
     pub source_title: Option<String>,
+    /// The sender's own [`DocumentLocator`](crate::document::DocumentLocator),
+    /// serialized exactly as it was stored.
+    ///
+    /// It is only usable when the receiver owns the very same original — then
+    /// the book id, unit ids and block ids all line up and the citation can
+    /// keep pointing at the exact block. The receiving side revalidates it
+    /// before use and falls back to a chapter-level locator, so a locator that
+    /// does not describe the receiving document is never trusted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locator_json: Option<String>,
 }
 
 /// One message of a shared conversation. `parent_ordinal` refers to a message in

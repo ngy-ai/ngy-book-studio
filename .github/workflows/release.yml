@@ -13,7 +13,7 @@ env:
   # 双保险：脚本自己也会 reconfigure，但 runner 的控制台代码页在脚本启动前就可能出事。
   PYTHONIOENCODING: utf-8
   # 磁盘：这个项目的 debug 产物在本机累积到 27GB，而 runner 只有十几 GB。
-  # 去掉调试符号能砍掉一大半，发布流程也不需要它们。
+  # 去掉调试符号能砍掉一大半，且发布流程不需要它们。
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
   CARGO_INCREMENTAL: "0"
@@ -34,7 +34,7 @@ jobs:
           - name: linux-x86_64
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            # 不跑测试：runner 上 release 与 debug 两份产物装不下。
+            # 不跑测试：runner 装不下 release 与 debug 两份产物。
             # 这一条必须和 Release 说明里的「仅验证构建」对上，不要假装测过。
             test: false
           - name: macos-arm64
@@ -96,7 +96,8 @@ jobs:
             build-essential cmake pkg-config clang libclang-dev \
             libfontconfig1-dev libfreetype6-dev \
             libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
-            libx11-dev libxcb1-dev libvulkan-dev \
+            libx11-dev libxcb1-dev libxrandr-dev libxi-dev libxcursor-dev \
+            libvulkan-dev libgl1-mesa-dev libegl1-mesa-dev libssl-dev \
             libgtk-3-dev libwebkit2gtk-4.1-dev libsoup-3.0-dev \
             libayatana-appindicator3-dev
 
@@ -117,52 +118,100 @@ jobs:
             exit 1
           fi
 
+      # 每一条编译/测试命令都把输出落盘到 ci-output.txt，失败时由收尾步骤带走。
+      # pipefail 不能省：没有它，cargo 失败而 tee 成功会让这一步看起来是绿的。
       - name: 构建 release
+        shell: bash
         env:
           # 交叉到 x86_64 时，带 C 部分的依赖要靠它选对架构。
           CMAKE_OSX_ARCHITECTURES: ${{ matrix.target == 'x86_64-apple-darwin' && 'x86_64' || '' }}
-        run: cargo build --release --locked --bin ngy-book-studio --target ${{ matrix.target }}
+        run: |
+          set -o pipefail
+          cargo build --release --locked --bin ngy-book-studio \
+            --target ${{ matrix.target }} 2>&1 | tee -a ci-output.txt
 
       # 与本地完全同一条命令：在 workflow 里写只存在于 CI 的打包命令，
       # 那段代码永远不会被本地跑过。
       - name: 打包
-        run: python packaging/package.py --target ${{ matrix.target }} --out dist
+        if: success()
+        shell: bash
+        run: |
+          set -o pipefail
+          python packaging/package.py --target ${{ matrix.target }} --out dist 2>&1 | tee -a ci-output.txt
 
       - name: 列出产物
+        if: success()
         shell: bash
         run: |
           ls -la dist
           df -h | head -6
 
       - uses: actions/upload-artifact@v4
+        if: success()
         with:
           name: dist-${{ matrix.name }}
           path: dist/*
           if-no-files-found: error
 
-      # 产物已经进 artifact 了，把 release 目录删掉再编译测试：
-      # 否则 debug 与 release 两份同时占地，Windows 上就是这么写满的。
-      - name: 腾出 release 产物
-        if: matrix.test
-        shell: bash
-        run: |
-          rm -rf "target/${{ matrix.target }}/release"
-          df -h | head -6
-
-      # 测试放在最后，跑完这个 job 也就结束了。
+      # 用 release profile 跑测试：复用刚构建好的那份 target/release，
+      # 不再单独拉一份 debug 产物 —— Windows 上一次就是倒在编译 debug 测试目标上的。
       # 编译与测试拆两步 —— cargo test 返回 101 分不清「编译失败」与「测试失败」。
       - name: 编译测试目标
         if: matrix.test
-        run: cargo test --locked --target ${{ matrix.target }} --no-run
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --release --locked --target ${{ matrix.target }} --no-run 2>&1 | tee -a ci-output.txt
 
       - name: 运行测试
         if: matrix.test
-        run: cargo test --locked --target ${{ matrix.target }} --no-fail-fast
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --release --locked --target ${{ matrix.target }} --no-fail-fast 2>&1 | tee -a ci-output.txt
+
+      # 手上没有 PAT 时读不到 job 日志（未认证一律 403），所以让 CI 自己把输出交出来：
+      # 一份进 check-run 注解（匿名就能读，不用 fetch），一份推到 ci-log 分支（零配额取回）。
+      # 这步自己红了会盖住真正失败的那一步，所以 continue-on-error。
+      - name: 失败时交出构建输出
+        if: failure()
+        continue-on-error: true
+        shell: bash
+        run: |
+          {
+            set -x
+            if [ ! -f ci-output.txt ]; then
+              echo "没有捕获到输出（失败发生在第一个 tee 之前）"
+              exit 0
+            fi
+            echo "=== 输出行数：$(wc -l < ci-output.txt) ==="
+            python - <<'PY' || true
+          import pathlib
+          text = pathlib.Path("ci-output.txt").read_text(encoding="utf-8", errors="replace")
+          # 头尾都留：首个报错常在头部，汇总在尾部。
+          excerpt = text[:1500] + "\n...[中略]...\n" + text[-6000:]
+          escaped = excerpt.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+          print("::error title=构建输出(" + str(len(text)) + "字符)::" + escaped)
+          PY
+            branch="ci-log/${{ matrix.name }}"
+            mkdir -p ci-log
+            cp ci-output.txt "ci-log/${{ matrix.name }}.txt"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git checkout -B "${branch}"
+            git add -f "ci-log/${{ matrix.name }}.txt"
+            git commit -m "ci: 失败输出"
+            git push --force origin "${branch}"
+          } > push-report.txt 2>&1 || echo "推送失败（原因见 push-report.txt）"
+          cat push-report.txt || true
 
   release:
     name: publish release
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    # always()：构建 job 里某个平台失败时也要走到这里。needs 的隐式「必须全绿」会把
+    # Release 直接 skip 掉，那样连「为什么没发」都看不见。产物齐全才发，不齐全由
+    # 下面的硬校验拦住。
+    if: always() && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       # 必须 checkout：gh 靠 git remote 回答「往哪个仓库发」，
@@ -170,7 +219,9 @@ jobs:
       # 且要放在 download 之前 —— checkout 会清理工作目录，反过来会把刚取回的 dist/ 删掉。
       - uses: actions/checkout@v4
 
+      # 缺 artifact 时别让这一步自己炸掉，留给下面的齐全检查报出到底差几个。
       - uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           pattern: dist-*
           merge-multiple: true
@@ -209,7 +260,7 @@ jobs:
 
           ### 平台验证状态（请先读这一条）
 
-          - **Windows 10/11 / MSVC**：唯一完整验收的平台。本次发布在 runner 上跑了全量测试。
+          - **Windows 10/11 / MSVC**：唯一完整验收的平台。本次发布在 runner 上跑过全量测试。
           - **Linux x86_64**：只验证了「编得过、打得出来」，**没有跑测试，也没有人运行过界面**。
           - **macOS（arm64 与 x86_64）**：同上，**只验证构建**；x86_64 那一份还是交叉编译出来的。
 

@@ -156,13 +156,14 @@ pub(crate) struct PreparedEditorMedia {
 }
 
 impl PreparedEditorMedia {
-    pub(crate) fn new(draft: MediaDraft) -> Self {
+    pub(crate) fn new(book_id: &str, draft: MediaDraft) -> Self {
         let role = match draft.kind {
             MediaKind::Image => AssetRole::ContentImage,
             MediaKind::Audio => AssetRole::Audio,
             MediaKind::Video => AssetRole::Video,
         };
         let asset = AssetRef::from_bytes(
+            book_id,
             role,
             draft.media_type.clone(),
             draft.original_file_name.clone(),

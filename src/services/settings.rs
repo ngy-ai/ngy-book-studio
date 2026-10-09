@@ -174,10 +174,10 @@ pub(crate) fn default_auto_run_background_jobs() -> bool {
 /// Upper bound of background model jobs running at the same time. The indexing
 /// worker spawns this many tasks once and parks the ones above the configured
 /// concurrency, so raising or lowering the setting takes effect without a
-/// restart. Parked slots only sleep on the idle poll interval, so the bound is
-/// deliberately generous; the actual pressure still comes from the concurrency
-/// the user configures.
-pub const MAX_BACKGROUND_JOB_CONCURRENCY: usize = 1024;
+/// restart. Parked slots only sleep on the idle poll interval, so the bound
+/// sits well above any usable concurrency; the actual pressure still comes
+/// from the concurrency the user configures.
+pub const MAX_BACKGROUND_JOB_CONCURRENCY: usize = 64;
 /// Fewer than one worker cannot make progress.
 pub const MIN_BACKGROUND_JOB_CONCURRENCY: usize = 1;
 /// One job at a time keeps memory and network pressure predictable; users on

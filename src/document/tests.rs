@@ -4,30 +4,35 @@ use super::*;
 
 fn sample_book() -> BookDocument {
     let original = AssetRef::from_bytes(
+        "book-1",
         AssetRole::OriginalSource,
         "application/epub+zip",
         Some("sample.epub".to_string()),
         b"source",
     );
     let image = AssetRef::from_bytes(
+        "book-1",
         AssetRole::ContentImage,
         "image/png",
         Some("figure.png".to_string()),
         b"image",
     );
     let audio = AssetRef::from_bytes(
+        "book-1",
         AssetRole::Audio,
         "audio/mpeg",
         Some("voice.mp3".to_string()),
         b"audio",
     );
     let video = AssetRef::from_bytes(
+        "book-1",
         AssetRole::Video,
         "video/mp4",
         Some("demo.mp4".to_string()),
         b"video",
     );
     let poster = AssetRef::from_bytes(
+        "book-1",
         AssetRole::Poster,
         "image/jpeg",
         Some("poster.jpg".to_string()),
@@ -217,18 +222,30 @@ fn deterministic_ids_and_asset_ids_are_reproducible() {
     );
 
     let first = AssetRef::from_bytes(
+        "book-1",
         AssetRole::Attachment,
         "application/octet-stream",
         None,
         b"same bytes",
     );
     let second = AssetRef::from_bytes(
+        "book-1",
         AssetRole::Attachment,
         "application/octet-stream",
         None,
         b"same bytes",
     );
     assert_eq!(first.id, second.id);
+    // The derived id is scoped to the owning book, so the same bytes in another
+    // book get their own row instead of colliding on the library-wide primary key.
+    let other_book = AssetRef::from_bytes(
+        "book-2",
+        AssetRole::Attachment,
+        "application/octet-stream",
+        None,
+        b"same bytes",
+    );
+    assert_ne!(first.id, other_book.id);
     assert_eq!(first.content_hash, second.content_hash);
 }
 

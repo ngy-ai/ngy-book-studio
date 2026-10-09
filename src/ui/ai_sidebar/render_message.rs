@@ -2,9 +2,16 @@
 
 use super::*;
 
+/// The chat action icons this project maintains itself (see `ui::assets`).
+/// GPUI Component's fixed `IconName` set has no pencil or circular-arrow
+/// glyph, and a wrong existing icon reads worse than a dedicated one.
+const EDIT_ICON: &str = "icons/pencil.svg";
+const REGENERATE_ICON: &str = "icons/refresh-cw.svg";
+
 impl AiSidebar {
     pub(super) fn render_message(
         &self,
+        index: usize,
         message: &AiMessage,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -158,7 +165,6 @@ impl AiSidebar {
                             .h_flex()
                             .min_w(px(0.))
                             .items_start()
-                            .gap_1()
                             .line_height(gpui::relative(1.5))
                             .child(div().min_w(px(0.)).flex_1().child(selectable_message_text(
                                 SharedString::from(format!("ai-message-text-{}", message.id)),
@@ -167,21 +173,90 @@ impl AiSidebar {
                                 message_text_width(self.expanded_width, window.rem_size()),
                                 window,
                                 cx,
-                            )))
-                            .child(
-                                div().w(px(24.)).flex_none().child(
-                                    Clipboard::new(SharedString::from(format!(
-                                        "ai-message-copy-{}",
-                                        message.id
-                                    )))
-                                    .value(message.content.clone()),
-                                ),
-                            ),
+                            ))),
                     )
                     .when(!sources.is_empty(), |this| {
                         this.child(div().v_flex().items_start().gap_1().children(sources))
                     }),
             )
+            .when_some(
+                self.render_message_actions(index, message, cx),
+                |this, actions| this.child(actions),
+            )
             .into_any_element()
+    }
+
+    /// The action row under one bubble: copy plus edit and delete for a user
+    /// question, copy plus regenerate for an assistant answer.
+    ///
+    /// Status and error notices carry no actions. While a request is running
+    /// (or the session is changing) the mutating actions are disabled, because
+    /// editing, regenerating or deleting rewrites the stored thread and must
+    /// never race an answer that is still being written. Copying stays
+    /// available.
+    fn render_message_actions(
+        &self,
+        index: usize,
+        message: &AiMessage,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let busy = self.conversation.is_sending() || self.sessions.busy || self.pending_scope_sync;
+        let mut row = div().h_flex().gap_0p5().items_center().pt_1().child(
+            Clipboard::new(SharedString::from(format!(
+                "ai-message-copy-{}",
+                message.id
+            )))
+            .value(message.content.clone()),
+        );
+        match message.role {
+            AiMessageRole::User => {
+                let view = cx.entity().clone();
+                let selector = format!("ai-message-edit-{}", message.id);
+                row = row.child(
+                    Button::new(SharedString::from(selector.clone()))
+                        .debug_selector(move || selector)
+                        .xsmall()
+                        .ghost()
+                        .icon(Icon::empty().path(EDIT_ICON))
+                        .tooltip("修改这条提问并重新发送")
+                        .disabled(busy)
+                        .on_click(move |_, window, cx| {
+                            view.update(cx, |this, cx| this.edit_message(index, window, cx));
+                        }),
+                );
+                let view = cx.entity().clone();
+                let selector = format!("ai-message-delete-{}", message.id);
+                row = row.child(
+                    Button::new(SharedString::from(selector.clone()))
+                        .debug_selector(move || selector)
+                        .xsmall()
+                        .ghost()
+                        .icon(IconName::Delete)
+                        .tooltip("删除这条提问和它的回答")
+                        .disabled(busy)
+                        .on_click(move |_, _, cx| {
+                            view.update(cx, |this, cx| this.delete_turn(index, cx));
+                        }),
+                );
+            }
+            AiMessageRole::Assistant => {
+                let view = cx.entity().clone();
+                let selector = format!("ai-message-regenerate-{}", message.id);
+                row = row.child(
+                    Button::new(SharedString::from(selector.clone()))
+                        .debug_selector(move || selector)
+                        .xsmall()
+                        .ghost()
+                        .icon(Icon::empty().path(REGENERATE_ICON))
+                        .tooltip("重新生成这条回答（它之后的对话会被替换）")
+                        .disabled(busy)
+                        .on_click(move |_, _, cx| {
+                            view.update(cx, |this, cx| this.regenerate_message(index, cx));
+                        }),
+                );
+            }
+            AiMessageRole::Status | AiMessageRole::Error => return None,
+        }
+        Some(row.into_any_element())
     }
 }

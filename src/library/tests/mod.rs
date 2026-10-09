@@ -1,7 +1,7 @@
 //! Shared fixtures and constants for the library tests.
 
 use super::*;
-use crate::annotations::AnnotationKind;
+use crate::annotations::{AnnotationKind, TextAnchor};
 use crate::editing::{DocumentEditor, NewContentUnit};
 
 /// How long a background publication, or the hand-off to the publication
@@ -23,9 +23,13 @@ const BACKGROUND_PUBLICATION_TIMEOUT: std::time::Duration = std::time::Duration:
 /// somebody else already set, and must not run a second time.
 mod annotations_test;
 
+mod asset_identity_test;
+
 mod media_test;
 
 mod progress_test;
+
+mod share_reuse_test;
 
 mod share_test;
 
@@ -53,4 +57,47 @@ fn create_two_unit_book(library: &mut LibraryStore) -> (BookRecord, String, Stri
         .unwrap();
     let updated = library.apply_document(editor.into_document()).unwrap();
     (updated, first_unit_id, second_unit_id)
+}
+
+/// A selection the host accepts: the tail of the first chapter's reading body
+/// text, so the offsets are those of the reading projection rather than of an
+/// edited copy. Returns the unit id, both revisions and the anchor.
+pub(crate) fn first_chapter_anchor(
+    library: &LibraryStore,
+    book_id: &str,
+) -> (String, u64, u64, TextAnchor) {
+    let record = library.book_record(book_id).unwrap();
+    let document = library.document(book_id).unwrap();
+    let unit = &document.units[0];
+    let opened =
+        crate::reader::OpenedBook::open_bytes(library.reader_epub_bytes(book_id).unwrap()).unwrap();
+    let response = crate::reader::load_resource(&opened.epub, &opened.spine[0].href).unwrap();
+    let html = std::str::from_utf8(&response.bytes).unwrap();
+    let text = crate::annotations::reader_body_text(html);
+    let start = text.chars().take(3).map(char::len_utf16).sum::<usize>() as u32;
+    let end = text.encode_utf16().count() as u32;
+    assert!(end > start, "the fixture chapter must have selectable text");
+    let anchor = TextAnchor {
+        quote: text.chars().skip(3).collect(),
+        start,
+        end,
+    };
+    (
+        unit.id.clone(),
+        record.revision,
+        unit.revision.get(),
+        anchor,
+    )
+}
+
+/// One stored machine译文 in the shape the reader parses.
+pub(crate) fn stored_translation_payload(execution_identity: &str, translated: &str) -> String {
+    serde_json::to_string(&crate::ai::translation::StoredTranslation {
+        execution_identity: execution_identity.to_string(),
+        segments: vec![crate::ai::translation::TranslationSegment {
+            source: "开始写作……".into(),
+            translated: translated.to_string(),
+        }],
+    })
+    .unwrap()
 }

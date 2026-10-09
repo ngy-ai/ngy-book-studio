@@ -372,6 +372,7 @@ mod tests {
 
     fn test_document(bytes: &[u8], page_count: u32) -> BookDocument {
         let original = AssetRef::from_bytes(
+            "book-djvu",
             AssetRole::OriginalSource,
             "image/vnd.djvu",
             Some("sample.djvu".to_string()),

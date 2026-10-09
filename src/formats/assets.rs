@@ -16,6 +16,14 @@ pub(crate) fn original_asset(
     )
 }
 
+/// Builds one asset from bytes the importer already validated.
+///
+/// `id_seed` must identify the asset inside its owning book — the book id
+/// followed by the href or slot the source declared — and `original_asset`
+/// passes the format instead, because the book id of every importer is itself
+/// derived from that original's content hash. `assets.id` is a library-wide
+/// primary key, so a seed that only names a source-local href lets a second
+/// book with the same resource collide with the first.
 pub(crate) fn asset_from_bytes(
     id_seed: &str,
     roles: Vec<AssetRole>,

@@ -110,6 +110,10 @@ pub(crate) async fn walk_translation_blocks(
     let mut consecutive_request_failures = 0usize;
     // 凑满阈值：提交完手上这批槽位之后先冷却，再继续开新请求。
     let mut streak_cooldown = false;
+    // 本次运行接下来该用的翻译服务。默认是领取时的那份快照；用户在这次运行期间保存了
+    // Endpoint、密钥、超时或生成参数时，换成库里最新的一份
+    // （见 `refreshed_translation_services`）。
+    let mut request_services = translation.clone();
     // 收窄的重试在范围之外撞上一个还没翻译的块：运行停在这里，任务留在可继续的状态。
     let mut retry_stopped = false;
     loop {
@@ -187,6 +191,22 @@ pub(crate) async fn walk_translation_blocks(
                 consecutive_request_failures = 0;
             }
         }
+        // 用户在这次运行期间保存过 Endpoint、密钥、超时或生成参数时，`models.translation`
+        // 已经是新的，而这次运行手里还是领取时的快照（现场 2026-09-24：改完 Endpoint 与密钥
+        // 后，正在跑的任务继续用旧值翻完剩下的块）。下一块起换用新的 provider 与生成参数：
+        // 模型、执行身份与目标语言保持一致，已存译文的缓存键与缓存行都不受影响。
+        if let Some(fresh) = refreshed_translation_services(inner, &request_services) {
+            if !Arc::ptr_eq(&fresh.provider, &request_services.provider) {
+                tracing::info!(
+                    target: "ngy_ai",
+                    stage = "translation_services_refreshed",
+                    next_ordinal = run.cursor.next_ordinal,
+                    model = %crate::ai::ai_diagnostics::safe_label(&fresh.model),
+                    "Translation requests will use the reconfigured endpoint and key"
+                );
+            }
+            request_services = fresh;
+        }
         // 2) Fill the window. The configured concurrency is re-read every round, so
         //    a saved change applies to a run that is already going — raising it does
         //    not interrupt anything, it only lets the walk run further ahead.
@@ -243,6 +263,7 @@ pub(crate) async fn walk_translation_blocks(
                         run.persist(inner, job).await?;
                         let scope = run.scope(ordinal);
                         let inner = Arc::clone(inner);
+                        let services = request_services.clone();
                         let source_language = source_language.as_deref();
                         in_flight.push(
                             async move {
@@ -250,7 +271,7 @@ pub(crate) async fn walk_translation_blocks(
                                     &inner,
                                     job,
                                     &scope,
-                                    translation,
+                                    &services,
                                     target_language,
                                     source_language,
                                     source,
@@ -412,6 +433,27 @@ async fn cool_down_after_request_failure_streak(
         "Translation failure cooldown finished; continuing"
     );
     Ok(None)
+}
+
+/// 这次运行接下来该用的翻译服务：库里最新的一份，前提是它属于同一套引擎。
+///
+/// `None` 表示保持现在这一份：没有配置翻译，或者模型、执行身份、目标语言里有一项与本次
+/// 运行不同。后者（改地址、换模型或换目标语言）不是「换一份凭据」，而是一次会重置任务行的
+/// 重配置：本次运行会在下一个控制检查里被判成已被替换（`Abandoned`），重新领取时才会按新
+/// 引擎继续；绝不能在这里悄悄换身份，把两种来源的译文混进同一次运行。
+///
+/// 同一套引擎下换 provider（例如只换了 API key 或超时）或换生成参数必须立刻生效：这正是
+/// 用户保存 Endpoint 设置之后期望看到的行为（现场 2026-09-24：改完 Endpoint 与 API key，
+/// 正在跑的任务仍用旧值翻完剩下的块）。
+fn refreshed_translation_services(
+    inner: &Arc<IndexingInner>,
+    current: &TranslationServices,
+) -> Option<TranslationServices> {
+    let fresh = inner.models_snapshot().translation?;
+    let same_engine = fresh.model == current.model
+        && fresh.execution_identity == current.execution_identity
+        && fresh.target_language == current.target_language;
+    same_engine.then_some(fresh)
 }
 
 /// Remembers one committed translation so a later block with the same text hits it

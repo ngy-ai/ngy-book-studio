@@ -105,6 +105,13 @@ pub(crate) fn chat_request_body(request: &ChatRequest) -> Result<serde_json::Val
 }
 
 impl OpenAiCompatibleProvider for OpenAiHttpProvider {
+    /// 这一发实际的端点来源（`scheme://host[:port]`，路径见
+    /// [`endpoint_origin_label`] 的说明）。从 `base_url` 现取，所以保存设置换端点后
+    /// 的下一发请求立刻标出新地址。
+    fn endpoint_origin(&self) -> Option<String> {
+        Some(endpoint_origin_label(&self.base_url))
+    }
+
     fn models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>>> {
         async move {
             #[derive(Deserialize)]

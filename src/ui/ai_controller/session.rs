@@ -47,6 +47,67 @@ impl AiSidebarController {
         }));
     }
 
+    /// Deletes one stored question together with its answer and republishes
+    /// the reloaded transcript.
+    ///
+    /// The sidebar keeps displaying the stored turn until this succeeds, so a
+    /// storage failure cannot leave a deletion visible that never happened.
+    pub(crate) fn delete_turn<Owner: 'static>(
+        &mut self,
+        user_db_id: String,
+        sidebar: Entity<AiSidebar>,
+        cx: &mut Context<Owner>,
+    ) {
+        let generation = self.session_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let current_generation = Arc::clone(&self.session_generation);
+        let conversation = self.conversation.clone();
+        let services = Arc::clone(&self.services);
+        let allowed_book_ids = sidebar.read(cx).authorized_book_ids();
+        let join = self.services.runtime().spawn(async move {
+            let session = conversation
+                .delete_turn(&user_db_id, &allowed_book_ids)
+                .await
+                .map_err(|error| format!("{error:#}"))?;
+            match session {
+                Some(session) => Ok::<_, String>(Some(
+                    load_ui_session_state(
+                        services,
+                        &conversation,
+                        Some(session),
+                        &allowed_book_ids,
+                    )
+                    .await,
+                )),
+                None => Ok(None),
+            }
+        });
+        self.session_task = Some(cx.spawn(async move |_, cx| {
+            let outcome = match join.await {
+                Ok(outcome) => outcome,
+                Err(error) => Err(format!("删除 AI 问答任务已停止：{error}")),
+            };
+            if current_generation.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            let _ = sidebar.update(cx, |sidebar, cx| match outcome {
+                Ok(Some(session)) => {
+                    sidebar.apply_session(
+                        session.active_thread_id,
+                        session.threads,
+                        session.messages,
+                        cx,
+                    );
+                }
+                Ok(None) => {
+                    sidebar.fail_session_operation("这条问答已不在存储会话中，未做修改。", cx)
+                }
+                Err(error) => {
+                    sidebar.fail_session_operation(format!("无法删除这条 AI 问答：{error}"), cx)
+                }
+            });
+        }));
+    }
+
     pub(crate) fn reconcile_scope<Owner: 'static>(
         &mut self,
         allowed_book_ids: Vec<String>,

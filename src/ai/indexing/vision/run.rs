@@ -32,6 +32,9 @@ pub(crate) async fn run_vision(
     }
 
     let mut pending = first;
+    // 本次运行实际使用的 provider：默认是领取时的那份快照，用户保存过新配置之后换成新的
+    // （见下面每一页的重读）。
+    let mut provider = Arc::clone(&models.vision_provider);
     loop {
         if let Some(outcome) = requested_outcome(inner, job, &cursor).await? {
             return Ok(outcome);
@@ -226,6 +229,23 @@ pub(crate) async fn run_vision(
             metadata.media_type,
             BASE64_STANDARD.encode(&bytes)
         );
+        // 用户在这次运行期间保存过 Endpoint/密钥时，`inner.models` 已经是新的，而这次运行
+        // 手里还是领取时的快照（同类现场 2026-09-24：只换 key 时任务行不会被重置）。本页起
+        // 换用新的 provider：模型与执行身份都一致才换 —— 换了身份的那次重配置会把任务行整个
+        // 重置，本次运行随后会被判成已被替换。
+        let live = inner.models_snapshot();
+        let same_engine = live.config.vision_model == models.config.vision_model
+            && live.config.vision_execution_identity == models.config.vision_execution_identity;
+        if same_engine && !Arc::ptr_eq(&live.vision_provider, &provider) {
+            tracing::info!(
+                target: "ngy_ai",
+                stage = "vision_provider_refreshed",
+                page_index = page.page_index,
+                model = %crate::ai::ai_diagnostics::safe_label(&models.config.vision_model),
+                "Vision requests will use the reconfigured endpoint and key"
+            );
+            provider = Arc::clone(&live.vision_provider);
+        }
         let request = vision_request(&models.config.vision_model, image_url);
         record_index_event(
             inner,
@@ -236,17 +256,11 @@ pub(crate) async fn run_vision(
                 ..JobLogMetrics::default()
             },
         );
-        let stream = match await_provider_step(
-            inner,
-            job,
-            &cursor,
-            models.vision_provider.chat_stream(request),
-        )
-        .await?
-        {
-            Controlled::Value(stream) => stream,
-            Controlled::Interrupted(outcome) => return Ok(outcome),
-        };
+        let stream =
+            match await_provider_step(inner, job, &cursor, provider.chat_stream(request)).await? {
+                Controlled::Value(stream) => stream,
+                Controlled::Interrupted(outcome) => return Ok(outcome),
+            };
         let response = match collect_vision_response(inner, job, &cursor, stream).await? {
             Controlled::Value(response) => response,
             Controlled::Interrupted(outcome) => return Ok(outcome),

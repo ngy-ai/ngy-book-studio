@@ -33,7 +33,10 @@
   的两条上限（`SAVE_WAIT_LIMIT` 与 `AI_SETTINGS_GATE_TIMEOUT`）对五个窗口同样适用。
   窗口内的调试选择器统一由 `AiSettingsSection::selector` 生成：`ai-<窗口短名>-<name>`，
   例如 `ai-models-save-settings`、`ai-background-job-scheduling`；GUI 冒烟与 GPUI 测试
-  按它定位元素，不要再写死旧窗口的选择器。
+  按它定位元素，不要再写死旧窗口的选择器。底部提示条（`widgets.rs::render_notice`）
+  的文字容器是横向布局的主轴子项，自动最小宽度按整段文字计算，必须显式
+  `min_w(px(0.))` 才能收缩到可用宽度；模型检测失败会带回整条请求地址，缺了它提示会
+  撑出窗口而不是折行（`ai-<窗口>-notice-text` 上有长提示折行的 GPUI 回归测试）。
 - `src/ui/`：按窗口/职责拆分的 GPUI 界面。`library/`、`reader.rs`、`pdf_reader.rs`、
   `editor.rs`、`page_image.rs` 分别管理对应窗口；`ai_sidebar.rs`、
   `ai_controller.rs`、`ai_settings/` 管理 AI 交互；`background_jobs.rs` 管理当前图书范围
@@ -112,9 +115,21 @@
   AI 回复用与 `gpui-component` 相同的固定版 `markdown` 解析器生成展示投影，按消息
   缓存；链接、图片与原始 HTML 只显示文字，不能让模型正文自动加载资源或打开 URL。
   Markdown 渲染保留自然高度和外层会话滚动，复制与持久化使用原文；来源按钮继续走
-  宿主引用校验。TextView 在 flex 消息列内必须获得扣除 padding、边框和复制按钮后的
-  明确像素宽度；仅用 `w_full()` 会使 Windows 上的短列表正文被裁掉，测试字体不一定
-  复现。`src/ui/ai_sidebar/` 保存展示清洗和 GPUI 选择、流式更新回归。
+  宿主引用校验。  每条消息的气泡下方是操作条：用户问题提供复制、「修改」与「删除」，AI 回答提供
+  复制与「重新生成」（状态与错误提示没有操作条）。修改把问题原文放回输入框并聚焦，
+  重新生成直接重问该回答对应的问题，两者都先把会话回卷到对应消息再用替换的一轮续写
+  同一前缀，所以重新生成历史回答会一并替换它之后的对话；删除移除该问答对并保留其它
+  轮次。三者都以消息的 `chat_messages.id` 为锚点（`ConversationState` 的
+  `turn_deletion`/`begin_edit`/`begin_regenerate` 决定动作，恢复的会话立即带上，
+  实时回答由 `finish_persisted_answer` 回填）。删除走控制器在存储侧真正删掉之后重新
+  加载会话再发布消息，因此存储失败不会让界面上出现一条其实没删掉的记录；编辑与重新
+  生成把锚点随请求带出，拿不到锚点时只改本地投影，绝不用猜测的位置动词库里的其它
+  轮次。操作条的铅笔与圆形箭头是项目自有的 `assets/icons/pencil.svg`、
+  `refresh-cw.svg`，删除用 gpui-component 的 `IconName::Delete`；自有图标由
+  `src/ui/assets.rs` 的 `AppAssets` 在 gpui-component 图标之外补充，`main.rs` 必须
+  以它注册资源。TextView 在 flex 消息列内必须获得扣除 padding 与边框后的明确像素
+  宽度；仅用 `w_full()` 会使 Windows 上的短列表正文被裁掉，测试字体不一定复现。
+  `src/ui/ai_sidebar/` 保存展示清洗、GPUI 选择、流式更新与消息操作回归。
   图书库的视图状态（分组筛选、排序字段与方向、卡片 / 列表）和它们的纯函数都在
   `ui/library/state.rs`；排序只在 `visible_book_indices()` 的出口按当前选择应用一次，
   卡片与列表因此共用同一顺序、同一份右键菜单（`book_menu.rs`）和同一套行级操作，
