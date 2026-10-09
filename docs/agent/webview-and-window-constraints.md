@@ -57,6 +57,11 @@
     见 `src/ui/pdf_reader/viewer.rs`）只能画半透明层：不透明的底色会画在 canvas 之上，
     把正文整块盖住（选中一段文字后那里只剩一块纯色）。选中底色因此是叠了 alpha 的
     强调色，与 `Palette::selection()` 同一档，不要写回不透明的 `--ngy-accent-soft`。
+13. Windows 主线程栈默认只有 1 MiB，而组件层的 `request_layout`/`paint` 沿元素树递归，
+    每个节点还带着滚动容器、文本样式、交互层的包装，比旧版更深。`build.rs` 为 bin
+    目标加的 `/STACK:16777216` 是必需的：删掉它，图书库窗口会在后台任务触发重绘时以
+    `STATUS_STACK_OVERFLOW`（0xc00000fd）崩在 `render_library` 的布局递归里。需要看
+    崩溃栈时用 `cdb -o -g -G -c "g; kb 60; q" target\debug\ngy-book-studio.exe`。
 
 ## 不可破坏的内容安全约束
 

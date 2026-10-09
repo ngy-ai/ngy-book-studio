@@ -28,6 +28,13 @@ fn main() {
     // 改成监视目录后，目录里新增文件也会触发重跑。
     println!("cargo:rerun-if-changed=assets");
 
+    // Windows 的主线程栈默认只有 1 MiB，而 GPUI 的 request_layout/paint 是沿元素树
+    // 递归的：组件层给每个节点套的包装（滚动容器、文本样式、交互层）比旧版多，图书库
+    // 窗口的侧栏 + 内容树在 debug 构建下会把默认栈耗尽（启动后台翻译任务触发重绘时
+    // 崩在 render_library 的递归布局里）。为 bin 目标把主线程栈放大到 16 MiB。
+    #[cfg(windows)]
+    println!("cargo:rustc-link-arg-bins=/STACK:16777216");
+
     #[cfg(windows)]
     embed_icon();
 }
