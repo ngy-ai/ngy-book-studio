@@ -37,13 +37,13 @@
   的文字容器是横向布局的主轴子项，自动最小宽度按整段文字计算，必须显式
   `min_w(px(0.))` 才能收缩到可用宽度；模型检测失败会带回整条请求地址，缺了它提示会
   撑出窗口而不是折行（`ai-<窗口>-notice-text` 上有长提示折行的 GPUI 回归测试）。
-- `src/ui/`：按窗口/职责拆分的 GPUI 界面。`library/`、`reader.rs`、`pdf_reader.rs`、
-  `editor.rs`、`page_image.rs` 分别管理对应窗口；`ai_sidebar.rs`、
-  `ai_controller.rs`、`ai_settings/` 管理 AI 交互；`background_jobs.rs` 管理当前图书范围
+- `src/ui/`：按窗口/职责拆分的 GPUI 界面。`library/`、`reader/`、`pdf_reader/`、
+  `editor/`、`page_image/` 分别管理对应窗口；`ai_sidebar/`、
+  `ai_controller/`、`ai_settings/` 管理 AI 交互；`background_jobs/` 管理当前图书范围
   的派生任务；后台任务窗口全应用只有一个，重复打开时激活现有窗口并按新的库范围刷新，
   不打开第二个；`mod.rs` 只保留跨窗口主题、窗口打开与安全关闭基础设施，其中包含按
   图书登记的窗口表：删除图书后关闭该书已打开的阅读、PDF/Office 预览、DjVu 页面和编辑窗口。
-  `page_image.rs` 是 Office 增强预览与 DjVu 共用的页面图片窗口，以
+  `page_image/` 是 Office 增强预览与 DjVu 共用的页面图片窗口，以
   `VisualPageSourceKind` 区分来源：它决定副标题文案、AI 引用资格（DjVu 每页 1:1 可引用，
   Office 重排预览页不可）与是否提供“本页文字”面板。缩放是呈现层的像素尺寸变化，
   不重新渲染；文字面板必须沿用 `scrollable_page_text` 的「外层滚动 + 自然高度
@@ -129,7 +129,9 @@
   `src/ui/assets.rs` 的 `AppAssets` 在 `gpui-kit` 图标之外补充，`main.rs` 必须
   以它注册资源。TextView 在 flex 消息列内必须获得扣除 padding 与边框后的明确像素
   宽度；仅用 `w_full()` 会使 Windows 上的短列表正文被裁掉，测试字体不一定复现。
-  `src/ui/ai_sidebar/` 保存展示清洗、GPUI 选择、流式更新与消息操作回归。
+  `src/ui/ai_sidebar/` 保存展示清洗、GPUI 选择、流式更新与消息操作回归；
+  `src/ui/ai_controller/tests/delete_turn_test.rs` 用真实服务覆盖删除一轮问答的三条
+  回载路径（成功重载、陈旧锚点、存储失败），断言存储结果与界面投影一致。
   图书库的视图状态（分组筛选、排序字段与方向、卡片 / 列表）和它们的纯函数都在
   `ui/library/state.rs`；排序只在 `visible_book_indices()` 的出口按当前选择应用一次，
   卡片与列表因此共用同一顺序、同一份右键菜单（`book_menu.rs`）和同一套行级操作，
