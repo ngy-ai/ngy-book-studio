@@ -6,9 +6,10 @@ impl LearningWindow {
     #[inline(never)]
     pub(super) fn render_result(
         &self,
-        window: &mut Window,
+        // 0.6 的 TextView 在构造时不再需要 window。
+        _window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         let Some(report) = &self.report else {
             return div()
                 .v_flex()
@@ -108,15 +109,10 @@ impl LearningWindow {
                     .child(format!("耗时：{:.2} 秒", report.metrics.elapsed_seconds)),
             )
             .child(div().text_sm().font_semibold().child("最终答案"))
-            .child(TextView::markdown(
-                "learning-answer-text",
-                fenced_text(answer, "json"),
-                window,
-                cx,
-            ).selectable(true))
+            .child(TextView::markdown("learning-answer-text", fenced_text(answer, "json")).selectable(true))
             .when_some(report.raw.pointer("/error/message").and_then(serde_json::Value::as_str), |panel, error| {
                 panel.child(div().text_sm().font_semibold().child("运行诊断"))
-                    .child(TextView::markdown("learning-runtime-error", fenced_text(error, "text"), window, cx).selectable(true))
+                    .child(TextView::markdown("learning-runtime-error", fenced_text(error, "text")).selectable(true))
             })
             .child(checks)
             .child(
@@ -143,7 +139,7 @@ impl LearningWindow {
         &self,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         let Some(report) = &self.report else {
             return div()
                 .p_4()

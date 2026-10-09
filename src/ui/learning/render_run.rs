@@ -4,7 +4,7 @@ use super::*;
 
 impl LearningWindow {
     #[inline(never)]
-    pub(super) fn render_run_controls(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(super) fn render_run_controls(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let scenario_view = cx.entity();
         let selected_scenario = self.scenario.clone();
         let chapter = self.service.chapter();
@@ -125,7 +125,7 @@ impl LearningWindow {
     }
 
     #[inline(never)]
-    pub(super) fn render_evidence_tabs(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(super) fn render_evidence_tabs(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let mut tabs = div().h_flex().gap_1().px_2().py_2();
         for (id, label, pane) in [
             ("learning-result-tab", "结果", EvidencePane::Result),

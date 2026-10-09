@@ -42,7 +42,7 @@ impl EpubReaderApp {
         indices
     }
 
-    pub(super) fn render_empty_library(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(super) fn render_empty_library(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let view = cx.entity().clone();
         div()
             .flex_1()
@@ -84,7 +84,7 @@ impl EpubReaderApp {
                             .max_w(px(330.))
                             .text_center()
                             .text_sm()
-                            .line_height(gpui::relative(1.6))
+                            .line_height(gpui_kit::relative(1.6))
                             .text_color(rgb(palette(cx).muted))
                             .child("导入 EPUB、PDF、Office 或 DRM-free Kindle 图书，原件会完整保存在本地。"),
                     )
@@ -105,7 +105,10 @@ impl EpubReaderApp {
             .into_any_element()
     }
 
-    pub(super) fn render_library_search_results(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(super) fn render_library_search_results(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
         if self.search_loading {
             return div()
                 .flex_1()
@@ -150,7 +153,7 @@ impl EpubReaderApp {
                                 .max_w(px(330.))
                                 .text_center()
                                 .text_sm()
-                                .line_height(gpui::relative(1.6))
+                                .line_height(gpui_kit::relative(1.6))
                                 .text_color(rgb(palette(cx).muted))
                                 .child("搜索范围只包含当前分组及其子分组中的图书。"),
                         ),
@@ -193,7 +196,7 @@ impl EpubReaderApp {
                                 .max_w(px(350.))
                                 .text_center()
                                 .text_sm()
-                                .line_height(gpui::relative(1.6))
+                                .line_height(gpui_kit::relative(1.6))
                                 .text_color(rgb(palette(cx).muted))
                                 .child(error.clone()),
                         ),
@@ -242,7 +245,7 @@ impl EpubReaderApp {
                                 .max_w(px(320.))
                                 .text_center()
                                 .text_sm()
-                                .line_height(gpui::relative(1.6))
+                                .line_height(gpui_kit::relative(1.6))
                                 .text_color(rgb(palette(cx).muted))
                                 .child(match self.search_mode {
                                     SearchMode::Keyword => "试试更短的关键词，或检查正文中的拼写。",

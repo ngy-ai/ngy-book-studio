@@ -11,7 +11,7 @@ use super::*;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use gpui_component::Selectable as _;
+use gpui_kit::component::Selectable as _;
 use ngy_book_studio::ai::{
     ChatGenerationSettings, DEFAULT_CHAT_OUTPUT_TOKENS, DEFAULT_TRANSLATION_OUTPUT_TOKENS,
     MAX_EMBEDDING_DIMENSIONS, TranslationGenerationSettings,

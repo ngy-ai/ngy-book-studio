@@ -276,7 +276,8 @@ fn render_pdf_blocking(
         let page_size = page
             .Size()
             .with_context(|| format!("Windows 无法读取 PDF 第 {} 页尺寸", target.pdf_page))?;
-        let (width, height) = raster_dimensions(page_size.Width, page_size.Height, &profile)?;
+        let (mut width, mut height) =
+            raster_dimensions(page_size.Width, page_size.Height, &profile)?;
         let output = InMemoryRandomAccessStream::new().context("无法创建 PDF 页面输出流")?;
         let options = PdfPageRenderOptions::new().context("无法创建 PDF 页面渲染配置")?;
         options
@@ -305,6 +306,14 @@ fn render_pdf_blocking(
             total_bytes <= MAX_TOTAL_PNG_BYTES,
             "PDF 页面输出超过 {MAX_TOTAL_PNG_BYTES} 字节总上限"
         );
+        // WinRT 的 `DestinationWidth/Height` 在 DPI 感知进程里按 DIP 生效，
+        // 系统缩放（例如 125%）会让输出的位图大于上面算出的像素数。记录值
+        // 必须以实际位图为准：阅读器按它布局与缩放，两者不一致会让页面被
+        // 放大或缩小。
+        if let Some((actual_width, actual_height)) = png_dimensions(&bytes) {
+            width = actual_width;
+            height = actual_height;
+        }
         let id_seed = format!(
             "{}\0{}\0{}\0{}\0{}\0{}",
             document_id,
@@ -342,6 +351,18 @@ fn render_pdf_blocking(
         "PDF 视觉任务断点超过当前页面总数"
     );
     Ok(total_pages)
+}
+
+/// 读取 PNG 的 IHDR 宽高（签名 8 字节 + 块长 4 + 类型 4 + 宽 4 + 高 4，
+/// 均为大端）。只解析固定头部，不做完整图像解码。
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    let header = bytes.get(..24)?;
+    if &header[..8] != PNG_SIGNATURE {
+        return None;
+    }
+    let width = u32::from_be_bytes(header[16..20].try_into().ok()?);
+    let height = u32::from_be_bytes(header[20..24].try_into().ok()?);
+    (width > 0 && height > 0).then_some((width, height))
 }
 
 fn raster_dimensions(

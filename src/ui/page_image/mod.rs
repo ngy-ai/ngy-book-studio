@@ -8,8 +8,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use gpui::{AnyElement, ScrollWheelEvent, rems};
-use gpui_component::text::{TextView, TextViewStyle};
+use gpui_kit::component::text::{TextView, TextViewStyle};
+use gpui_kit::{AnyElement, ScrollWheelEvent, rems};
 
 use super::reader::{ReadingProgressWrite, ReadingProgressWriteEvent, ReadingProgressWriter};
 use super::*;

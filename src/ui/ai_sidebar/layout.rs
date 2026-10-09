@@ -39,9 +39,9 @@ pub(crate) fn message_text_width(sidebar_width: Pixels, rem_size: Pixels) -> Pix
     // Two horizontal padding pairs (3 rem: the scroll area and the message
     // card) plus 4 px for borders/rounding. The action row (copy, edit,
     // regenerate) sits under the bubble, so it no longer narrows the text
-    // column. TextView 0.5.1's clipped list rows lose short text on Windows
-    // when width is only a percent inside a flex item. Resolve it before
-    // laying out the Markdown tree.
+    // column. The TextView's clipped list rows lose short text on Windows when
+    // the width is only a percent inside a flex item, so it is resolved to a
+    // concrete pixel width before the Markdown tree is laid out.
     (sidebar_width - rems(3.).to_pixels(rem_size) - px(4.)).max(px(0.))
 }
 

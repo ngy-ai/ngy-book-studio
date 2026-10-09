@@ -10,7 +10,7 @@ impl NotesWindow {
         width: Pixels,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         let note = &self.listing.notes[card.index];
         let annotation = &note.annotation;
         let id = annotation.id.clone();

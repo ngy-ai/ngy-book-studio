@@ -32,7 +32,7 @@ impl LearningWindow {
         &self,
         document: CourseDocument,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         let view = cx.entity();
         Button::new(SharedString::from(format!(
             "learning-document-{}",
@@ -56,7 +56,7 @@ impl LearningWindow {
     }
 
     #[inline(never)]
-    pub(super) fn render_header(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(super) fn render_header(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let save_view = cx.entity();
         let export_view = cx.entity();
         let restore_view = cx.entity();
@@ -158,7 +158,7 @@ impl LearningWindow {
     }
 
     #[inline(never)]
-    pub(super) fn render_notice(&self, theme: Palette) -> Option<gpui::AnyElement> {
+    pub(super) fn render_notice(&self, theme: Palette) -> Option<gpui_kit::AnyElement> {
         let notice = self.notice.as_ref()?;
         Some(
             div()

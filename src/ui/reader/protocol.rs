@@ -37,8 +37,8 @@ pub(crate) fn same_base_media_type(left: &str, right: &str) -> bool {
 
 pub(crate) fn reader_resource_response(
     response: ResourceResponse,
-) -> gpui_component::wry::http::Response<Cow<'static, [u8]>> {
-    let mut builder = gpui_component::wry::http::Response::builder()
+) -> wry::http::Response<Cow<'static, [u8]>> {
+    let mut builder = wry::http::Response::builder()
         .status(response.status)
         .header("Content-Type", response.mime)
         .header("Content-Length", response.content_length.to_string())
@@ -59,8 +59,8 @@ pub(crate) fn reader_resource_response(
 pub(crate) fn reader_error_response(
     status: u16,
     message: impl Into<String>,
-) -> gpui_component::wry::http::Response<Cow<'static, [u8]>> {
-    gpui_component::wry::http::Response::builder()
+) -> wry::http::Response<Cow<'static, [u8]>> {
+    wry::http::Response::builder()
         .status(status)
         .header("Content-Type", "text/plain; charset=utf-8")
         .header("Content-Security-Policy", "default-src 'none'")
@@ -71,16 +71,13 @@ pub(crate) fn reader_error_response(
 }
 
 pub(crate) fn reader_owned_response(
-    response: gpui_component::wry::http::Response<Cow<'static, [u8]>>,
-) -> gpui_component::wry::http::Response<Vec<u8>> {
+    response: wry::http::Response<Cow<'static, [u8]>>,
+) -> wry::http::Response<Vec<u8>> {
     let (parts, body) = response.into_parts();
-    gpui_component::wry::http::Response::from_parts(parts, body.into_owned())
+    wry::http::Response::from_parts(parts, body.into_owned())
 }
 
-pub(crate) fn reader_ipc_event(
-    uri: &gpui_component::wry::http::Uri,
-    body: &str,
-) -> Option<ReaderWebEvent> {
+pub(crate) fn reader_ipc_event(uri: &wry::http::Uri, body: &str) -> Option<ReaderWebEvent> {
     if body.len() > 128 * 1024 || !is_reader_document_uri(uri) {
         return None;
     }
@@ -139,7 +136,7 @@ pub(crate) fn reader_ipc_event(
     }
 }
 
-pub(crate) fn is_reader_document_uri(uri: &gpui_component::wry::http::Uri) -> bool {
+pub(crate) fn is_reader_document_uri(uri: &wry::http::Uri) -> bool {
     matches!(
         (uri.scheme_str(), uri.host()),
         (Some("epubreader"), Some("book")) | (Some("http" | "https"), Some("epubreader.book"))

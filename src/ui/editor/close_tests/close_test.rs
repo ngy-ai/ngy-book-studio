@@ -2,7 +2,7 @@
 
 use super::*;
 
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn close_requires_an_answer_and_cancel_preserves_the_draft(cx: &mut TestAppContext) {
     let (fixture, visual) = open_editor(cx, false);
     edit_draft(&fixture, visual, "取消后保留的书名");
@@ -37,7 +37,7 @@ pub(crate) fn close_requires_an_answer_and_cancel_preserves_the_draft(cx: &mut T
     visual.run_until_parked();
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn close_without_saving_keeps_the_persisted_document(cx: &mut TestAppContext) {
     let (fixture, visual) = open_editor(cx, false);
     edit_draft(&fixture, visual, "不应该保存的书名");
@@ -54,7 +54,7 @@ pub(crate) fn close_without_saving_keeps_the_persisted_document(cx: &mut TestApp
     assert_eq!(persisted_document(&fixture), fixture.original);
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn export_picker_cancels_application_exit_and_preserves_the_editor(
     cx: &mut TestAppContext,
 ) {
@@ -88,7 +88,7 @@ pub(crate) fn export_picker_cancels_application_exit_and_preserves_the_editor(
     assert_eq!(persisted_document(&fixture), fixture.original);
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn save_and_close_waits_for_the_confirmed_background_commit(cx: &mut TestAppContext) {
     let (fixture, visual) = open_editor(cx, false);
     edit_draft(&fixture, visual, "确认后保存的书名");
@@ -135,7 +135,7 @@ pub(crate) fn save_and_close_waits_for_the_confirmed_background_commit(cx: &mut 
     assert!(saved.revision > fixture.original.revision);
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn rejected_save_keeps_the_window_open_and_can_be_corrected(cx: &mut TestAppContext) {
     let (fixture, visual) = open_editor(cx, false);
     edit_draft(&fixture, visual, "");
@@ -170,7 +170,7 @@ pub(crate) fn rejected_save_keeps_the_window_open_and_can_be_corrected(cx: &mut 
     assert_eq!(persisted_document(&fixture).title, "修正后再次确认");
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn background_save_failure_keeps_the_draft_and_reopens_confirmation(
     cx: &mut TestAppContext,
 ) {
@@ -220,7 +220,7 @@ pub(crate) fn background_save_failure_keeps_the_draft_and_reopens_confirmation(
     assert!(!fixture.editor.read_with(visual, |editor, _| editor.closing));
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn close_during_an_explicit_save_waits_and_then_asks(cx: &mut TestAppContext) {
     let (fixture, visual) = open_editor(cx, false);
     edit_draft(&fixture, visual, "用户已点击保存");
@@ -249,7 +249,7 @@ pub(crate) fn close_during_an_explicit_save_waits_and_then_asks(cx: &mut TestApp
     assert_eq!(persisted_document(&fixture), saved);
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn discard_during_a_previously_requested_write_waits_without_another_save(
     cx: &mut TestAppContext,
 ) {
@@ -295,7 +295,7 @@ pub(crate) fn discard_during_a_previously_requested_write_waits_without_another_
     assert_eq!(persisted_document(&fixture).title, "已经请求的保存");
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn failed_webview_build_resumes_close_with_a_question(cx: &mut TestAppContext) {
     let (fixture, visual) = open_editor(cx, true);
     edit_draft(&fixture, visual, "初始化期间的草稿");
@@ -319,7 +319,7 @@ pub(crate) fn failed_webview_build_resumes_close_with_a_question(cx: &mut TestAp
     assert_eq!(persisted_document(&fixture), fixture.original);
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn removing_the_book_closes_without_saving_or_asking(cx: &mut TestAppContext) {
     let (fixture, visual) = open_editor(cx, false);
     edit_draft(&fixture, visual, "删除后不应保存的书名");
@@ -340,7 +340,7 @@ pub(crate) fn removing_the_book_closes_without_saving_or_asking(cx: &mut TestApp
     assert_eq!(persisted_document(&fixture), fixture.original);
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn removing_the_book_during_webview_build_discards_the_draft(cx: &mut TestAppContext) {
     let (fixture, visual) = open_editor(cx, true);
     edit_draft(&fixture, visual, "初始化期间的草稿");

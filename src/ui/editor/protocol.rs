@@ -77,10 +77,7 @@ pub(crate) enum EditorOrigin {
     Content,
 }
 
-pub(crate) fn editor_query_value<'a>(
-    uri: &'a gpui_component::wry::http::Uri,
-    key: &str,
-) -> Option<&'a str> {
+pub(crate) fn editor_query_value<'a>(uri: &'a wry::http::Uri, key: &str) -> Option<&'a str> {
     let mut matches = uri.query()?.split('&').filter_map(|part| {
         let (name, value) = part.split_once('=')?;
         (name == key).then_some(value)
@@ -89,12 +86,12 @@ pub(crate) fn editor_query_value<'a>(
     matches.next().is_none().then_some(value)
 }
 
-pub(crate) fn editor_query_id(uri: &gpui_component::wry::http::Uri, key: &str) -> Option<String> {
+pub(crate) fn editor_query_id(uri: &wry::http::Uri, key: &str) -> Option<String> {
     let decoded = urlencoding::decode(editor_query_value(uri, key)?).ok()?;
     valid_editor_ipc_id(&decoded).then(|| decoded.into_owned())
 }
 
-pub(crate) fn editor_origin(uri: &gpui_component::wry::http::Uri) -> Option<EditorOrigin> {
+pub(crate) fn editor_origin(uri: &wry::http::Uri) -> Option<EditorOrigin> {
     let custom_origin = match (uri.scheme_str(), uri.host()) {
         (Some("epubeditor"), Some(EDITOR_SHELL_HOST)) => Some(EditorOrigin::Shell),
         (Some("epubeditor"), Some(EDITOR_CONTENT_HOST)) => Some(EditorOrigin::Content),
@@ -169,7 +166,7 @@ pub(crate) enum EditorAssetRequest {
     Asset(String),
 }
 
-pub(crate) fn editor_asset_request(uri: &gpui_component::wry::http::Uri) -> EditorAssetRequest {
+pub(crate) fn editor_asset_request(uri: &wry::http::Uri) -> EditorAssetRequest {
     let Some(path) = normalized_editor_path(uri.path()) else {
         return if uri.path().contains(EDITOR_ASSET_PATH_PREFIX) {
             EditorAssetRequest::Invalid
@@ -312,7 +309,7 @@ pub(crate) fn canonicalize_editor_asset_urls(
         let asset_id = if let Some(asset_id) = value.strip_prefix(&relative_prefix) {
             asset_id.to_string()
         } else {
-            let uri = value.parse::<gpui_component::wry::http::Uri>().ok()?;
+            let uri = value.parse::<wry::http::Uri>().ok()?;
             if editor_origin(&uri) != Some(EditorOrigin::Content) || uri.query().is_some() {
                 return None;
             }
@@ -345,9 +342,7 @@ pub(crate) fn editor_ipc_matches_document_request(
         && normalized_editor_path(&message.href).as_deref() == Some(document.href.as_str())
 }
 
-pub(crate) fn has_trusted_editor_shell_origin<B>(
-    request: &gpui_component::wry::http::Request<B>,
-) -> bool {
+pub(crate) fn has_trusted_editor_shell_origin<B>(request: &wry::http::Request<B>) -> bool {
     request
         .headers()
         .get("Origin")
@@ -355,9 +350,7 @@ pub(crate) fn has_trusted_editor_shell_origin<B>(
         .is_some_and(|origin| origin == EDITOR_SHELL_ORIGIN)
 }
 
-pub(crate) fn editor_document_request(
-    uri: &gpui_component::wry::http::Uri,
-) -> Option<EditorDocumentRequest> {
+pub(crate) fn editor_document_request(uri: &wry::http::Uri) -> Option<EditorDocumentRequest> {
     let kind = match (editor_origin(uri)?, editor_query_value(uri, "mode")?) {
         (EditorOrigin::Shell, "edit") => EditorDocumentKind::TrustedShell,
         (EditorOrigin::Content, "preview") => EditorDocumentKind::Preview,
@@ -430,8 +423,8 @@ pub(crate) fn is_editor_navigation_url(url: &str) -> bool {
 pub(crate) fn editor_error_response(
     status: u16,
     message: impl Into<String>,
-) -> gpui_component::wry::http::Response<Cow<'static, [u8]>> {
-    gpui_component::wry::http::Response::builder()
+) -> wry::http::Response<Cow<'static, [u8]>> {
+    wry::http::Response::builder()
         .status(status)
         .header("Content-Type", "text/plain; charset=utf-8")
         .header("Content-Security-Policy", "default-src 'none'")
@@ -442,8 +435,8 @@ pub(crate) fn editor_error_response(
 
 pub(crate) fn editor_media_response(
     response: MediaResponse,
-) -> gpui_component::wry::http::Response<Cow<'static, [u8]>> {
-    let mut builder = gpui_component::wry::http::Response::builder()
+) -> wry::http::Response<Cow<'static, [u8]>> {
+    let mut builder = wry::http::Response::builder()
         .status(response.status)
         .header("Content-Type", response.media_type)
         .header("Accept-Ranges", response.accept_ranges)
@@ -460,10 +453,10 @@ pub(crate) fn editor_media_response(
 }
 
 pub(crate) fn editor_owned_response(
-    response: gpui_component::wry::http::Response<Cow<'static, [u8]>>,
-) -> gpui_component::wry::http::Response<Vec<u8>> {
+    response: wry::http::Response<Cow<'static, [u8]>>,
+) -> wry::http::Response<Vec<u8>> {
     let (parts, body) = response.into_parts();
-    gpui_component::wry::http::Response::from_parts(parts, body.into_owned())
+    wry::http::Response::from_parts(parts, body.into_owned())
 }
 
 pub(crate) fn spawn_persisted_editor_media(
@@ -514,8 +507,8 @@ pub(crate) fn spawn_editor_media(
 
 pub(crate) fn editor_protocol_response<B>(
     state: &EditorWebState,
-    request: &gpui_component::wry::http::Request<B>,
-) -> gpui_component::wry::http::Response<Cow<'static, [u8]>> {
+    request: &wry::http::Request<B>,
+) -> wry::http::Response<Cow<'static, [u8]>> {
     let uri = request.uri();
     let Some(origin) = editor_origin(uri) else {
         return editor_error_response(403, "拒绝非编辑器来源");
@@ -551,7 +544,7 @@ pub(crate) fn editor_protocol_response<B>(
             }
         };
         let content_length = html.len().to_string();
-        let mut response = gpui_component::wry::http::Response::builder()
+        let mut response = wry::http::Response::builder()
             .status(200)
             .header("Content-Type", "application/xhtml+xml; charset=utf-8")
             .header("Content-Length", content_length)

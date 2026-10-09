@@ -274,9 +274,9 @@ pub(crate) fn name_input_required_message(action: &NameInputAction) -> Option<&'
     }
 }
 
-/// Modal dialogs for library and group actions. The pinned `gpui-component`
-/// revision predates its `dialog` module, so these are rendered as an in-app
-/// overlay.
+/// Modal dialogs for library and group actions. They are rendered as an in-app
+/// overlay layered over the library view rather than through the component
+/// library's dialog host.
 #[derive(Clone)]
 pub(crate) enum GroupModal {
     NameInput {

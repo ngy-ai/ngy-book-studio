@@ -4,7 +4,7 @@ use super::*;
 
 impl SystemSettingsWindow {
     #[inline(never)]
-    pub(crate) fn render_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(crate) fn render_panel(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let theme = palette(cx);
         let busy = self.state.busy();
         let compact_view = cx.entity();

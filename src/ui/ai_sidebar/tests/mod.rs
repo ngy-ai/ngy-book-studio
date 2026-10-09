@@ -17,8 +17,8 @@ mod scope_test;
 mod stream_test;
 
 use super::*;
-use gpui::{AppContext, TestAppContext};
-use gpui_component::Root;
+use gpui_kit::component::Root;
+use gpui_kit::{AppContext, TestAppContext};
 use ngy_book_studio::document::{
     Block, BlockDocument, ContentUnit, ContentUnitKind, NormalizedRect,
 };

@@ -240,7 +240,7 @@ impl Render for ReaderApp {
                 div().h(px(3.)).w_full().bg(rgb(palette(cx).border)).child(
                     div()
                         .h_full()
-                        .w(gpui::relative(progress))
+                        .w(gpui_kit::relative(progress))
                         .bg(rgb(palette(cx).accent)),
                 ),
             );
@@ -472,7 +472,7 @@ impl Render for ReaderApp {
                         .child(body),
                 ),
             );
-        let navigation: gpui::AnyElement = if self.pane_layout.is_navigation_collapsed() {
+        let navigation: gpui_kit::AnyElement = if self.pane_layout.is_navigation_collapsed() {
             self.render_collapsed_navigation(cx)
         } else {
             toc.into_any_element()

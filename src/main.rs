@@ -2,9 +2,9 @@
 
 mod ui;
 
-use gpui::{
-    AnyWindowHandle, App, AppContext as _, Application, Bounds, WeakEntity, Window, WindowBounds,
-    WindowOptions, px, size,
+use gpui_kit::{
+    AnyWindowHandle, App, AppContext as _, Bounds, WeakEntity, Window, WindowBounds, WindowOptions,
+    px, size,
 };
 use native_dialog::{DialogBuilder, MessageLevel};
 use ngy_book_studio::{
@@ -57,10 +57,10 @@ fn main() {
         }
     };
 
-    Application::new()
+    gpui_kit::application()
         .with_assets(AppAssets)
         .run(move |cx: &mut App| {
-            gpui_component::init(cx);
+            gpui_kit::init(cx);
             match plan {
                 LaunchPlan::Ready(selection) => start_application(selection, None, cx),
                 LaunchPlan::NeedsSetup { reason, suggestion } => {
@@ -338,7 +338,7 @@ fn open_main_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             window_min_size: Some(size(px(940.), px(640.))),
-            titlebar: Some(gpui::TitlebarOptions {
+            titlebar: Some(gpui_kit::TitlebarOptions {
                 title: Some("墨页 · 私人图书馆".into()),
                 ..Default::default()
             }),
@@ -356,7 +356,7 @@ fn open_main_window(
 
 #[cfg(target_os = "windows")]
 fn ensure_webview2_runtime() -> bool {
-    let detection_error = match gpui_component::wry::webview_version() {
+    let detection_error = match wry::webview_version() {
         Ok(version) if !version.trim().is_empty() => {
             tracing::debug!(%version, "WebView2 Runtime detected");
             return true;

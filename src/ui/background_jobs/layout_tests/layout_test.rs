@@ -2,7 +2,7 @@
 
 use super::*;
 
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn complete_background_task_layout_keeps_all_controls_inside_both_window_sizes(
     cx: &mut TestAppContext,
 ) {

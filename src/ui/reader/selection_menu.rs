@@ -1,6 +1,5 @@
 use super::is_reader_document_uri;
 use anyhow::Context as _;
-use gpui_component::wry::{WebView, WebViewExtWindows, http::Uri};
 use std::sync::Arc;
 use webview2_com::{
     CoTaskMemPWSTR, ContextMenuRequestedEventHandler, CustomItemSelectedEventHandler,
@@ -10,6 +9,7 @@ use webview2_com::{
     },
 };
 use windows::core::{BOOL, Interface, PWSTR, w};
+use wry::{WebView, WebViewExtWindows, http::Uri};
 
 pub(crate) const MAX_MENU_DOCUMENT_URI_BYTES: usize = 16 * 1024;
 

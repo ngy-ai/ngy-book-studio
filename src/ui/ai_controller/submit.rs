@@ -258,10 +258,10 @@ impl AiSidebarController {
                                     sidebar.fail_answer(request_id, friendly_agent_error(&error), cx)
                                 }
                             });
-                            match applied {
-                                Ok(true) => tracing::debug!(target: "ngy_ai", stage = "ui_completion", succeeded, delta_bytes, elapsed_ms = started.elapsed().as_millis() as u64, "AI result applied to sidebar"),
-                                Ok(false) => tracing::debug!(target: "ngy_ai", stage = "ui_completion", succeeded, "AI stale completion ignored by sidebar"),
-                                Err(_) => tracing::debug!(target: "ngy_ai", stage = "ui_completion", succeeded, "AI completion dropped because sidebar closed"),
+                            if applied {
+                                tracing::debug!(target: "ngy_ai", stage = "ui_completion", succeeded, delta_bytes, elapsed_ms = started.elapsed().as_millis() as u64, "AI result applied to sidebar");
+                            } else {
+                                tracing::debug!(target: "ngy_ai", stage = "ui_completion", succeeded, "AI stale completion ignored by sidebar");
                             }
                             return;
                         }

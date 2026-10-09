@@ -5,7 +5,7 @@
 
 use super::*;
 
-use gpui::{Focusable as _, Modifiers, TestAppContext, VisualTestContext};
+use gpui_kit::{Focusable as _, Modifiers, TestAppContext, VisualTestContext};
 use ngy_book_studio::ai::credentials::MemoryCredentialStore;
 
 pub(crate) fn open_settings_view<V: SettingsWindowView>(
@@ -21,7 +21,7 @@ pub(crate) fn open_settings_view<V: SettingsWindowView>(
         .unwrap(),
     );
     let settings = services.provider_settings().unwrap();
-    cx.update(gpui_component::init);
+    init_ui_test(cx);
     let mut settings_view = None;
     let (_, visual) = cx.add_window_view(|window, cx| {
         let view = cx.new(|cx| build(services, settings, window, cx));
@@ -35,7 +35,7 @@ pub(crate) fn open_settings_view<V: SettingsWindowView>(
 
 pub(crate) fn redraw(visual: &mut VisualTestContext) {
     visual.run_until_parked();
-    visual.update(|window, cx| window.draw(cx).clear());
+    visual.update(|window, cx| window.draw(cx).clear(cx));
     visual.run_until_parked();
 }
 

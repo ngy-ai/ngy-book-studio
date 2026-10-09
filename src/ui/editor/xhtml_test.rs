@@ -3,13 +3,13 @@
 //! or replace acceptance in a real Windows WebView.
 
 use super::*;
-use gpui_component::wry::http::Request;
 use ngy_book_studio::{
     document::{ContentUnit, SourceLocator, TocTarget},
     library::ImportOutcome,
 };
 use resvg::usvg::roxmltree;
 use std::{collections::BTreeSet, path::Path};
+use wry::http::Request;
 
 const XHTML_NAMESPACE: &str = "http://www.w3.org/1999/xhtml";
 const CHAPTER_TITLE: &str = "图文 & 音视频 <第一章>";

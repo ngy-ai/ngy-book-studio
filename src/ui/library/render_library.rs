@@ -1,7 +1,7 @@
 //! The library list itself, its sort/view controls and its status bar.
 
 use super::*;
-use gpui_component::Selectable as _;
+use gpui_kit::component::Selectable as _;
 
 impl EpubReaderApp {
     pub(super) fn set_error(&mut self, text: String, cx: &mut Context<Self>) {
@@ -9,7 +9,7 @@ impl EpubReaderApp {
         cx.notify();
     }
 
-    pub(super) fn accent_button(&self, id: impl Into<gpui::ElementId>, cx: &App) -> Button {
+    pub(super) fn accent_button(&self, id: impl Into<gpui_kit::ElementId>, cx: &App) -> Button {
         Button::new(id)
             .custom(
                 ButtonCustomVariant::new(cx)
@@ -17,14 +17,15 @@ impl EpubReaderApp {
                     // 与 `theme.primary_foreground` 一致：写死的白色文字压在深色
                     // 皮肤的 `accent`（偏亮的砖红）上只有 3.2:1，读不出来。
                     .foreground(rgb(palette(cx).paper).into())
-                    .border(rgb(palette(cx).accent).into())
+                    // 0.6 的自定义按钮变体去掉了 `border`：描边不再单独存在，
+                    // 边框与 `color` 同色，实心填充的观感不变。
                     .hover(rgb(palette(cx).accent_strong).into())
                     .active(rgb(palette(cx).accent_strong).into()),
             )
             .rounded(px(9.))
     }
 
-    pub(super) fn render_library(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(super) fn render_library(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let view = cx.entity().clone();
         let count = self.library.books().len();
         let mode_view = view.clone();
@@ -287,7 +288,11 @@ impl EpubReaderApp {
             .into_any_element()
     }
 
-    pub(super) fn render_library_status_bar(&self, visible: usize, cx: &App) -> gpui::AnyElement {
+    pub(super) fn render_library_status_bar(
+        &self,
+        visible: usize,
+        cx: &App,
+    ) -> gpui_kit::AnyElement {
         let theme = palette(cx);
         let (status_icon, status_text, status_color) = if self.search_loading {
             (IconName::Search, "正在检索…", theme.accent)
@@ -342,7 +347,7 @@ impl EpubReaderApp {
 
     /// The sort menu of the shelf: pick the field, then the direction. Both the
     /// card grid and the list reorder through this one choice.
-    pub(super) fn render_book_sort_button(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(super) fn render_book_sort_button(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let view = cx.entity().clone();
         let field = self.book_sort;
         let direction = self.book_sort_direction;
@@ -416,7 +421,7 @@ impl EpubReaderApp {
     /// Card grid or one-book-per-row list. Built as segmented buttons instead
     /// of a `TabBar`: its tabs do not expose `debug_selector`, and the GUI
     /// smoke runs and GPUI tests locate controls through selectors.
-    pub(super) fn render_book_view_toggle(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(super) fn render_book_view_toggle(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let view = cx.entity().clone();
         let current = self.book_view;
         let mut tabs = Vec::new();

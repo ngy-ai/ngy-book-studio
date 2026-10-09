@@ -13,10 +13,10 @@ impl EpubReaderApp {
         book: &BookRecord,
         cx: &mut Context<Self>,
     ) -> impl Fn(
-        gpui_component::menu::PopupMenu,
+        gpui_kit::component::menu::PopupMenu,
         &mut Window,
-        &mut gpui::Context<gpui_component::menu::PopupMenu>,
-    ) -> gpui_component::menu::PopupMenu
+        &mut gpui_kit::Context<gpui_kit::component::menu::PopupMenu>,
+    ) -> gpui_kit::component::menu::PopupMenu
     + 'static {
         // 菜单在 `move` 闭包里构造，闭包要求 `'static`，借用 `cx` 会逃逸；
         // 取一次值（`Palette` 是 `Copy`）供整份菜单共用。

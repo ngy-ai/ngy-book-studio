@@ -56,7 +56,7 @@ pub(crate) fn prepare_toc_document(document: &mut BookDocument) {
 
 pub(crate) fn redraw_editor(visual: &mut VisualTestContext) {
     visual.run_until_parked();
-    visual.update(|window, cx| window.draw(cx).clear());
+    visual.update(|window, cx| window.draw(cx).clear(cx));
     visual.run_until_parked();
 }
 

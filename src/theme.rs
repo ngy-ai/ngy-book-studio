@@ -7,7 +7,7 @@
 //! 三件事必须同时成立，否则界面会出现"一半深一半浅"：
 //!
 //! 1. 项目自己的调色板（本模块的 [`Palette`]）——所有自绘元素读它；
-//! 2. `gpui-component` 的语义色（按钮、输入框、Tab、滚动条、菜单）——由
+//! 2. `gpui-kit` 组件的语义色（按钮、输入框、Tab、滚动条、菜单）——由
 //!    [`set_appearance`] 在切换后按同一调色板写入，所以第三方组件与自绘元素同色系；
 //! 3. WebView 里的正文（阅读器章节、富文本编辑器、PDF 阅读器）——通过
 //!    [`Palette::css_variables`] 把同一份颜色转成 CSS 自定义属性下发。
@@ -17,7 +17,7 @@
 //! 外观偏好存在图书库的 `settings` 表里（见 `services::ProviderSettings::appearance`），
 //! 所以它是**应用级**偏好而不是某个窗口的：`set_appearance` 结束时刷新全部窗口。
 
-use gpui::{App, Global, rgb};
+use gpui_kit::{App, Global, rgb};
 use serde::{Deserialize, Serialize};
 
 /// 界面皮肤。
@@ -188,13 +188,13 @@ impl Palette {
     /// 半透明色必须由皮肤给出基色：写死的 `rgba(0x2926210a)` 在深色皮肤下是"深色
     /// 叠深色"，hover 与遮罩会彻底看不见。基色取语义色（`ink`、`surface`、`danger`…），
     /// 透明度取调用方的意图，两套皮肤因此得到同一层关系而不是同一串数字。
-    pub fn tint(value: u32, alpha: f32) -> gpui::Rgba {
+    pub fn tint(value: u32, alpha: f32) -> gpui_kit::Rgba {
         let alpha = (alpha.clamp(0.0, 1.0) * 255.0).round() as u32;
-        gpui::rgba((value << 8) | alpha)
+        gpui_kit::rgba((value << 8) | alpha)
     }
 
     /// 浮层遮罩的缩放：两套皮肤都要压暗背景，浅色下用深色压，深色下用纯黑压。
-    pub fn scrim_with_alpha(self, alpha: f32) -> gpui::Rgba {
+    pub fn scrim_with_alpha(self, alpha: f32) -> gpui_kit::Rgba {
         Self::tint(self.scrim, alpha)
     }
 
@@ -206,7 +206,7 @@ impl Palette {
     /// 三种底色上都读得出来，而且选中不改文字颜色，所以文字仍与其自己的底色
     /// 保持原来的对比度。GPUI 在绘制文字之前先填这个矩形，透明度会与卡片底色
     /// 正常合成。
-    pub fn selection(self) -> gpui::Rgba {
+    pub fn selection(self) -> gpui_kit::Rgba {
         Self::tint(self.accent, 0.4)
     }
 
@@ -302,7 +302,7 @@ pub fn palette(cx: &App) -> Palette {
 /// 切换皮肤并让所有窗口立即生效。
 ///
 /// 三个副作用都必须做完：记住新皮肤（[`palette`] 的读数）、把同一套颜色写进
-/// `gpui-component` 的语义色（否则按钮和滚动条会留在旧皮肤上）、刷新全部窗口
+/// `gpui-kit` 组件的语义色（否则按钮和滚动条会留在旧皮肤上）、刷新全部窗口
 /// （否则已经画好的界面要等下一次重绘才变）。WebView 里的三个面不在这里刷新 ——
 /// 它们由各自的窗口在自己的 `apply_theme` 里下发，因为只有窗口知道自己的 WebView
 /// 是否已经建好。
@@ -316,25 +316,25 @@ pub fn set_appearance(appearance: Appearance, cx: &mut App) {
     cx.refresh_windows();
 }
 
-/// 把当前皮肤写进 `gpui-component` 的语义色。
+/// 把当前皮肤写进 `gpui-kit` 组件的语义色。
 ///
 /// `Theme::change` 会先按内置主题全量覆盖 `ThemeColor`，所以必须在它之后写，顺序
 /// 反了就被内置配色盖掉。`ThemeRegistry` 未初始化时（测试里没有调
-/// `gpui_component::init`）整个同步跳过：那时 `Theme::change` 会自己去读 registry
+/// `gpui_kit::component::init`）整个同步跳过：那时 `Theme::change` 会自己去读 registry
 /// 并 panic，而皮肤本身仍然可用。
 fn sync_component_theme(appearance: Appearance, cx: &mut App) {
-    if !cx.has_global::<gpui_component::ThemeRegistry>() {
+    if !cx.has_global::<gpui_kit::component::ThemeRegistry>() {
         return;
     }
     let mode = match appearance {
-        Appearance::Light => gpui_component::ThemeMode::Light,
-        Appearance::Dark => gpui_component::ThemeMode::Dark,
+        Appearance::Light => gpui_kit::component::ThemeMode::Light,
+        Appearance::Dark => gpui_kit::component::ThemeMode::Dark,
     };
-    gpui_component::Theme::change(mode, None, cx);
+    gpui_kit::component::Theme::change(mode, None, cx);
 
     let palette = Palette::for_appearance(appearance);
-    let to_hsla = |value: u32| gpui::Hsla::from(rgb(value));
-    let theme = gpui_component::Theme::global_mut(cx);
+    let to_hsla = |value: u32| gpui_kit::Hsla::from(rgb(value));
+    let theme = gpui_kit::component::Theme::global_mut(cx);
     theme.mode = mode;
     theme.background = to_hsla(palette.paper);
     theme.foreground = to_hsla(palette.ink);
@@ -379,7 +379,9 @@ fn sync_component_theme(appearance: Appearance, cx: &mut App) {
     theme.sidebar_accent_foreground = to_hsla(palette.accent_strong);
     theme.sidebar_primary = to_hsla(palette.accent);
     theme.sidebar_primary_foreground = to_hsla(palette.surface);
-    theme.list = to_hsla(palette.paper);
+    // 0.6 起 `Theme::list` 是 List 的行为设置（`ListSettings`），颜色叫
+    // `colors.list`；`Theme` 通过 Deref 暴露 `colors`，只有这个同名键要显式绕开。
+    theme.colors.list = to_hsla(palette.paper);
     theme.list_active = to_hsla(palette.accent_soft);
     theme.list_active_border = to_hsla(palette.accent);
     theme.list_hover = to_hsla(palette.sidebar);
@@ -408,12 +410,16 @@ fn sync_component_theme(appearance: Appearance, cx: &mut App) {
     theme.switch = to_hsla(palette.neutral_soft);
     theme.title_bar = to_hsla(palette.sidebar);
     theme.title_bar_border = to_hsla(palette.border);
-    theme.tiles = to_hsla(palette.surface);
     theme.progress_bar = to_hsla(palette.accent_soft);
     theme.drop_target = to_hsla(palette.accent_soft);
     theme.drag_border = to_hsla(palette.accent);
     theme.accordion = to_hsla(palette.paper);
-    theme.accordion_hover = to_hsla(palette.sidebar);
+    // 0.6 移除了 `tiles` 与 `accordion_hover` 两个色位：组件不再读取它们，
+    // 瓦片底色与手风琴悬停由组件按 `surface` / `accent` 自行推导。
+    // 组件读的是 `Theme::change` 时从 `colors` 派生的 `tokens` 快照；上面写进
+    // `colors` 的自定义色必须重新派生一次，否则按钮、列表等仍显示内置配色。
+    let colors = theme.colors;
+    theme.tokens = gpui_kit::component::ThemeTokens::from(&colors);
 }
 
 #[cfg(test)]
@@ -607,7 +613,7 @@ mod tests {
 
     /// 半透明色按 alpha 合成到不透明底色上，得到实际显示的颜色 —— 也就是 GPU 上
     /// 选中矩形压在卡片底色之后，用户真正看到的那一版。
-    fn composited(foreground: gpui::Rgba, backdrop: u32) -> u32 {
+    fn composited(foreground: gpui_kit::Rgba, backdrop: u32) -> u32 {
         let channel = |shift: u32, value: f32| {
             let base = ((backdrop >> shift) & 0xff) as f32 / 255.0;
             value * foreground.a + base * (1.0 - foreground.a)

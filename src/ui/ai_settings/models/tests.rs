@@ -2,7 +2,7 @@
 
 use super::super::tests_support::*;
 use super::*;
-use gpui::{Modifiers, TestAppContext, VisualTestContext};
+use gpui_kit::{Modifiers, TestAppContext, VisualTestContext};
 use ngy_book_studio::ai::DEFAULT_AI_REQUEST_TIMEOUT_SECS;
 use ngy_book_studio::services::{DEFAULT_ENDPOINT_ID, DEFAULT_TRANSLATION_MODEL, EndpointSettings};
 
@@ -47,7 +47,7 @@ fn refocus(visual: &mut VisualTestContext) {
     redraw(visual);
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 fn role_bindings_change_without_saving_and_block_missing_endpoints(cx: &mut TestAppContext) {
     let (_directory, settings, visual) = open_window(cx);
     visual.simulate_resize(size(px(1080.), px(1600.)));
@@ -87,7 +87,7 @@ fn role_bindings_change_without_saving_and_block_missing_endpoints(cx: &mut Test
     });
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 fn model_and_generation_drafts_survive_invalid_save_then_reset(cx: &mut TestAppContext) {
     let (_directory, settings, visual) = open_window(cx);
     visual.simulate_resize(size(px(1080.), px(2200.)));
@@ -153,7 +153,7 @@ fn model_and_generation_drafts_survive_invalid_save_then_reset(cx: &mut TestAppC
     });
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 fn detected_models_fill_the_role_input(cx: &mut TestAppContext) {
     let (_directory, settings, visual) = open_window(cx);
     visual.simulate_resize(size(px(1080.), px(2200.)));
@@ -190,7 +190,7 @@ fn detected_models_fill_the_role_input(cx: &mut TestAppContext) {
 /// 翻译 Tab 带自己的一组生成参数：默认温度 0（确定性，与问答的 0.1 不同），两组草稿
 /// 分别解析进 `chat_generation` / `translation_generation`，互不影响，「恢复默认」也
 /// 只动对应那一组。
-#[gpui::test]
+#[gpui_kit::test]
 fn translation_generation_is_configured_separately_from_chat(cx: &mut TestAppContext) {
     let (_directory, settings, visual) = open_window(cx);
     visual.simulate_resize(size(px(1080.), px(2600.)));
@@ -273,7 +273,7 @@ fn generation_text_parsing_supports_blank_options_and_rejects_invalid_drafts() {
 
 /// 模型设置用 Tab 切换四个配置：一次只渲染一个模型的区域，问答生成参数只跟着问答
 /// 模型；翻译模型与问答模型是两个独立字段，草稿在同一个实体里因此切 Tab 不会丢。
-#[gpui::test]
+#[gpui_kit::test]
 fn model_tabs_switch_the_visible_role_and_keep_translation_independent(cx: &mut TestAppContext) {
     let (_directory, settings, visual) = open_window(cx);
     visual.simulate_resize(size(px(1080.), px(1600.)));
@@ -343,7 +343,7 @@ fn model_tabs_switch_the_visible_role_and_keep_translation_independent(cx: &mut 
 
 /// Endpoint 列表由「Endpoint」窗口维护：那边保存之后，模型设置窗口重新获得焦点时必须
 /// 跟上。否则新加的 Endpoint 在这里根本选不到（此前只能关掉本窗口再打开）。
-#[gpui::test]
+#[gpui_kit::test]
 fn endpoint_choices_follow_the_saved_list_when_the_window_regains_focus(cx: &mut TestAppContext) {
     let (_directory, settings, visual) = open_window(cx);
     visual.simulate_resize(size(px(1080.), px(1600.)));

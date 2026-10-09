@@ -2,7 +2,7 @@
 
 use super::super::tests_support::*;
 use super::*;
-use gpui::{Modifiers, TestAppContext, VisualTestContext};
+use gpui_kit::{Modifiers, TestAppContext, VisualTestContext};
 
 fn open_window(
     cx: &mut TestAppContext,
@@ -14,7 +14,7 @@ fn open_window(
     open_settings_view::<SystemSettingsWindow>(cx, SystemSettingsWindow::new)
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 fn preferences_are_drafts_until_saved(cx: &mut TestAppContext) {
     let (_directory, settings, visual) = open_window(cx);
     visual.simulate_resize(size(px(1080.), px(1600.)));
@@ -64,7 +64,7 @@ fn preferences_are_drafts_until_saved(cx: &mut TestAppContext) {
     );
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 fn language_dropdown_updates_the_translation_draft(cx: &mut TestAppContext) {
     let (_directory, settings, visual) = open_window(cx);
     settings.read_with(visual, |view, _| {
@@ -103,7 +103,7 @@ fn language_dropdown_updates_the_translation_draft(cx: &mut TestAppContext) {
     });
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 fn storage_paths_are_shown_without_touching_other_settings(cx: &mut TestAppContext) {
     let (_directory, settings, visual) = open_window(cx);
     let change = visual

@@ -4,7 +4,7 @@ use super::*;
 
 impl NotesWindow {
     #[inline(never)]
-    pub(super) fn render_footer(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(super) fn render_footer(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let previous = cx.entity();
         let next = cx.entity();
         div()
@@ -74,7 +74,7 @@ impl NotesWindow {
         &self,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         // Explicit width avoids TextView's clipped short rows on Windows. The
         // card sits inside 48px outer padding and 34px card padding/borders.
         let width = (window.viewport_size().width - px(84.)).max(px(0.));

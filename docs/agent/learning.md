@@ -23,9 +23,9 @@
   恢复备份时重建编辑器和订阅，隔离撤销历史；`InputState::set_value` 不会清除历史，
   不能让 Ctrl+Z 将上一章文字带入本章。
   可选择的只读正文使用 `scrollable_learning_text`：自然高度的 TextView 放在外层
-  滚动容器内。0.5.1 的 TextView 内部虚拟列表滚动不会平移选区坐标，不得恢复
-  `selectable(true).scrollable(true)` 组合。GPUI `test-support` 仅用于开发测试，
-  事件与内存剪贴板回归不能替代真实 Windows 鼠标、字体和系统剪贴板验收。
+  滚动容器内，选区几何与文字一起移动。不得恢复 `selectable(true).scrollable(true)`
+  组合：内部虚拟列表滚动会让选区与文字脱节。GPUI `test-support` 仅用于开发测试，
+  事件与剪贴板回归不能替代真实 Windows 鼠标、字体和系统剪贴板验收。
 
 ## Python 课程实验包
 

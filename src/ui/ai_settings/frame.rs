@@ -5,10 +5,10 @@ use super::*;
 /// 五个设置窗口共用的外框：标题栏、可滚动正文、提示条与底部保存栏。
 pub(crate) fn settings_frame<V: SettingsWindowView>(
     view: &V,
-    body: gpui::AnyElement,
-    footer_extra: Option<gpui::AnyElement>,
+    body: gpui_kit::AnyElement,
+    footer_extra: Option<gpui_kit::AnyElement>,
     cx: &mut Context<V>,
-) -> gpui::AnyElement {
+) -> gpui_kit::AnyElement {
     let section = V::section();
     let state = view.state();
     let busy = state.busy();
@@ -107,7 +107,7 @@ pub(crate) fn settings_frame<V: SettingsWindowView>(
                     div()
                         .max_w(px(440.))
                         .text_xs()
-                        .line_height(gpui::relative(1.5))
+                        .line_height(gpui_kit::relative(1.5))
                         .text_color(rgb(palette(cx).muted))
                         .child("保存只写入本窗口的设置；其它设置窗口里未保存的输入不会被覆盖。"),
                 )

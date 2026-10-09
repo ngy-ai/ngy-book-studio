@@ -7,11 +7,12 @@ pub(crate) fn selectable_note_text(
     id: String,
     html: SharedString,
     width: Pixels,
-    window: &mut Window,
-    cx: &mut App,
+    // 0.6 的 TextView 在构造时不再需要 window/cx；参数保留以稳定这一内部接口。
+    _window: &mut Window,
+    _cx: &mut App,
 ) -> TextView {
-    TextView::html(SharedString::from(id), html, window, cx)
-        .style(TextViewStyle::default().paragraph_gap(gpui::rems(0.4)))
+    TextView::html(SharedString::from(id), html)
+        .style(TextViewStyle::default().paragraph_gap(gpui_kit::rems(0.4)))
         .selectable(true)
         .scrollable(false)
         .w(width)
@@ -24,11 +25,12 @@ pub(crate) fn selectable_note_thought(
     id: String,
     markdown: SharedString,
     width: Pixels,
-    window: &mut Window,
-    cx: &mut App,
+    // 0.6 的 TextView 在构造时不再需要 window/cx；参数保留以稳定这一内部接口。
+    _window: &mut Window,
+    _cx: &mut App,
 ) -> TextView {
-    TextView::markdown(SharedString::from(id), markdown, window, cx)
-        .style(TextViewStyle::default().paragraph_gap(gpui::rems(0.4)))
+    TextView::markdown(SharedString::from(id), markdown)
+        .style(TextViewStyle::default().paragraph_gap(gpui_kit::rems(0.4)))
         .selectable(true)
         .scrollable(false)
         .w(width)
@@ -43,7 +45,7 @@ pub(crate) fn render_note_thought(
     width: Pixels,
     window: &mut Window,
     cx: &mut App,
-) -> gpui::AnyElement {
+) -> gpui_kit::AnyElement {
     if display.parts.is_empty() {
         return selectable_note_thought(id, display.markdown.clone(), width, window, cx)
             .into_any_element();
@@ -84,7 +86,7 @@ pub(crate) fn render_note_table(
     width: Pixels,
     window: &mut Window,
     cx: &mut App,
-) -> gpui::AnyElement {
+) -> gpui_kit::AnyElement {
     let columns = rows.iter().map(Vec::len).max().unwrap_or(1).max(1);
     let column_width = ((width - px(2.)) / columns as f32).max(px(180.));
     let table_width = column_width * columns as f32;

@@ -2,7 +2,7 @@
 
 use super::*;
 
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn toc_clicks_use_real_node_targets_and_nonoverlapping_rows(cx: &mut TestAppContext) {
     let (fixture, visual) = open_editor_with_document(cx, false, Some(prepare_toc_document));
     visual.simulate_resize(size(px(1360.), px(860.)));
@@ -34,7 +34,7 @@ pub(crate) fn toc_clicks_use_real_node_targets_and_nonoverlapping_rows(cx: &mut 
     assert_eq!(persisted_document(&fixture), fixture.original);
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn toc_siblings_in_one_unit_keep_independent_selection_and_unsaved_source(
     cx: &mut TestAppContext,
 ) {
@@ -85,7 +85,7 @@ pub(crate) fn toc_siblings_in_one_unit_keep_independent_selection_and_unsaved_so
     assert_eq!(persisted_document(&fixture), fixture.original);
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn toc_navigation_resolves_stable_ids_after_linear_units_are_reordered(
     cx: &mut TestAppContext,
 ) {
@@ -116,7 +116,7 @@ pub(crate) fn toc_navigation_resolves_stable_ids_after_linear_units_are_reordere
     assert_eq!(persisted_document(&fixture), fixture.original);
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn saving_an_edited_unit_preserves_all_293_distinct_toc_entries(
     cx: &mut TestAppContext,
 ) {
@@ -258,7 +258,7 @@ pub(crate) fn deliver_unchanged_rich_snapshot(
     visual.run_until_parked();
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn unchanged_rich_snapshot_preserves_typed_media_and_all_draft_state(
     cx: &mut TestAppContext,
 ) {
@@ -291,7 +291,7 @@ pub(crate) fn unchanged_rich_snapshot_preserves_typed_media_and_all_draft_state(
     assert_eq!(persisted_document(&fixture), fixture.original);
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn unchanged_rich_ack_runs_only_the_matching_toc_action_and_saves_typed_media(
     cx: &mut TestAppContext,
 ) {

@@ -9,7 +9,7 @@ pub(crate) fn render_status_bar(
     summary: String,
     context: String,
     palette: Palette,
-) -> gpui::AnyElement {
+) -> gpui_kit::AnyElement {
     div()
         .h_flex()
         .h(px(STATUS_BAR_HEIGHT))

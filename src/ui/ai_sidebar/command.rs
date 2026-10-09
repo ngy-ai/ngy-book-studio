@@ -20,12 +20,18 @@ impl AiSidebar {
 
     pub(super) fn on_input_event(
         &mut self,
-        _input: &Entity<InputState>,
+        _input: &Entity<TextareaState>,
         event: &InputEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if matches!(event, InputEvent::PressEnter { secondary: true }) {
+        if matches!(
+            event,
+            InputEvent::PressEnter {
+                secondary: true,
+                ..
+            }
+        ) {
             self.submit(window, cx);
         }
     }

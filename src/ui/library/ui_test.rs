@@ -3,11 +3,11 @@
 //! not only through the pure helpers.
 
 use super::*;
-use gpui::{Modifiers, TestAppContext, VisualTestContext};
+use gpui_kit::{Modifiers, TestAppContext, VisualTestContext};
 
 fn redraw(cx: &mut VisualTestContext) {
     cx.run_until_parked();
-    cx.update(|window, app| window.draw(app).clear());
+    cx.update(|window, app| window.draw(app).clear(app));
     cx.run_until_parked();
 }
 
@@ -21,7 +21,7 @@ fn click(cx: &mut VisualTestContext, selector: &'static str) {
     redraw(cx);
 }
 
-fn row_top(cx: &mut VisualTestContext, book_id: &str) -> gpui::Pixels {
+fn row_top(cx: &mut VisualTestContext, book_id: &str) -> gpui_kit::Pixels {
     // `debug_bounds` only accepts `&'static str`. The ids live in the fixture
     // for the whole test, so leaking the selector here is bounded and
     // deliberate.
@@ -33,9 +33,9 @@ fn row_top(cx: &mut VisualTestContext, book_id: &str) -> gpui::Pixels {
 
 /// Builds a shelf whose catalog order (newest import first) is opposite to the
 /// title order, then checks that the list layout follows the picked sort.
-#[gpui::test]
+#[gpui_kit::test]
 fn list_view_renders_rows_in_the_selected_sort_order(cx: &mut TestAppContext) {
-    cx.update(gpui_component::init);
+    init_ui_test(cx);
     let directory = tempfile::tempdir().unwrap();
     let services = Arc::new(AppServices::open(directory.path()).unwrap());
     let mut books = Vec::new();

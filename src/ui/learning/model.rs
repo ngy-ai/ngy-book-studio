@@ -56,10 +56,10 @@ pub(crate) fn close_action(running: bool, pending: bool, dirty: bool) -> CloseAc
 pub(crate) struct LearningWindowTracker {
     pub(crate) opening: bool,
     pub(crate) closing: bool,
-    pub(crate) handle: Option<gpui::AnyWindowHandle>,
+    pub(crate) handle: Option<gpui_kit::AnyWindowHandle>,
 }
 
-impl gpui::Global for LearningWindowTracker {}
+impl gpui_kit::Global for LearningWindowTracker {}
 
 pub(crate) struct LearningNotice {
     pub(crate) text: String,

@@ -4,7 +4,7 @@ use super::reader::{
     ReadingProgressWriteEvent, ReadingProgressWriter,
 };
 use super::*;
-use gpui::{DragMoveEvent, EmptyView, Focusable};
+use gpui_kit::{DragMoveEvent, EmptyView, Focusable};
 use ngy_book_studio::document::DocumentLocator;
 use ngy_book_studio::services::ReaderZoomSurface;
 
@@ -79,7 +79,7 @@ pub struct PdfReaderApp {
     pub(crate) search_input: Entity<InputState>,
     pub(crate) search_query: String,
     pub(crate) search_results: Vec<SearchHit>,
-    pub(crate) page_list_scroll: gpui::UniformListScrollHandle,
+    pub(crate) page_list_scroll: gpui_kit::UniformListScrollHandle,
     pub(crate) page_list_synced_page: Option<u32>,
     pub(crate) annotations: PdfAnnotations,
     pub(crate) _annotation_ai_subscription: Subscription,

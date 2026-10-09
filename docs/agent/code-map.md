@@ -75,8 +75,10 @@
 - `src/theme.rs`：浅色 / 深色两套皮肤的唯一定义。`Appearance` 是**应用级**偏好
   （存 `appearance.preferences.v1`，由 `ProviderSettings.appearance` 合并进快照），
   `Palette` 给每个语义色一个取值，`set_appearance` 一次做完三件事：记住皮肤、把同一份
-  颜色写进 `gpui-component` 的 `ThemeColor`（不写的话按钮、输入框、滚动条会留在旧皮肤
+  颜色写进 `gpui-kit` 的 `Theme::colors`（不写的话按钮、输入框、滚动条会留在旧皮肤
   上，而且必须在 `Theme::change` **之后**写，否则被内置主题覆盖）、刷新全部窗口。
+  组件读的是 `Theme::change` 时从 `colors` 派生的 `tokens` 快照，所以写完后还要
+  `theme.tokens = ThemeTokens::from(&theme.colors)` 重建一次，否则旧皮肤颜色继续生效。
   界面代码一律 `palette(cx).xxx` 取色，不要再写 `rgb(0x...)`：写死的颜色在深色皮肤里就是
   「深色叠深色」。取色点拿不到 `cx`（自由函数、`'static` 闭包）时先
   `let theme = palette(cx);` 取值再传：闭包里直接写 `palette(cx)` 会把 `&App` 借用带出

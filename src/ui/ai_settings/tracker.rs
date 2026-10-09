@@ -37,7 +37,7 @@ pub(crate) fn existing_window_disposition<Handle: Copy>(
 pub(crate) struct SettingsWindowTracker<V: 'static> {
     pub(crate) opening: bool,
     pub(crate) closing: bool,
-    pub(crate) handle: Option<gpui::AnyWindowHandle>,
+    pub(crate) handle: Option<gpui_kit::AnyWindowHandle>,
     pub(crate) view: Option<WeakEntity<V>>,
 }
 
@@ -62,7 +62,7 @@ pub(crate) struct SettingsWindowTrackers {
     pub(crate) system: SettingsWindowTracker<SystemSettingsWindow>,
 }
 
-impl gpui::Global for SettingsWindowTrackers {}
+impl gpui_kit::Global for SettingsWindowTrackers {}
 
 pub(crate) fn ensure_settings_window_trackers(cx: &mut App) {
     if !cx.has_global::<SettingsWindowTrackers>() {

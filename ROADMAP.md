@@ -90,7 +90,7 @@
     对已打开的窗口生效，页面投影、左右留白与阅读位置不变
   - [x] 同一「系统配置」窗口提供“界面外观”（浅色 / 深色，默认浅色，独立 settings key
     `appearance.preferences.v1` 持久化，加入 `AI_SETTINGS_KEYS`）：项目自绘颜色、
-    `gpui-component` 语义色与三处 WebView（阅读器章节、富文本编辑器、PDF.js viewer）
+    `gpui-kit` 语义色与三处 WebView（阅读器章节、富文本编辑器、PDF.js viewer）
     由同一份 `theme::Palette` 驱动，保存后立即应用到所有已打开的窗口，启动时在打开
     主窗口之前应用以免首帧闪色；两套皮肤的正文、次要文字与状态色按 4.5:1 校过对比度
     （`theme::tests`），阅读器与选区菜单通过 `--ngy-*` 变量取色，只有配色变化，

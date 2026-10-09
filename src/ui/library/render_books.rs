@@ -15,7 +15,7 @@ impl EpubReaderApp {
         &self,
         book: &BookRecord,
         radius: f32,
-    ) -> Option<gpui::AnyElement> {
+    ) -> Option<gpui_kit::AnyElement> {
         let bytes = self.library.cover_bytes_cached(&book.id)?;
         let format = book
             .cover_mime
@@ -35,7 +35,7 @@ impl EpubReaderApp {
         &self,
         indices: &[usize],
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         let cards = indices
             .iter()
             .map(|index| self.render_book_card(&self.library.books()[*index], cx))
@@ -63,7 +63,7 @@ impl EpubReaderApp {
         &self,
         book: &BookRecord,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         // 悬停/按下样式是 `'static` 闭包，借用 `cx` 会逃逸，`move` 闭包又会夺走它；
         // 取一次值（`Palette` 是 `Copy`）供整张卡片共用。
         let theme = palette(cx);
@@ -203,7 +203,7 @@ impl EpubReaderApp {
                     // The folder button sits on top of the card that opens the
                     // book. Stop the propagation at this overlay so pressing it
                     // doesn't also open the book.
-                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                    .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| {
                         cx.stop_propagation();
                     })
                     .child(self.render_book_group_menu(book, cx)),

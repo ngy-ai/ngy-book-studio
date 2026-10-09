@@ -2,7 +2,7 @@
 
 use super::*;
 
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn chapter_buttons_preserve_unsaved_work_and_resume_the_sixth_lesson(
     cx: &mut TestAppContext,
 ) {
@@ -28,14 +28,10 @@ pub(crate) fn chapter_buttons_preserve_unsaved_work_and_resume_the_sixth_lesson(
     };
     visual.update(|window, cx| {
         learning.update(cx, |view, cx| {
-            for (input, value) in [
-                (&view.manual_input, &edited.manual_code),
-                (&view.langgraph_input, &edited.langgraph_code),
-                (&view.notes_input, &edited.notes),
-                (&view.prediction_input, &edited.prediction),
-            ] {
-                input.update(cx, |input, cx| input.set_value(value.clone(), window, cx));
-            }
+            set_learning_input(view, 0, edited.manual_code.clone(), window, cx);
+            set_learning_input(view, 1, edited.langgraph_code.clone(), window, cx);
+            set_learning_input(view, 2, edited.notes.clone(), window, cx);
+            set_learning_input(view, 3, edited.prediction.clone(), window, cx);
             cx.notify();
         });
     });
@@ -91,7 +87,7 @@ pub(crate) fn chapter_buttons_preserve_unsaved_work_and_resume_the_sixth_lesson(
     );
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn active_run_blocks_document_navigation_and_keeps_cancel_clickable(
     cx: &mut TestAppContext,
 ) {
@@ -139,7 +135,7 @@ pub(crate) fn active_run_blocks_document_navigation_and_keeps_cancel_clickable(
     assert!(!directory.path().join("learning").exists());
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn closing_document_disables_chapter_and_continue_buttons(cx: &mut TestAppContext) {
     let workspace = LearningWorkspace {
         revision: 2,
@@ -194,7 +190,7 @@ pub(crate) fn closing_document_disables_chapter_and_continue_buttons(cx: &mut Te
     );
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn restore_dialog_error_and_cancel_keep_unsaved_inputs_and_controls_usable(
     cx: &mut TestAppContext,
 ) {
@@ -264,7 +260,7 @@ pub(crate) fn restore_dialog_error_and_cancel_keep_unsaved_inputs_and_controls_u
     );
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn restore_record_failure_still_requires_reload_and_dialog_error_does_not_clear_it(
     cx: &mut TestAppContext,
 ) {

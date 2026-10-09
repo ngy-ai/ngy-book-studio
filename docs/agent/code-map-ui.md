@@ -14,7 +14,7 @@
   `models/` 里四个模型（问答、翻译、Embedding、视觉）**用一个 Tab 条切换**，一次只渲染
   当前 Tab 的模型区域；问答与翻译各带一组生成参数（两份设置分开存储、分别随各自的请求
   发送），因此生成参数面板只在对应的 Tab 里出现，向量与视觉没有。Tab 用分段按钮实现而不是
-  `gpui_component::tab::TabBar`：`TabBar` 的子项不暴露 `debug_selector`，而本仓库的 GUI
+  `gpui_kit::component::tab::TabBar`：`TabBar` 的子项不暴露 `debug_selector`，而本仓库的 GUI
   冒烟与 GPUI 测试都按选择器定位控件。Tab 的选择器是 `ai-models-tab-<role>`；`debug_bounds`
   不清理旧帧的选择器，因此测试只能断言「新 Tab 的控件出现」，不能靠它断言旧 Tab 消失。
   **每个窗口只保存自己那一块**：各窗口的 `entered_settings` 一律以
@@ -112,7 +112,7 @@
   阅读窗口推送 `<html data-pdf-compact>`，这是唯一能枚举非单例 Office 预览窗口的登记表。
   这类关闭走各窗口的“图书已移除”路径，不写最终阅读进度、不保存草稿、不弹保存确认，
   WebView 仍在构建时等构建结束后再拆除。
-  AI 回复用与 `gpui-component` 相同的固定版 `markdown` 解析器生成展示投影，按消息
+  AI 回复用与 `gpui-kit` 组件层相同的固定版 `markdown` 解析器生成展示投影，按消息
   缓存；链接、图片与原始 HTML 只显示文字，不能让模型正文自动加载资源或打开 URL。
   Markdown 渲染保留自然高度和外层会话滚动，复制与持久化使用原文；来源按钮继续走
   宿主引用校验。  每条消息的气泡下方是操作条：用户问题提供复制、「修改」与「删除」，AI 回答提供
@@ -125,8 +125,8 @@
   加载会话再发布消息，因此存储失败不会让界面上出现一条其实没删掉的记录；编辑与重新
   生成把锚点随请求带出，拿不到锚点时只改本地投影，绝不用猜测的位置动词库里的其它
   轮次。操作条的铅笔与圆形箭头是项目自有的 `assets/icons/pencil.svg`、
-  `refresh-cw.svg`，删除用 gpui-component 的 `IconName::Delete`；自有图标由
-  `src/ui/assets.rs` 的 `AppAssets` 在 gpui-component 图标之外补充，`main.rs` 必须
+  `refresh-cw.svg`，删除用 `gpui-kit` 组件层的 `IconName::Delete`；自有图标由
+  `src/ui/assets.rs` 的 `AppAssets` 在 `gpui-kit` 图标之外补充，`main.rs` 必须
   以它注册资源。TextView 在 flex 消息列内必须获得扣除 padding 与边框后的明确像素
   宽度；仅用 `w_full()` 会使 Windows 上的短列表正文被裁掉，测试字体不一定复现。
   `src/ui/ai_sidebar/` 保存展示清洗、GPUI 选择、流式更新与消息操作回归。

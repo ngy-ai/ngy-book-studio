@@ -2,7 +2,7 @@
 
 use super::*;
 
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn chapter_changes_do_not_apply_another_chapters_undo_history(cx: &mut TestAppContext) {
     let original = LearningWorkspace {
         manual_code: "original_manual".into(),
@@ -13,7 +13,7 @@ pub(crate) fn chapter_changes_do_not_apply_another_chapters_undo_history(cx: &mu
     };
     let (_directory, learning, visual) = open_learning(cx, original);
     let previous = learning.read_with(visual, |view, _| {
-        std::array::from_fn::<_, 4, _>(|index| learning_input(view, index))
+        std::array::from_fn::<_, 4, _>(|index| learning_input_entity_id(view, index))
     });
     for index in 0..4 {
         edit_learning_input(&learning, visual, index, &format!("edited_{index}"));
@@ -29,10 +29,7 @@ pub(crate) fn chapter_changes_do_not_apply_another_chapters_undo_history(cx: &mu
     wait_for_chapter_load(&learning, visual);
     for (index, previous) in previous.iter().enumerate() {
         learning.read_with(visual, |view, _| {
-            assert_ne!(
-                learning_input(view, index).entity_id(),
-                previous.entity_id()
-            );
+            assert_ne!(learning_input_entity_id(view, index), *previous);
         });
         let expected = input_text(&learning, visual, index);
         focus_learning_input(&learning, visual, index);
@@ -43,7 +40,7 @@ pub(crate) fn chapter_changes_do_not_apply_another_chapters_undo_history(cx: &mu
     }
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn save_preserves_undo_but_new_round_and_restore_reset_each_editors_history(
     cx: &mut TestAppContext,
 ) {
@@ -56,7 +53,7 @@ pub(crate) fn save_preserves_undo_but_new_round_and_restore_reset_each_editors_h
     };
     let (directory, learning, visual) = open_learning(cx, original);
     let previous = learning.read_with(visual, |view, _| {
-        std::array::from_fn::<_, 4, _>(|index| learning_input(view, index))
+        std::array::from_fn::<_, 4, _>(|index| learning_input_entity_id(view, index))
     });
     for index in 0..4 {
         edit_learning_input(&learning, visual, index, &format!("saved_{index}"));
@@ -65,10 +62,7 @@ pub(crate) fn save_preserves_undo_but_new_round_and_restore_reset_each_editors_h
     wait_for_chapter_load(&learning, visual);
     for (index, previous) in previous.iter().enumerate() {
         learning.read_with(visual, |view, _| {
-            assert_eq!(
-                learning_input(view, index).entity_id(),
-                previous.entity_id()
-            );
+            assert_eq!(learning_input_entity_id(view, index), *previous);
         });
         focus_learning_input(&learning, visual, index);
         undo(visual);
@@ -130,7 +124,7 @@ pub(crate) fn save_preserves_undo_but_new_round_and_restore_reset_each_editors_h
     }
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn entering_chapter_saves_previous_inputs_and_restores_separate_workspaces(
     cx: &mut TestAppContext,
 ) {
@@ -210,7 +204,7 @@ pub(crate) fn entering_chapter_saves_previous_inputs_and_restores_separate_works
     assert!(directory.path().join("learning/chapter-02.json").exists());
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn failed_chapter_load_opens_its_recovery_and_preserves_previous_inputs(
     cx: &mut TestAppContext,
 ) {
@@ -284,7 +278,7 @@ pub(crate) fn failed_chapter_load_opens_its_recovery_and_preserves_previous_inpu
     );
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn previous_chapter_save_failure_keeps_its_unsaved_inputs(cx: &mut TestAppContext) {
     let (directory, learning, visual) = open_learning(cx, LearningWorkspace::default());
     let store =
@@ -314,7 +308,7 @@ pub(crate) fn previous_chapter_save_failure_keeps_its_unsaved_inputs(cx: &mut Te
     assert!(!directory.path().join("learning/chapter-02.json").exists());
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn unloaded_corrupt_chapters_allow_leaving_and_restoring_their_own_backup(
     cx: &mut TestAppContext,
 ) {

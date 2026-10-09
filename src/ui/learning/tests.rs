@@ -1,7 +1,7 @@
 //! Tests for the learning window.
 
 use super::*;
-use gpui_component::highlighter::{HighlightTheme, LanguageRegistry, SyntaxHighlighter};
+use gpui_kit::component::highlighter::{HighlightTheme, LanguageRegistry, SyntaxHighlighter};
 
 #[test]
 fn course_markdown_keeps_web_links_and_code_examples_without_opening_local_paths() {
@@ -140,12 +140,12 @@ fn python_highlighting_colors_python_tokens_in_both_themes() {
     assert_eq!(config.name.as_ref(), "python");
     let code = "# 读取资料\ndef research():\n    return '松果项目', 42\n";
     let mut highlighter = SyntaxHighlighter::new(CODE_LANGUAGE);
-    highlighter.update(None, &code.into());
+    highlighter.update(None, &code.into(), None);
     for theme in [
         HighlightTheme::default_light(),
         HighlightTheme::default_dark(),
     ] {
-        let styles = highlighter.styles(&(0..code.len()), &theme);
+        let styles = highlighter.styles(&(0..code.len()), &*theme);
         for (token, capture) in [
             ("# 读取资料", "comment"),
             ("def", "keyword"),
@@ -173,10 +173,10 @@ fn python_highlighting_reclassifies_code_after_editing_to_a_comment() {
     let mut highlighter = SyntaxHighlighter::new(CODE_LANGUAGE);
     let theme = HighlightTheme::default_light();
     let original = "return '正文'\n";
-    highlighter.update(None, &original.into());
+    highlighter.update(None, &original.into(), None);
     let edited = "# return '正文'\n";
-    highlighter.update(None, &edited.into());
-    let styles = highlighter.styles(&(0..edited.len()), &theme);
+    highlighter.update(None, &edited.into(), None);
+    let styles = highlighter.styles(&(0..edited.len()), &*theme);
     assert!(styles.iter().any(|(range, style)| range.start == 0
         && range.end >= edited.trim_end().len()
         && style.color == theme.style.syntax.style("comment").unwrap().color));

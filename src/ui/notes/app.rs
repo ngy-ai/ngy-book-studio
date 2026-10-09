@@ -38,7 +38,7 @@ impl NotesWindow {
     }
 
     pub(super) fn reset_scroll(&mut self) {
-        self.scroll.set_offset(gpui::point(px(0.), px(0.)));
+        self.scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
         self.copied_note = None;
     }
 

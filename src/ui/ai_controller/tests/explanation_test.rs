@@ -1,6 +1,7 @@
 //! Tests for the selection-explanation flow and session handling.
 
 use super::*;
+use crate::ui::init_ui_test;
 
 #[test]
 pub(crate) fn explains_local_ollama_connection_failure() {
@@ -25,7 +26,7 @@ pub(crate) fn selection_explanation_rejects_missing_selection_and_untrusted_scop
     assert!(validate_explanation_reference(&selected, &allowed).is_err());
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn reader_selection_explanation_emits_once_after_fresh_session_callback(
     cx: &mut TestAppContext,
 ) {
@@ -64,7 +65,7 @@ pub(crate) fn reader_selection_explanation_emits_once_after_fresh_session_callba
             .unwrap();
         thread
     });
-    cx.update(gpui_component::init);
+    init_ui_test(cx);
     let mut sidebar = None;
     let (_, visual) = cx.add_window_view(|window, cx| {
         let view = cx.new(|cx| {

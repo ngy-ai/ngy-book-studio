@@ -4,7 +4,7 @@ use super::*;
 
 impl LearningWindow {
     #[inline(never)]
-    pub(super) fn render_navigation(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(super) fn render_navigation(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let mut steps = div().v_flex().gap_2();
         for (index, lesson) in self.lessons.iter().enumerate() {
             let view = cx.entity();
@@ -119,7 +119,7 @@ impl LearningWindow {
     }
 
     #[inline(never)]
-    pub(super) fn render_study_tabs(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(super) fn render_study_tabs(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let mut tabs = div().h_flex().gap_1().px_3().py_2();
         for (id, label, pane) in [
             ("learning-tab-lesson", "讲义", StudyPane::Lesson),
@@ -172,7 +172,7 @@ impl LearningWindow {
         &self,
         document: CourseDocument,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         let mut navigation = div().h_flex().gap_2();
         if let Some(index) = document.chapter_index() {
             for (id, label, destination) in [
@@ -216,7 +216,7 @@ impl LearningWindow {
         document: CourseDocument,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         let guide_view = cx.entity();
         let continue_view = cx.entity();
         let chapter = document
@@ -311,7 +311,7 @@ impl LearningWindow {
     }
 
     #[inline(never)]
-    pub(super) fn render_lesson_navigation(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(super) fn render_lesson_navigation(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let previous_view = cx.entity();
         let next_view = cx.entity();
         div()

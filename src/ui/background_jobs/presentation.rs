@@ -15,7 +15,7 @@ pub(crate) fn job_kind_label(kind: &str) -> &'static str {
 pub(crate) fn status_presentation(
     job: &BackgroundJobSnapshot,
     theme: Palette,
-) -> (&'static str, gpui::Rgba, gpui::Rgba) {
+) -> (&'static str, gpui_kit::Rgba, gpui_kit::Rgba) {
     if job.cancel_requested {
         return ("正在取消", rgb(theme.warning), rgb(theme.warning_soft));
     }

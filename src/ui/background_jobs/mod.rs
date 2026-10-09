@@ -1,6 +1,6 @@
 use super::*;
 
-use gpui::{ClipboardItem, DragMoveEvent, EmptyView, Pixels, ScrollHandle};
+use gpui_kit::{ClipboardItem, DragMoveEvent, EmptyView, Pixels, ScrollHandle};
 
 #[cfg(test)]
 mod layout_tests;

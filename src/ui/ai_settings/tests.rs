@@ -3,7 +3,7 @@
 use super::models::ModelsSettingsWindow;
 use super::tests_support::*;
 use super::*;
-use gpui::TestAppContext;
+use gpui_kit::TestAppContext;
 
 #[test]
 pub(crate) fn singleton_window_state_distinguishes_live_stale_and_reentrant_requests() {
@@ -50,7 +50,7 @@ pub(crate) fn api_key_input_has_explicit_keep_set_and_delete_semantics() {
 /// 模型检测失败会带回整条请求地址。提示文字必须折行，而不是撑开提示条溢出窗口：
 /// 文字容器的自动最小宽度按整段文字计算，`render_notice` 里显式 `min_w(px(0.))`
 /// 之后它才能收缩到可用宽度并按宽度折行。
-#[gpui::test]
+#[gpui_kit::test]
 fn long_notice_text_wraps_inside_the_window(cx: &mut TestAppContext) {
     let (_directory, settings, visual) =
         open_settings_view::<ModelsSettingsWindow>(cx, ModelsSettingsWindow::new);

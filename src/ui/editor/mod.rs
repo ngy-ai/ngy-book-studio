@@ -6,7 +6,7 @@ use super::{
         AiSourceLink, citation_dom_navigation_script,
     },
 };
-use gpui::{Pixels, PromptButton, PromptLevel};
+use gpui_kit::{Pixels, PromptButton, PromptLevel};
 use ngy_book_studio::{
     ai::chat::ChatWindowKind,
     document::{

@@ -1,7 +1,7 @@
 //! The cover panel of the editor sidebar.
 
 use super::*;
-use gpui::AnyElement;
+use gpui_kit::AnyElement;
 
 /// Renders the cover thumbnail, its status note and the change/clear actions.
 pub(crate) fn editor_cover_panel(

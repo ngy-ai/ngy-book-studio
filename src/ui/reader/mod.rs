@@ -6,7 +6,7 @@ use super::{
     },
 };
 use anyhow::ensure;
-use gpui::{DragMoveEvent, EmptyView, Pixels};
+use gpui_kit::{DragMoveEvent, EmptyView, Pixels};
 use ngy_book_studio::{
     ai::chat::ChatWindowKind,
     document::{BookDocument, DocumentLocator, SourceLocator},

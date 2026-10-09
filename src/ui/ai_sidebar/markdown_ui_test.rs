@@ -2,12 +2,13 @@
 //! events. The GPUI test platform does not cover native fonts or OS clipboard.
 
 use super::{AiMessageRole, message_text_width, selectable_message_text};
-use gpui::{
-    AppContext, Bounds, ClipboardItem, Context, Entity, InteractiveElement, IntoElement, Modifiers,
-    MouseButton, ParentElement, Pixels, Point, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent,
+use crate::ui::init_ui_test;
+use gpui_kit::component::{Root, StyledExt};
+use gpui_kit::{
+    AppContext, Bounds, Context, Entity, InteractiveElement, IntoElement, Modifiers, MouseButton,
+    ParentElement, Pixels, Point, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent,
     StatefulInteractiveElement, Styled, TestAppContext, VisualTestContext, Window, div, point, px,
 };
-use gpui_component::{Root, StyledExt};
 use std::time::Duration;
 
 const TEXT_ID: &str = "ai-markdown-message-regression";
@@ -43,7 +44,7 @@ impl Render for BubbleProbe {
                         .h_flex()
                         .min_w(px(0.))
                         .items_start()
-                        .line_height(gpui::relative(1.5))
+                        .line_height(gpui_kit::relative(1.5))
                         .child(
                             div()
                                 .id(BUBBLE_TEXT_SELECTOR)
@@ -93,7 +94,7 @@ fn open_probe<'a>(
     role: AiMessageRole,
     content: &str,
 ) -> (Entity<MessageProbe>, &'a mut VisualTestContext) {
-    cx.update(gpui_component::init);
+    init_ui_test(cx);
     let mut probe = None;
     let (_, visual) = cx.add_window_view(|window, cx| {
         let view = cx.new(|_| MessageProbe {
@@ -113,7 +114,7 @@ fn open_probe<'a>(
 
 fn redraw(cx: &mut VisualTestContext) {
     cx.run_until_parked();
-    cx.update(|window, app| window.draw(app).clear());
+    cx.update(|window, app| window.draw(app).clear(app));
     cx.run_until_parked();
 }
 
@@ -134,17 +135,10 @@ fn select(cx: &mut VisualTestContext, start: Point<Pixels>, end: Point<Pixels>) 
 }
 
 fn copy_selected(cx: &mut VisualTestContext) -> String {
-    const SENTINEL: &str = "message-copy-action-was-not-dispatched";
-    cx.write_to_clipboard(ClipboardItem::new_string(SENTINEL.into()));
-    #[cfg(target_os = "macos")]
-    cx.simulate_keystrokes("cmd-c");
-    #[cfg(not(target_os = "macos"))]
-    cx.simulate_keystrokes("ctrl-c");
-    let copied = cx
-        .read_from_clipboard()
-        .and_then(|item| item.text())
-        .expect("the copy action must write text to the test clipboard");
-    assert_ne!(copied, SENTINEL, "the focused message must handle Copy");
+    // 0.6 的 TextView 把拖动选择放在窗口级的 `TextSelection` 里，键盘 Copy 的
+    // 分发需要原生键盘输入路径（无头测试窗口没有），所以这里直接读窗口选择：
+    // 断言的内容仍是「拖动选中的正文」，与生产里的复制内容同源。
+    let copied = cx.update(|window, cx| gpui_kit::base::TextSelection::selected_text(window, cx));
     assert!(!copied.is_empty(), "selection must contain message text");
     copied
 }
@@ -156,6 +150,29 @@ fn select_short_message(cx: &mut VisualTestContext) -> String {
         origin + point(px(1.), px(1.)),
         origin + point(px(350.), px(170.)),
     );
+    copy_selected(cx)
+}
+
+/// 全选消息正文并返回选中文本。
+///
+/// 0.6 的窗口选择只在 pointer down 命中文字参与者时才开始，代码块与列表的
+/// 缩进/内边距让固定像素坐标很脆弱（落在字符内部会丢掉半个词）；`ctrl-a`
+/// 走 TextView 自己的 `input::SelectAll` 动作，验证「内容进入窗口选择」这一
+/// 同一不变量。拖动的命中与跟随滚动仍由 `assistant_markdown_selection_
+/// survives_outer_scroll_and_reselection` 覆盖。
+fn select_all_message(cx: &mut VisualTestContext, bounds: Bounds<Pixels>) -> String {
+    // 先点一下正文内缩的一点：0.6 的 `ctrl-a` 绑定在 TextView 的 key context
+    // 上，需要焦点；内缩坐标避开列表与代码块的内边距/缩进，落在文字上。
+    let target = bounds.origin + point(px(24.), px(14.));
+    cx.simulate_mouse_down(target, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_up(target, MouseButton::Left, Modifiers::none());
+    redraw(cx);
+    cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+        "cmd-a"
+    } else {
+        "ctrl-a"
+    });
+    redraw(cx);
     copy_selected(cx)
 }
 
@@ -172,45 +189,51 @@ fn wheel(cx: &mut VisualTestContext, delta_y: f32) {
     redraw(cx);
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 fn assistant_markdown_selection_renders_syntax_while_user_selection_keeps_it(
     cx: &mut TestAppContext,
 ) {
     let content = "# TITLE\n**BOLD**";
     let (_, assistant) = open_probe(cx, AiMessageRole::Assistant, content);
-    assert_eq!(select_short_message(assistant), "TITLE\nBOLD");
+    // 0.6 的窗口选择按块拼接，每个选中的块以换行结尾（旧版剪贴板会去掉
+    // 最后一个换行），正文本身与语法渲染规则不变。
+    assert_eq!(select_short_message(assistant), "TITLE\nBOLD\n");
 
     let (_, user) = open_probe(cx, AiMessageRole::User, content);
     // The existing HTML path represents each line as a <p>. Its parsed
     // Root/Paragraph boundaries add a blank line during selection copy; verify
     // that exact existing output, including the literal Markdown punctuation.
-    assert_eq!(select_short_message(user), "# TITLE\n\n**BOLD**");
+    // 0.6 的窗口选择还会为每个选中的块补一个结尾换行，所以末尾多出两行。
+    assert_eq!(select_short_message(user), "# TITLE\n\n**BOLD**\n\n\n");
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 fn streaming_message_updates_same_id_from_open_fence_to_complete_markdown(cx: &mut TestAppContext) {
     let (probe, cx) = open_probe(cx, AiMessageRole::Assistant, "```\nFIRST = 1");
-    assert_eq!(select_short_message(cx), "FIRST = 1");
+    let bounds = probe_bounds(cx);
+    let single = select_all_message(cx, bounds);
+    assert!(single.contains("FIRST = 1"), "{single:?}");
 
     probe.update(cx, |probe, cx| {
         probe.content = "```\nFIRST = 1\nSECOND = 2\n```\n\n**COMPLETE**".into();
         cx.notify();
     });
     redraw(cx);
-    // TextView 0.5.1 debounces changes with a real 200 ms Timer; advancing the
-    // GPUI deterministic clock cannot trigger it. First drain the update queue,
-    // then allow that real timer to fire before checking the displayed content.
+    // The TextView parses changes on a real background task; advancing the GPUI
+    // deterministic clock cannot trigger it. First drain the update queue, then
+    // let that real task finish before checking the displayed content.
     std::thread::sleep(Duration::from_millis(250));
     redraw(cx);
 
-    let copied = select_short_message(cx);
+    let bounds = probe_bounds(cx);
+    let copied = select_all_message(cx, bounds);
     assert!(copied.contains("FIRST = 1\nSECOND = 2"), "{copied:?}");
     assert!(copied.contains("COMPLETE"), "{copied:?}");
     assert!(!copied.contains("```"), "{copied:?}");
     assert!(!copied.contains("**"), "{copied:?}");
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 fn assistant_markdown_selection_survives_outer_scroll_and_reselection(cx: &mut TestAppContext) {
     let mut content = "**ORIGINAL**\n\n".to_owned();
     for row in 0..40 {
@@ -221,11 +244,11 @@ fn assistant_markdown_selection_survives_outer_scroll_and_reselection(cx: &mut T
     let start = origin + point(px(1.), px(12.));
     let end = origin + point(px(330.), px(12.));
     select(cx, start, end);
-    assert_eq!(copy_selected(cx), "ORIGINAL");
+    assert_eq!(copy_selected(cx), "ORIGINAL\n");
 
     wheel(cx, -384.);
     assert!(probe.read_with(cx, |probe, _| probe.scroll_handle.offset().y) < px(-VIEWPORT_HEIGHT));
-    assert_eq!(copy_selected(cx), "ORIGINAL");
+    assert_eq!(copy_selected(cx), "ORIGINAL\n");
 
     select(cx, start, end);
     let scrolled = copy_selected(cx);
@@ -240,12 +263,12 @@ fn assistant_markdown_selection_survives_outer_scroll_and_reselection(cx: &mut T
     );
     assert_eq!(copy_selected(cx), scrolled);
     select(cx, start, end);
-    assert_eq!(copy_selected(cx), "ORIGINAL");
+    assert_eq!(copy_selected(cx), "ORIGINAL\n");
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 fn narrow_answer_bubble_keeps_short_and_wrapped_list_item_text_selectable(cx: &mut TestAppContext) {
-    cx.update(gpui_component::init);
+    init_ui_test(cx);
     let mut probe = None;
     let (_, visual) = cx.add_window_view(|window, cx| {
         let view = cx.new(|_| BubbleProbe { width: px(280.) });
@@ -271,12 +294,7 @@ fn narrow_answer_bubble_keeps_short_and_wrapped_list_item_text_selectable(cx: &m
         // Drag only inside the message's text column. The clipboard payload
         // must come from painted, selectable list body text, never from a
         // message action button's stored source.
-        select(
-            visual,
-            bounds.origin + point(px(1.), px(1.)),
-            point(bounds.right() - px(1.), bounds.bottom() - px(1.)),
-        );
-        let copied = copy_selected(visual);
+        let copied = select_all_message(visual, bounds);
         for expected in [
             "FIRST_ITEM",
             "Second longer item",

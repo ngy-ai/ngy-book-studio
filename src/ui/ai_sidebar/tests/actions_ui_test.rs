@@ -4,13 +4,13 @@
 //! persisted anchor, and deleting must leave the stored turn to the backend.
 
 use super::*;
-use gpui::{Modifiers, Subscription, TestAppContext, VisualTestContext};
-use gpui_component::Root;
+use gpui_kit::component::Root;
+use gpui_kit::{Modifiers, Subscription, TestAppContext, VisualTestContext};
 use std::{cell::RefCell, rc::Rc};
 
 fn redraw(cx: &mut VisualTestContext) {
     cx.run_until_parked();
-    cx.update(|window, app| window.draw(app).clear());
+    cx.update(|window, app| window.draw(app).clear(app));
     cx.run_until_parked();
 }
 
@@ -32,7 +32,7 @@ fn open_sidebar(
 ) {
     let temp = tempfile::tempdir().unwrap();
     let services = Arc::new(AppServices::open(temp.path()).unwrap());
-    cx.update(gpui_component::init);
+    init_ui_test(cx);
     let mut sidebar = None;
     let (_, visual) = cx.add_window_view(|window, cx| {
         let view = cx.new(|cx| {
@@ -104,7 +104,7 @@ fn restore_one_turn(sidebar: &Entity<AiSidebar>, cx: &mut VisualTestContext) {
     redraw(cx);
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 fn clicking_edit_moves_the_question_back_into_the_input_box(cx: &mut TestAppContext) {
     let (sidebar, _, _subscription, visual) = open_sidebar(cx);
     restore_one_turn(&sidebar, visual);
@@ -141,7 +141,7 @@ fn clicking_edit_moves_the_question_back_into_the_input_box(cx: &mut TestAppCont
     });
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 fn clicking_regenerate_resubmits_the_questions_own_turn(cx: &mut TestAppContext) {
     let (sidebar, events, _subscription, visual) = open_sidebar(cx);
     restore_one_turn(&sidebar, visual);
@@ -172,7 +172,7 @@ fn clicking_regenerate_resubmits_the_questions_own_turn(cx: &mut TestAppContext)
     });
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 fn clicking_delete_waits_for_the_stored_turn_to_be_removed(cx: &mut TestAppContext) {
     let (sidebar, events, _subscription, visual) = open_sidebar(cx);
     restore_one_turn(&sidebar, visual);
@@ -201,7 +201,7 @@ fn clicking_delete_waits_for_the_stored_turn_to_be_removed(cx: &mut TestAppConte
     });
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 fn deleting_an_unpersisted_question_only_changes_the_transcript(cx: &mut TestAppContext) {
     let (sidebar, events, _subscription, visual) = open_sidebar(cx);
     sidebar.update(visual, |sidebar, cx| {

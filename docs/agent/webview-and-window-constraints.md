@@ -6,7 +6,7 @@
 
 1. `src/main.rs` 必须在 GPUI 启动任何工作线程前设置
    `GPUI_DISABLE_DIRECT_COMPOSITION=1`，并在创建应用前完成 WebView2 Runtime 探测。
-   应用启动时调用 `gpui_component::init(cx)`；每个使用 `gpui-component` 的窗口必须以
+   应用启动时调用 `gpui_kit::init(cx)`；每个使用 `gpui-kit` 组件层的窗口必须以
    `Root::new(...)` 作为第一层视图。
 2. Reader、Editor 和 PDF Reader 的 Wry 子 WebView 必须通过
    `build_as_child_async(...).await` 异步创建。等待过程位于 GPUI entity/state 借用
@@ -37,9 +37,10 @@
    第三方模块会在求值阶段访问 `document.documentElement`，所以必须保留构建脚本中
    对整个 bundle 的 `DOMContentLoaded` 外层门禁；只在 TypeScript 入口函数里等待
    DOM 仍然太晚。修改后同时运行前端 typecheck 和 bundle 一致性检查。
-9. `gpui-component 0.5.1` 的 `overflow_x_scrollbar()` 会把原元素样式转移到
-   `size_full()` 外壳并清空内部布局。固定高度的横向工具栏使用带稳定 ID 的 GPUI
-   `overflow_x_scroll()`，不要把该包装器直接套在承载按钮的 `h_flex()` 上。
+9. 固定高度的横向工具栏使用带稳定 ID 的 GPUI `overflow_x_scroll()`，不要把
+   `overflow_x_scrollbar()` 直接套在承载按钮的 `h_flex()` 上：0.5.1 的包装器会把
+   原元素样式转移到 `size_full()` 外壳并清空内部布局。0.6 已改为保留原元素作为
+   滚动容器，但那两种语义仍然不要混用，工具栏高度与滚动条行为改完要人工确认。
 10. 富文本 IPC 返回完整的可信 XHTML 页面壳，但只有 `<body>` 属于可编辑正文。更新
     统一 AST 前先提取该元素再清洗解析；不要把含 `<head><title>` 的整页交给片段
     清洗器，否则移除标签后留下的标题文本可能进入正文并在保存时重复。

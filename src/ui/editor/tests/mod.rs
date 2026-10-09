@@ -133,11 +133,8 @@ fn document_with_audio(book_id: &str, asset: AssetRef) -> BookDocument {
     document
 }
 
-fn protocol_request(
-    uri: impl AsRef<str>,
-    range: Option<&str>,
-) -> gpui_component::wry::http::Request<()> {
-    let mut builder = gpui_component::wry::http::Request::builder().uri(uri.as_ref());
+fn protocol_request(uri: impl AsRef<str>, range: Option<&str>) -> wry::http::Request<()> {
+    let mut builder = wry::http::Request::builder().uri(uri.as_ref());
     if let Some(range) = range {
         builder = builder.header("Range", range);
     }

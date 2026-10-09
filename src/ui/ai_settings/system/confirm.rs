@@ -7,7 +7,7 @@ impl SystemSettingsWindow {
     pub(crate) fn render_confirm_overwrite(
         &self,
         cx: &mut Context<Self>,
-    ) -> Option<gpui::AnyElement> {
+    ) -> Option<gpui_kit::AnyElement> {
         let change = self.confirm_overwrite.clone()?;
         let theme = palette(cx);
         Some(
@@ -20,7 +20,7 @@ impl SystemSettingsWindow {
                 .child(
                     div()
                         .text_sm()
-                        .line_height(gpui::relative(1.5))
+                        .line_height(gpui_kit::relative(1.5))
                         .text_color(rgb(theme.danger))
                         .child(format!(
                             "{} 已经是一个图书库。继续会先删掉它的内容，再把当前数据目录的内容\

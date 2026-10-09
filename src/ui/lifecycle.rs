@@ -21,7 +21,7 @@ pub(crate) struct ApplicationWindowLifecycle {
     _closed_subscription: Option<Subscription>,
 }
 
-impl gpui::Global for ApplicationWindowLifecycle {}
+impl gpui_kit::Global for ApplicationWindowLifecycle {}
 
 pub(crate) struct ApplicationExit {
     pub(crate) main_window: AnyWindowHandle,
@@ -36,7 +36,7 @@ pub(crate) fn init_application_window_lifecycle(cx: &mut App) {
     if cx.has_global::<ApplicationWindowLifecycle>() {
         return;
     }
-    let subscription = cx.on_window_closed(|cx| {
+    let subscription = cx.on_window_closed(|cx, _window_id| {
         // The closing window can still be on the update stack. Advance only
         // after its callback and entity borrows have been released.
         cx.defer(advance_application_exit);
@@ -86,12 +86,12 @@ pub(crate) fn request_application_exit(
     }
     lifecycle.prompt_open = true;
     let answer = window.prompt(
-        gpui::PromptLevel::Warning,
+        gpui_kit::PromptLevel::Warning,
         "是否退出墨页？",
         Some("退出将关闭图书阅读、图书编辑、AI 配置等全部窗口。编辑窗口会继续询问是否保存修改。"),
         &[
-            gpui::PromptButton::ok("退出软件"),
-            gpui::PromptButton::cancel("继续运行"),
+            gpui_kit::PromptButton::ok("退出软件"),
+            gpui_kit::PromptButton::cancel("继续运行"),
         ],
         cx,
     );

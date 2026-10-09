@@ -11,7 +11,7 @@ pub(crate) async fn build_reader_webview(
     services: Arc<AppServices>,
     appearance: Appearance,
 ) -> Result<(
-    gpui_component::wry::WebView,
+    wry::WebView,
     async_channel::Receiver<ReaderWebEvent>,
     ReaderProtocolGate,
 )> {
@@ -42,7 +42,7 @@ pub(crate) async fn build_reader_webview(
     let navigation_sender = event_sender.clone();
     let navigation_gate = protocol_gate.clone();
 
-    let raw_webview = gpui_component::wry::WebViewBuilder::new()
+    let raw_webview = wry::WebViewBuilder::new()
         .with_asynchronous_custom_protocol(
             "epubreader".to_string(),
             move |_, request, responder| {
@@ -121,9 +121,9 @@ pub(crate) async fn build_reader_webview(
         .with_initialization_script(READER_INITIALIZATION_SCRIPT)
         .with_initialization_script(include_str!("annotations.js"))
         .with_initialization_script(include_str!("translations.js"))
-        .with_new_window_req_handler(|_, _| gpui_component::wry::NewWindowResponse::Deny)
+        .with_new_window_req_handler(|_, _| wry::NewWindowResponse::Deny)
         .with_on_page_load_handler(move |event, url| {
-            if matches!(event, gpui_component::wry::PageLoadEvent::Finished) {
+            if matches!(event, wry::PageLoadEvent::Finished) {
                 let _ = page_sender.try_send(ReaderWebEvent::PageLoaded(url));
             }
         })

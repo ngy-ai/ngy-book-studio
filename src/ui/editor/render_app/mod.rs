@@ -461,10 +461,12 @@ impl Render for EditorApp {
                 .py_1()
                 .border_b_1()
                 .border_color(rgb(palette(cx).border))
-                // gpui-component 0.5.1's `overflow_x_scrollbar` moves this
-                // element's styles onto a `size_full` wrapper and clears the
-                // inner flex-row style. That makes this fixed-height toolbar
-                // consume the whole editor and stacks its controls vertically.
+                // Keep an explicit `overflow_x_scroll` on this fixed-height
+                // toolbar: the component library's `overflow_x_scrollbar`
+                // wrapper once moved the element's styles onto a `size_full`
+                // shell, which made the toolbar consume the whole editor and
+                // stacked its controls vertically. 0.6 preserves the source
+                // element, but the two semantics must not be mixed.
                 .overflow_x_scroll()
                 .child(
                     div()
@@ -545,7 +547,11 @@ impl Render for EditorApp {
                 .min_h(px(0.))
                 .bg(rgb(palette(cx).paper))
                 .p_2()
-                .child(Input::new(&self.body_input).h_full().disabled(write_busy))
+                .child(
+                    Textarea::new(&self.body_input)
+                        .h_full()
+                        .disabled(write_busy),
+                )
                 .into_any_element(),
             EditorTab::Preview | EditorTab::RichText => match &self.editor_webview {
                 Some(webview) => div()

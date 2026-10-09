@@ -10,7 +10,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
-use gpui::{Context, Entity, Task};
+use gpui_kit::{Context, Entity, Task};
 use ngy_book_studio::{
     ai::ChatRole,
     ai::agent::{AgentAnswerSourceStatus, AgentCitation, SelectionSnapshot},

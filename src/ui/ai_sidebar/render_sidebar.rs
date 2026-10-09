@@ -4,7 +4,7 @@
 use super::*;
 
 impl AiSidebar {
-    pub(super) fn render_endpoint_status(&self, theme: Palette) -> gpui::AnyElement {
+    pub(super) fn render_endpoint_status(&self, theme: Palette) -> gpui_kit::AnyElement {
         let warning = self.endpoint_status.is_warning();
         let (background, foreground, icon) = if warning {
             (
@@ -50,7 +50,7 @@ impl AiSidebar {
             .into_any_element()
     }
 
-    pub(super) fn render_collapsed(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(super) fn render_collapsed(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let view = cx.entity().clone();
         let warning = self.endpoint_status.is_warning();
         let (status_color, status_text) = if warning {
@@ -103,7 +103,7 @@ impl AiSidebar {
             .into_any_element()
     }
 
-    pub(super) fn render_scope(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(super) fn render_scope(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let view = cx.entity().clone();
         let selected = self.conversation.scope.selected_books();
         let is_book_scope = matches!(self.conversation.scope, AiSidebarScope::Book { .. });
@@ -180,7 +180,7 @@ impl AiSidebar {
             .into_any_element()
     }
 
-    pub(super) fn render_references(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    pub(super) fn render_references(&self, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
         if self.conversation.reference_hints.is_empty() {
             return None;
         }
@@ -290,7 +290,10 @@ impl AiSidebar {
         )
     }
 
-    pub(super) fn render_session_picker(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    pub(super) fn render_session_picker(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui_kit::AnyElement> {
         if !self.sessions.open && !self.sessions.busy && self.sessions.error.is_none() {
             return None;
         }

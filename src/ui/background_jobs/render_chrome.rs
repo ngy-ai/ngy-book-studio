@@ -3,7 +3,7 @@
 use super::*;
 
 impl BackgroundJobsWindow {
-    pub(super) fn render_header(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(super) fn render_header(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         div()
             .debug_selector(|| "jobs-layout-header".into())
             .flex_none()
@@ -80,7 +80,7 @@ impl BackgroundJobsWindow {
     /// Task-kind switcher pinned to the top of the window, above the list and
     /// detail columns. Wraps instead of clipping so every category stays
     /// reachable at the minimum window width.
-    pub(super) fn render_kinds_bar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(super) fn render_kinds_bar(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let mut bar = div()
             .debug_selector(|| "jobs-layout-kinds".into())
             .flex_none()
@@ -150,7 +150,7 @@ impl BackgroundJobsWindow {
         &self,
         viewport_width: Pixels,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         div()
             .debug_selector(|| "jobs-layout-list-column".into())
             .v_flex()
@@ -165,7 +165,7 @@ impl BackgroundJobsWindow {
 
     /// Draggable divider between the list column and the detail panel. The
     /// pointer grabs it, follows it horizontally, and releases it in place.
-    pub(super) fn render_resize_handle(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(super) fn render_resize_handle(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let handle_view = cx.entity().clone();
         let active = self.resizing_list;
         div()
@@ -200,7 +200,7 @@ impl BackgroundJobsWindow {
                 },
             ))
             .on_mouse_up(
-                gpui::MouseButton::Left,
+                gpui_kit::MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     if this.finish_list_resize() {
                         cx.notify();
@@ -208,7 +208,7 @@ impl BackgroundJobsWindow {
                 }),
             )
             .on_mouse_up_out(
-                gpui::MouseButton::Left,
+                gpui_kit::MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     if this.finish_list_resize() {
                         cx.notify();
@@ -231,7 +231,7 @@ impl BackgroundJobsWindow {
     /// Status filters and the task search box. The kind switcher above already
     /// names and counts the current scope, so no extra summary line is drawn
     /// here.
-    pub(super) fn render_filters(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(super) fn render_filters(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let mut filters = div().h_flex().flex_wrap().gap_1();
         for &(status, label) in STATUS_FILTERS {
             filters = filters.child(

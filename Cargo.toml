@@ -21,18 +21,19 @@ djvu-rs = { version = "=0.32.1", default-features = false, features = ["std"] }
 directories = "6.0"
 futures-util = "=0.3.34"
 getrandom = "=0.4.3"
-gpui = { version = "0.2.2", features = [
-    "font-kit",
-    "x11",
-    "wayland",
-    "runtime_shaders",
-] }
-gpui-component = { version = "0.5.1", features = ["webview"] }
-gpui-component-assets = { version = "0.5.1" }
+# GPUI Kit 是应用唯一的框架入口：`gpui_kit::*` 是新版 GPUI（gpui-pre），
+# `gpui_kit::component` 是组件库，`gpui_kit::assets` 是默认图标。
+# `test-support` 统一开启 GPUI 的测试支持（含 `debug_selector`）。
+gpui-kit = { version = "0.6.4", features = ["test-support", "tree-sitter-python"] }
+# WebView 从 gpui-component 拆成了独立 crate（Wry 原生子视图，实验性）。
+gpui-wry = "0.6.4"
+# gpui-wry 只包装 `wry::WebView`；自身的 builder、协议回调与 Windows 扩展
+# （`WebViewExtWindows`、`raw_window_handle`）仍直接从这份 Wry 绑定使用。
+wry = { package = "lb-wry", version = "0.53.3" }
 html5ever = "=0.27.0"
 image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 lopdf = { version = "=0.44.0", default-features = false }
-# Keep chat sanitization on the same Markdown parser as gpui-component.
+# Keep chat sanitization on the same Markdown parser as gpui-kit's components.
 markdown = "=1.0.0"
 mime_guess = "2.0"
 markup5ever_rcdom = "=0.3.0"
@@ -64,7 +65,8 @@ ebook-rs = { version = "=0.16.4", default-features = false }
 ngy-utils-tracing = "0.6.0"
 
 [dev-dependencies]
-gpui = { version = "0.2.2", features = ["test-support"] }
+# 测试支持由上面 `gpui-kit` 的 `test-support` feature 统一开启；
+# 同一个 package 的 feature 在普通与测试构建间取并集，因此不再单独声明。
 
 # 在构建期把应用图标嵌进 Windows exe 资源段（见根目录 build.rs）。
 # WindowOptions::icon 只对 X11 生效，Windows 上图标只能从 PE 资源段来。

@@ -13,7 +13,7 @@ impl BackgroundJobsWindow {
         &self,
         probe: &BlockProbeState,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         let mut panel =
             div()
                 .v_flex()
@@ -106,7 +106,7 @@ impl BackgroundJobsWindow {
                 .w_full()
                 .flex_none()
                 .text_xs()
-                .line_height(gpui::relative(1.5))
+                .line_height(gpui_kit::relative(1.5))
                 .text_color(rgb(palette(cx).ink))
                 .whitespace_normal()
                 .child(prettify_json(&result.response_text))

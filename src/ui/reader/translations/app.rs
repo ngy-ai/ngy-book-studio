@@ -23,7 +23,9 @@ impl ReaderApp {
     pub(crate) fn start_translation_refresh(&mut self, cx: &mut Context<Self>) {
         self.translations._refresh_task = Some(cx.spawn(async move |view, cx| {
             loop {
-                Timer::after(TRANSLATION_REFRESH_INTERVAL).await;
+                cx.background_executor()
+                    .timer(TRANSLATION_REFRESH_INTERVAL)
+                    .await;
                 let alive = view.update(cx, |this, cx| this.poll_translation_progress(cx));
                 if alive.is_err() {
                     break;

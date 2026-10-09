@@ -8,7 +8,7 @@ use super::*;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use gpui_component::checkbox::Checkbox;
+use gpui_kit::component::checkbox::Checkbox;
 use ngy_book_studio::ai::web_search::{
     DEFAULT_WEB_SEARCH_TIMEOUT_SECS, MAX_WEB_SEARCH_RESULTS, MAX_WEB_SEARCH_TIMEOUT_SECS,
     MIN_WEB_SEARCH_TIMEOUT_SECS, normalize_web_endpoint,
@@ -162,7 +162,7 @@ impl WebSearchSettingsWindow {
     }
 
     #[inline(never)]
-    pub(crate) fn render_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(crate) fn render_panel(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let theme = palette(cx);
         let web_enable_view = cx.entity();
         let web_confirm_view = cx.entity();
@@ -399,7 +399,7 @@ pub(crate) fn parse_web_search_max_results(value: &str) -> Result<usize> {
 mod tests {
     use super::tests_support::*;
     use super::*;
-    use gpui::{TestAppContext, VisualTestContext};
+    use gpui_kit::{TestAppContext, VisualTestContext};
 
     fn open_window(
         cx: &mut TestAppContext,
@@ -411,7 +411,7 @@ mod tests {
         open_settings_view::<WebSearchSettingsWindow>(cx, WebSearchSettingsWindow::new)
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn search_drafts_parse_without_saving(cx: &mut TestAppContext) {
         let (_directory, settings, visual) = open_window(cx);
         let (url, timeout, results) = settings.read_with(visual, |view, _| {
@@ -450,7 +450,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn enabling_search_needs_a_url_and_stays_a_draft(cx: &mut TestAppContext) {
         let (_directory, settings, visual) = open_window(cx);
         click(visual, "ai-web-search-enabled");

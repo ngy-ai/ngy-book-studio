@@ -12,7 +12,7 @@
 ## 项目概览
 
 “墨页”是一个面向 Windows 10/11 的本地图书库、阅读器与编辑器。项目使用 Rust
-2024、GPUI、`gpui-component`/WebView2 和 SQLite。导入层将 EPUB、PDF、Office 与
+2024、GPUI（经由 `gpui-kit` 引入）、`gpui-wry`/WebView2 和 SQLite。导入层将 EPUB、PDF、Office 与
 DRM-free Kindle 文件转换为项目自有的 `BookDocument`；第三方解析器 IR 不得进入
 数据库、UI 或其它公共领域模型。
 
@@ -66,7 +66,7 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
   fixture、`tempfile` 或下文的唯一隔离数据目录。
 - 保持 `Cargo.lock` 可复现。普通构建、测试和运行都使用 `--locked`；只有明确增删
   依赖时才更新锁文件，并检查更新范围。
-- 不要顺手升级 GPUI、`gpui-component`、Wry/WebView2、`rbook`、`office_oxide`、
+- 不要顺手升级 GPUI/`gpui-kit`、`gpui-wry`/Wry、WebView2、`rbook`、`office_oxide`、
   `ebook-rs`、PDF.js 或 `sqlite-vec`。这些依赖已固定并涉及 Windows 句柄、解析安全、
   资产一致性或数据库 ABI；确需升级时按高风险变更重新走完整门禁。
 - 许可证口径（2026-09-23 已由用户裁定，不要再改动除非他改口）：`LICENSE` 全文是

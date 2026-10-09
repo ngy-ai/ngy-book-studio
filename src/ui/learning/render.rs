@@ -8,7 +8,7 @@ impl LearningWindow {
         &self,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         if let StudyPane::Document(document) = self.study_pane {
             return div()
                 .v_flex()
@@ -45,7 +45,7 @@ impl LearningWindow {
         &self,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         let pane = match self.evidence_pane {
             EvidencePane::Result => self.render_result(window, cx),
             EvidencePane::Trace => self.render_trace(window, cx),

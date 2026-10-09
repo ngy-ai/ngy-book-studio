@@ -61,7 +61,7 @@ impl EpubReaderApp {
         Self {
             library,
             services,
-            library_window: gpui::Window::window_handle(window),
+            library_window: gpui_kit::Window::window_handle(window),
             library_mutations: LibraryMutationLifecycle::default(),
             ai_sidebar,
             ai_controller,
@@ -219,7 +219,7 @@ impl EpubReaderApp {
     pub(super) fn finish_library_request(
         &mut self,
         cx: &mut Context<Self>,
-    ) -> Option<gpui::AnyWindowHandle> {
+    ) -> Option<gpui_kit::AnyWindowHandle> {
         let should_close = self.library_mutations.finish();
         cx.notify();
         should_close.then_some(self.library_window)

@@ -11,7 +11,7 @@ impl AiSidebar {
         cx: &mut Context<Self>,
     ) -> Self {
         let input = cx.new(|cx| {
-            InputState::new(window, cx)
+            TextareaState::new(window, cx)
                 .auto_grow(2, 6)
                 .placeholder("向这些图书提问…（Ctrl+Enter 发送）")
         });
@@ -27,7 +27,9 @@ impl AiSidebar {
         let endpoint_services = Arc::clone(&services);
         let endpoint_refresh_task = cx.spawn(async move |view, cx| {
             loop {
-                Timer::after(AI_ENDPOINT_REFRESH_INTERVAL).await;
+                cx.background_executor()
+                    .timer(AI_ENDPOINT_REFRESH_INTERVAL)
+                    .await;
                 let endpoint_status = AiEndpointStatus::current(&endpoint_services);
                 if view
                     .update(cx, |this, cx| {

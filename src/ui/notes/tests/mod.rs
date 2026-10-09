@@ -1,7 +1,7 @@
 //! Shared fixtures for the notes tests.
 
 use super::*;
-use gpui::{
+use gpui_kit::{
     Modifiers, MouseButton, ScrollDelta, ScrollWheelEvent, TestAppContext, VisualTestContext, point,
 };
 use ngy_book_studio::annotations::{Annotation, TextAnchor};

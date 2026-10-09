@@ -95,9 +95,9 @@ pub(crate) fn zoom_wheel_listener(
 
 /// A selectable, naturally sized page text view inside an outer scroller.
 ///
-/// `TextView` 0.5.1 keeps selection endpoints in its own bounds, so its
-/// internal virtual list must stay disabled and the whole view has to move
-/// with the outer scroll container.
+/// The TextView's selection geometry must follow the text it paints, so its
+/// internal virtual list stays disabled and the whole view moves with the
+/// outer scroll container instead.
 pub(crate) fn scrollable_page_text(
     id: SharedString,
     html: SharedString,
@@ -106,7 +106,7 @@ pub(crate) fn scrollable_page_text(
 ) -> AnyElement {
     let scroll_handle = window
         .use_keyed_state(SharedString::from(format!("{id}/scroll")), cx, |_, _| {
-            gpui::ScrollHandle::default()
+            gpui_kit::ScrollHandle::default()
         })
         .read(cx)
         .clone();
@@ -123,7 +123,7 @@ pub(crate) fn scrollable_page_text(
                 .track_scroll(&scroll_handle)
                 .p_3()
                 .child(
-                    TextView::html(id, html, window, cx)
+                    TextView::html(id, html)
                         .style(TextViewStyle::default().paragraph_gap(rems(0.5)))
                         .selectable(true)
                         .scrollable(false)

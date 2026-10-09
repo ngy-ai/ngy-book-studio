@@ -208,8 +208,7 @@ impl EditorApp {
                 .default_value(title.to_string())
         });
         let description_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
+            TextareaState::new(window, cx)
                 .placeholder("可选；将进入正文纯文本、全文检索与 AI 引用")
                 .default_value(description.to_string())
         });

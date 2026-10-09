@@ -46,7 +46,13 @@ impl DataDirSetupWindow {
         });
         // 回车等同于点「确认并启动」：输入路径后不必再去够鼠标。
         let subscription = cx.subscribe_in(&input, window, |this, _, event, window, cx| {
-            if matches!(event, InputEvent::PressEnter { secondary: false }) {
+            if matches!(
+                event,
+                InputEvent::PressEnter {
+                    secondary: false,
+                    ..
+                }
+            ) {
                 this.confirm(window, cx);
             }
         });
@@ -188,7 +194,7 @@ impl DataDirSetupWindow {
         self.launching
     }
 
-    fn render_error(&self, theme: Palette) -> Option<gpui::AnyElement> {
+    fn render_error(&self, theme: Palette) -> Option<gpui_kit::AnyElement> {
         let error = self.error.as_ref()?;
         Some(
             div()
@@ -205,7 +211,7 @@ impl DataDirSetupWindow {
                     div()
                         .flex_1()
                         .min_w(px(0.))
-                        .line_height(gpui::relative(1.5))
+                        .line_height(gpui_kit::relative(1.5))
                         .child(error.clone()),
                 )
                 .into_any_element(),
@@ -248,7 +254,7 @@ impl Render for DataDirSetupWindow {
                             .child(
                                 div()
                                     .text_sm()
-                                    .line_height(gpui::relative(1.5))
+                                    .line_height(gpui_kit::relative(1.5))
                                     .text_color(rgb(palette(cx).muted))
                                     .child(self.explanation()),
                             ),
@@ -290,7 +296,7 @@ impl Render for DataDirSetupWindow {
                     .child(
                         div()
                             .text_xs()
-                            .line_height(gpui::relative(1.5))
+                            .line_height(gpui_kit::relative(1.5))
                             .text_color(rgb(palette(cx).muted))
                             .child(
                                 "图书、笔记、索引和日志都放在这里，建议放在非系统盘；日志写在它的 \
@@ -388,7 +394,7 @@ pub(crate) fn open_data_dir_setup_window(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{Modifiers, TestAppContext, VisualTestContext};
+    use gpui_kit::{Modifiers, TestAppContext, VisualTestContext};
     use ngy_book_studio::startup::load_remembered_data_dir;
     use std::cell::RefCell;
     use std::fs;
@@ -405,7 +411,7 @@ mod tests {
         Entity<DataDirSetupWindow>,
         &'a mut VisualTestContext,
     ) {
-        cx.update(gpui_component::init);
+        init_ui_test(cx);
         let confirmed: Confirmed = Rc::new(RefCell::new(None));
         let captured = Rc::clone(&confirmed);
         let mut setup_view = None;
@@ -449,7 +455,7 @@ mod tests {
         visual.run_until_parked();
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn the_input_starts_with_the_suggested_directory_and_confirm_saves_the_edit(
         cx: &mut TestAppContext,
     ) {
@@ -485,7 +491,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn an_unusable_directory_keeps_the_window_open_for_another_try(cx: &mut TestAppContext) {
         let temp = tempfile::tempdir().expect("临时目录");
         let config_path = temp.path().join("bootstrap.json");
@@ -514,7 +520,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn an_empty_input_is_rejected_without_saving(cx: &mut TestAppContext) {
         let temp = tempfile::tempdir().expect("临时目录");
         let config_path = temp.path().join("bootstrap.json");
@@ -534,7 +540,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn a_launch_failure_is_reported_in_the_same_window(cx: &mut TestAppContext) {
         let temp = tempfile::tempdir().expect("临时目录");
         let config_path = temp.path().join("bootstrap.json");

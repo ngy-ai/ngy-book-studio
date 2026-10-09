@@ -11,10 +11,10 @@
 
 use std::borrow::Cow;
 
-use gpui::{AssetSource, Result, SharedString};
+use gpui_kit::{AssetSource, Result, SharedString};
 
 /// Vector art this repository maintains itself, keyed by the bundle path an
-/// [`gpui::Svg`] resolves through.
+/// [`gpui_kit::Svg`] resolves through.
 const LOCAL_ICONS: &[(&str, &[u8])] = &[
     (
         "icons/pencil.svg",
@@ -42,11 +42,11 @@ impl AssetSource for AppAssets {
         if let Some(bytes) = Self::local(path) {
             return Ok(Some(bytes));
         }
-        gpui_component_assets::Assets.load(path)
+        gpui_kit::assets::Assets.load(path)
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
-        let mut listed = gpui_component_assets::Assets.list(path)?;
+        let mut listed = gpui_kit::assets::Assets.list(path)?;
         listed.extend(
             LOCAL_ICONS
                 .iter()

@@ -7,7 +7,7 @@ pub(crate) const MAX_VISIBLE_TRACES: usize = 1_000;
 pub(crate) const CODE_LANGUAGE: &str = "python";
 
 pub(crate) fn register_python_highlighting() {
-    use gpui_component::highlighter::{LanguageConfig, LanguageRegistry};
+    use gpui_kit::component::highlighter::{LanguageConfig, LanguageRegistry};
     static REGISTER: std::sync::Once = std::sync::Once::new();
     REGISTER.call_once(|| {
         // The component's default language bundle only contains JSON. Register
@@ -26,21 +26,21 @@ pub(crate) fn register_python_highlighting() {
     });
 }
 
-// TextView 0.5.1 stores selection endpoints relative to its own bounds. Its
-// virtual list scrolls text inside fixed bounds, so repainting selects different
-// characters after a wheel event. Scroll the whole, naturally sized TextView
-// instead: the text and selection coordinates then move together.
+// The TextView anchors its selection geometry to the text it paints. Its
+// internal virtual list scrolls text inside fixed bounds, so repainting would
+// select different characters after a wheel event. Scroll the whole, naturally
+// sized TextView instead: the text and the selection then move together.
 #[inline(never)]
 pub(crate) fn scrollable_learning_text(
     id: impl Into<SharedString>,
     markdown: impl Into<SharedString>,
     window: &mut Window,
     cx: &mut App,
-) -> gpui::AnyElement {
+) -> gpui_kit::AnyElement {
     let id = id.into();
     let scroll_handle = window
         .use_keyed_state(SharedString::from(format!("{id}/scroll")), cx, |_, _| {
-            gpui::ScrollHandle::default()
+            gpui_kit::ScrollHandle::default()
         })
         .read(cx)
         .clone();
@@ -55,7 +55,7 @@ pub(crate) fn scrollable_learning_text(
                 .overflow_y_scroll()
                 .track_scroll(&scroll_handle)
                 .child(
-                    TextView::markdown(id, markdown, window, cx)
+                    TextView::markdown(id, markdown)
                         .selectable(true)
                         .scrollable(false)
                         .w_full()

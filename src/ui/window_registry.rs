@@ -17,7 +17,7 @@ pub(crate) fn remove_window_after_current_frame(
             .spawn(cx, async move |cx| {
                 if let Some(webview) = webview {
                     while webview.upgrade().is_some() {
-                        Timer::after(WEBVIEW_RELEASE_POLL).await;
+                        cx.background_executor().timer(WEBVIEW_RELEASE_POLL).await;
                         if cx.update(|window, _| window.refresh()).is_err() {
                             return;
                         }
@@ -35,7 +35,7 @@ pub(crate) fn remove_window_after_current_frame(
                 {
                     if let Some(native_window) = native_window {
                         while !native_window.is_minimized() {
-                            Timer::after(WINDOW_MINIMIZE_POLL).await;
+                            cx.background_executor().timer(WINDOW_MINIMIZE_POLL).await;
                         }
                     } else {
                         // Capture can already have failed while constructing a
@@ -43,13 +43,13 @@ pub(crate) fn remove_window_after_current_frame(
                         // path, so do not strand an unclosable GPUI window;
                         // allow one frame for the minimize request to settle.
                         tracing::warn!("cannot verify window minimization during close");
-                        Timer::after(WINDOW_MINIMIZE_POLL).await;
+                        cx.background_executor().timer(WINDOW_MINIMIZE_POLL).await;
                     }
                 }
                 #[cfg(not(target_os = "windows"))]
-                Timer::after(WINDOW_MINIMIZE_POLL).await;
+                cx.background_executor().timer(WINDOW_MINIMIZE_POLL).await;
 
-                Timer::after(WINDOW_MINIMIZE_SETTLE).await;
+                cx.background_executor().timer(WINDOW_MINIMIZE_SETTLE).await;
                 let _ = cx.update(|window, _| window.remove_window());
             })
             .detach();
@@ -67,7 +67,7 @@ pub(crate) struct BookWindowRegistry {
     windows: Vec<BookWindowHandle>,
 }
 
-impl gpui::Global for BookWindowRegistry {}
+impl gpui_kit::Global for BookWindowRegistry {}
 
 pub(crate) struct BookWindowHandle {
     book_id: String,
@@ -147,7 +147,7 @@ pub(crate) struct SingletonWindowRegistry {
     background_jobs: Option<WeakEntity<BackgroundJobsWindow>>,
 }
 
-impl gpui::Global for SingletonWindowRegistry {}
+impl gpui_kit::Global for SingletonWindowRegistry {}
 
 pub(crate) enum SingletonWindowReservation {
     /// A live window already owns this key; activate it instead of opening one.

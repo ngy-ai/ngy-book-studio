@@ -184,7 +184,7 @@ impl Render for PdfReaderApp {
                 div().h(px(3.)).w_full().bg(rgb(palette(cx).border)).child(
                     div()
                         .h_full()
-                        .w(gpui::relative(progress))
+                        .w(gpui_kit::relative(progress))
                         .bg(rgb(palette(cx).accent)),
                 ),
             );
@@ -354,7 +354,7 @@ impl Render for PdfReaderApp {
                         .position(|(page_number, _)| *page_number == current_page)
                     {
                         self.page_list_scroll
-                            .scroll_to_item(index, gpui::ScrollStrategy::Center);
+                            .scroll_to_item(index, gpui_kit::ScrollStrategy::Center);
                     }
                     self.page_list_synced_page = Some(current_page);
                 }
@@ -364,7 +364,7 @@ impl Render for PdfReaderApp {
                 // 虚拟列表是 `move` 闭包，捕获 `cx` 会把借用带出方法体；
                 // `Palette` 是 `Copy`，取一次值即可。
                 let theme = palette(cx);
-                gpui::uniform_list("pdf-page-list", entries.len(), move |range, _, _| {
+                gpui_kit::uniform_list("pdf-page-list", entries.len(), move |range, _, _| {
                     range
                         .map(|index| {
                             let (page_number, title) = entries[index].clone();
@@ -415,7 +415,7 @@ impl Render for PdfReaderApp {
                         })
                         .collect::<Vec<_>>()
                 })
-                .track_scroll(self.page_list_scroll.clone())
+                .track_scroll(&self.page_list_scroll.clone())
                 .flex_1()
                 .min_h(px(0.))
                 .w_full()
@@ -453,7 +453,7 @@ impl Render for PdfReaderApp {
             // 底色，必须和 viewer 的根背景同色，否则会露出一圈旧皮肤的边。
             .bg(rgb(palette(cx).paper))
             .child(body);
-        let navigation: gpui::AnyElement = if self.pane_layout.is_navigation_collapsed() {
+        let navigation: gpui_kit::AnyElement = if self.pane_layout.is_navigation_collapsed() {
             self.render_collapsed_navigation(cx)
         } else {
             navigation.into_any_element()
@@ -467,7 +467,7 @@ impl Render for PdfReaderApp {
             .v_flex()
             .size_full()
             .bg(rgb(palette(cx).paper))
-            .on_key_down(move |event: &gpui::KeyDownEvent, window, cx| {
+            .on_key_down(move |event: &gpui_kit::KeyDownEvent, window, cx| {
                 let view = view.clone();
                 let current_page = current_page;
                 view.update(cx, |this, cx| {
@@ -479,7 +479,7 @@ impl Render for PdfReaderApp {
                     {
                         return;
                     }
-                    if event.keystroke.modifiers != gpui::Modifiers::control() {
+                    if event.keystroke.modifiers != gpui_kit::Modifiers::control() {
                         return;
                     }
                     match event.keystroke.key.as_str() {

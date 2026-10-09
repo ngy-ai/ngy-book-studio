@@ -55,7 +55,7 @@ impl Render for PageImageApp {
             let (width, height) = zoomed_size(natural_width, natural_height, zoom_milli);
             let scroll = window
                 .use_keyed_state(SharedString::from("page-image-zoom/scroll"), cx, |_, _| {
-                    gpui::ScrollHandle::default()
+                    gpui_kit::ScrollHandle::default()
                 })
                 .read(cx)
                 .clone();

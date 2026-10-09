@@ -67,7 +67,7 @@ pub(crate) fn storage_path_row(
     label: &'static str,
     path: &Path,
     theme: Palette,
-) -> gpui::AnyElement {
+) -> gpui_kit::AnyElement {
     div()
         .v_flex()
         .gap_0p5()
@@ -75,7 +75,7 @@ pub(crate) fn storage_path_row(
         .child(
             div()
                 .text_sm()
-                .line_height(gpui::relative(1.4))
+                .line_height(gpui_kit::relative(1.4))
                 .text_color(rgb(theme.ink))
                 .child(path.display().to_string()),
         )

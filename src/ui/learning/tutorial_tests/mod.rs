@@ -2,7 +2,8 @@
 //! No provider, library, desktop worker, or native window is started by these tests.
 
 use super::*;
-use gpui::{Modifiers, TestAppContext, VisualTestContext};
+use gpui_kit::component::input::AnyInputState;
+use gpui_kit::{Modifiers, TestAppContext, VisualTestContext};
 
 pub(crate) const TUTORIAL_BUTTON: &str = "learning-document-../ai-agent-tutorial/README.md";
 pub(crate) const FIRST_CHAPTER_BUTTON: &str = "learning-document-README.md";
@@ -11,7 +12,7 @@ pub(crate) const TOOLS_BUTTON: &str =
 
 pub(crate) fn redraw(cx: &mut VisualTestContext) {
     cx.run_until_parked();
-    cx.update(|window, app| window.draw(app).clear());
+    cx.update(|window, app| window.draw(app).clear(app));
     cx.run_until_parked();
 }
 
@@ -41,7 +42,7 @@ pub(crate) fn open_learning(
         directory.path().join("learning"),
         ngy_book_studio::runtime::IoRuntime::new(1).unwrap(),
     ));
-    cx.update(gpui_component::init);
+    init_ui_test(cx);
     let mut learning = None;
     let (_, visual) = cx.add_window_view(|window, cx| {
         let view = cx.new(|cx| {
@@ -99,13 +100,45 @@ pub(crate) fn wait_for_chapter_load(learning: &Entity<LearningWindow>, cx: &mut 
     }
 }
 
-pub(crate) fn learning_input(view: &LearningWindow, index: usize) -> Entity<InputState> {
+/// 学习窗口的四个输入在 0.6 里是两种状态类型；测试用 `AnyInputState`
+/// 统一引用它们，再按具体变体调用 `set_value`/`focus`。
+pub(crate) fn learning_input(view: &LearningWindow, index: usize) -> AnyInputState {
     match index {
-        0 => view.manual_input.clone(),
-        1 => view.langgraph_input.clone(),
-        2 => view.notes_input.clone(),
-        3 => view.prediction_input.clone(),
+        0 => AnyInputState::Editor(view.manual_input.clone()),
+        1 => AnyInputState::Editor(view.langgraph_input.clone()),
+        2 => AnyInputState::Textarea(view.notes_input.clone()),
+        3 => AnyInputState::Textarea(view.prediction_input.clone()),
         _ => panic!("unknown learning input"),
+    }
+}
+
+pub(crate) fn learning_input_entity_id(view: &LearningWindow, index: usize) -> gpui_kit::EntityId {
+    match learning_input(view, index) {
+        AnyInputState::Input(state) => state.entity_id(),
+        AnyInputState::Textarea(state) => state.entity_id(),
+        AnyInputState::Editor(state) => state.entity_id(),
+        AnyInputState::Otp(state) => state.entity_id(),
+    }
+}
+
+pub(crate) fn set_learning_input(
+    view: &LearningWindow,
+    index: usize,
+    value: String,
+    window: &mut Window,
+    cx: &mut Context<LearningWindow>,
+) {
+    match learning_input(view, index) {
+        AnyInputState::Input(state) => {
+            state.update(cx, |input, cx| input.set_value(value, window, cx));
+        }
+        AnyInputState::Textarea(state) => {
+            state.update(cx, |input, cx| input.set_value(value, window, cx));
+        }
+        AnyInputState::Editor(state) => {
+            state.update(cx, |input, cx| input.set_value(value, window, cx));
+        }
+        AnyInputState::Otp(_) => panic!("learning inputs are never OTP fields"),
     }
 }
 
@@ -124,7 +157,18 @@ pub(crate) fn focus_learning_input(
             if index < 2 {
                 view.implementation = if index == 0 { "manual" } else { "langgraph" }.into();
             }
-            learning_input(view, index).update(cx, |input, cx| input.focus(window, cx));
+            match learning_input(view, index) {
+                AnyInputState::Input(state) => {
+                    state.update(cx, |input, cx| input.focus(window, cx));
+                }
+                AnyInputState::Textarea(state) => {
+                    state.update(cx, |input, cx| input.focus(window, cx));
+                }
+                AnyInputState::Editor(state) => {
+                    state.update(cx, |input, cx| input.focus(window, cx));
+                }
+                AnyInputState::Otp(_) => panic!("learning inputs are never OTP fields"),
+            }
             cx.notify();
         });
     });
@@ -137,7 +181,7 @@ pub(crate) fn input_text(
     index: usize,
 ) -> String {
     learning.read_with(visual, |view, cx| {
-        learning_input(view, index).read(cx).value().to_string()
+        learning_input(view, index).value(cx).to_string()
     })
 }
 
@@ -158,22 +202,29 @@ pub(crate) fn edit_learning_input(
     assert_eq!(input_text(learning, visual, index), text);
 }
 
+/// 0.6 的编辑器按输入批次记录撤销历史：测试里的逐字符输入会留下多条记录，
+/// 「撤销这次编辑」需要按到历史耗尽（耗尽后继续按不再改变文本），因此这里
+/// 连按固定次数，让调用点继续断言「撤销后的文本」而不是「撤销一步的文本」。
 pub(crate) fn undo(visual: &mut VisualTestContext) {
-    visual.simulate_keystrokes(if cfg!(target_os = "macos") {
-        "cmd-z"
-    } else {
-        "ctrl-z"
-    });
-    redraw(visual);
+    for _ in 0..24 {
+        visual.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-z"
+        } else {
+            "ctrl-z"
+        });
+        redraw(visual);
+    }
 }
 
 pub(crate) fn redo(visual: &mut VisualTestContext) {
-    visual.simulate_keystrokes(if cfg!(target_os = "macos") {
-        "cmd-shift-z"
-    } else {
-        "ctrl-y"
-    });
-    redraw(visual);
+    for _ in 0..24 {
+        visual.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-shift-z"
+        } else {
+            "ctrl-y"
+        });
+        redraw(visual);
+    }
 }
 
 mod history_test;

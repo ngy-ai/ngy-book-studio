@@ -15,7 +15,7 @@ impl AiSidebar {
         message: &AiMessage,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         let view = cx.entity().clone();
         let user = message.role == AiMessageRole::User;
         let show_no_source_warning = should_show_no_knowledge_base_source_warning(message);
@@ -23,7 +23,7 @@ impl AiSidebar {
         // 就是"浅底浅字"（回答几乎看不见），浅色皮肤里也只是看不出卡片层次。
         // 用户气泡用 `paper` 而不是白色文字，理由与 `theme.primary_foreground`
         // 相同：两套皮肤下它离 `accent` 都比白色更远。
-        let (background, foreground): (gpui::Hsla, gpui::Hsla) = match message.role {
+        let (background, foreground): (gpui_kit::Hsla, gpui_kit::Hsla) = match message.role {
             AiMessageRole::User => (
                 rgb(palette(cx).accent).into(),
                 rgb(palette(cx).paper).into(),
@@ -129,7 +129,7 @@ impl AiSidebar {
                                 .child(
                                     div()
                                         .text_xs()
-                                        .line_height(gpui::relative(1.5))
+                                        .line_height(gpui_kit::relative(1.5))
                                         .child(NO_KNOWLEDGE_BASE_SOURCE_WARNING_BODY),
                                 ),
                         )
@@ -156,7 +156,10 @@ impl AiSidebar {
                                         .child(title),
                                 )
                                 .child(
-                                    div().text_xs().line_height(gpui::relative(1.5)).child(body),
+                                    div()
+                                        .text_xs()
+                                        .line_height(gpui_kit::relative(1.5))
+                                        .child(body),
                                 ),
                         )
                     })
@@ -165,7 +168,7 @@ impl AiSidebar {
                             .h_flex()
                             .min_w(px(0.))
                             .items_start()
-                            .line_height(gpui::relative(1.5))
+                            .line_height(gpui_kit::relative(1.5))
                             .child(div().min_w(px(0.)).flex_1().child(selectable_message_text(
                                 SharedString::from(format!("ai-message-text-{}", message.id)),
                                 message.role,
@@ -199,7 +202,7 @@ impl AiSidebar {
         index: usize,
         message: &AiMessage,
         cx: &mut Context<Self>,
-    ) -> Option<gpui::AnyElement> {
+    ) -> Option<gpui_kit::AnyElement> {
         let busy = self.conversation.is_sending() || self.sessions.busy || self.pending_scope_sync;
         let mut row = div().h_flex().gap_0p5().items_center().pt_1().child(
             Clipboard::new(SharedString::from(format!(

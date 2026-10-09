@@ -7,7 +7,7 @@
 //! destruction and WebView teardown still require Windows GUI acceptance.
 
 use super::*;
-use gpui::{Modifiers, TestAppContext, VisualTestContext};
+use gpui_kit::{Modifiers, TestAppContext, VisualTestContext};
 use ngy_book_studio::document::{
     BlockDocument, ContentUnit as DocumentUnit, SourceLocator, TocTarget,
 };
@@ -90,7 +90,7 @@ pub(crate) fn open_editor_with_prepared_assets(
         chapters[0].html.clone(),
     );
     web_state.authorize_media(&original).unwrap();
-    cx.update(gpui_component::init);
+    init_ui_test(cx);
     let mut editor_entity = None;
     let mut library_entity = None;
     let (_, visual) = cx.add_window_view(|window, cx| {
@@ -103,7 +103,7 @@ pub(crate) fn open_editor_with_prepared_assets(
             cx.new(|cx| InputState::new(window, cx).default_value(created.value.author.clone()));
         let chapter_title_input =
             cx.new(|cx| InputState::new(window, cx).default_value(chapters[0].title.clone()));
-        let body_input = cx.new(|cx| InputState::new(window, cx).multi_line(true));
+        let body_input = cx.new(|cx| TextareaState::new(window, cx));
         let editor = cx.new(|cx| {
             let mut editor = EditorApp::new(
                 original.id.clone(),

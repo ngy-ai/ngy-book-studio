@@ -8,7 +8,7 @@ impl LearningWindow {
         &self,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         let content = match self.lessons.get(self.selected_lesson) {
             Some(lesson) => scrollable_learning_text(
                 SharedString::from(format!(
@@ -48,7 +48,7 @@ impl LearningWindow {
         &self,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         let reference_view = cx.entity();
         let copy_view = cx.entity();
         let header = div()
@@ -107,7 +107,7 @@ impl LearningWindow {
                                         if this.inputs_disabled() {
                                             return;
                                         }
-                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
                                             reference_code_for(this.service.chapter(), &this.implementation).to_string(),
                                         ));
                                         this.help_level = "S".to_string();
@@ -138,7 +138,7 @@ impl LearningWindow {
             } else {
                 &self.manual_input
             };
-            Input::new(input)
+            Editor::new(input)
                 .h_full()
                 .disabled(self.inputs_disabled())
                 .into_any_element()
@@ -154,7 +154,7 @@ impl LearningWindow {
     }
 
     #[inline(never)]
-    pub(super) fn render_notes(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(super) fn render_notes(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let menu_view = cx.entity();
         let selected_help = self.help_level.clone();
         let label = HELP_LEVELS
@@ -197,7 +197,7 @@ impl LearningWindow {
                 div()
                     .h(px(116.))
                     .flex_none()
-                    .child(Input::new(&self.prediction_input).h_full().disabled(self.inputs_disabled())),
+                    .child(Textarea::new(&self.prediction_input).h_full().disabled(self.inputs_disabled())),
             )
             .child(
                 div()
@@ -211,7 +211,7 @@ impl LearningWindow {
                 div()
                     .flex_1()
                     .min_h(px(0.))
-                    .child(Input::new(&self.notes_input).h_full().disabled(self.inputs_disabled())),
+                    .child(Textarea::new(&self.notes_input).h_full().disabled(self.inputs_disabled())),
             )
             .child(
                 div()

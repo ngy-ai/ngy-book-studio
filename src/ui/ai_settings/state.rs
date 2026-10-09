@@ -7,9 +7,9 @@ pub(crate) struct SettingsWindowState {
     pub(crate) operation: PendingOperation,
     pub(crate) notice: Option<SettingsNotice>,
     /// 关窗时用它在当前帧之后移除本窗口。
-    pub(crate) window_handle: gpui::AnyWindowHandle,
+    pub(crate) window_handle: gpui_kit::AnyWindowHandle,
     /// 正文的滚动位置；每个窗口独立，互不影响。
-    pub(crate) scroll_handle: gpui::ScrollHandle,
+    pub(crate) scroll_handle: gpui_kit::ScrollHandle,
 }
 
 impl SettingsWindowState {
@@ -17,8 +17,8 @@ impl SettingsWindowState {
         Self {
             operation: PendingOperation::Idle,
             notice: None,
-            window_handle: gpui::Window::window_handle(window),
-            scroll_handle: gpui::ScrollHandle::new(),
+            window_handle: gpui_kit::Window::window_handle(window),
+            scroll_handle: gpui_kit::ScrollHandle::new(),
         }
     }
 

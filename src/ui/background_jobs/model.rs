@@ -39,7 +39,7 @@ impl BlockState {
         }
     }
 
-    pub(super) fn colors(self, theme: Palette) -> (gpui::Rgba, gpui::Rgba) {
+    pub(super) fn colors(self, theme: Palette) -> (gpui_kit::Rgba, gpui_kit::Rgba) {
         match self {
             Self::Done => (rgb(theme.success), rgb(theme.success_soft)),
             Self::Processing => (rgb(theme.accent_strong), rgb(theme.accent_soft)),

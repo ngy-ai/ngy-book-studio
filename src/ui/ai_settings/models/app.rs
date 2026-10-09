@@ -304,7 +304,7 @@ impl ModelsSettingsWindow {
     }
 
     #[inline(never)]
-    pub(crate) fn render_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(crate) fn render_panel(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let theme = palette(cx);
         // 一个 Tab 只显示一个模型的配置。问答与翻译各带一组生成参数：两份设置分开
         // 存储、分别随各自的请求发送，所以各自只在对应的 Tab 里出现。向量与视觉没有
@@ -329,11 +329,11 @@ impl ModelsSettingsWindow {
 
     /// 模型 Tab 条。
     ///
-    /// 用分段按钮而不是 `gpui_component::tab::TabBar`：`TabBar` 的子项不暴露
+    /// 用分段按钮而不是 `gpui_kit::component::tab::TabBar`：`TabBar` 的子项不暴露
     /// `debug_selector`，而本仓库的 GUI 冒烟与 GPUI 测试都按
     /// `ai-models-tab-<role>` 定位控件（`docs/agent/code-map-ui.md`）。
     #[inline(never)]
-    pub(crate) fn render_model_tabs(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(crate) fn render_model_tabs(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let theme = palette(cx);
         let busy = self.state.busy();
         let mut tabs = div().h_flex().flex_wrap().gap_1();
@@ -369,7 +369,7 @@ impl ModelsSettingsWindow {
         &self,
         role: ModelRole,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         let theme = palette(cx);
         let (label, description, selector) = model_role_text(role);
         let endpoint_id = self.endpoint_id_for(role).to_string();
@@ -394,7 +394,7 @@ impl ModelsSettingsWindow {
                         .disabled(busy)
                         .debug_selector(move || format!("ai-{selector}-endpoint-{index}"))
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            window.blur();
+                            window.blur(cx);
                             this.assign_endpoint(role, &id, cx);
                         }))
                 }),
@@ -443,7 +443,7 @@ impl ModelsSettingsWindow {
         &self,
         role: ModelRole,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         let theme = palette(cx);
         let busy = self.state.busy();
         let (title, note, temperature_help, reset_selector, inputs) = match role {

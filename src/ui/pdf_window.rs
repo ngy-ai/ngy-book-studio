@@ -13,7 +13,7 @@ pub(crate) struct PdfReaderWindowRegistry {
     readers: Vec<WeakEntity<PdfReaderApp>>,
 }
 
-impl gpui::Global for PdfReaderWindowRegistry {}
+impl gpui_kit::Global for PdfReaderWindowRegistry {}
 
 /// Remembers a PDF reader window and drops registrations whose window is gone.
 pub(crate) fn register_pdf_reader_window(reader: WeakEntity<PdfReaderApp>, cx: &mut App) {

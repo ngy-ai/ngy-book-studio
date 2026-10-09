@@ -164,7 +164,10 @@ impl ReaderApp {
 
     /// Narrow rail shown while the table of contents is collapsed. The reader
     /// keeps the resized width so expanding restores the previous layout.
-    pub(crate) fn render_collapsed_navigation(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(crate) fn render_collapsed_navigation(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
         let view = cx.entity().clone();
         div()
             .v_flex()
@@ -198,7 +201,7 @@ impl ReaderApp {
         &self,
         pane: ReaderResizablePane,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         let view = cx.entity().clone();
         let drag_view = view.clone();
         let handle_id = match pane {
@@ -261,7 +264,7 @@ impl ReaderApp {
                 },
             )
             .on_mouse_up(
-                gpui::MouseButton::Left,
+                gpui_kit::MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     if this.pane_layout.finish_resize() {
                         cx.notify();
@@ -269,7 +272,7 @@ impl ReaderApp {
                 }),
             )
             .on_mouse_up_out(
-                gpui::MouseButton::Left,
+                gpui_kit::MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     if this.pane_layout.finish_resize() {
                         cx.notify();

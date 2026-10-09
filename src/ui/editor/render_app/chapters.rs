@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::ui::editor::navigation::EditorTocRow;
-use gpui::AnyElement;
+use gpui_kit::AnyElement;
 
 /// Builds the rows of the chapter list, or the search results when searching.
 pub(crate) fn editor_chapter_list(

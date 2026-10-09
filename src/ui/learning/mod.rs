@@ -2,7 +2,7 @@ use super::*;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use gpui_component::text::TextView;
+use gpui_kit::component::text::TextView;
 use ngy_book_studio::learning::{
     LearningEnvironment, LearningLesson, LearningRunReport, LearningRunSummary, LearningService,
     LearningSnapshot, LearningTrace, LearningWorkspace,
@@ -70,10 +70,10 @@ pub(super) struct LearningWindow {
     reload_required: bool,
     environment: Option<LearningEnvironment>,
     history: Vec<LearningRunSummary>,
-    manual_input: Entity<InputState>,
-    langgraph_input: Entity<InputState>,
-    notes_input: Entity<InputState>,
-    prediction_input: Entity<InputState>,
+    manual_input: Entity<EditorState>,
+    langgraph_input: Entity<EditorState>,
+    notes_input: Entity<TextareaState>,
+    prediction_input: Entity<TextareaState>,
     selected_lesson: usize,
     implementation: String,
     scenario: String,

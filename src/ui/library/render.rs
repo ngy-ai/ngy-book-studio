@@ -38,7 +38,7 @@ pub(crate) fn render_delete_confirm_body(
     description: String,
     view: &Entity<EpubReaderApp>,
     theme: Palette,
-) -> gpui::AnyElement {
+) -> gpui_kit::AnyElement {
     let cancel_view = view.clone();
     let confirm_view = view.clone();
     div()
@@ -48,7 +48,7 @@ pub(crate) fn render_delete_confirm_body(
             div()
                 .text_sm()
                 .text_color(rgb(theme.ink))
-                .line_height(gpui::relative(1.6))
+                .line_height(gpui_kit::relative(1.6))
                 .child(description),
         )
         .child(
@@ -78,8 +78,8 @@ pub(crate) fn render_delete_confirm_body(
 }
 
 pub(crate) fn schedule_library_window_removal(
-    window_handle: gpui::AnyWindowHandle,
-    cx: &mut gpui::AsyncApp,
+    window_handle: gpui_kit::AnyWindowHandle,
+    cx: &mut gpui_kit::AsyncApp,
 ) {
     if let Err(error) = window_handle.update(cx, |_, window, cx| {
         finish_library_window_close(window, cx);

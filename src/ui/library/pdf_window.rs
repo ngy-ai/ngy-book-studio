@@ -191,7 +191,9 @@ pub(crate) fn open_pdf_reader_window(request: PdfReaderWindowRequest, cx: &mut A
                                                     %error,
                                                     "retrying PDF page synchronization"
                                                 );
-                                                Timer::after(Duration::from_millis(8)).await;
+                                                cx.background_executor()
+                                                    .timer(Duration::from_millis(8))
+                                                    .await;
                                             }
                                             Err(error) => {
                                                 if sync_weak.upgrade().is_some() {

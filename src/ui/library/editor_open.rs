@@ -120,9 +120,7 @@ impl EpubReaderApp {
                     let chapter_title_input = cx
                         .new(|cx| InputState::new(window, cx).default_value(initial_chapter_title));
                     let body_input = cx.new(|cx| {
-                        InputState::new(window, cx)
-                            .multi_line(true)
-                            .default_value(initial_chapter_html.clone())
+                        TextareaState::new(window, cx).default_value(initial_chapter_html.clone())
                     });
                     let parent = match ParentWindowHandle::capture(window) {
                         Ok(parent) => parent,
@@ -276,7 +274,7 @@ impl EpubReaderApp {
                             .unwrap_or(false)
                     });
 
-                    // Wrap in `Root` like the library window: gpui-component
+                    // Wrap in `Root` like the library window: gpui-kit
                     // widgets (e.g. `Input`) look up `window.root::<Root>()`
                     // when painting and would panic without it.
                     cx.new(|cx| Root::new(editor, window, cx))

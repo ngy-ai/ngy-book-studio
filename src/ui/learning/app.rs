@@ -6,42 +6,47 @@ impl LearningWindow {
     pub(super) fn create_inputs(
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> ([Entity<InputState>; 4], Vec<Subscription>) {
+    ) -> (
+        (
+            Entity<EditorState>,
+            Entity<EditorState>,
+            Entity<TextareaState>,
+            Entity<TextareaState>,
+        ),
+        Vec<Subscription>,
+    ) {
+        // 0.6 把输入拆成三种状态：代码编辑器用 `EditorState`（语言与行号只在
+        // 该模式上存在），多行文本用 `TextareaState`。
         let manual_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .code_editor(CODE_LANGUAGE)
+            EditorState::new(window, cx)
+                .language(CODE_LANGUAGE)
                 .line_number(true)
                 .placeholder("正在读取你的手搓实现…")
         });
         let langgraph_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .code_editor(CODE_LANGUAGE)
+            EditorState::new(window, cx)
+                .language(CODE_LANGUAGE)
                 .line_number(true)
                 .placeholder("正在读取你的 LangGraph 实现…")
         });
         let notes_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
+            TextareaState::new(window, cx)
                 .rows(18)
                 .placeholder("记录首次作答、卡点、修改理由和复测结果；保留原判断。")
         });
         let prediction_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
+            TextareaState::new(window, cx)
                 .rows(4)
                 .placeholder("运行前：你预计会调用什么、在哪里失败、怎样停止？")
         });
-        let subscriptions = [
-            &manual_input,
-            &langgraph_input,
-            &notes_input,
-            &prediction_input,
-        ]
-        .into_iter()
-        .map(|input| cx.subscribe_in(input, window, Self::on_input_event))
-        .collect();
+        let subscriptions = vec![
+            cx.subscribe_in(&manual_input, window, Self::on_input_event),
+            cx.subscribe_in(&langgraph_input, window, Self::on_input_event),
+            cx.subscribe_in(&notes_input, window, Self::on_input_event),
+            cx.subscribe_in(&prediction_input, window, Self::on_input_event),
+        ];
         (
-            [manual_input, langgraph_input, notes_input, prediction_input],
+            (manual_input, langgraph_input, notes_input, prediction_input),
             subscriptions,
         )
     }
@@ -50,7 +55,7 @@ impl LearningWindow {
         // set_value deliberately keeps InputState's undo history. A different
         // chapter, restored backup or new round must not inherit edits whose
         // ranges and old text belonged to the previous workspace.
-        let ([manual, langgraph, notes, prediction], subscriptions) =
+        let ((manual, langgraph, notes, prediction), subscriptions) =
             Self::create_inputs(window, cx);
         self.manual_input = manual;
         self.langgraph_input = langgraph;
@@ -65,7 +70,7 @@ impl LearningWindow {
         cx: &mut Context<Self>,
     ) -> Self {
         register_python_highlighting();
-        let ([manual_input, langgraph_input, notes_input, prediction_input], subscriptions) =
+        let ((manual_input, langgraph_input, notes_input, prediction_input), subscriptions) =
             Self::create_inputs(window, cx);
         Self {
             service,
@@ -100,9 +105,10 @@ impl LearningWindow {
         }
     }
 
-    pub(super) fn on_input_event(
+    /// 三种输入状态都发同一种 `InputEvent`；订阅只关心「内容变了」这一件事。
+    pub(super) fn on_input_event<T: gpui_kit::EventEmitter<InputEvent> + 'static>(
         &mut self,
-        _input: &Entity<InputState>,
+        _input: &Entity<T>,
         event: &InputEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,

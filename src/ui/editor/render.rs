@@ -16,7 +16,9 @@ pub(crate) const DEFAULT_CHAPTER_HTML: &str = r#"<?xml version="1.0" encoding="U
 /// Windows builds a single monolithic editor render previously reserved almost
 /// the entire 1 MiB main-thread stack before GPUI started layout.
 #[inline(never)]
-pub(crate) fn render_editor_section(render: impl FnOnce() -> gpui::AnyElement) -> gpui::AnyElement {
+pub(crate) fn render_editor_section(
+    render: impl FnOnce() -> gpui_kit::AnyElement,
+) -> gpui_kit::AnyElement {
     render()
 }
 
@@ -26,7 +28,7 @@ pub(crate) fn render_editor_resize_handle(
     pane: EditorResizablePane,
     view: Entity<EditorApp>,
     theme: Palette,
-) -> gpui::AnyElement {
+) -> gpui_kit::AnyElement {
     div()
         .id(id)
         .h_full()

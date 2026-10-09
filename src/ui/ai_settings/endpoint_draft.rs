@@ -376,7 +376,7 @@ pub(crate) fn render_model_detection<V: EndpointBackedWindow>(
     endpoint: &EndpointDraft,
     role: Option<ModelRole>,
     cx: &mut Context<V>,
-) -> Option<gpui::AnyElement> {
+) -> Option<gpui_kit::AnyElement> {
     let models = endpoint.detected_models.as_ref()?;
     let missing_models = role
         .and_then(|role| view.role_model(role, cx))
@@ -411,7 +411,7 @@ pub(crate) fn render_model_detection<V: EndpointBackedWindow>(
             .child(
                 div()
                     .text_xs()
-                    .line_height(gpui::relative(1.5))
+                    .line_height(gpui_kit::relative(1.5))
                     .text_color(rgb(palette(cx).muted))
                     .child(if models.is_empty() {
                         "未返回模型".to_string()

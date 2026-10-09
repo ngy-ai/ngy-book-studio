@@ -528,7 +528,7 @@ impl EpubReaderApp {
                                                                             %error,
                                                                             "retrying EPUB page synchronization"
                                                                         );
-                                                                        Timer::after(
+                                                                        cx.background_executor().timer(
                                                                             Duration::from_millis(
                                                                                 8,
                                                                             ),
@@ -578,7 +578,7 @@ impl EpubReaderApp {
                                     .unwrap_or(false)
                             });
 
-                            // Wrap in `Root` like the library window: gpui-component
+                            // Wrap in `Root` like the library window: gpui-kit
                             // widgets (e.g. `Input`) look up `window.root::<Root>()`
                             // when painting, and would panic without it.
                             cx.new(|cx| Root::new(reader, window, cx))

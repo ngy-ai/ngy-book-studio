@@ -8,7 +8,7 @@ use super::*;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use gpui_component::{Selectable as _, checkbox::Checkbox};
+use gpui_kit::component::{Selectable as _, checkbox::Checkbox};
 use ngy_book_studio::ai::{DEFAULT_AI_REQUEST_TIMEOUT_SECS, normalize_provider_base_url};
 use ngy_book_studio::services::{
     ApiKeyUpdate, DEFAULT_ENDPOINT_ID, EndpointSettings, ProviderSettings,
@@ -93,7 +93,7 @@ impl EndpointSettingsWindow {
         }
         if self.selected_endpoint_id != id {
             // Keep drafts and input history while removing focus from hidden fields.
-            window.blur();
+            window.blur(cx);
         }
         self.selected_endpoint_id = id.to_string();
         self.state.notice = None;
@@ -174,7 +174,7 @@ impl EndpointSettingsWindow {
     }
 
     #[inline(never)]
-    pub(crate) fn render_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(crate) fn render_panel(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         div()
             .v_flex()
             .gap_5()
@@ -184,7 +184,7 @@ impl EndpointSettingsWindow {
     }
 
     #[inline(never)]
-    pub(crate) fn render_endpoint_card(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(crate) fn render_endpoint_card(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let theme = palette(cx);
         let endpoint = self.selected_endpoint();
         let busy = self.state.busy();
@@ -283,7 +283,7 @@ impl EndpointSettingsWindow {
     }
 
     #[inline(never)]
-    pub(crate) fn render_endpoint_list(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(crate) fn render_endpoint_list(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let theme = palette(cx);
         let busy = self.state.busy();
         div()
@@ -333,7 +333,7 @@ impl EndpointSettingsWindow {
     }
 
     #[inline(never)]
-    pub(crate) fn render_api_key_card(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(crate) fn render_api_key_card(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let theme = palette(cx);
         let endpoint = self.selected_endpoint();
         let endpoint_id = endpoint.id.clone();
@@ -369,7 +369,7 @@ impl EndpointSettingsWindow {
     }
 
     /// 底栏上的「检测模型」：检测当前选中的 Endpoint，结果可用于模型设置窗口。
-    pub(crate) fn render_footer_actions(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(crate) fn render_footer_actions(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let detecting = self.state.operation == PendingOperation::Detecting;
         Button::new("ai-endpoint-detect-models")
             .debug_selector(|| "ai-endpoint-detect-models".into())
@@ -464,7 +464,7 @@ mod tests {
     use super::endpoint_draft::{apply_detected_models, canonical_endpoint, detection_matches};
     use super::tests_support::*;
     use super::*;
-    use gpui::{Modifiers, TestAppContext, VisualTestContext};
+    use gpui_kit::{Modifiers, TestAppContext, VisualTestContext};
 
     fn open_window(
         cx: &mut TestAppContext,
@@ -476,7 +476,7 @@ mod tests {
         open_settings_view::<EndpointSettingsWindow>(cx, EndpointSettingsWindow::new)
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn endpoint_switches_preserve_drafts_and_role_bindings_block_deletion(cx: &mut TestAppContext) {
         let (_directory, settings, visual) = open_window(cx);
         visual.simulate_resize(size(px(1080.), px(1400.)));
@@ -552,7 +552,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn endpoint_url_change_resets_only_its_authorization_key_and_detection(
         cx: &mut TestAppContext,
     ) {
@@ -605,7 +605,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn key_edits_and_key_deletion_invalidate_only_the_matching_endpoint(cx: &mut TestAppContext) {
         let (_directory, settings, visual) = open_window(cx);
         visual.simulate_resize(size(px(1080.), px(1600.)));

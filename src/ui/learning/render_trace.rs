@@ -8,7 +8,7 @@ impl LearningWindow {
         &self,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         if self.trace.is_empty() {
             return div()
                 .p_4()
@@ -123,7 +123,7 @@ impl LearningWindow {
     }
 
     #[inline(never)]
-    pub(super) fn render_history(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(super) fn render_history(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let mut list = div()
             .id("learning-history-scroll")
             .v_flex()
@@ -193,7 +193,7 @@ impl LearningWindow {
     }
 
     #[inline(never)]
-    pub(super) fn render_environment(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(super) fn render_environment(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let Some(environment) = &self.environment else {
             return div().into_any_element();
         };

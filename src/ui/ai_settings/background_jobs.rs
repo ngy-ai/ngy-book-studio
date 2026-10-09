@@ -8,7 +8,7 @@ use super::*;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use gpui_component::checkbox::Checkbox;
+use gpui_kit::component::checkbox::Checkbox;
 use ngy_book_studio::services::{
     ApiKeyUpdate, DEFAULT_BACKGROUND_JOB_CONCURRENCY, DEFAULT_BACKGROUND_JOB_INTERVAL_MS,
     MAX_BACKGROUND_JOB_CONCURRENCY, MAX_BACKGROUND_JOB_INTERVAL_MS, MIN_BACKGROUND_JOB_CONCURRENCY,
@@ -69,7 +69,7 @@ impl BackgroundJobsSettingsWindow {
     }
 
     #[inline(never)]
-    pub(crate) fn render_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(crate) fn render_panel(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let theme = palette(cx);
         let auto_run_view = cx.entity();
         let busy = self.state.busy();
@@ -221,7 +221,7 @@ pub(crate) fn parse_background_job_interval_ms(value: &str) -> Result<u64> {
 mod tests {
     use super::tests_support::*;
     use super::*;
-    use gpui::{Modifiers, TestAppContext};
+    use gpui_kit::{Modifiers, TestAppContext};
 
     #[test]
     fn background_job_scheduling_parsing_enforces_supported_ranges() {
@@ -255,7 +255,7 @@ mod tests {
         }
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn scheduling_drafts_parse_without_saving(cx: &mut TestAppContext) {
         let (_directory, settings, visual) = open_settings_view::<BackgroundJobsSettingsWindow>(
             cx,

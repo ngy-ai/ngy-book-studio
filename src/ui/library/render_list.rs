@@ -9,7 +9,7 @@ impl EpubReaderApp {
         &self,
         indices: &[usize],
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         let rows = indices
             .iter()
             .map(|index| self.render_book_row(&self.library.books()[*index], cx))
@@ -30,7 +30,7 @@ impl EpubReaderApp {
         &self,
         book: &BookRecord,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         let theme = palette(cx);
         let view = cx.entity().clone();
         let book_id = book.id.clone();

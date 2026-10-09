@@ -140,7 +140,7 @@ impl Render for AiSidebar {
                                 .text_color(rgb(palette(cx).muted))
                                 .child(Icon::new(IconName::Bot).large())
                                 .child(div().text_sm().child("围绕当前图书范围提问"))
-                                .child(div().text_xs().line_height(gpui::relative(1.5)).child(
+                                .child(div().text_xs().line_height(gpui_kit::relative(1.5)).child(
                                     "回答将显示可点击来源；图书内容只通过宿主授权的只读工具读取。",
                                 )),
                         )
@@ -163,7 +163,7 @@ impl Render for AiSidebar {
                     .border_t_1()
                     .border_color(rgb(palette(cx).border))
                     .bg(rgb(palette(cx).surface))
-                    .child(Input::new(&self.input).disabled(sending || session_busy))
+                    .child(Textarea::new(&self.input).disabled(sending || session_busy))
                     .child(
                         div()
                             .h_flex()

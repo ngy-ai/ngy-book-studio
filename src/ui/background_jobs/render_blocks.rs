@@ -11,8 +11,8 @@ impl BackgroundJobsWindow {
         job: &BackgroundJobSnapshot,
         inspector: Option<&BlockInspector>,
         cx: &mut Context<Self>,
-    ) -> Vec<gpui::AnyElement> {
-        let mut rows: Vec<gpui::AnyElement> = Vec::new();
+    ) -> Vec<gpui_kit::AnyElement> {
+        let mut rows: Vec<gpui_kit::AnyElement> = Vec::new();
         rows.push(
             div()
                 .text_color(rgb(palette(cx).muted))
@@ -121,7 +121,8 @@ impl BackgroundJobsWindow {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.blocks_state = state;
                         this.blocks_page = 0;
-                        this.detail_scroll.set_offset(gpui::point(px(0.), px(0.)));
+                        this.detail_scroll
+                            .set_offset(gpui_kit::point(px(0.), px(0.)));
                         cx.notify();
                     })),
             );
@@ -315,7 +316,8 @@ impl BackgroundJobsWindow {
                         .disabled(page == 0)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.blocks_page = this.blocks_page.saturating_sub(1);
-                            this.detail_scroll.set_offset(gpui::point(px(0.), px(0.)));
+                            this.detail_scroll
+                                .set_offset(gpui_kit::point(px(0.), px(0.)));
                             cx.notify();
                         })),
                 )
@@ -327,7 +329,8 @@ impl BackgroundJobsWindow {
                         .disabled(page + 1 >= pages)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.blocks_page = (this.blocks_page + 1).min(pages - 1);
-                            this.detail_scroll.set_offset(gpui::point(px(0.), px(0.)));
+                            this.detail_scroll
+                                .set_offset(gpui_kit::point(px(0.), px(0.)));
                             cx.notify();
                         })),
                 )
@@ -339,7 +342,8 @@ impl BackgroundJobsWindow {
                         .disabled(progress.total == 0)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.blocks_page = anchor;
-                            this.detail_scroll.set_offset(gpui::point(px(0.), px(0.)));
+                            this.detail_scroll
+                                .set_offset(gpui_kit::point(px(0.), px(0.)));
                             cx.notify();
                         })),
                 )
@@ -355,7 +359,7 @@ impl BackgroundJobsWindow {
         &self,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Option<gpui::AnyElement> {
+    ) -> Option<gpui_kit::AnyElement> {
         let state = self.block_detail.as_ref()?;
         let ordinal = state.ordinal;
         let detail = state.detail.as_ref();
@@ -381,7 +385,7 @@ impl BackgroundJobsWindow {
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if let Some(state) = this.block_detail.as_mut() {
                         state.tab = tab;
-                        state.scroll.set_offset(gpui::point(px(0.), px(0.)));
+                        state.scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
                     }
                     cx.notify();
                 })),
@@ -445,7 +449,7 @@ impl BackgroundJobsWindow {
                     .w_full()
                     .flex_none()
                     .text_xs()
-                    .line_height(gpui::relative(1.5))
+                    .line_height(gpui_kit::relative(1.5))
                     .text_color(rgb(palette(cx).ink))
                     // `whitespace_normal` keeps the JSON indentation while still
                     // breaking long lines, so a body never runs off the panel.
@@ -524,9 +528,9 @@ impl BackgroundJobsWindow {
                 .v_flex()
                 .items_center()
                 .justify_center()
-                .on_any_mouse_down(cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                .on_any_mouse_down(cx.listener(|this, event: &gpui_kit::MouseDownEvent, _, cx| {
                     cx.stop_propagation();
-                    if event.button == gpui::MouseButton::Left {
+                    if event.button == gpui_kit::MouseButton::Left {
                         this.close_block_detail(cx);
                     }
                 }))
@@ -538,7 +542,7 @@ impl BackgroundJobsWindow {
                         .v_flex()
                         .w(px(720.))
                         .h(px(panel_height))
-                        .max_w(gpui::relative(0.92))
+                        .max_w(gpui_kit::relative(0.92))
                         .p_5()
                         .gap_3()
                         .rounded(px(12.))

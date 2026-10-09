@@ -4,7 +4,7 @@
 //! teardown and Esc/titlebar cancellation still require Windows GUI testing.
 
 use super::*;
-use gpui::{TestAppContext, VisualTestContext};
+use gpui_kit::{TestAppContext, VisualTestContext};
 use std::cell::RefCell;
 
 type CloseEvents = Rc<RefCell<Vec<AnyWindowHandle>>>;
@@ -72,7 +72,7 @@ fn assert_idle(cx: &TestAppContext) {
     });
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 fn continue_running_preserves_all_windows_and_repeated_closes_share_one_prompt(
     cx: &mut TestAppContext,
 ) {
@@ -104,7 +104,7 @@ fn continue_running_preserves_all_windows_and_repeated_closes_share_one_prompt(
     assert_idle(cx);
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 fn dropped_prompt_response_preserves_windows_and_allows_another_exit_attempt(
     cx: &mut TestAppContext,
 ) {
@@ -112,7 +112,7 @@ fn dropped_prompt_response_preserves_windows_and_allows_another_exit_attempt(
     let main = main_window(cx, &closed);
     waiting_child(cx, &closed);
     let open = cx.windows();
-    cx.update(|cx| cx.set_prompt_builder(gpui::fallback_prompt_renderer));
+    cx.update(|cx| cx.set_prompt_builder(gpui_kit::fallback_prompt_renderer));
     request_close(cx, main);
 
     // Replacing a rendered prompt drops its response sender. This exercises
@@ -121,10 +121,10 @@ fn dropped_prompt_response_preserves_windows_and_allows_another_exit_attempt(
     let _replacement_response = cx
         .update_window(main, |_, window, cx| {
             window.prompt(
-                gpui::PromptLevel::Info,
+                gpui_kit::PromptLevel::Info,
                 "测试替换提示",
                 None,
-                &[gpui::PromptButton::cancel("关闭测试提示")],
+                &[gpui_kit::PromptButton::cancel("关闭测试提示")],
                 cx,
             )
         })
@@ -141,7 +141,7 @@ fn dropped_prompt_response_preserves_windows_and_allows_another_exit_attempt(
     assert!(cx.windows() == open);
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 fn confirmed_exit_waits_for_each_child_before_requesting_main_close_once(cx: &mut TestAppContext) {
     let closed = CloseEvents::default();
     let main = main_window(cx, &closed);
@@ -179,7 +179,7 @@ fn confirmed_exit_waits_for_each_child_before_requesting_main_close_once(cx: &mu
     assert!(!cx.has_pending_prompt());
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 fn a_child_opened_while_exit_waits_is_closed_before_the_main_window(cx: &mut TestAppContext) {
     let closed = CloseEvents::default();
     let main = main_window(cx, &closed);
@@ -198,7 +198,7 @@ fn a_child_opened_while_exit_waits_is_closed_before_the_main_window(cx: &mut Tes
     assert!(*closed.borrow() == vec![original, late, main]);
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 fn main_persistence_completion_waits_for_a_child_opened_during_its_save(cx: &mut TestAppContext) {
     let closed = CloseEvents::default();
     let main = main_window(cx, &closed);
@@ -237,7 +237,7 @@ fn main_persistence_completion_waits_for_a_child_opened_during_its_save(cx: &mut
     assert_idle(cx);
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 fn child_veto_cancels_the_exit_attempt_and_keeps_the_main_window_open(cx: &mut TestAppContext) {
     let closed = CloseEvents::default();
     let main = main_window(cx, &closed);
@@ -266,7 +266,7 @@ fn child_veto_cancels_the_exit_attempt_and_keeps_the_main_window_open(cx: &mut T
     assert_idle(cx);
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 fn canceled_exit_ignores_late_child_completion_and_can_be_confirmed_again(cx: &mut TestAppContext) {
     let closed = CloseEvents::default();
     let main = main_window(cx, &closed);

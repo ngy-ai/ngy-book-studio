@@ -119,21 +119,11 @@ pub(crate) fn selectable_message_text(
     }
     let display = cache.read(cx).as_ref().unwrap().2.clone();
     let text = if role == AiMessageRole::Assistant {
-        TextView::markdown(
-            SharedString::from(format!("{id}/markdown")),
-            display,
-            window,
-            cx,
-        )
-        .style(TextViewStyle::default().paragraph_gap(rems(0.5)))
+        TextView::markdown(SharedString::from(format!("{id}/markdown")), display)
+            .style(TextViewStyle::default().paragraph_gap(rems(0.5)))
     } else {
-        TextView::html(
-            SharedString::from(format!("{id}/plain")),
-            display,
-            window,
-            cx,
-        )
-        .style(TextViewStyle::default().paragraph_gap(rems(0.)))
+        TextView::html(SharedString::from(format!("{id}/plain")), display)
+            .style(TextViewStyle::default().paragraph_gap(rems(0.)))
     };
     // Move the whole naturally sized view with the outer conversation scroller.
     // TextView's internal virtual scrolling invalidates selection coordinates.

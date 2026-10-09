@@ -15,6 +15,12 @@ mod reader;
 #[cfg(test)]
 mod application_exit_test;
 
+#[cfg(test)]
+mod test_support;
+
+#[cfg(test)]
+pub(crate) use test_support::init_ui_test;
+
 pub(crate) use assets::AppAssets;
 pub(crate) use data_dir_setup::{DataDirSetupWindow, open_data_dir_setup_window};
 pub(crate) use library::{EpubReaderApp, wrap_root};
@@ -47,26 +53,23 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
-use gpui::{
-    AnyWindowHandle, App, AppContext as _, Bounds, Context, Entity, Image, ImageFormat,
-    InteractiveElement as _, IntoElement, ObjectFit, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription, Task, Timer,
-    TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions, div, img,
-    prelude::FluentBuilder as _, px, rgb, rgba, size, white,
-};
-use gpui_component::{
+use gpui_kit::component::{
     Disableable as _, Icon, IconName, InteractiveElementExt as _, Root, Sizable as _,
     StyledExt as _,
     button::{Button, ButtonCustomVariant, ButtonVariants as _},
-    input::{Input, InputEvent, InputState},
+    input::{Editor, EditorState, Input, InputEvent, InputState, Textarea, TextareaState},
     menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem},
     scroll::ScrollableElement as _,
     tab::{Tab, TabBar},
-    webview::WebView,
-    wry::raw_window_handle::{
-        HandleError, HasWindowHandle, RawWindowHandle, Win32WindowHandle, WindowHandle,
-    },
 };
+use gpui_kit::{
+    AnyWindowHandle, App, AppContext as _, Bounds, Context, Entity, Image, ImageFormat,
+    InteractiveElement as _, IntoElement, ObjectFit, ParentElement as _, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription, Task,
+    TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions, div, img,
+    prelude::FluentBuilder as _, px, rgb, rgba, size, white,
+};
+use gpui_wry::WebView;
 use native_dialog::DialogBuilder;
 use ngy_book_studio::{
     ai::chat::ChatWindowKind,
@@ -82,6 +85,9 @@ use ngy_book_studio::{
     share,
 };
 use serde::Deserialize;
+use wry::raw_window_handle::{
+    HandleError, HasWindowHandle, RawWindowHandle, Win32WindowHandle, WindowHandle,
+};
 
 /// 当前皮肤。窗口在渲染或推送 WebView 时读它；改名成 `current_appearance` 是为了
 /// 不和界面代码里的同名字段/局部变量撞名。
@@ -114,7 +120,7 @@ pub(crate) use window_registry::*;
 #[cfg(test)]
 mod book_window_tests {
     use super::*;
-    use gpui::TestAppContext;
+    use gpui_kit::TestAppContext;
     use std::{cell::RefCell, rc::Rc};
 
     struct TrackedWindow;
@@ -125,7 +131,7 @@ mod book_window_tests {
         }
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn closing_a_book_closes_only_its_own_windows(cx: &mut TestAppContext) {
         let closed: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let first: AnyWindowHandle = cx.add_window(|_, _| TrackedWindow).into();
@@ -171,7 +177,7 @@ mod book_window_tests {
 #[cfg(test)]
 mod singleton_window_tests {
     use super::*;
-    use gpui::TestAppContext;
+    use gpui_kit::TestAppContext;
 
     struct TrackedWindow;
 
@@ -181,7 +187,7 @@ mod singleton_window_tests {
         }
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn a_reserved_window_is_reused_until_it_closes(cx: &mut TestAppContext) {
         let window: AnyWindowHandle = cx.add_window(|_, _| TrackedWindow).into();
         let key = singleton_window_key("reader", "book-a");
@@ -204,7 +210,7 @@ mod singleton_window_tests {
         }
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn closed_and_failed_windows_free_their_scope(cx: &mut TestAppContext) {
         let window: AnyWindowHandle = cx.add_window(|_, _| TrackedWindow).into();
         let key = singleton_window_key("editor", "book-a");

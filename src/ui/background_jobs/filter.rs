@@ -36,7 +36,7 @@ pub(crate) fn failure_banner(
     job: &BackgroundJobSnapshot,
     inspector: &BlockInspector,
     theme: Palette,
-) -> Option<gpui::AnyElement> {
+) -> Option<gpui_kit::AnyElement> {
     let failed = inspector.progress.failed;
     let failed_task = job.status == BackgroundJobStatus::Failed;
     if !failed_task && failed == 0 {

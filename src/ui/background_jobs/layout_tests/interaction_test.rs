@@ -2,7 +2,7 @@
 
 use super::*;
 
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn pagination_clicks_select_the_current_page_after_filter_changes(
     cx: &mut TestAppContext,
 ) {
@@ -70,7 +70,7 @@ pub(crate) fn pagination_clicks_select_the_current_page_after_filter_changes(
     assert_regions_fit(visual, 900., 640.);
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn divider_drag_clamps_the_list_column_and_keeps_the_detail_readable(
     cx: &mut TestAppContext,
 ) {
@@ -140,7 +140,7 @@ pub(crate) fn divider_drag_clamps_the_list_column_and_keeps_the_detail_readable(
 /// sitting in front of 重新翻译 and re-sending every untranslated block, and a
 /// failed row's own 重试, which re-sends exactly that block. A translated row
 /// offers neither, because there is nothing to repair and no request to spend.
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn failed_blocks_offer_a_bulk_retry_before_retranslate_and_a_row_retry(
     cx: &mut TestAppContext,
 ) {
@@ -181,7 +181,7 @@ pub(crate) fn failed_blocks_offer_a_bulk_retry_before_retranslate_and_a_row_retr
         });
         // Draw this frame directly: `run_until_parked` would let the queued load
         // for the synthetic task run again and replace the list with an error.
-        window.draw(cx).clear();
+        window.draw(cx).clear(cx);
     });
 
     // Reproduce the state the inspector derives from: failed blocks 18 and 19.

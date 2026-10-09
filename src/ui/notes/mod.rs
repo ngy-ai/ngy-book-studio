@@ -1,8 +1,8 @@
 use super::ai_sidebar::markdown::assistant_display_markdown;
 use super::*;
 
-use gpui::{ClipboardItem, Pixels, ScrollHandle};
-use gpui_component::text::{TextView, TextViewStyle};
+use gpui_kit::component::text::{TextView, TextViewStyle};
+use gpui_kit::{ClipboardItem, Pixels, ScrollHandle};
 use ngy_book_studio::annotations::{AnnotationKind, AnnotationOverview};
 use std::collections::HashMap;
 

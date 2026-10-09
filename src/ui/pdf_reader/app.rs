@@ -114,7 +114,7 @@ impl PdfReaderApp {
             search_input,
             search_query: String::new(),
             search_results: Vec::new(),
-            page_list_scroll: gpui::UniformListScrollHandle::new(),
+            page_list_scroll: gpui_kit::UniformListScrollHandle::new(),
             page_list_synced_page: None,
             annotations: PdfAnnotations::new(document_revision),
             _annotation_ai_subscription,

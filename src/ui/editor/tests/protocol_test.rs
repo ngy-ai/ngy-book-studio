@@ -62,7 +62,7 @@ fn editor_protocol_separates_trusted_shell_from_canonical_content() {
     let state = EditorWebState::new("book-a".to_string(), href.clone(), html);
     let (session_id, chapter_id) = editor_ipc_identity(&state, 0);
 
-    let document_request = gpui_component::wry::http::Request::builder()
+    let document_request = wry::http::Request::builder()
         .uri(editor_custom_url(
             EditorTab::RichText,
             &session_id,
@@ -96,7 +96,7 @@ fn editor_protocol_separates_trusted_shell_from_canonical_content() {
         "epubeditor://content/{href}?mode=source&session_id={}&chapter_id={chapter_id}&rev=0",
         urlencoding::encode(&session_id)
     );
-    let source_request = gpui_component::wry::http::Request::builder()
+    let source_request = wry::http::Request::builder()
         .uri(&source_url)
         .header("Origin", EDITOR_SHELL_ORIGIN)
         .body(())
@@ -119,7 +119,7 @@ fn editor_protocol_separates_trusted_shell_from_canonical_content() {
     let source_without_origin =
         editor_protocol_response(&state, &protocol_request(&source_url, None));
     assert_eq!(source_without_origin.status(), 403);
-    let forged_source = gpui_component::wry::http::Request::builder()
+    let forged_source = wry::http::Request::builder()
         .uri(&source_url)
         .header("Origin", "http://epubeditor.evil")
         .body(())
@@ -182,15 +182,12 @@ fn editor_protocol_separates_trusted_shell_from_canonical_content() {
         "epubeditor://content/EPUB/Images/pixel.png",
         "epubeditor://content/EPUB/Fonts/book.woff2",
     ] {
-        let request = gpui_component::wry::http::Request::builder()
-            .uri(uri)
-            .body(())
-            .unwrap();
+        let request = wry::http::Request::builder().uri(uri).body(()).unwrap();
         let response = editor_protocol_response(&state, &request);
         assert_eq!(response.status(), 404, "{uri}");
     }
 
-    let missing_request = gpui_component::wry::http::Request::builder()
+    let missing_request = wry::http::Request::builder()
         .uri("epubeditor://content/EPUB/Images/missing.png")
         .body(())
         .unwrap();

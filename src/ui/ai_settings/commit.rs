@@ -32,7 +32,7 @@ pub(crate) fn commit_settings<V: SettingsWindowView>(
         // this UI future only awaits and applies the result.
         let save = Box::pin(services.configure_providers(settings, key_updates));
         let outcome =
-            match futures_util::future::select(save, Box::pin(Timer::after(SAVE_WAIT_LIMIT))).await
+            match futures_util::future::select(save, Box::pin(cx.background_executor().timer(SAVE_WAIT_LIMIT))).await
             {
                 futures_util::future::Either::Left((outcome, _)) => Some(outcome),
                 futures_util::future::Either::Right((_, _)) => None,

@@ -24,7 +24,7 @@ fn explanation_question_names_the_displayed_translation_within_its_budget() {
     assert!(truncated.is_char_boundary(truncated.len()));
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 fn explanation_events_publish_only_current_persisted_answers_and_report_recoverable_failures(
     cx: &mut TestAppContext,
 ) {
@@ -41,7 +41,7 @@ fn explanation_events_publish_only_current_persisted_answers_and_report_recovera
 
     let temp = tempfile::tempdir().unwrap();
     let services = Arc::new(AppServices::open(temp.path()).unwrap());
-    cx.update(gpui_component::init);
+    init_ui_test(cx);
     let mut sidebar = None;
     let (_, visual) = cx.add_window_view(|window, cx| {
         let view = cx.new(|cx| {

@@ -2,7 +2,7 @@
 
 use super::*;
 
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn rejected_rich_body_cannot_be_saved_by_an_unchanged_ack_and_can_be_corrected(
     cx: &mut TestAppContext,
 ) {

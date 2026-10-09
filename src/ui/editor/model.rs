@@ -189,7 +189,7 @@ pub(crate) struct EditorMediaModal {
     pub(crate) action: EditorMediaModalAction,
     pub(crate) kind: MediaKind,
     pub(crate) title_input: Entity<InputState>,
-    pub(crate) description_input: Entity<InputState>,
+    pub(crate) description_input: Entity<TextareaState>,
 }
 
 /// Which editor view is active for the current chapter.

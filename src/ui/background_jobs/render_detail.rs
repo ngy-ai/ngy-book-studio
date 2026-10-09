@@ -3,7 +3,7 @@
 use super::*;
 
 impl BackgroundJobsWindow {
-    pub(super) fn render_detail(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(super) fn render_detail(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let Some(job) = self
             .jobs
             .iter()
@@ -103,7 +103,8 @@ impl BackgroundJobsWindow {
                     })
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.tab = tab;
-                        this.detail_scroll.set_offset(gpui::point(px(0.), px(0.)));
+                        this.detail_scroll
+                            .set_offset(gpui_kit::point(px(0.), px(0.)));
                         this.refresh_logs(window, cx);
                         this.refresh_blocks(window, cx);
                         cx.notify();
@@ -215,7 +216,7 @@ impl BackgroundJobsWindow {
                     content = content.child(
                         div()
                             .flex_none()
-                            .line_height(gpui::relative(1.5))
+                            .line_height(gpui_kit::relative(1.5))
                             .border_b_1()
                             .border_color(rgb(palette(cx).border))
                             .py_1()

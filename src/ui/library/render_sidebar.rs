@@ -9,7 +9,7 @@ impl EpubReaderApp {
         &self,
         book: &BookRecord,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         let view = cx.entity().clone();
         let book_id = book.id.clone();
         Button::new(SharedString::from(format!("book-group-{book_id}")))
@@ -32,10 +32,10 @@ impl EpubReaderApp {
             .into_any_element()
     }
 
-    pub(super) fn render_group_sidebar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(super) fn render_group_sidebar(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let view = cx.entity().clone();
 
-        let mut rows: Vec<gpui::AnyElement> = vec![
+        let mut rows: Vec<gpui_kit::AnyElement> = vec![
             Button::new("open-learning-center")
                 .ghost()
                 .icon(IconName::BookOpen)
@@ -141,7 +141,7 @@ impl EpubReaderApp {
                     .px_3()
                     .py_3()
                     .text_xs()
-                    .line_height(gpui::relative(1.6))
+                    .line_height(gpui_kit::relative(1.6))
                     .text_color(rgb(palette(cx).muted))
                     .child("还没有分组，点击右上角 + 新建一个。")
                     .into_any_element(),
@@ -182,7 +182,7 @@ impl EpubReaderApp {
         selected: bool,
         filter: GroupFilter,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         let view = cx.entity().clone();
         Button::new(id)
             .ghost()
@@ -240,7 +240,7 @@ impl EpubReaderApp {
         &self,
         group: &BookGroup,
         depth: usize,
-        rows: &mut Vec<gpui::AnyElement>,
+        rows: &mut Vec<gpui_kit::AnyElement>,
         cx: &mut Context<Self>,
     ) {
         rows.push(self.render_group_row(group, depth, cx));
@@ -257,7 +257,7 @@ impl EpubReaderApp {
         group: &BookGroup,
         depth: usize,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         let view = cx.entity().clone();
         let group_id = group.id.clone();
         let has_children = !self.library.child_groups(Some(&group.id)).is_empty();
@@ -408,7 +408,7 @@ impl EpubReaderApp {
         &self,
         group_id: &str,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         // 分组菜单在 `move` 闭包里构造，捕获 `cx` 会把借用带走；取一次值即可。
         let theme = palette(cx);
         let view = cx.entity().clone();
@@ -475,7 +475,7 @@ impl EpubReaderApp {
             .into_any_element()
     }
 
-    pub(super) fn render_empty_group(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(super) fn render_empty_group(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let view = cx.entity().clone();
         div()
             .flex_1()
@@ -517,7 +517,7 @@ impl EpubReaderApp {
                             .max_w(px(320.))
                             .text_center()
                             .text_sm()
-                            .line_height(gpui::relative(1.6))
+                            .line_height(gpui_kit::relative(1.6))
                             .text_color(rgb(palette(cx).muted))
                             .child("可在图书卡片右上角的文件夹菜单中，将图书移动到这里。"),
                     )

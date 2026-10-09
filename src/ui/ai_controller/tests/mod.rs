@@ -3,8 +3,8 @@
 pub(crate) use crate::ui::ai_sidebar::{AiBookOption, AiSidebarEvent, AiSidebarScope};
 
 use super::*;
-use gpui::{AppContext, TestAppContext};
-use gpui_component::Root;
+use gpui_kit::component::Root;
+use gpui_kit::{AppContext, TestAppContext};
 use ngy_book_studio::document::{
     Block, BlockDocument, BookDocument, ContentUnit, ContentUnitKind, DocumentLocator, Revision,
 };

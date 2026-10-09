@@ -58,7 +58,7 @@ pub(crate) fn open_settings_window<V: SettingsWindowView>(
         tracker.handle = None;
         tracker.view = None;
     }
-    let opened: Result<gpui::AnyWindowHandle> = (|| {
+    let opened: Result<gpui_kit::AnyWindowHandle> = (|| {
         let bounds = Bounds::centered(None, section.window_size(), cx);
         let handle = cx
             .open_window(
@@ -75,7 +75,7 @@ pub(crate) fn open_settings_window<V: SettingsWindowView>(
                 move |window, cx| {
                     let view = cx.new(|cx| build(window, cx));
                     V::tracker(cx).view = Some(view.downgrade());
-                    let settings_window = gpui::Window::window_handle(window);
+                    let settings_window = gpui_kit::Window::window_handle(window);
                     let close_view = view.downgrade();
                     let close_requested = Cell::new(false);
                     on_window_close(window, cx, move |window, cx| {

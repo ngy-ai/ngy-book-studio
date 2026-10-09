@@ -199,13 +199,13 @@ impl Render for TextProbe {
 
 fn redraw(cx: &mut VisualTestContext) {
     cx.run_until_parked();
-    cx.update(|window, app| window.draw(app).clear());
+    cx.update(|window, app| window.draw(app).clear(app));
     cx.run_until_parked();
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 fn displayed_quote_is_selectable_plain_text_including_markdown_and_html(cx: &mut TestAppContext) {
-    cx.update(gpui_component::init);
+    init_ui_test(cx);
     let (_, visual) = cx.add_window_view(|window, cx| {
         let text = cx.new(|_| TextProbe);
         Root::new(text, window, cx)
@@ -256,10 +256,10 @@ impl Render for ThoughtProbe {
     }
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 fn human_and_ai_markdown_display_selection_reads_formatted_text(cx: &mut TestAppContext) {
     const SOURCE: &str = "# TITLE\n\n**BOLD**\n\n- FIRST_ITEM\n- SECOND_ITEM\n\n[LINK_LABEL](https://example.invalid/link)\n\n![IMAGE_LABEL](https://example.invalid/image)\n\n<img src='https://example.invalid/raw'>";
-    cx.update(gpui_component::init);
+    init_ui_test(cx);
     for kind in [AnnotationKind::HumanComment, AnnotationKind::AiComment] {
         let mut note = note(0, "书", kind);
         note.annotation.comment = Some(SOURCE.into());
@@ -337,7 +337,7 @@ impl Render for TableProbe {
     }
 }
 
-#[gpui::test]
+#[gpui_kit::test]
 fn native_table_wraps_long_cells_and_scrolls_to_later_columns(cx: &mut TestAppContext) {
     let long_cell = format!(
         "**BOLD** *EMPHASIS* `CODE` {} TABLE_END",
@@ -347,7 +347,7 @@ fn native_table_wraps_long_cells_and_scrolls_to_later_columns(cx: &mut TestAppCo
         "| First | Second | Third | Last |\n| --- | --- | --- | --- |\n| {long_cell} | Two | Three | LAST_COLUMN |"
     );
     let display = Arc::new(ThoughtDisplay::new(assistant_display_markdown(&source)));
-    cx.update(gpui_component::init);
+    init_ui_test(cx);
     let (_, visual) = cx.add_window_view(|window, cx| {
         let table = cx.new(|_| TableProbe { display });
         Root::new(table, window, cx)

@@ -3,7 +3,7 @@
 use super::*;
 
 impl BackgroundJobsWindow {
-    pub(super) fn render_list(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(super) fn render_list(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let jobs = self.filtered_jobs();
         let count = jobs.len();
         let mut list = div()
@@ -171,7 +171,8 @@ impl BackgroundJobsWindow {
                                     .disabled(self.page == 0)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.page = this.page.saturating_sub(1);
-                                        this.list_scroll.set_offset(gpui::point(px(0.), px(0.)));
+                                        this.list_scroll
+                                            .set_offset(gpui_kit::point(px(0.), px(0.)));
                                         this.reconcile_selection();
                                         this.refresh_logs(window, cx);
                                         this.refresh_blocks(window, cx);
@@ -187,7 +188,8 @@ impl BackgroundJobsWindow {
                                     .disabled(self.page + 1 >= pages)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.page += 1;
-                                        this.list_scroll.set_offset(gpui::point(px(0.), px(0.)));
+                                        this.list_scroll
+                                            .set_offset(gpui_kit::point(px(0.), px(0.)));
                                         this.reconcile_selection();
                                         this.refresh_logs(window, cx);
                                         this.refresh_blocks(window, cx);

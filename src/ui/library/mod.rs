@@ -95,7 +95,7 @@ const OFFICE_PREVIEW_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub struct EpubReaderApp {
     library: LibraryStore,
     services: Arc<AppServices>,
-    library_window: gpui::AnyWindowHandle,
+    library_window: gpui_kit::AnyWindowHandle,
     library_mutations: LibraryMutationLifecycle,
     ai_sidebar: Entity<AiSidebar>,
     ai_controller: AiSidebarController,

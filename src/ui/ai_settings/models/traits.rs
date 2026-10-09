@@ -54,14 +54,14 @@ impl SettingsWindowView for ModelsSettingsWindow {
                     "向量维度已修改"
                 };
                 let answer = window.prompt(
-                    gpui::PromptLevel::Warning,
+                    gpui_kit::PromptLevel::Warning,
                     title,
                     Some(
                         "修改 Embedding 模型或向量维度会使所有已索引的向量失效，保存后将自动重新生成索引。是否继续？",
                     ),
                     &[
-                        gpui::PromptButton::ok("继续保存"),
-                        gpui::PromptButton::cancel("取消"),
+                        gpui_kit::PromptButton::ok("继续保存"),
+                        gpui_kit::PromptButton::cancel("取消"),
                     ],
                     cx,
                 );

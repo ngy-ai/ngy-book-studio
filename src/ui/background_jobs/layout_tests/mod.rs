@@ -3,7 +3,7 @@
 //! services use a fresh local directory and in-memory credentials only.
 
 use super::*;
-use gpui::{
+use gpui_kit::{
     Modifiers, Pixels, ScrollDelta, ScrollWheelEvent, TestAppContext, VisualTestContext, point,
 };
 use ngy_book_studio::{
@@ -105,7 +105,7 @@ pub(crate) fn open_fixture(
         )
         .unwrap(),
     );
-    cx.update(gpui_component::init);
+    init_ui_test(cx);
     let mut view = None;
     let (_, visual) = cx.add_window_view(|window, cx| {
         let jobs = cx.new(|cx| {
@@ -134,13 +134,24 @@ pub(crate) fn open_fixture(
 
 pub(crate) fn redraw(cx: &mut VisualTestContext) {
     cx.run_until_parked();
-    cx.update(|window, app| window.draw(app).clear());
+    cx.update(|window, app| window.draw(app).clear(app));
     cx.run_until_parked();
 }
 
 pub(crate) fn bounds(cx: &mut VisualTestContext, selector: &'static str) -> Bounds<Pixels> {
-    cx.debug_bounds(selector)
-        .unwrap_or_else(|| panic!("missing rendered region {selector}"))
+    // 组件层的 TextView 在后台任务里解析正文，区域出现可能晚一帧；并行跑全量
+    // 测试时更明显。轮询到有界上界，仍然要求它最终真的被渲染出来。
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(bounds) = cx.debug_bounds(selector) {
+            return bounds;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("missing rendered region {selector}");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        redraw(cx);
+    }
 }
 
 pub(crate) fn assert_regions_fit(cx: &mut VisualTestContext, width: f32, height: f32) {

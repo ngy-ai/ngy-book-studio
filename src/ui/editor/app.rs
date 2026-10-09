@@ -34,7 +34,7 @@ pub struct EditorApp {
     pub(crate) title_input: Entity<InputState>,
     pub(crate) author_input: Entity<InputState>,
     pub(crate) chapter_title_input: Entity<InputState>,
-    pub(crate) body_input: Entity<InputState>,
+    pub(crate) body_input: Entity<TextareaState>,
     pub(crate) chapters: Vec<EditorChapter>,
     pub(crate) canonical_document: Option<BookDocument>,
     pub(crate) unit_states: Vec<EditorUnitState>,
@@ -91,7 +91,7 @@ impl EditorApp {
         title_input: Entity<InputState>,
         author_input: Entity<InputState>,
         chapter_title_input: Entity<InputState>,
-        body_input: Entity<InputState>,
+        body_input: Entity<TextareaState>,
         chapters: Vec<EditorChapter>,
         document: BookDocument,
         web_state: EditorWebState,
@@ -586,7 +586,7 @@ impl EditorApp {
 
     pub(crate) fn on_body_input_event(
         &mut self,
-        _input: &Entity<InputState>,
+        _input: &Entity<TextareaState>,
         event: &InputEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,

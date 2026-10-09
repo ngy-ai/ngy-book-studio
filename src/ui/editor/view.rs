@@ -92,7 +92,7 @@ impl EditorApp {
         } else if tab == EditorTab::RichText {
             let href = chapter.href.clone();
             self.ready_timeout_task = Some(cx.spawn_in(window, async move |view, cx| {
-                Timer::after(EDITOR_READY_TIMEOUT).await;
+                cx.background_executor().timer(EDITOR_READY_TIMEOUT).await;
                 let _ = view.update_in(cx, |editor, window, cx| {
                     editor.handle_editor_ready_timeout(
                         &session_id,

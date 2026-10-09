@@ -19,7 +19,7 @@ impl BackgroundJobsWindow {
         });
         let poll_task = cx.spawn_in(window, async move |view, cx| {
             loop {
-                Timer::after(Duration::from_secs(2)).await;
+                cx.background_executor().timer(Duration::from_secs(2)).await;
                 let alive = cx.update(|window, cx| {
                     view.update(cx, |this, cx| {
                         if this.auto_refresh && !this.loading && this.pending_job_id.is_none() {
@@ -103,7 +103,8 @@ impl BackgroundJobsWindow {
     /// Drops every cached per-task payload. Called whenever the inspected task
     /// changes or its identity may have been rewritten.
     pub(super) fn clear_detail_cache(&mut self) {
-        self.detail_scroll.set_offset(gpui::point(px(0.), px(0.)));
+        self.detail_scroll
+            .set_offset(gpui_kit::point(px(0.), px(0.)));
         self.logs_generation = self.logs_generation.wrapping_add(1);
         self.logs_loading = false;
         self.logs = None;
@@ -178,7 +179,7 @@ impl BackgroundJobsWindow {
 
     pub(super) fn filters_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.page = 0;
-        self.list_scroll.set_offset(gpui::point(px(0.), px(0.)));
+        self.list_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
         self.reconcile_selection();
         self.refresh_logs(window, cx);
         self.refresh_blocks(window, cx);
@@ -200,7 +201,7 @@ impl BackgroundJobsWindow {
         self.selected_job_id = None;
         self.clear_detail_cache();
         self.page = 0;
-        self.list_scroll.set_offset(gpui::point(px(0.), px(0.)));
+        self.list_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
         self.loaded = false;
         self.loading = false;
         self.notice = None;
@@ -320,7 +321,8 @@ impl BackgroundJobsWindow {
                     return;
                 }
                 this.blocks_loading = false;
-                this.detail_scroll.set_offset(gpui::point(px(0.), px(0.)));
+                this.detail_scroll
+                    .set_offset(gpui_kit::point(px(0.), px(0.)));
                 match result {
                     Ok(list) => {
                         // Open on the page holding the block being translated so
@@ -475,7 +477,7 @@ impl BackgroundJobsWindow {
                     return;
                 }
                 detail.loading = false;
-                detail.scroll.set_offset(gpui::point(px(0.), px(0.)));
+                detail.scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
                 match result {
                     Ok(loaded) => {
                         detail.detail = Some(loaded);

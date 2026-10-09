@@ -4,7 +4,7 @@ use super::*;
 
 impl NotesWindow {
     #[inline(never)]
-    pub(super) fn render_header(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(super) fn render_header(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let title = if self.book.is_some() {
             "本书笔记"
         } else {
@@ -58,7 +58,7 @@ impl NotesWindow {
     }
 
     #[inline(never)]
-    pub(super) fn render_filters(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(super) fn render_filters(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let mut filters = div().h_flex().gap_2();
         for (index, filter) in NoteFilter::ALL.into_iter().enumerate() {
             let view = cx.entity();

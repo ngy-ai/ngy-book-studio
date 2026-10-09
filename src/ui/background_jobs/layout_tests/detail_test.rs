@@ -5,7 +5,7 @@ use super::*;
 /// The debug panel of one block: what it shows, that it never grows past the
 /// window, and that a click on the overlay closes it without also activating
 /// the block row underneath.
-#[gpui::test]
+#[gpui_kit::test]
 pub(crate) fn block_detail_panel_shows_every_payload_and_stays_inside_the_window(
     cx: &mut TestAppContext,
 ) {

@@ -1,9 +1,9 @@
 use super::*;
-use gpui::{EventEmitter, Pixels, rems};
-use gpui_component::{
+use gpui_kit::component::{
     clipboard::Clipboard,
     text::{TextView, TextViewStyle},
 };
+use gpui_kit::{EventEmitter, Pixels, rems};
 use ngy_book_studio::{
     ai::agent::AgentAnswerSourceStatus,
     ai::normalize_provider_base_url,
@@ -75,7 +75,7 @@ pub(crate) struct AiSidebar {
     layout: ResponsiveSidebar,
     expanded_width: Pixels,
     endpoint_status: AiEndpointStatus,
-    input: Entity<InputState>,
+    input: Entity<TextareaState>,
     _endpoint_refresh_task: Task<()>,
     _subscriptions: Vec<Subscription>,
 }

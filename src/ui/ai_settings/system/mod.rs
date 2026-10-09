@@ -9,7 +9,7 @@ use super::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use gpui_component::checkbox::Checkbox;
+use gpui_kit::component::checkbox::Checkbox;
 use ngy_book_studio::services::{
     ApiKeyUpdate, ProviderSettings, TRANSLATION_LANGUAGES, TranslationDisplayMode,
     translation_language_label,

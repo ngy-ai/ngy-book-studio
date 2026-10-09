@@ -9,7 +9,7 @@ pub(crate) fn render_input_field(
     label: &'static str,
     description: &'static str,
     input: &Entity<InputState>,
-) -> gpui::AnyElement {
+) -> gpui_kit::AnyElement {
     div()
         .v_flex()
         .gap_1p5()
@@ -36,7 +36,7 @@ pub(crate) fn render_notice(
     notice: &SettingsNotice,
     theme: Palette,
     selector: impl Fn() -> String + 'static,
-) -> gpui::AnyElement {
+) -> gpui_kit::AnyElement {
     let (background, foreground, icon) = if notice.error {
         (
             rgb(theme.danger_soft),
@@ -68,14 +68,14 @@ pub(crate) fn render_notice(
                 .debug_selector(selector)
                 .flex_1()
                 .min_w(px(0.))
-                .line_height(gpui::relative(1.5))
+                .line_height(gpui_kit::relative(1.5))
                 .child(notice.text.clone()),
         )
         .into_any_element()
 }
 
 /// 设置面板的统一容器：白底、圆角、细边框。
-pub(crate) fn panel(theme: Palette, children: Vec<gpui::AnyElement>) -> gpui::AnyElement {
+pub(crate) fn panel(theme: Palette, children: Vec<gpui_kit::AnyElement>) -> gpui_kit::AnyElement {
     div()
         .v_flex()
         .gap_3()
@@ -89,7 +89,7 @@ pub(crate) fn panel(theme: Palette, children: Vec<gpui::AnyElement>) -> gpui::An
 }
 
 /// 面板里的小节标题。
-pub(crate) fn card_title(theme: Palette, text: impl Into<SharedString>) -> gpui::AnyElement {
+pub(crate) fn card_title(theme: Palette, text: impl Into<SharedString>) -> gpui_kit::AnyElement {
     div()
         .text_sm()
         .font_semibold()
@@ -99,10 +99,10 @@ pub(crate) fn card_title(theme: Palette, text: impl Into<SharedString>) -> gpui:
 }
 
 /// 面板里的说明文字。
-pub(crate) fn card_note(theme: Palette, text: impl Into<SharedString>) -> gpui::AnyElement {
+pub(crate) fn card_note(theme: Palette, text: impl Into<SharedString>) -> gpui_kit::AnyElement {
     div()
         .text_xs()
-        .line_height(gpui::relative(1.5))
+        .line_height(gpui_kit::relative(1.5))
         .text_color(rgb(theme.muted))
         .child(text.into())
         .into_any_element()

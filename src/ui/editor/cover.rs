@@ -6,7 +6,7 @@ impl EditorApp {
     pub(crate) fn render_media_metadata_modal(
         &mut self,
         cx: &mut Context<Self>,
-    ) -> Option<gpui::AnyElement> {
+    ) -> Option<gpui_kit::AnyElement> {
         let modal = self.media_modal.clone()?;
         let view = cx.entity().clone();
         let kind = match modal.kind {
@@ -81,7 +81,7 @@ impl EditorApp {
                                 .child(
                                     div()
                                         .h(px(120.))
-                                        .child(Input::new(&modal.description_input).h_full()),
+                                        .child(Textarea::new(&modal.description_input).h_full()),
                                 )
                                 .child(div().text_xs().text_color(rgb(palette(cx).muted)).child(
                                     "图片说明会写入 alt 与 caption；所有说明都会参与全文检索。",

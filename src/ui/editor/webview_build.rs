@@ -10,10 +10,7 @@ pub(crate) async fn build_editor_webview(
     state: EditorWebState,
     services: Arc<AppServices>,
     appearance: Appearance,
-) -> Result<(
-    gpui_component::wry::WebView,
-    async_channel::Receiver<EditorWebEvent>,
-)> {
+) -> Result<(wry::WebView, async_channel::Receiver<EditorWebEvent>)> {
     let initial_page = state.page(0).context("编辑器缺少初始章节")?;
     let initial_url = editor_custom_url(
         EditorTab::Preview,
@@ -27,7 +24,7 @@ pub(crate) async fn build_editor_webview(
     let ipc_state = state.clone();
     let protocol_state = state.clone();
     let protocol_runtime = services.runtime();
-    let raw_webview = gpui_component::wry::WebViewBuilder::new()
+    let raw_webview = wry::WebViewBuilder::new()
         .with_ipc_handler(move |request| {
             if request.body().len() > MAX_EDITOR_IPC_BYTES {
                 return;
@@ -135,11 +132,11 @@ pub(crate) async fn build_editor_webview(
         .with_initialization_script(EDITOR_INITIALIZATION_SCRIPT)
         .with_navigation_handler(|url| is_editor_navigation_url(&url))
         .with_on_page_load_handler(move |event, url| {
-            if matches!(event, gpui_component::wry::PageLoadEvent::Finished) {
+            if matches!(event, wry::PageLoadEvent::Finished) {
                 let _ = page_sender.try_send(EditorWebEvent::PageLoaded(url));
             }
         })
-        .with_new_window_req_handler(|_, _| gpui_component::wry::NewWindowResponse::Deny)
+        .with_new_window_req_handler(|_, _| wry::NewWindowResponse::Deny)
         .with_download_started_handler(|_, _| false)
         // 章节 XHTML 到达之前显示的就是这个底色，所以它必须已经是当前皮肤的颜色。
         .with_background_color(Palette::bytes(Palette::for_appearance(appearance).paper))

@@ -13,7 +13,7 @@ impl EpubReaderApp {
         selected: &Option<String>,
         expanded: &HashSet<String>,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         let view = cx.entity().clone();
         let ungrouped_selected = selected.is_none();
         let ungrouped_view = view.clone();
@@ -187,7 +187,7 @@ impl EpubReaderApp {
         depth: usize,
         selected: &Option<String>,
         expanded: &HashSet<String>,
-        out: &mut Vec<gpui::AnyElement>,
+        out: &mut Vec<gpui_kit::AnyElement>,
         cx: &mut Context<Self>,
     ) {
         for group in self.library.child_groups(parent_id) {
@@ -205,7 +205,7 @@ impl EpubReaderApp {
         selected: &Option<String>,
         expanded: &HashSet<String>,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         let view = cx.entity().clone();
         let group_id = group.id.clone();
         let has_children = !self.library.child_groups(Some(&group.id)).is_empty();
@@ -297,7 +297,7 @@ impl EpubReaderApp {
     pub(super) fn render_group_modal(
         &mut self,
         cx: &mut Context<Self>,
-    ) -> Option<gpui::AnyElement> {
+    ) -> Option<gpui_kit::AnyElement> {
         let modal = self.group_modal.clone()?;
         let view = cx.entity().clone();
         let modal_pending = matches!(
@@ -413,7 +413,7 @@ impl EpubReaderApp {
                         div()
                             .text_sm()
                             .text_color(rgb(palette(cx).ink))
-                            .line_height(gpui::relative(1.6))
+                            .line_height(gpui_kit::relative(1.6))
                             .child(description),
                     )
                     .child(
@@ -477,7 +477,7 @@ impl EpubReaderApp {
                 .justify_center()
                 .on_any_mouse_down(move |event, _, cx| {
                     cx.stop_propagation();
-                    if event.button == gpui::MouseButton::Left && !modal_pending {
+                    if event.button == gpui_kit::MouseButton::Left && !modal_pending {
                         cancel_view.update(cx, |this, cx| this.close_group_modal(cx));
                     }
                 })
@@ -508,7 +508,7 @@ impl EpubReaderApp {
         )
     }
 
-    pub(super) fn render_notice(&self, notice: &Notice, theme: Palette) -> gpui::AnyElement {
+    pub(super) fn render_notice(&self, notice: &Notice, theme: Palette) -> gpui_kit::AnyElement {
         let (background, foreground, icon) = if notice.error {
             (
                 rgb(theme.danger_soft),
@@ -549,7 +549,7 @@ impl EpubReaderApp {
             .child(
                 div()
                     .min_w(px(0.))
-                    .line_height(gpui::relative(1.4))
+                    .line_height(gpui_kit::relative(1.4))
                     .child(notice.text.clone()),
             )
             .into_any_element()

@@ -98,7 +98,7 @@ impl AiSettingsSection {
         format!("dev.ngy.book-studio.ai-settings.{}", self.slug())
     }
 
-    pub(crate) fn window_size(self) -> gpui::Size<gpui::Pixels> {
+    pub(crate) fn window_size(self) -> gpui_kit::Size<gpui_kit::Pixels> {
         match self {
             Self::Endpoint => size(px(760.), px(820.)),
             Self::Models => size(px(820.), px(880.)),
@@ -108,7 +108,7 @@ impl AiSettingsSection {
         }
     }
 
-    pub(crate) fn window_min_size(self) -> gpui::Size<gpui::Pixels> {
+    pub(crate) fn window_min_size(self) -> gpui_kit::Size<gpui_kit::Pixels> {
         size(px(560.), px(440.))
     }
 
