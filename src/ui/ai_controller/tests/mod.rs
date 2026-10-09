@@ -19,6 +19,8 @@ pub(crate) fn reference(book_id: &str, unit_id: &str, index: usize) -> AiReferen
     AiReferenceHint::chapter(book_id, unit_id, index, format!("Unit {index}"))
 }
 
+mod delete_turn_test;
+
 mod explanation_test;
 
 mod reference_test;

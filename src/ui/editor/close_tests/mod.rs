@@ -225,8 +225,10 @@ pub(crate) fn assert_ready_for_removal(fixture: &EditorFixture, visual: &VisualT
 
 pub(crate) fn wait_for_write(fixture: &EditorFixture, visual: &mut VisualTestContext) {
     // Storage uses the independent IoRuntime, so a parked GPUI executor does
-    // not by itself mean the background write has completed.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // not by itself mean the background write has completed. The bound is
+    // generous because the whole binary test suite runs in parallel and that
+    // shared runtime can be busy; a write that never finishes still fails.
+    let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         visual.run_until_parked();
         if fixture

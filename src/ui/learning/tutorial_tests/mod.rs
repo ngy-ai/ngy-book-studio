@@ -86,7 +86,10 @@ pub(crate) fn assert_workspace(
 pub(crate) fn wait_for_chapter_load(learning: &Entity<LearningWindow>, cx: &mut VisualTestContext) {
     // Persistence runs on the real, independent IoRuntime, so the GPUI test
     // executor becoming parked alone does not mean the disk operation finished.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    // The bound is generous because the whole binary test suite runs in
+    // parallel and that shared runtime can be busy; a load that never finishes
+    // still fails.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
         redraw(cx);
         if learning.read_with(cx, |view, _| view.operation.is_none()) {
@@ -202,29 +205,64 @@ pub(crate) fn edit_learning_input(
     assert_eq!(input_text(learning, visual, index), text);
 }
 
-/// 0.6 的编辑器按输入批次记录撤销历史：测试里的逐字符输入会留下多条记录，
-/// 「撤销这次编辑」需要按到历史耗尽（耗尽后继续按不再改变文本），因此这里
-/// 连按固定次数，让调用点继续断言「撤销后的文本」而不是「撤销一步的文本」。
-pub(crate) fn undo(visual: &mut VisualTestContext) {
-    for _ in 0..24 {
-        visual.simulate_keystrokes(if cfg!(target_os = "macos") {
+/// 撤销/重做最多按多少次。0.6 的编辑器按输入批次记录历史，逐字符输入会产生
+/// 多条记录；正常用例在近十步内耗尽，这个上限只保护死循环。
+const MAX_HISTORY_STEPS: usize = 64;
+
+/// 连按 `keys` 直到输入文本不再变化：历史耗尽后继续按不再改变文本，所以
+/// 「按到稳定」等于「撤销/重做到这次编辑的尽头」，调用点可以继续断言最终
+/// 文本而不是某一步的中间态。`index` 是当前聚焦的输入。
+fn press_until_stable(
+    learning: &Entity<LearningWindow>,
+    visual: &mut VisualTestContext,
+    keys: &'static str,
+    index: usize,
+) {
+    let mut previous = input_text(learning, visual, index);
+    for _ in 0..MAX_HISTORY_STEPS {
+        visual.simulate_keystrokes(keys);
+        redraw(visual);
+        let current = input_text(learning, visual, index);
+        if current == previous {
+            return;
+        }
+        previous = current;
+    }
+    panic!("editor history did not settle within {MAX_HISTORY_STEPS} steps");
+}
+
+pub(crate) fn undo(
+    learning: &Entity<LearningWindow>,
+    visual: &mut VisualTestContext,
+    index: usize,
+) {
+    press_until_stable(
+        learning,
+        visual,
+        if cfg!(target_os = "macos") {
             "cmd-z"
         } else {
             "ctrl-z"
-        });
-        redraw(visual);
-    }
+        },
+        index,
+    );
 }
 
-pub(crate) fn redo(visual: &mut VisualTestContext) {
-    for _ in 0..24 {
-        visual.simulate_keystrokes(if cfg!(target_os = "macos") {
+pub(crate) fn redo(
+    learning: &Entity<LearningWindow>,
+    visual: &mut VisualTestContext,
+    index: usize,
+) {
+    press_until_stable(
+        learning,
+        visual,
+        if cfg!(target_os = "macos") {
             "cmd-shift-z"
         } else {
             "ctrl-y"
-        });
-        redraw(visual);
-    }
+        },
+        index,
+    );
 }
 
 mod history_test;

@@ -20,9 +20,9 @@ pub(crate) fn chapter_changes_do_not_apply_another_chapters_undo_history(cx: &mu
     }
     // Verify that keyboard Undo really reaches the focused GPUI editor.
     focus_learning_input(&learning, visual, 0);
-    undo(visual);
+    undo(&learning, visual, 0);
     assert_eq!(input_text(&learning, visual, 0), "original_manual");
-    redo(visual);
+    redo(&learning, visual, 0);
     assert_eq!(input_text(&learning, visual, 0), "edited_0");
     click(visual, TOOLS_BUTTON);
     click(visual, "learning-enter-chapter-2");
@@ -33,9 +33,9 @@ pub(crate) fn chapter_changes_do_not_apply_another_chapters_undo_history(cx: &mu
         });
         let expected = input_text(&learning, visual, index);
         focus_learning_input(&learning, visual, index);
-        undo(visual);
+        undo(&learning, visual, index);
         assert_eq!(input_text(&learning, visual, index), expected);
-        redo(visual);
+        redo(&learning, visual, index);
         assert_eq!(input_text(&learning, visual, index), expected);
     }
 }
@@ -65,12 +65,12 @@ pub(crate) fn save_preserves_undo_but_new_round_and_restore_reset_each_editors_h
             assert_eq!(learning_input_entity_id(view, index), *previous);
         });
         focus_learning_input(&learning, visual, index);
-        undo(visual);
+        undo(&learning, visual, index);
         assert_eq!(
             input_text(&learning, visual, index),
             format!("original_{index}")
         );
-        redo(visual);
+        redo(&learning, visual, index);
         assert_eq!(
             input_text(&learning, visual, index),
             format!("saved_{index}")
@@ -80,7 +80,7 @@ pub(crate) fn save_preserves_undo_but_new_round_and_restore_reset_each_editors_h
     wait_for_chapter_load(&learning, visual);
     for index in 0..4 {
         focus_learning_input(&learning, visual, index);
-        undo(visual);
+        undo(&learning, visual, index);
         assert_eq!(
             input_text(&learning, visual, index),
             format!("saved_{index}")
@@ -111,12 +111,12 @@ pub(crate) fn save_preserves_undo_but_new_round_and_restore_reset_each_editors_h
     wait_for_chapter_load(&learning, visual);
     for index in 0..4 {
         focus_learning_input(&learning, visual, index);
-        undo(visual);
+        undo(&learning, visual, index);
         assert_eq!(
             input_text(&learning, visual, index),
             format!("saved_{index}")
         );
-        redo(visual);
+        redo(&learning, visual, index);
         assert_eq!(
             input_text(&learning, visual, index),
             format!("saved_{index}")

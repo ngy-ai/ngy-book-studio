@@ -84,6 +84,22 @@ impl AiSidebar {
         self.conversation.scope.book_ids()
     }
 
+    /// 宿主与测试观察用：当前显示的消息文本序列。
+    #[allow(dead_code)]
+    pub(crate) fn transcript_contents(&self) -> Vec<String> {
+        self.conversation
+            .messages
+            .iter()
+            .map(|message| message.content.clone())
+            .collect()
+    }
+
+    /// 宿主与测试观察用：最近一次会话操作的错误提示。
+    #[allow(dead_code)]
+    pub(crate) fn session_error(&self) -> Option<&str> {
+        self.sessions.error.as_deref()
+    }
+
     pub(crate) fn set_reference_hint(
         &mut self,
         reference: Option<AiReferenceHint>,
