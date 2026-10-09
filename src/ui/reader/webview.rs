@@ -121,6 +121,7 @@ pub(crate) async fn build_reader_webview(
         .with_initialization_script(READER_INITIALIZATION_SCRIPT)
         .with_initialization_script(include_str!("annotations.js"))
         .with_initialization_script(include_str!("translations.js"))
+        .with_initialization_script(include_str!("read_aloud.js"))
         .with_new_window_req_handler(|_, _| wry::NewWindowResponse::Deny)
         .with_on_page_load_handler(move |event, url| {
             if matches!(event, wry::PageLoadEvent::Finished) {

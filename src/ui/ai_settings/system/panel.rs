@@ -2,6 +2,10 @@
 
 use super::*;
 
+/// 朗读语速的预设档位：分段按钮比滑杆更好点，也不会产生越界的取值。
+/// 中间那档（1.0x）是默认值，`selected_index` 的兜底下标因此是 1。
+const SPEECH_RATE_PRESETS: [f32; 5] = [0.75, 1.0, 1.25, 1.5, 2.0];
+
 impl SystemSettingsWindow {
     #[inline(never)]
     pub(crate) fn render_panel(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
@@ -11,6 +15,7 @@ impl SystemSettingsWindow {
         let language_view = cx.entity();
         let display_mode_view = cx.entity();
         let use_proxy_view = cx.entity();
+        let speech_view = cx.entity();
         // 图书库自己记的是标准化路径（Windows 上是 `\\?\C:\…`），菜单、资源管理器和
         // 对话框都更认常规写法，所以显示与打开都用转换后的路径。
         let data_dir = startup::shell_dialog_directory(self.services.data_dir());
@@ -103,6 +108,82 @@ impl SystemSettingsWindow {
                     .map(|appearance| Tab::new().label(appearance.label())),
             );
 
+        // 朗读：音色下拉 + 语速档位 + 试听。音色列表来自系统（窗口创建时读一次），
+        // 没有可选语音时控件禁用，说明写在卡片注释里。
+        let selected_voice = self.speech_voice_id.clone();
+        let selected_voice_list = self.speech_voices.clone();
+        let voice_label = self
+            .speech_voices
+            .iter()
+            .find(|voice| voice.id == selected_voice)
+            .map(|voice| format!("{}（{}）", voice.label, voice.language))
+            .unwrap_or_else(|| "系统默认语音".to_string());
+        let voice_button = Button::new("ai-speech-voice")
+            .debug_selector(|| "ai-speech-voice".into())
+            .outline()
+            .label(voice_label)
+            .disabled(busy || self.speech_voices.is_empty())
+            .dropdown_menu({
+                let view = speech_view.clone();
+                move |menu, _, _| {
+                    let mut menu = menu.item(
+                        PopupMenuItem::new("系统默认语音")
+                            .checked(selected_voice.is_empty())
+                            .on_click({
+                                let view = view.clone();
+                                move |_, _, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.set_speech_voice(String::new(), cx);
+                                    });
+                                }
+                            }),
+                    );
+                    for voice in &selected_voice_list {
+                        menu = menu.item(
+                            PopupMenuItem::new(format!("{}（{}）", voice.label, voice.language))
+                                .checked(voice.id == selected_voice)
+                                .on_click({
+                                    let view = view.clone();
+                                    let id = voice.id.clone();
+                                    move |_, _, cx| {
+                                        view.update(cx, |this, cx| {
+                                            this.set_speech_voice(id.clone(), cx);
+                                        });
+                                    }
+                                }),
+                        );
+                    }
+                    menu
+                }
+            });
+        let speech_rate_switch = TabBar::new("ai-speech-rate")
+            .segmented()
+            .selected_index(
+                SPEECH_RATE_PRESETS
+                    .iter()
+                    .position(|rate| (rate - self.speech_rate).abs() < 0.01)
+                    .unwrap_or(1),
+            )
+            .on_click(cx.listener(|this, index: &usize, _, cx| {
+                if let Some(rate) = SPEECH_RATE_PRESETS.get(*index) {
+                    this.set_speech_rate(*rate, cx);
+                }
+            }))
+            .children(
+                SPEECH_RATE_PRESETS
+                    .iter()
+                    .map(|rate| Tab::new().label(format!("{rate}x"))),
+            );
+        let preview_view = cx.entity();
+        let speech_preview = Button::new("ai-speech-preview")
+            .debug_selector(|| "ai-speech-preview".into())
+            .outline()
+            .label("试听")
+            .disabled(busy || self.speech_voices.is_empty())
+            .on_click(move |_, _, cx| {
+                preview_view.update(cx, |this, cx| this.preview_speech(cx));
+            });
+
         div()
             .v_flex()
             .gap_5()
@@ -140,6 +221,27 @@ impl SystemSettingsWindow {
                         theme,
                         "开启后 PDF 阅读窗口的页面上下贴合，不再保留页间留白；关闭时恢复默认间距。\
                          页面投影、左右留白与阅读位置不变，标注与笔记仍按页面文字位置保存。",
+                    ),
+                ],
+            ))
+            .child(panel(
+                theme,
+                vec![
+                    card_title(theme, "朗读"),
+                    div()
+                        .h_flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_3()
+                        .child(voice_button)
+                        .child(speech_rate_switch)
+                        .child(speech_preview)
+                        .into_any_element(),
+                    card_note(
+                        theme,
+                        "阅读窗口的朗读使用 Windows 系统语音：离线、无需下载模型，点下去即可出声。\
+                         音色与语速在这里设置，对所有图书生效。试听会占用音频输出：正在进行的朗读\
+                         会随之停下；系统没有可用语音时，朗读控件与阅读窗口的朗读按钮都会提示不可用。",
                     ),
                 ],
             ))

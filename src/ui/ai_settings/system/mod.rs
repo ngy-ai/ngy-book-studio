@@ -36,6 +36,13 @@ pub(crate) struct SystemSettingsWindow {
     pub(crate) translation_display_mode: TranslationDisplayMode,
     /// Whether AI and web-search requests go through the system proxy.
     pub(crate) use_proxy: bool,
+    /// 朗读用的系统语音 ID；空串表示系统默认语音。
+    pub(crate) speech_voice_id: String,
+    /// 朗读语速倍率（1.0 为正常）。
+    pub(crate) speech_rate: f32,
+    /// 系统语音列表，窗口创建时读一次；空列表表示本机没有可用语音，
+    /// 那时音色与试听都被禁用并给出说明。
+    pub(crate) speech_voices: Vec<ngy_book_studio::speech::SpeechVoice>,
     pub(crate) state: SettingsWindowState,
     /// 目录选择对话框正开着（或更改正在提交）。原生对话框在自己的消息循环里跑，
     /// 用它挡住重复点击。

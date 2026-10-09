@@ -140,8 +140,9 @@ pub(crate) fn redraw(cx: &mut VisualTestContext) {
 
 pub(crate) fn bounds(cx: &mut VisualTestContext, selector: &'static str) -> Bounds<Pixels> {
     // 组件层的 TextView 在后台任务里解析正文，区域出现可能晚一帧；并行跑全量
-    // 测试时更明显。轮询到有界上界，仍然要求它最终真的被渲染出来。
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    // 测试时更明显（整机负载高时首帧解析要等更久）。上界放宽到 15 秒，但仍然
+    // 要求它最终真的被渲染出来。
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
         if let Some(bounds) = cx.debug_bounds(selector) {
             return bounds;

@@ -20,6 +20,11 @@ pub(crate) enum ReaderIpcMessage {
     SelectionChanged {
         selected_text: String,
     },
+    /// 页面请求从某一段开始朗读：列表是当前显示模式下的段落（id + 文字）。
+    ReadAloudStart {
+        start_block: String,
+        blocks: Vec<ReadAloudPageBlock>,
+    },
     /// Sent by the chapter runtime after Ctrl + wheel changed the reading text
     /// size. The host owns the stored size, so the runtime only reports it.
     ReaderTextSize {
@@ -56,6 +61,11 @@ pub(crate) enum ReaderWebEvent {
     SelectionChanged {
         url: String,
         selected_text: Option<String>,
+    },
+    ReadAloudStart {
+        url: String,
+        start_block: String,
+        blocks: Vec<ReadAloudPageBlock>,
     },
     TextSize {
         url: String,

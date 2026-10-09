@@ -110,6 +110,9 @@ impl ReaderApp {
         self.translations.override_mode = Some(mode);
         self.translations.effective = mode;
         if changed {
+            // 显示方式变了，正在朗读的文字也会变（译文 ↔ 原文）：先停下来，
+            // 让用户从新文字重新开始，而不是让朗读跳变。
+            self.stop_read_aloud(cx);
             if let Some(url) = self.current_reader_url.clone() {
                 self.configure_translations(&url, cx);
             }

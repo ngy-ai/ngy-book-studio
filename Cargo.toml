@@ -78,9 +78,15 @@ keyring = { version = "=4.2.0", default-features = false, features = ["v1"] }
 open = "5.4"
 # Match Wry's pinned WebView2 bindings for the native reader selection menu.
 webview2-com = "=0.38.2"
+# `Media_SpeechSynthesis` / `Media_Core` / `Media_Playback` 是朗读（TTS）用的：
+# 系统语音合成为 WAV 流后交给 `MediaPlayer` 播放，零模型、零新依赖。
 windows = { version = "0.61.3", features = [
     "Data_Pdf",
     "Foundation",
+    "Foundation_Collections",
+    "Media_Core",
+    "Media_Playback",
+    "Media_SpeechSynthesis",
     "Storage_Streams",
     "Win32_Foundation",
     "Win32_System_WinRT",

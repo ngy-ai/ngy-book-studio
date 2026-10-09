@@ -16,6 +16,13 @@ impl SystemSettingsWindow {
             default_language: settings.default_language.clone(),
             translation_display_mode: settings.translation_display_mode,
             use_proxy: settings.use_proxy,
+            speech_voice_id: settings.speech_voice_id.clone(),
+            speech_rate: settings.speech_rate,
+            // 系统语音列表读一次即可：枚举很快，但没必要每次渲染都问合成器。
+            // 读不到就当成「本机没有可用语音」，界面据此禁用朗读控件。
+            speech_voices: ngy_book_studio::speech::platform_engine()
+                .voices()
+                .unwrap_or_default(),
             state: SettingsWindowState::new(window),
             choosing_data_directory: false,
             confirm_overwrite: None,
@@ -30,6 +37,8 @@ impl SystemSettingsWindow {
         settings.default_language = self.default_language.clone();
         settings.translation_display_mode = self.translation_display_mode;
         settings.use_proxy = self.use_proxy;
+        settings.speech_voice_id = self.speech_voice_id.clone();
+        settings.speech_rate = self.speech_rate;
         settings.validate()?;
         Ok(settings)
     }
@@ -50,6 +59,39 @@ impl SystemSettingsWindow {
     ) {
         self.translation_display_mode = mode;
         cx.notify();
+    }
+
+    pub(crate) fn set_speech_voice(&mut self, voice_id: String, cx: &mut Context<Self>) {
+        self.speech_voice_id = voice_id;
+        cx.notify();
+    }
+
+    pub(crate) fn set_speech_rate(&mut self, rate: f32, cx: &mut Context<Self>) {
+        self.speech_rate = rate;
+        cx.notify();
+    }
+
+    /// 试听当前选择：合成一句话并播放到底。
+    ///
+    /// 合成与播放都在后台线程（会占用音频输出），界面只等一个结果提示；试听会
+    /// 打断正在进行的朗读——它是应用级播放资源，两者不能同时出声。
+    pub(crate) fn preview_speech(&mut self, cx: &mut Context<Self>) {
+        let voice_id = self.speech_voice_id.clone();
+        let rate = self.speech_rate;
+        let preview = cx
+            .background_executor()
+            .spawn(async move { ngy_book_studio::speech::preview(&voice_id, rate) });
+        cx.spawn(async move |view, cx| {
+            let outcome = preview.await;
+            let _ = view.update(cx, |this, cx| {
+                match outcome {
+                    Ok(()) => this.state.report("试听完成。".to_string(), false),
+                    Err(error) => this.state.report(format!("试听失败：{error:#}"), true),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// 更改数据目录：选新位置、校验、记录，然后重启墨页完成搬迁。

@@ -5,7 +5,7 @@ use super::*;
 
 /// 一次 AI 设置保存会写到的所有行。回滚按这份清单逐键恢复（缺过的行重新删掉），
 /// 所以**每个新设置键都必须加进来**，否则失败保存会留下一个半新半旧的行。
-pub(crate) const AI_SETTINGS_KEYS: [&str; 9] = [
+pub(crate) const AI_SETTINGS_KEYS: [&str; 10] = [
     PROVIDER_SETTINGS_KEY,
     CHAT_GENERATION_SETTINGS_KEY,
     TRANSLATION_GENERATION_SETTINGS_KEY,
@@ -15,6 +15,7 @@ pub(crate) const AI_SETTINGS_KEYS: [&str; 9] = [
     APPEARANCE_SETTINGS_KEY,
     TRANSLATION_SETTINGS_KEY,
     NETWORK_SETTINGS_KEY,
+    SPEECH_SETTINGS_KEY,
 ];
 
 pub(crate) fn snapshot_ai_settings(db_path: &Path) -> Result<Vec<Option<db::settings::Setting>>> {

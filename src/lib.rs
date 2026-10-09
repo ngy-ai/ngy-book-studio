@@ -22,6 +22,7 @@ pub mod reader;
 pub mod runtime;
 pub mod services;
 pub mod share;
+pub mod speech;
 pub mod startup;
 pub mod storage;
 pub mod theme;

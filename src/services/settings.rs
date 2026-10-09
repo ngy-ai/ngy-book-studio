@@ -16,6 +16,10 @@ pub(crate) const PDF_READER_SETTINGS_KEY: &str = "pdf.reader.preferences.v1";
 pub(crate) const APPEARANCE_SETTINGS_KEY: &str = "appearance.preferences.v1";
 pub(crate) const TRANSLATION_SETTINGS_KEY: &str = "translation.preferences.v1";
 pub(crate) const NETWORK_SETTINGS_KEY: &str = "ai.network.preferences.v1";
+/// 朗读（系统语音）的全局偏好：音色与语速。与上面的阅读偏好一样存进自己的
+/// settings key；它是**应用级**设置（所有阅读窗口共用一份），因此不按书记忆，
+/// 也就不需要任何删书清理。
+pub(crate) const SPEECH_SETTINGS_KEY: &str = "speech.preferences.v1";
 pub(crate) const WEB_SEARCH_CREDENTIAL_TARGET: &str = "ai.openai_compatible.web_search.v1";
 pub(crate) const MAX_MODEL_NAME_CHARS: usize = 256;
 /// 等待 `ai_configuration` 门闩的上限。
@@ -254,6 +258,32 @@ impl Default for PersistedPdfReaderSettings {
     }
 }
 
+/// 朗读（系统语音）偏好的持久化形状。字段在 [`ProviderSettings`] 里展开成
+/// `speech_voice_id` / `speech_rate` 两个基本类型，公开接口因此不暴露这个结构。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PersistedSpeechSettings {
+    #[serde(default)]
+    pub(crate) voice_id: String,
+    #[serde(default = "default_speech_rate")]
+    pub(crate) rate: f32,
+}
+
+impl Default for PersistedSpeechSettings {
+    fn default() -> Self {
+        Self {
+            voice_id: String::new(),
+            rate: default_speech_rate(),
+        }
+    }
+}
+
+/// 朗读的正常语速。只有这一个默认值：改它等于改变所有人的默认朗读手感，
+/// 不是一次普通重构。
+pub(crate) fn default_speech_rate() -> f32 {
+    1.0
+}
+
 /// 界面皮肤偏好。与上面的阅读偏好一样存进自己的 settings key，provider JSON 的
 /// 既有契约不变。
 ///
@@ -457,6 +487,14 @@ pub struct ProviderSettings {
     /// its own settings key, like the preferences above.
     #[serde(skip, default = "default_ai_use_proxy")]
     pub use_proxy: bool,
+    /// 朗读用的系统语音 ID；空串表示用系统默认语音。存进自己的 settings key
+    /// （`speech.preferences.v1`），与上面的偏好同理：应用级设置，所有阅读窗口共用。
+    #[serde(skip, default)]
+    pub speech_voice_id: String,
+    /// 朗读语速倍率。合法范围见 `ngy_book_studio::speech::SpeechRequest`；读取时按
+    /// 该范围钳制，手改坏的行不会让阅读窗口打不开。
+    #[serde(skip, default = "default_speech_rate")]
+    pub speech_rate: f32,
     pub embedding_model: String,
     /// Dimension override sent to the embedding provider. Changing this value
     /// invalidates all existing vector indices because stored vectors with the
@@ -546,6 +584,9 @@ impl Default for ProviderSettings {
             web_search_confirmed_remote_endpoint: String::new(),
             web_search_timeout_secs: crate::ai::web_search::DEFAULT_WEB_SEARCH_TIMEOUT_SECS,
             web_search_max_results: crate::ai::web_search::MAX_WEB_SEARCH_RESULTS,
+            // 空 ID 表示系统默认语音；默认语速 1.0 倍。
+            speech_voice_id: String::new(),
+            speech_rate: default_speech_rate(),
         }
     }
 }

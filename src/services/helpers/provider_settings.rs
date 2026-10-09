@@ -1,6 +1,7 @@
 //! Loading, validating and saving the provider settings.
 
 use super::*;
+use crate::speech::SpeechRequest;
 
 pub(crate) fn load_provider_settings(db_path: &Path) -> Result<ProviderSettings> {
     let mut conn = db::open_conn(db_path)?;
@@ -99,6 +100,17 @@ pub(crate) fn load_provider_settings(db_path: &Path) -> Result<ProviderSettings>
         }
         None => default_ai_use_proxy(),
     };
+    let speech = match db::settings::get(&tx, SPEECH_SETTINGS_KEY)? {
+        Some(row) => serde_json::from_str::<PersistedSpeechSettings>(&row.value_json)
+            .context("保存的朗读设置无效")?,
+        None => PersistedSpeechSettings::default(),
+    };
+    settings.speech_voice_id = speech.voice_id;
+    // Clamp instead of failing, like the background-job preference above: a
+    // hand-edited row must not prevent the reader from opening.
+    settings.speech_rate = speech
+        .rate
+        .clamp(SpeechRequest::RATE_MIN, SpeechRequest::RATE_MAX);
     settings.validate()?;
     tx.commit().context("无法完成 AI 设置快照读取")?;
     Ok(settings)
@@ -185,6 +197,15 @@ pub(crate) fn save_provider_settings(db_path: &Path, settings: &ProviderSettings
         .context("无法序列化网络设置")?,
         updated_at,
     };
+    let speech = db::settings::Setting {
+        key: SPEECH_SETTINGS_KEY.to_string(),
+        value_json: serde_json::to_string(&PersistedSpeechSettings {
+            voice_id: settings.speech_voice_id.clone(),
+            rate: settings.speech_rate,
+        })
+        .context("无法序列化朗读设置")?,
+        updated_at,
+    };
     let mut conn = db::open_conn(db_path)?;
     let tx = conn.transaction().context("无法开始保存 AI 设置")?;
     ensure!(
@@ -223,6 +244,7 @@ pub(crate) fn save_provider_settings(db_path: &Path, settings: &ProviderSettings
         db::settings::upsert(&tx, &network)? == 1,
         "网络设置未能保存"
     );
+    ensure!(db::settings::upsert(&tx, &speech)? == 1, "朗读设置未能保存");
     tx.commit().context("无法提交 AI 设置")?;
     Ok(())
 }

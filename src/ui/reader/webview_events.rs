@@ -183,6 +183,11 @@ impl ReaderApp {
             ReaderWebEvent::SelectionChanged { url, selected_text } => {
                 self.sync_selection(&url, selected_text, cx)
             }
+            ReaderWebEvent::ReadAloudStart {
+                url,
+                start_block,
+                blocks,
+            } => self.start_read_aloud_from_page(&url, start_block, blocks, cx),
             ReaderWebEvent::TextSize { url, font_size } => self.sync_text_size(&url, font_size, cx),
             ReaderWebEvent::CitationNavigationResult {
                 url,
@@ -194,10 +199,30 @@ impl ReaderApp {
         self.refresh_note_navigation_gate();
     }
 
+    /// 页面请求朗读。只接受**当前章页面**的请求：迟到的消息不能借旧页面启动朗读，
+    /// 段落列表本身也要过容量校验。
+    pub(crate) fn start_read_aloud_from_page(
+        &mut self,
+        url: &str,
+        start_block: String,
+        blocks: Vec<ReadAloudPageBlock>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.closing || !read_aloud_request_is_valid(&blocks) {
+            return;
+        }
+        if self.current_reader_url.as_deref() != Some(url) {
+            return;
+        }
+        self.start_read_aloud(blocks, &start_block, cx);
+    }
+
     pub(crate) fn sync_loaded_page(&mut self, url: &str, cx: &mut Context<Self>) {
         if self.closing {
             return;
         }
+        // 新章节或重新加载的页面：旧页面的朗读段落与高亮都不再对应当前 DOM。
+        self.stop_read_aloud(cx);
         let Some(spine_index) = self.book.spine_index_for_url(url) else {
             return;
         };

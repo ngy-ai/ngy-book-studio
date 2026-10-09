@@ -8,6 +8,10 @@
   闭合 Shadow DOM 隔离正文 CSS，覆盖层绘制而不改写正文节点。
   `src/ui/reader/selection_menu.rs` 是 EPUB 与 PDF 共用的 WebView2 原生「AI解释」菜单，
   由调用方提供私有文档判定与事件构造，仍要求 page/frame 为同一私有文档。
+- `src/ui/reader/speech.rs`、`read_aloud.js`：Reader 朗读（Windows 系统语音）。
+  页面按当前显示模式收集段落（有译文层就读译文）并发起朗读，宿主合成播放并把当前
+  段落推回页面高亮；切章、切显示方式与重新加载都会停止，进程内只允许一个朗读会话。
+  详见 `docs/agent/speech-and-read-aloud.md`。
 - `src/ui/reader/translations.rs`、`translations.js`：Reader 双语对照展示。宿主在
   `sync_loaded_page` 之后按当前书/单元从   `translations` 表读取与当前
   `(document_revision, unit_revision)`、翻译模型与翻译执行身份一致的译文，经 session/generation

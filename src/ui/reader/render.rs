@@ -65,6 +65,86 @@ impl Render for ReaderApp {
         let previous_view = view.clone();
         let next_view = view.clone();
         let notes_view = view.clone();
+        // 朗读控制：没有会话时是「朗读」，播放中换成暂停/继续与停止。段落文字由
+        // 页面提供（跟随译文显示方式），这里只管播放状态。
+        let read_aloud_controls = {
+            let active = self.read_aloud.is_active();
+            let paused = matches!(
+                self.read_aloud.state(),
+                Some(ngy_book_studio::speech::ReadAloudState::Paused)
+            );
+            let mut row = div().h_flex().gap_1();
+            if active {
+                let toggle = view.clone();
+                row = row
+                    .child(
+                        Button::new("reader-read-aloud-toggle")
+                            .ghost()
+                            .xsmall()
+                            .label(if paused { "继续" } else { "暂停" })
+                            .tooltip(if paused {
+                                "继续朗读"
+                            } else {
+                                "暂停朗读"
+                            })
+                            .on_click(move |_, _, cx| {
+                                toggle.update(cx, |this, cx| {
+                                    if paused {
+                                        this.resume_read_aloud(cx);
+                                    } else {
+                                        this.pause_read_aloud(cx);
+                                    }
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("reader-read-aloud-stop")
+                            .ghost()
+                            .xsmall()
+                            .label("停止")
+                            .tooltip("停止朗读并清除正文高亮")
+                            .on_click({
+                                let stop = view.clone();
+                                move |_, _, cx| {
+                                    stop.update(cx, |this, cx| this.stop_read_aloud(cx));
+                                }
+                            }),
+                    );
+            } else {
+                let start = view.clone();
+                row = row.child(
+                    Button::new("reader-read-aloud-start")
+                        .ghost()
+                        .xsmall()
+                        .label("朗读")
+                        .tooltip("从当前可见的段落开始朗读；鼠标移到段落上也有朗读按钮")
+                        .on_click(move |_, _, cx| {
+                            start.update(cx, |this, cx| this.start_read_aloud_from_viewport(cx));
+                        }),
+                );
+                // 音色与语速在「系统配置」里；入口贴着朗读按钮，省得用户去翻设置。
+                let settings_view = view.clone();
+                row = row.child(
+                    Button::new("reader-read-aloud-settings")
+                        .ghost()
+                        .xsmall()
+                        .label("设置")
+                        .tooltip("打开「系统配置」设置朗读音色与语速")
+                        .on_click(move |_, _, cx| {
+                            settings_view.update(cx, |this, cx| {
+                                if let Err(error) = crate::ui::ai_settings::open_ai_settings_window(
+                                    Arc::clone(&this.services),
+                                    crate::ui::ai_settings::AiSettingsSection::System,
+                                    cx,
+                                ) {
+                                    this.set_error(format!("无法打开系统配置：{error:#}"), cx);
+                                }
+                            });
+                        }),
+                );
+            }
+            row
+        };
         // The reading window owns the display choice for this book: once chosen it
         // wins over the global preference from the system configuration and is
         // stored per book, and "跟随全局" hands it back to that default. Without a
@@ -180,6 +260,7 @@ impl Render for ReaderApp {
                         div()
                             .h_flex()
                             .gap_2()
+                            .child(read_aloud_controls)
                             .when_some(display_switch, |row, switch| row.child(switch))
                             .when_some(follow_global, |row, button| row.child(button))
                             .child(

@@ -107,6 +107,16 @@ pub(crate) fn reader_ipc_event(uri: &wry::http::Uri, body: &str) -> Option<Reade
                 selected_text,
             })
         }
+        ReaderIpcMessage::ReadAloudStart {
+            start_block,
+            blocks,
+        } => (read_aloud_request_is_valid(&blocks) && start_block.len() <= 64).then(|| {
+            ReaderWebEvent::ReadAloudStart {
+                url: uri.to_string(),
+                start_block,
+                blocks,
+            }
+        }),
         ReaderIpcMessage::CitationNavigationResult {
             request_id,
             found,
