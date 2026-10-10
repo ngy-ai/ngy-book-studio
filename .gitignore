@@ -1,4 +1,4 @@
-/target/
+target/
 # 发布包产物（packaging/package.py 的输出），不入库。
 /dist/
 /node_modules/

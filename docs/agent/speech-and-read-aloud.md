@@ -32,9 +32,23 @@ PCM 缓冲自行编码成 16-bit 单声道 PCM 的 WAV）+ `AVAudioPlayer`，只
 Huihui / Kangkang / Yaoyao；macOS 上是 Ting-Ting 等（`say -v '?'` 可列出）。
 
 **macOS 分支的状态（2026-10-10）**：`src/speech/` 的 macOS 模块在 Windows 上用
-`aarch64-apple-darwin` 交叉编译检查通过（探针 crate 用 `include!` 引入项目源码，
-整包 macOS 构建仍受 C 依赖的 SDK 限制没有跑通）；**尚未在 macOS 上实际运行验证**，
-语速换算也是未标定的近似（见「语速映射」）。
+`aarch64-apple-darwin` 交叉编译检查通过（整包 macOS 构建仍受 C 依赖的 SDK 限制没有
+跑通）；**尚未在 macOS 上实际运行验证**，语速换算也是未标定的近似（见「语速映射」）。
+
+改动 `src/speech/` 的 macOS 代码后，在 Windows 上重建这份交叉编译检查（不需要
+macOS 机器，临时目录验证完即删）：
+
+1. `rustup target add aarch64-apple-darwin`；
+2. 建一个临时 crate（`[workspace]` 空表隔离），依赖 `anyhow`、`block2 =0.6.2`、
+   `objc2 =0.6.4`、`objc2-avf-audio =0.3.2`、`objc2-foundation =0.3.2`；
+3. 从 `engine.rs`（`mod avf` 起至文件尾）与 `player.rs`（`mod avf_audio` 起至文件尾）
+   各提取一份副本、去掉 `#[cfg(target_os = "macos")]` 行，用 `include!` 收进该 crate
+   的模块（`engine` 模块里再放一个与项目 `platform_engine()` 等价的入口，因为 `avf`
+   是私有模块）；`lib.rs` 复刻 `SpeechVoice` / `SpeechRequest` / `SpeechEngine` 三个
+   定义即可；
+4. `cargo check --target aarch64-apple-darwin`（零警告是基线）。
+
+副本是**快照**：项目源码改了要重新提取，否则验证的是旧代码。
 
 为什么不上本地小模型或云端：
 
