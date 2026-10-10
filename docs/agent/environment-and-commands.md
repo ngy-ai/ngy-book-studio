@@ -115,7 +115,8 @@ ignored-only --test-threads=1` 对应 `cargo test --lib --locked learning:: -- -
 ## 可选 DOM 门禁（Node + 已安装 Playwright）
 
 `src/ui/reader/translations.test.cjs`、`src/ui/reader/annotations.test.cjs`、
-`src/ui/pdf_reader/annotations.test.cjs`、`src/ui/pdf_reader/viewer.test.cjs` 用
+`src/ui/reader/read_aloud.test.cjs`、`src/ui/pdf_reader/annotations.test.cjs`、
+`src/ui/pdf_reader/viewer.test.cjs`、`src/ui/pdf_reader/read_aloud.test.cjs` 用
 `node --test <file>` 运行。它们只使用本机已安装的 Playwright，不为测试安装依赖、
 不触碰用户数据，`NGY_TEST_CHROMIUM` 可指定浏览器。改动 `src/ui/**/*.js` 的交互代码
 或 `web/pdf` 产物时建议跑对应门禁，并在 `ROADMAP.md` 或本文件记下结果。

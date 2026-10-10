@@ -8,10 +8,18 @@
   闭合 Shadow DOM 隔离正文 CSS，覆盖层绘制而不改写正文节点。
   `src/ui/reader/selection_menu.rs` 是 EPUB 与 PDF 共用的 WebView2 原生「AI解释」菜单，
   由调用方提供私有文档判定与事件构造，仍要求 page/frame 为同一私有文档。
-- `src/ui/reader/speech.rs`、`read_aloud.js`：Reader 朗读（Windows 系统语音）。
-  页面按当前显示模式收集段落（有译文层就读译文）并发起朗读，宿主合成播放并把当前
-  段落推回页面高亮；切章、切显示方式与重新加载都会停止，进程内只允许一个朗读会话。
-  详见 `docs/agent/speech-and-read-aloud.md`。
+- `src/ui/read_aloud.rs`：朗读的宿主共享层（Windows 系统语音）——会话状态机
+  `ReadAloudHost`、进程级单会话登记表 `ReadAloudRegistry`（登记的是弱引用与停止入口，
+  新会话开始前先停旧窗口）、段落容量校验与 `ReadAloudWindow` 的默认流程（读设置、起
+  会话、轮询、呈现、停止）。EPUB、PDF 与页面图片三个窗口各自只提供「读什么」与
+  「高亮怎么呈现」。
+- `src/ui/reader/speech.rs`、`read_aloud.js`：EPUB 阅读窗口的朗读适配。页面按当前显示
+  模式收集段落（有译文层就读译文）并发起朗读，宿主合成播放并把当前段落推回页面高亮；
+  切章、切显示方式与重新加载都会停止。详见 `docs/agent/speech-and-read-aloud.md`。
+- `src/ui/pdf_reader/speech.rs`、`read_aloud.js`：PDF 阅读窗口的朗读适配。页面从 PDF.js
+  文字层收集段落（只取已绘制页面，按行距把相邻行合并成段、超长段按句末标点切开、行序
+  几何回跳时另起段），起点跟随视口；高亮走页面脚本 `ngyPdfReadAloud`，读到已绘制范围的
+  末尾停止（滚出后续页面后再点一次即可继续）。PDF 不提供段落悬停按钮，只用工具栏入口。
 - `src/ui/reader/translations.rs`、`translations.js`：Reader 双语对照展示。宿主在
   `sync_loaded_page` 之后按当前书/单元从   `translations` 表读取与当前
   `(document_revision, unit_revision)`、翻译模型与翻译执行身份一致的译文，经 session/generation

@@ -62,6 +62,87 @@ impl Render for PdfReaderApp {
             palette(cx),
         );
 
+        // 朗读控制：没有会话时是「朗读」，播放中换成暂停/继续与停止。段落文字
+        // 由 viewer 的文字层提供，这里只管播放状态。
+        let read_aloud_controls = {
+            let active = self.read_aloud.is_active();
+            let paused = matches!(
+                self.read_aloud.state(),
+                Some(ngy_book_studio::speech::ReadAloudState::Paused)
+            );
+            let mut row = div().h_flex().gap_2();
+            if active {
+                let toggle = view.clone();
+                row = row
+                    .child(
+                        Button::new("pdf-read-aloud-toggle")
+                            .ghost()
+                            .label(if paused { "继续" } else { "暂停" })
+                            .tooltip(if paused {
+                                "继续朗读"
+                            } else {
+                                "暂停朗读"
+                            })
+                            .on_click(move |_, _, cx| {
+                                toggle.update(cx, |this, cx| {
+                                    if paused {
+                                        this.resume_read_aloud(cx);
+                                    } else {
+                                        this.pause_read_aloud(cx);
+                                    }
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("pdf-read-aloud-stop")
+                            .ghost()
+                            .label("停止")
+                            .tooltip("停止朗读并清除页面高亮")
+                            .on_click({
+                                let stop = view.clone();
+                                move |_, _, cx| {
+                                    stop.update(cx, |this, cx| this.stop_read_aloud(cx));
+                                }
+                            }),
+                    );
+            } else {
+                let start = view.clone();
+                row = row.child(
+                    Button::new("pdf-read-aloud-start")
+                        .ghost()
+                        .label("朗读")
+                        .tooltip("从当前可见的文字层段落开始朗读；读到已绘制页面的末尾停止")
+                        .on_click(move |_, _, cx| {
+                            start.update(cx, |this, cx| this.start_read_aloud_from_viewport(cx));
+                        }),
+                );
+                // 音色与语速在「系统配置」里；入口贴着朗读按钮，省得用户去翻设置。
+                let settings_view = view.clone();
+                row = row.child(
+                    Button::new("pdf-read-aloud-settings")
+                        .ghost()
+                        .label("设置")
+                        .tooltip("打开「系统配置」设置朗读音色与语速")
+                        .on_click(move |_, _, cx| {
+                            settings_view.update(cx, |this, cx| {
+                                if let Err(error) = crate::ui::ai_settings::open_ai_settings_window(
+                                    Arc::clone(&this.services),
+                                    crate::ui::ai_settings::AiSettingsSection::System,
+                                    cx,
+                                ) {
+                                    this.notice = Some(Notice {
+                                        text: format!("无法打开系统配置：{error:#}"),
+                                        error: true,
+                                    });
+                                    cx.notify();
+                                }
+                            });
+                        }),
+                );
+            }
+            row
+        };
+
         let toolbar = div()
             .v_flex()
             .bg(rgb(palette(cx).surface))
@@ -126,6 +207,7 @@ impl Render for PdfReaderApp {
                         div()
                             .h_flex()
                             .gap_2()
+                            .child(read_aloud_controls)
                             .child(
                                 Button::new("pdf-book-notes")
                                     .ghost()

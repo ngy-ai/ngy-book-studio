@@ -102,6 +102,17 @@ impl PdfReaderApp {
                 };
                 self.request_page(target, cx);
             }
+            PdfIpcMessage::ReadAloudStart {
+                start_block,
+                blocks,
+            } => {
+                // 段落列表按不可信输入校验（共享层）；消息本身只可能来自私有
+                // origin 的 viewer 页面，长度上限仍然要兜住。
+                if start_block.len() <= 64 {
+                    self.start_read_aloud(blocks, &start_block, cx);
+                }
+                return;
+            }
             // The viewer already re-laid out at the scale the reader wheeled to,
             // so the host only stores it. A scale outside the range the viewer
             // clamps means the message did not come from it, and is dropped

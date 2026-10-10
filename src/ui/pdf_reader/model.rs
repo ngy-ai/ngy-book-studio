@@ -120,4 +120,10 @@ pub(crate) enum PdfIpcMessage {
         #[serde(rename = "zoomMilli")]
         zoom_milli: u32,
     },
+    /// 页面请求从某一段开始朗读：列表是已绘制页面文字层里的段落（id + 文字）。
+    #[serde(rename = "read_aloud_start")]
+    ReadAloudStart {
+        start_block: String,
+        blocks: Vec<ReadAloudPageBlock>,
+    },
 }

@@ -2,18 +2,81 @@
 
 use super::*;
 
+/// 一段文字最多多少字符：超过就按句末标点切成多段。
+pub(crate) const MAX_PAGE_TEXT_PARAGRAPH_CHARS: usize = 480;
+
+/// 把一页纯文本切成段落。显示与朗读共用这一份切分：段落索引就是朗读块 id，
+/// 高亮按同一个索引对齐。DjVu 的隐藏文字层常把一整页塞成一行，所以超过一段
+/// 上限的行再按句末标点切开——既不让一段朗读太久，也不越过共享层的单段上限。
+pub(crate) fn page_text_paragraphs(text: &str) -> Vec<String> {
+    let mut paragraphs = Vec::new();
+    for line in text.split('\n') {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.chars().count() <= MAX_PAGE_TEXT_PARAGRAPH_CHARS {
+            paragraphs.push(line.to_string());
+            continue;
+        }
+        paragraphs.extend(split_long_paragraph(line));
+    }
+    paragraphs
+}
+
+/// 句子结束的标点。不放英文句点：小数与缩写会被切得支离破碎。
+fn is_sentence_end(character: char) -> bool {
+    matches!(character, '。' | '！' | '？' | '!' | '?' | ';' | '；' | '…')
+}
+
+fn split_long_paragraph(line: &str) -> Vec<String> {
+    let mut paragraphs = Vec::new();
+    let mut rest = line;
+    while rest.chars().count() > MAX_PAGE_TEXT_PARAGRAPH_CHARS {
+        let mut cut = 0usize;
+        let mut sentence_end = 0usize;
+        for (units, (offset, character)) in rest.char_indices().enumerate() {
+            if units >= MAX_PAGE_TEXT_PARAGRAPH_CHARS {
+                break;
+            }
+            cut = offset + character.len_utf8();
+            if is_sentence_end(character) {
+                sentence_end = cut;
+            }
+        }
+        // 句末标点太靠前（不到一半）就不用它，避免切出很短的一段。
+        if sentence_end < cut / 2 {
+            sentence_end = cut;
+        }
+        paragraphs.push(rest[..sentence_end].trim().to_string());
+        rest = rest[sentence_end..].trim_start();
+    }
+    if !rest.is_empty() {
+        paragraphs.push(rest.to_string());
+    }
+    paragraphs.retain(|paragraph| !paragraph.is_empty());
+    paragraphs
+}
+
 /// Escapes a page's plain text into the HTML subset `TextView` renders.
-pub(crate) fn page_text_html(text: &str, has_hidden_text: bool) -> String {
+///
+/// `highlight` 是当前朗读段的索引：给它包一个 `<mark>`（组件层把 `<mark>` 折成
+/// 高亮标记），面板因此能跟着朗读走，不需要任何新 API。
+pub(crate) fn page_text_html(
+    text: &str,
+    has_hidden_text: bool,
+    highlight: Option<usize>,
+) -> String {
     if !has_hidden_text {
         return "<p>本页没有文字层；页面图片仅供阅读，不参与搜索或 AI 引用。</p>".to_string();
     }
     let mut html = String::with_capacity(text.len() + 16);
-    for paragraph in text.split('\n') {
-        let paragraph = paragraph.trim();
-        if paragraph.is_empty() {
-            continue;
-        }
+    for (index, paragraph) in page_text_paragraphs(text).iter().enumerate() {
         html.push_str("<p>");
+        let marked = highlight == Some(index);
+        if marked {
+            html.push_str("<mark>");
+        }
         for character in paragraph.chars() {
             match character {
                 '&' => html.push_str("&amp;"),
@@ -21,6 +84,9 @@ pub(crate) fn page_text_html(text: &str, has_hidden_text: bool) -> String {
                 '>' => html.push_str("&gt;"),
                 other => html.push(other),
             }
+        }
+        if marked {
+            html.push_str("</mark>");
         }
         html.push_str("</p>");
     }

@@ -78,7 +78,7 @@ impl ReaderApp {
             return;
         }
         // 换章即停：正在朗读的段落与高亮都属于上一章的 DOM。
-        // （关闭窗口不必显式停止：会话在 `ReaderReadAloud` 里，随窗口释放一起收敛。）
+        // （关闭窗口不必显式停止：会话在 `ReadAloudHost` 里，随窗口释放一起收敛。）
         self.stop_read_aloud(cx);
         let Some(spine) = self.book.spine.get(spine_index) else {
             return;

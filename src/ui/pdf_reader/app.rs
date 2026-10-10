@@ -117,6 +117,7 @@ impl PdfReaderApp {
             page_list_scroll: gpui_kit::UniformListScrollHandle::new(),
             page_list_synced_page: None,
             annotations: PdfAnnotations::new(document_revision),
+            read_aloud: ReadAloudHost::default(),
             _annotation_ai_subscription,
             _annotation_ai_submit_subscription,
             _annotation_ai_failure_subscription,

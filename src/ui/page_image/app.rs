@@ -54,6 +54,8 @@ impl PageImageApp {
             zoom_save_task: None,
             page_texts,
             text_panel_open: false,
+            read_aloud: ReadAloudHost::default(),
+            read_aloud_paragraph: None,
             progress_writer: None,
             progress_sync_task: None,
             services,

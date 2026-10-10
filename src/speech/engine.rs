@@ -31,8 +31,10 @@ pub struct SpeechRequest {
 
 impl SpeechRequest {
     /// 语速倍率的允许范围。上下界同时用于设置校验与合成钳制，避免两边各写一份。
+    /// 界面的预设档位（0.75x–2.0x）与下界都在系统语音的原生表达能力内；上界
+    /// 10.0 超出（实测约 5.7 倍处饱和），超出的部分需要重采样补齐，尚未实现。
     pub const RATE_MIN: f32 = 0.5;
-    pub const RATE_MAX: f32 = 2.0;
+    pub const RATE_MAX: f32 = 10.0;
 
     pub fn new(text: impl Into<String>, voice_id: impl Into<String>, rate: f32) -> Self {
         Self {
@@ -82,81 +84,146 @@ impl SpeechEngine for UnsupportedSpeechEngine {
 mod winrt {
     use super::*;
 
+    use std::sync::OnceLock;
+    use std::sync::mpsc::{Sender, channel};
+
     use anyhow::Context as _;
-    use windows::Media::SpeechSynthesis::SpeechSynthesizer;
+    use windows::Media::SpeechSynthesis::{SpeechSynthesizer, VoiceInformation};
     use windows::Storage::Streams::{Buffer, DataReader, InputStreamOptions};
     use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize};
     use windows::core::HSTRING;
 
-    /// WinRT 的 `SpeakingRate` 以 0.0 为正常速度，负值变慢、正值变快；这里按
-    /// 倍率差映射（1.0 倍 → 0.0），并钳到 WinRT 接受的范围，避免非法值让整次
-    /// 合成失败。
-    const WINRT_RATE_MIN: f64 = -1.0;
-    const WINRT_RATE_MAX: f64 = 2.0;
+    /// WinRT `SpeakingRate` 的实测有效范围与语义（2026-10-10 在 Huihui 与
+    /// David 上实测，曲线由引擎决定、与具体语音无关）：
+    /// - `0.2..=5.0` 内朗读时长与 `rate` 成反比（`rate` 档的时长 = `1.0` 档
+    ///   的时长 / `rate`），即 rate 本身就是倍率，映射是恒等；
+    /// - 负值被引擎忽略（与 0.0 输出逐字节一致），0.0 是语音库自己的慢速
+    ///   基准（约为 1.0 档的 1/5.7），所以不能用负值表达慢速；
+    /// - 大于 5.0 后增益递减，约 5.7 倍处饱和。
+    ///
+    /// 钳制只用于兜底：`SpeechRequest` 已把 rate 限制在 `0.5..=10.0`。
+    const WINRT_RATE_MIN: f64 = 0.2;
+    const WINRT_RATE_MAX: f64 = 5.0;
 
     #[derive(Debug, Default)]
     pub(super) struct WinRtSpeechEngine;
 
     impl SpeechEngine for WinRtSpeechEngine {
         fn voices(&self) -> Result<Vec<SpeechVoice>> {
-            ensure_apartment()?;
-            let all = SpeechSynthesizer::AllVoices().context("无法枚举系统语音")?;
-            let count = all.Size().context("无法读取系统语音数量")?;
-            let mut voices = Vec::with_capacity(count as usize);
-            for index in 0..count {
-                let voice = all.GetAt(index).context("无法读取系统语音")?;
-                let id = voice.Id().context("无法读取系统语音 ID")?.to_string();
-                let label = voice
-                    .DisplayName()
-                    .context("无法读取系统语音名称")?
-                    .to_string();
-                let language = voice
-                    .Language()
-                    .context("无法读取系统语音语言")?
-                    .to_string();
-                // 没有 ID 的语音无法持久化，也就无法再次选中：跳过。
-                if id.trim().is_empty() {
-                    continue;
-                }
-                voices.push(SpeechVoice {
-                    id,
-                    label,
-                    language,
-                });
-            }
-            Ok(voices)
+            with_winrt(collect_voices)
         }
 
         fn synthesize(&self, request: &SpeechRequest) -> Result<Vec<u8>> {
-            ensure_apartment()?;
-            let synthesizer = SpeechSynthesizer::new().context("无法创建系统语音合成器")?;
-            if !request.voice_id.is_empty() {
-                let voice = find_voice(&request.voice_id)?;
-                synthesizer
-                    .SetVoice(&voice)
-                    .with_context(|| format!("无法选用系统语音 {}", request.voice_id))?;
-            }
-            let options = synthesizer.Options().context("无法读取语音合成选项")?;
-            let rate = f64::from(request.rate) - 1.0;
-            options
-                .SetSpeakingRate(rate.clamp(WINRT_RATE_MIN, WINRT_RATE_MAX))
-                .context("无法设置朗读语速")?;
-            let stream = synthesizer
-                .SynthesizeTextToStreamAsync(&HSTRING::from(request.text.as_str()))
-                .context("无法开始语音合成")?
-                .get()
-                .context("语音合成失败")?;
-            read_stream(&stream)
+            let request = request.clone();
+            with_winrt(move || synthesize_wav(&request))
         }
     }
 
-    fn find_voice(voice_id: &str) -> Result<windows::Media::SpeechSynthesis::VoiceInformation> {
+    /// 投递到 WinRT 线程的一次任务。
+    type WinrtJob = Box<dyn FnOnce() + Send>;
+
+    static WINRT_WORKER: OnceLock<Sender<WinrtJob>> = OnceLock::new();
+
+    /// 所有 WinRT 调用都投递到这一个常驻线程上执行。
+    ///
+    /// 这样同时绕开两个坑：
+    /// 1. `windows` crate 的工厂激活缓存把接口指针缓存在进程里，**跨公寓**使用会
+    ///    打出访问违例（0xC0000005；并行跑整套测试时在 `AllVoices` 上随机复现，
+    ///    加锁并不能修——问题不在并发，而在缓存对象被别的公寓的线程使用）；
+    /// 2. `RoInitialize` 在已经是 STA 的线程上会以 `RPC_E_CHANGED_MODE` 失败，
+    ///    静默忽略就把 WinRT 调用留在了没有正确公寓的线程上。
+    ///
+    /// 工作线程只初始化一次 MTA 公寓，之后所有调用都在同一个正确的公寓里；朗读
+    /// 本身是串行资源（同一时刻只允许一个会话，试听也会打断朗读），一次线程切换
+    /// 的开销可以忽略。
+    fn with_winrt<T: Send + 'static>(
+        job: impl FnOnce() -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let (sender, receiver) = channel();
+        winrt_worker()
+            .send(Box::new(move || {
+                let _ = sender.send(job());
+            }))
+            .map_err(|_| anyhow::anyhow!("WinRT 工作线程已退出"))?;
+        receiver
+            .recv()
+            .map_err(|_| anyhow::anyhow!("WinRT 工作线程已退出"))?
+    }
+
+    fn winrt_worker() -> &'static Sender<WinrtJob> {
+        WINRT_WORKER.get_or_init(|| {
+            let (sender, receiver) = channel::<WinrtJob>();
+            std::thread::Builder::new()
+                .name("ngy-winrt".to_string())
+                .spawn(move || {
+                    // 失败（例如线程已经在别的公寓）不在这里拦，交给真正的 WinRT
+                    // 调用去报错如何应对。
+                    let _ = unsafe { RoInitialize(RO_INIT_MULTITHREADED) };
+                    while let Ok(job) = receiver.recv() {
+                        job();
+                    }
+                })
+                .expect("启动 WinRT 工作线程");
+            sender
+        })
+    }
+
+    fn collect_voices() -> Result<Vec<SpeechVoice>> {
+        let all = SpeechSynthesizer::AllVoices().context("无法枚举系统语音")?;
+        let count = all.Size().context("无法读取系统语音数量")?;
+        let mut voices = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let voice = all.GetAt(index).context("无法读取系统语音")?;
+            let id = voice.Id().context("无法读取系统语音 ID")?.to_string();
+            let label = voice
+                .DisplayName()
+                .context("无法读取系统语音名称")?
+                .to_string();
+            let language = voice
+                .Language()
+                .context("无法读取系统语音语言")?
+                .to_string();
+            // 没有 ID 的语音无法持久化，也就无法再次选中：跳过。
+            if id.trim().is_empty() {
+                continue;
+            }
+            voices.push(SpeechVoice {
+                id,
+                label,
+                language,
+            });
+        }
+        Ok(voices)
+    }
+
+    fn synthesize_wav(request: &SpeechRequest) -> Result<Vec<u8>> {
+        let synthesizer = SpeechSynthesizer::new().context("无法创建系统语音合成器")?;
+        if !request.voice_id.is_empty() {
+            let voice = find_voice(&request.voice_id)?;
+            synthesizer
+                .SetVoice(&voice)
+                .with_context(|| format!("无法选用系统语音 {}", request.voice_id))?;
+        }
+        let options = synthesizer.Options().context("无法读取语音合成选项")?;
+        // 恒等映射：WinRT 的 rate 实测就是倍率（见 `WINRT_RATE_MIN` 的注释）。
+        options
+            .SetSpeakingRate(f64::from(request.rate).clamp(WINRT_RATE_MIN, WINRT_RATE_MAX))
+            .context("无法设置朗读语速")?;
+        let stream = synthesizer
+            .SynthesizeTextToStreamAsync(&HSTRING::from(request.text.as_str()))
+            .context("无法开始语音合成")?
+            .get()
+            .context("语音合成失败")?;
+        read_stream(&stream)
+    }
+
+    fn find_voice(voice_id: &str) -> Result<VoiceInformation> {
         let all = SpeechSynthesizer::AllVoices().context("无法枚举系统语音")?;
         let count = all.Size().context("无法读取系统语音数量")?;
         for index in 0..count {
             let voice = all.GetAt(index).context("无法读取系统语音")?;
             if let Ok(id) = voice.Id()
-                && id.to_string() == voice_id
+                && id == voice_id
             {
                 return Ok(voice);
             }
@@ -184,13 +251,5 @@ mod winrt {
             .context("无法取出合成音频字节")?;
         anyhow::ensure!(!bytes.is_empty(), "语音合成没有产生音频");
         Ok(bytes)
-    }
-
-    /// WinRT 调用要求当前线程已进入 COM 单元。朗读线程是我们自己起的阻塞线程，
-    /// 这里按 MTA 初始化；失败（例如线程已在别的单元）不在这里拦，交给真正的
-    /// WinRT 调用去报错，避免把「已经初始化」误判成错误。
-    fn ensure_apartment() -> Result<()> {
-        let _ = unsafe { RoInitialize(RO_INIT_MULTITHREADED) };
-        Ok(())
     }
 }

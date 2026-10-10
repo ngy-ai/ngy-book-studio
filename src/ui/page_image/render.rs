@@ -39,6 +39,59 @@ impl Render for PageImageApp {
             .unwrap_or_default();
         let has_hidden_text = !page_text.trim().is_empty();
 
+        // 朗读控制：只在 DjVu 页面上提供（Office 逐页预览是图片页，没有文字层；
+        // Office 图书的结构化阅读在阅读窗口里，那里已经支持朗读）。
+        let read_aloud_controls = (kind == VisualPageSourceKind::Djvu).then(|| {
+            let start = cx.entity().clone();
+            let toggle = cx.entity().clone();
+            let stop = cx.entity().clone();
+            let mut row = div().h_flex().gap_2();
+            if self.read_aloud.is_active() {
+                let paused = matches!(
+                    self.read_aloud.state(),
+                    Some(ngy_book_studio::speech::ReadAloudState::Paused)
+                );
+                row = row
+                    .child(
+                        Button::new("page-image-read-aloud-toggle")
+                            .outline()
+                            .label(if paused {
+                                "继续朗读"
+                            } else {
+                                "暂停朗读"
+                            })
+                            .on_click(move |_, _, cx| {
+                                toggle.update(cx, |this, cx| {
+                                    if paused {
+                                        this.resume_read_aloud(cx);
+                                    } else {
+                                        this.pause_read_aloud(cx);
+                                    }
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("page-image-read-aloud-stop")
+                            .outline()
+                            .label("停止朗读")
+                            .on_click(move |_, _, cx| {
+                                stop.update(cx, |this, cx| this.stop_read_aloud(cx));
+                            }),
+                    );
+            } else {
+                row = row.child(
+                    Button::new("page-image-read-aloud-start")
+                        .outline()
+                        .label("朗读")
+                        .tooltip("从本页文字的第一段开始朗读；翻页会停止")
+                        .on_click(move |_, _, cx| {
+                            start.update(cx, |this, cx| this.start_read_aloud(cx));
+                        }),
+                );
+            }
+            row
+        });
+
         let page_area: AnyElement = if zoom_milli == ZOOM_FIT {
             div()
                 .id("page-image-fit")
@@ -116,6 +169,7 @@ impl Render for PageImageApp {
                     SharedString::from(page_text_html(
                         &page_text_preview(page_text),
                         has_hidden_text,
+                        self.read_aloud_paragraph,
                     )),
                     window,
                     cx,
@@ -160,6 +214,7 @@ impl Render for PageImageApp {
                             .h_flex()
                             .flex_none()
                             .gap_2()
+                            .children(read_aloud_controls)
                             .when(kind == VisualPageSourceKind::Djvu, |bar| {
                                 bar.child(
                                     Button::new("page-image-text-panel")

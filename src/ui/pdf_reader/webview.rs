@@ -53,6 +53,7 @@ pub(crate) async fn build_pdf_reader_webview(
         })
         .with_navigation_handler(|url| is_pdf_navigation_url(&url))
         .with_initialization_script(include_str!("annotations.js"))
+        .with_initialization_script(include_str!("read_aloud.js"))
         .with_new_window_req_handler(|_, _| wry::NewWindowResponse::Deny)
         .with_download_started_handler(|_, _| false)
         // 首页渲染出来之前显示的是这个底色，所以它要和 viewer 的外壳同色。

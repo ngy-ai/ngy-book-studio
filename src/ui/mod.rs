@@ -10,6 +10,7 @@ mod library;
 mod notes;
 mod page_image;
 mod pdf_reader;
+mod read_aloud;
 mod reader;
 
 #[cfg(test)]
@@ -110,6 +111,8 @@ mod window_registry;
 pub(crate) use lifecycle::*;
 
 pub(crate) use pdf_window::*;
+
+pub(crate) use read_aloud::*;
 
 pub(crate) use source::*;
 

@@ -82,8 +82,6 @@ pub(crate) use reference::*;
 
 pub(crate) use script::*;
 
-pub(crate) use speech::*;
-
 pub(crate) use translation_display::*;
 
 pub(crate) use webview::*;
@@ -127,7 +125,7 @@ pub struct ReaderApp {
     pub(crate) annotations: ReaderAnnotations,
     pub(crate) translations: ReaderTranslations,
     /// 朗读（系统语音）的会话状态。进程级资源：同一时刻只有一个窗口在朗读。
-    pub(crate) read_aloud: ReaderReadAloud,
+    pub(crate) read_aloud: ReadAloudHost,
     pub(crate) _annotation_ai_subscription: Subscription,
     pub(crate) _annotation_ai_submit_subscription: Subscription,
     pub(crate) _annotation_ai_failure_subscription: Subscription,

@@ -225,15 +225,45 @@ fn repaginated_office_pages_are_preview_only_and_not_ai_references() {
 
 #[test]
 fn djvu_page_text_is_escaped_and_zoom_is_clamped() {
-    let html = page_text_html("First line & <tag>\n\nSecond line", true);
+    let html = page_text_html("First line & <tag>\n\nSecond line", true, None);
     assert_eq!(
         html,
         "<p>First line &amp; &lt;tag&gt;</p><p>Second line</p>"
     );
-    assert!(page_text_html("", false).contains("没有文字层"));
+    assert!(page_text_html("", false, None).contains("没有文字层"));
+
+    // 朗读中的段落包一个 <mark>，其它段落不受影响；面板的段落索引与朗读块 id
+    // 是同一份切分。
+    let highlighted = page_text_html("First line & <tag>\n\nSecond line", true, Some(1));
+    assert_eq!(
+        highlighted,
+        "<p>First line &amp; &lt;tag&gt;</p><p><mark>Second line</mark></p>"
+    );
+    assert_eq!(page_text_paragraphs("First line\n\nSecond line").len(), 2);
 
     assert_eq!(zoomed_size(800, 1_200, 500), (400.0, 600.0));
     assert_eq!(zoomed_size(1, 1, 250), (1.0, 1.0));
+}
+
+#[test]
+fn a_long_djvu_line_splits_into_speakable_paragraphs() {
+    // 文字层把一整页塞成一行时，段落按句末标点切开：每段都短于上限，且拼接
+    // 回来的文字与原文逐字相同（切分只去掉了分段处的空白）。
+    let page = "第一句。第二句！第三句？".repeat(120);
+    let paragraphs = page_text_paragraphs(&page);
+    assert!(paragraphs.len() > 1, "{}", paragraphs.len());
+    assert!(
+        paragraphs
+            .iter()
+            .all(|paragraph| paragraph.chars().count() <= MAX_PAGE_TEXT_PARAGRAPH_CHARS)
+    );
+    assert_eq!(paragraphs.concat(), page);
+
+    // 没有句末标点的长行也能切：按上限硬切，不留空段。
+    let punctuation_free = "字".repeat(MAX_PAGE_TEXT_PARAGRAPH_CHARS * 2 + 7);
+    let paragraphs = page_text_paragraphs(&punctuation_free);
+    assert_eq!(paragraphs.len(), 3);
+    assert_eq!(paragraphs.concat(), punctuation_free);
 }
 
 #[test]

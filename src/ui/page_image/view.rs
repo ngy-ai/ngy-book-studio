@@ -10,6 +10,8 @@ impl PageImageApp {
             cx.notify();
             return;
         }
+        // 换页即停：正在读的段落与高亮都属于上一页的文字层。
+        self.stop_read_aloud(cx);
         self.current = index;
         self.sync_ai_references(cx);
         self.queue_progress(cx);
@@ -151,6 +153,7 @@ impl PageImageApp {
             return true;
         }
         self.closing = true;
+        self.stop_read_aloud(cx);
         self.ai_sidebar.update(cx, |sidebar, cx| {
             sidebar.cancel_for_window_close(cx);
         });

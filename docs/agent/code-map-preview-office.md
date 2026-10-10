@@ -17,3 +17,8 @@
   工作者、只读临时导出和持久视觉渲染器；原件禁用宏和外链更新，派生页按当前
   renderer/revision/profile 发布，失败时回退结构化预览。
 - `src/reader.rs`、`src/epub_limits.rs`：EPUB 投影、资源授权、导航 URL 和归档安全上限。
+- `src/ui/page_image/`：页面图片窗口（DjVu 与 Office 逐页预览共用）。`text.rs` 的
+  `page_text_paragraphs` 是显示与朗读共用的分段：面板 HTML 与朗读块按同一个段落索引
+  对齐，`page_text_html` 给当前朗读段包 `<mark>`，两处切分不得分叉。`speech.rs` 接
+  `src/ui/read_aloud.rs` 的共享朗读层；翻页与关闭窗口停止朗读。Office 逐页预览是图片页、
+  没有文字层，不提供朗读按钮（结构化阅读在阅读窗口，那里已支持朗读）。

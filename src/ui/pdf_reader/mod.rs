@@ -35,6 +35,8 @@ mod render;
 
 mod selection;
 
+mod speech;
+
 mod viewer;
 
 mod webview;
@@ -82,6 +84,8 @@ pub struct PdfReaderApp {
     pub(crate) page_list_scroll: gpui_kit::UniformListScrollHandle,
     pub(crate) page_list_synced_page: Option<u32>,
     pub(crate) annotations: PdfAnnotations,
+    /// 朗读（系统语音）的会话状态。进程级资源：同一时刻只有一个窗口在朗读。
+    pub(crate) read_aloud: ReadAloudHost,
     pub(crate) _annotation_ai_subscription: Subscription,
     pub(crate) _annotation_ai_submit_subscription: Subscription,
     pub(crate) _annotation_ai_failure_subscription: Subscription,

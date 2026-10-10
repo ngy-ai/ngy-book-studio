@@ -46,8 +46,8 @@ Windows/MSVC 是当前验收平台。依赖虽然启用了部分 Unix 图形后�
 | `docs/agent/code-map-ai.md` | `ai/` 全部：OpenAI-compatible 访问、检索、索引与整本翻译后台任务、只读 Agent、分段协议与诊断 | 改 AI 后端、检索索引、翻译任务或 Agent 时 |
 | `docs/agent/code-map-preview-office.md` | `preview/`、Windows PDF 与 DjVu 渲染器、Office COM/增强预览、`reader.rs`、`epub_limits.rs` | 改派生页面渲染、Office 增强、EPUB 投影与资源授权时 |
 | `docs/agent/code-map-ui.md` | `ui/` 各窗口、AI 设置五窗口、后台任务窗口、编辑器导航 | 改 GPUI 界面与窗口时 |
-| `docs/agent/code-map-reader.md` | Reader 笔记宿主、双语对照、朗读（系统语音）、PDF 页面笔记与笔记浏览窗口 | 改阅读窗口的笔记、译文、朗读或前端交互时 |
-| `docs/agent/speech-and-read-aloud.md` | 朗读的引擎选型（为什么先用 Windows 系统语音）、术语、生命周期与容量约束 | 改朗读、语音合成或阅读窗口的朗读交互时 |
+| `docs/agent/code-map-reader.md` | Reader 笔记宿主、双语对照、EPUB/PDF 朗读适配、PDF 页面笔记与笔记浏览窗口 | 改阅读窗口的笔记、译文、朗读或前端交互时 |
+| `docs/agent/speech-and-read-aloud.md` | 朗读的引擎选型（为什么先用 Windows 系统语音）、三个窗口的分工、术语、生命周期与容量约束 | 改朗读、语音合成或任一阅读窗口的朗读交互时 |
 | `docs/agent/code-map-web.md` | `web/editor`、`web/pdf` 源码与前端构建产物契约 | 改前端源码或重建产物时 |
 | `docs/agent/learning.md` | 学习中心模块与 `courses/` Python 课程实验包 | 改学习窗口、学习档案或课程包时 |
 | `docs/agent/environment-and-commands.md` | 运行环境、常用命令、nextest 与 DOM 门禁、真实语料门禁、数据目录与日志落点、AI/导入/阅读器诊断日志 | 要跑命令、排障或抓日志时 |

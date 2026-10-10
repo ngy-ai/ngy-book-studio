@@ -31,6 +31,8 @@ mod reference;
 
 mod render;
 
+mod speech;
+
 mod text;
 
 mod view;
@@ -64,6 +66,10 @@ pub(crate) struct PageImageApp {
     /// the hidden text layer is the page's searchable text.
     pub(crate) page_texts: Vec<Option<String>>,
     pub(crate) text_panel_open: bool,
+    /// 朗读（系统语音）的会话状态。进程级资源：同一时刻只有一个窗口在朗读。
+    pub(crate) read_aloud: ReadAloudHost,
+    /// 正在朗读的段落索引（「本页文字」面板里的第 n 段），用于面板高亮。
+    pub(crate) read_aloud_paragraph: Option<usize>,
     pub(crate) progress_writer: Option<ReadingProgressWriter>,
     pub(crate) progress_sync_task: Option<Task<()>>,
     pub(crate) services: Arc<AppServices>,
