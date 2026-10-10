@@ -1,4 +1,4 @@
-# 朗读（Windows 系统语音）
+# 朗读（Windows 与 macOS 系统语音）
 
 > 本文件由根 `AGENTS.md` 拆分而来；全局约束与文档索引见根 `AGENTS.md`。
 
@@ -21,18 +21,26 @@
 当前朗读段尽量滚到可视区；高亮只切换一个可逆的类（DjVu 面板用 `<mark>`）。朗读不写
 数据库、不改正文：原文、笔记锚点、选区文本与 AI 引用都不受影响。
 
-## 引擎：为什么先用 Windows 系统语音
+## 引擎：为什么用系统语音
 
-`src/speech/` 是引擎边界（`SpeechEngine`：列出语音 + 把一段文字合成成 WAV 字节），
-当前实现是 WinRT `SpeechSynthesizer`，播放用 `MediaPlayer`——两者都复用项目已有的
-`windows` crate（只加 feature），**零新依赖、零模型、离线、首字延迟低于 100ms**。
-本机已装的中文语音：Microsoft Huihui / Kangkang / Yaoyao。
+`src/speech/` 是引擎边界（`SpeechEngine`：列出语音 + 把一段文字合成成 WAV 字节）。
+Windows 实现是 WinRT `SpeechSynthesizer` + `MediaPlayer`，复用项目已有的 `windows`
+crate（只加 feature）；macOS 实现是 AVFAudio 的 `AVSpeechSynthesizer`（合成回调里的
+PCM 缓冲自行编码成 16-bit 单声道 PCM 的 WAV）+ `AVAudioPlayer`，只加了
+`objc2-avf-audio` 绑定（`objc2` / `objc2-foundation` 本来就在依赖树里）。两边都是
+**零模型、离线、首字延迟低于 100ms**。Windows 本机已装的中文语音：Microsoft
+Huihui / Kangkang / Yaoyao；macOS 上是 Ting-Ting 等（`say -v '?'` 可列出）。
+
+**macOS 分支的状态（2026-10-10）**：`src/speech/` 的 macOS 模块在 Windows 上用
+`aarch64-apple-darwin` 交叉编译检查通过（探针 crate 用 `include!` 引入项目源码，
+整包 macOS 构建仍受 C 依赖的 SDK 限制没有跑通）；**尚未在 macOS 上实际运行验证**，
+语速换算也是未标定的近似（见「语速映射」）。
 
 为什么不上本地小模型或云端：
 
 | 方案 | 代价 | 什么时候值得换 |
 | --- | --- | --- |
-| Windows 系统语音（现状） | 音质机械；音色取决于系统装了什么 | 默认选择 |
+| 系统语音（现状：Windows WinRT / macOS AVFAudio） | 音质机械；音色取决于系统装了什么 | 默认选择 |
 | 本地小模型（Piper 20–60MB / Kokoro-82M ≈300MB） | 需要 ONNX 运行时依赖（dll 20–50MB）+ 模型文件 + 首次加载 1–3 秒 | 更在意音质、能接受依赖与首次延迟 |
 | 云端 TTS | 每次点击 0.3–2 秒网络往返 | 能接受联网与延迟、要最好的音质 |
 
@@ -66,7 +74,12 @@
   补齐，尚未实现；界面预设全部落在原生范围内。
 
 `src/speech/tests.rs::speech_rate_presets_scale_duration_inversely` 是这段语义的护栏：
-各档实际时长必须与 1.0 档成反比（15% 容差）。
+各档实际时长必须与 1.0 档成反比（15% 容差），只对 Windows 生效。
+
+macOS 的 `AVSpeechUtterance.rate` 是 0.0–1.0 的绝对值语义（默认 0.5），实现按
+「默认档 = 应用层 1.0」线性换算（`0.5 × rate`，钳到区间内），**尚未在 macOS 上实测
+标定**：首次在 macOS 上人工验证时要核对 0.75x–2.0x 的手感是否接近标称倍率，如果偏差
+大就按 WinRT 的方式做一条换算曲线并补回归测试。
 
 ## 三个窗口的分工
 
@@ -133,7 +146,9 @@
 ## 验证
 
 - `cargo test --lib speech`：真实调用系统语音，验证语音列表、WAV 产物、未知音色报错、
-  语速钳制、倍率语义（各档时长与 1.0 档成反比）与播放到结束（会出声一次，一秒以内）。
+  语速钳制、倍率语义（各档时长与 1.0 档成反比，只对 Windows 生效）与播放到结束
+  （会出声一次，一秒以内）。macOS 上同样跑前三条与播放；macOS 侧的 WAV 编码、
+  播放器与语速换算尚未在真实 macOS 上验证过。
 - `cargo test --bin ngy-book-studio ai_sidebar`（ui 在 bin 目标）：侧栏操作条渲染出朗读
   按钮、Markdown 朗读清洗与消息块切分；点击「没有可朗读文字」的消息只报错、不启动会话
   （不触发真实合成）。

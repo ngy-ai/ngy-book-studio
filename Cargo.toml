@@ -73,6 +73,16 @@ ngy-utils-tracing = "0.6.0"
 [build-dependencies]
 winresource = "0.1"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# 朗读（TTS）的 macOS 后端：AVFAudio 的 AVSpeechSynthesizer 合成 WAV、
+# AVAudioPlayer 播放，零模型零新依赖。objc2 与 objc2-foundation 本来就在
+# 依赖树里（gpui 的 macOS 后端），这里只补 AVFAudio 绑定本身与写回调用的
+# block2。
+block2 = "=0.6.2"
+objc2 = "=0.6.4"
+objc2-avf-audio = "=0.3.2"
+objc2-foundation = "=0.3.2"
+
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "=4.2.0", default-features = false, features = ["v1"] }
 open = "5.4"

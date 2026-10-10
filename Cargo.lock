@@ -2962,7 +2962,7 @@ dependencies = [
  "log",
  "presser",
  "thiserror 2.0.20",
- "windows 0.61.3",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -5236,6 +5236,7 @@ dependencies = [
  "async-channel",
  "base64 0.22.1",
  "blake3",
+ "block2 0.6.2",
  "directories",
  "djvu-rs",
  "ebook-rs",
@@ -5253,6 +5254,9 @@ dependencies = [
  "mime_guess",
  "native-dialog",
  "ngy-utils-tracing",
+ "objc2 0.6.4",
+ "objc2-avf-audio",
+ "objc2-foundation 0.3.2",
  "object_store",
  "office_oxide",
  "open",
@@ -5641,6 +5645,32 @@ dependencies = [
  "objc2-core-video",
  "objc2-foundation 0.3.2",
  "objc2-quartz-core 0.3.2",
+]
+
+[[package]]
+name = "objc2-audio-toolbox"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6948501a91121d6399b79abaa33a8aa4ea7857fe019f341b8c23ad6e81b79b08"
+dependencies = [
+ "bitflags 2.13.1",
+ "block2 0.6.2",
+ "objc2 0.6.4",
+ "objc2-foundation 0.3.2",
+]
+
+[[package]]
+name = "objc2-avf-audio"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13a380031deed8e99db00065c45937da434ca987c034e13b87e4441f9e4090be"
+dependencies = [
+ "bitflags 2.13.1",
+ "block2 0.6.2",
+ "objc2 0.6.4",
+ "objc2-audio-toolbox",
+ "objc2-core-audio-types",
+ "objc2-foundation 0.3.2",
 ]
 
 [[package]]

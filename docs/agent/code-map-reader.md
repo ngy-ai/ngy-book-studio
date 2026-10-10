@@ -8,7 +8,7 @@
   闭合 Shadow DOM 隔离正文 CSS，覆盖层绘制而不改写正文节点。
   `src/ui/reader/selection_menu.rs` 是 EPUB 与 PDF 共用的 WebView2 原生「AI解释」菜单，
   由调用方提供私有文档判定与事件构造，仍要求 page/frame 为同一私有文档。
-- `src/ui/read_aloud.rs`：朗读的宿主共享层（Windows 系统语音）——会话状态机
+- `src/ui/read_aloud.rs`：朗读的宿主共享层（Windows/macOS 系统语音，macOS 未验证运行）——会话状态机
   `ReadAloudHost`、进程级单会话登记表 `ReadAloudRegistry`（登记的是弱引用与停止入口，
   新会话开始前先停旧窗口）、段落容量校验与 `ReadAloudWindow` 的默认流程（读设置、起
   会话、轮询、呈现、停止）。EPUB、PDF 与页面图片三个窗口各自只提供「读什么」与

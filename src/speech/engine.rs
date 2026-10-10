@@ -1,7 +1,11 @@
 //! 合成引擎：一段文字 → 一份可播放的音频（WAV 字节）。
 //!
-//! Windows 实现走 WinRT `SpeechSynthesizer`：系统语音离线合成，合成结果是一份
-//! WAV 流。非 Windows 平台没有实现，朗读整体不可用，调用方拿到明确错误而不是 panic。
+//! Windows 实现走 WinRT `SpeechSynthesizer`，macOS 实现走 AVFAudio 的
+//! `AVSpeechSynthesizer`：都是系统语音离线合成，合成结果是一份 WAV 流。其它
+//! 平台没有实现，朗读整体不可用，调用方拿到明确错误而不是 panic。
+//!
+//! macOS 分支已通过 `aarch64-apple-darwin` 的交叉编译检查（2026-10-10），但
+//! 尚未在 macOS 上实际运行验证；语速换算也还没有实测标定。
 
 use std::sync::Arc;
 
@@ -54,29 +58,33 @@ pub trait SpeechEngine: Send + Sync {
     fn synthesize(&self, request: &SpeechRequest) -> Result<Vec<u8>>;
 }
 
-/// 平台默认引擎。Windows 上是系统语音；其它平台返回一个只会报错的实现。
+/// 平台默认引擎。Windows 与 macOS 上是系统语音；其它平台返回一个只会报错的实现。
 pub fn platform_engine() -> Arc<dyn SpeechEngine> {
     #[cfg(target_os = "windows")]
     {
         Arc::new(winrt::WinRtSpeechEngine)
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        Arc::new(avf::AvfSpeechEngine)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         Arc::new(UnsupportedSpeechEngine)
     }
 }
 
-/// 非 Windows 平台的占位实现：朗读不可用，但错误信息要说清楚原因。
+/// 没有系统语音实现时的占位：朗读不可用，但错误信息要说清楚原因。
 #[derive(Debug, Default)]
 pub struct UnsupportedSpeechEngine;
 
 impl SpeechEngine for UnsupportedSpeechEngine {
     fn voices(&self) -> Result<Vec<SpeechVoice>> {
-        anyhow::bail!("朗读目前只支持 Windows 系统语音")
+        anyhow::bail!("朗读目前只支持 Windows 与 macOS 的系统语音")
     }
 
     fn synthesize(&self, _request: &SpeechRequest) -> Result<Vec<u8>> {
-        anyhow::bail!("朗读目前只支持 Windows 系统语音")
+        anyhow::bail!("朗读目前只支持 Windows 与 macOS 的系统语音")
     }
 }
 
@@ -251,5 +259,212 @@ mod winrt {
             .context("无法取出合成音频字节")?;
         anyhow::ensure!(!bytes.is_empty(), "语音合成没有产生音频");
         Ok(bytes)
+    }
+}
+
+/// macOS 实现：AVFAudio 的 `AVSpeechSynthesizer` 合成到内存缓冲，再编码成
+/// 16-bit 单声道 PCM 的 WAV。
+///
+/// 与 `winrt` 模块的差别：这里没有常驻工作线程——每个 `AVSpeechSynthesizer`
+/// 实例自带内部队列，回调经 `std::sync::mpsc` 桥回调用线程，因此可以并发合成
+/// （朗读会话的预取会同时跑两段）。
+#[cfg(target_os = "macos")]
+mod avf {
+    use super::*;
+
+    use std::ptr::NonNull;
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+
+    use anyhow::{anyhow, bail, ensure};
+    use block2::RcBlock;
+    use objc2_avf_audio::{
+        AVAudioBuffer, AVAudioCommonFormat, AVAudioPCMBuffer, AVSpeechSynthesisVoice,
+        AVSpeechSynthesizer, AVSpeechUtterance,
+    };
+    use objc2_foundation::NSString;
+
+    /// 合成回调送回的一块数据。
+    enum Chunk {
+        /// 一段单声道 PCM 与它的采样率。
+        Data { sample_rate: f64, samples: Vec<f32> },
+        /// 回调报告 `frameLength == 0`：合成结束。
+        Done,
+    }
+
+    #[derive(Debug, Default)]
+    pub(super) struct AvfSpeechEngine;
+
+    impl SpeechEngine for AvfSpeechEngine {
+        fn voices(&self) -> Result<Vec<SpeechVoice>> {
+            collect_voices()
+        }
+
+        fn synthesize(&self, request: &SpeechRequest) -> Result<Vec<u8>> {
+            synthesize_wav(request)
+        }
+    }
+
+    fn collect_voices() -> Result<Vec<SpeechVoice>> {
+        let voices = unsafe { AVSpeechSynthesisVoice::speechVoices() };
+        let mut result = Vec::new();
+        for voice in voices.to_vec() {
+            // SAFETY: 访问器只读系统语音的属性。
+            let (id, label, language) = unsafe {
+                (
+                    voice.identifier().to_string(),
+                    voice.name().to_string(),
+                    voice.language().to_string(),
+                )
+            };
+            if id.trim().is_empty() {
+                continue;
+            }
+            result.push(SpeechVoice {
+                id,
+                label,
+                language,
+            });
+        }
+        Ok(result)
+    }
+
+    /// `AVSpeechUtterance.rate` 是 0.0..=1.0 的绝对值（默认 0.5），不是倍率：
+    /// 按「默认档 = 应用层 1.0」线性换算，`RATE_MAX` 因此会被钳到区间内。
+    ///
+    /// 注意：macOS 侧尚未实测标定（Windows 的倍率曲线见 `WINRT_RATE_MIN` 的
+    /// 注释）；首次在 macOS 上人工验证时要核对 0.75x–2.0x 的手感是否接近倍率。
+    fn utterance_rate(rate: f32) -> f32 {
+        (0.5 * rate).clamp(0.0, 1.0)
+    }
+
+    fn synthesize_wav(request: &SpeechRequest) -> Result<Vec<u8>> {
+        let text = NSString::from_str(&request.text);
+        let utterance = unsafe { AVSpeechUtterance::speechUtteranceWithString(&text) };
+        if !request.voice_id.is_empty() {
+            let identifier = NSString::from_str(&request.voice_id);
+            let voice = unsafe { AVSpeechSynthesisVoice::voiceWithIdentifier(&identifier) }
+                .ok_or_else(|| anyhow!("找不到系统语音 {}", request.voice_id))?;
+            unsafe { utterance.setVoice(Some(&voice)) };
+        }
+        unsafe { utterance.setRate(utterance_rate(request.rate)) };
+
+        let synthesizer = unsafe { AVSpeechSynthesizer::new() };
+        let (sender, receiver) = channel::<Chunk>();
+        let done = sender.clone();
+        let callback = RcBlock::new(move |buffer: NonNull<AVAudioBuffer>| {
+            // SAFETY: 回调保证 buffer 非空且在回调期间有效。
+            let buffer = unsafe { buffer.as_ref() };
+            let Some(pcm) = buffer.downcast_ref::<AVAudioPCMBuffer>() else {
+                return;
+            };
+            // SAFETY: 下面的访问器都只在回调期间使用对象，满足前置条件。
+            let frames = unsafe { pcm.frameLength() };
+            if frames == 0 {
+                let _ = done.send(Chunk::Done);
+                return;
+            }
+            let format = unsafe { pcm.format() };
+            let sample_rate = unsafe { format.sampleRate() };
+            let channels = unsafe { format.channelCount() } as usize;
+            if channels == 0 {
+                return;
+            }
+            // 系统语音是单声道；多声道时只读第一条（不做交织处理）。
+            let samples = match unsafe { format.commonFormat() } {
+                AVAudioCommonFormat::PCMFormatFloat32 => {
+                    let data = unsafe { pcm.floatChannelData() };
+                    if data.is_null() {
+                        return;
+                    }
+                    // SAFETY: 指针数组至少有一条声道（channels > 0），前 frames 个
+                    // 样本由缓冲保证有效。
+                    let first = unsafe { (*data).as_ptr() };
+                    unsafe { std::slice::from_raw_parts(first, frames as usize) }
+                        .iter()
+                        .copied()
+                        .collect::<Vec<f32>>()
+                }
+                AVAudioCommonFormat::PCMFormatInt16 => {
+                    let data = unsafe { pcm.int16ChannelData() };
+                    if data.is_null() {
+                        return;
+                    }
+                    // SAFETY: 同上（int16 视图）。
+                    let first = unsafe { (*data).as_ptr() };
+                    unsafe { std::slice::from_raw_parts(first, frames as usize) }
+                        .iter()
+                        .map(|sample| f32::from(*sample) / 32768.0)
+                        .collect::<Vec<f32>>()
+                }
+                _ => return,
+            };
+            let _ = sender.send(Chunk::Data {
+                sample_rate,
+                samples,
+            });
+        });
+
+        // SAFETY: 回调指针来自仍然存活的 RcBlock；在收到 Done 或超时之前这里一直
+        // 等待，block 不会在回调仍在进行时被释放。
+        unsafe {
+            synthesizer
+                .writeUtterance_toBufferCallback(&utterance, RcBlock::as_ptr(&callback).cast());
+        }
+
+        let (mut samples, mut sample_rate) = (Vec::new(), 0.0_f64);
+        loop {
+            match receiver.recv_timeout(Duration::from_secs(30)) {
+                Ok(Chunk::Data {
+                    sample_rate: chunk_rate,
+                    samples: chunk,
+                }) => {
+                    if samples.is_empty() {
+                        sample_rate = chunk_rate;
+                    }
+                    samples.extend(chunk);
+                }
+                Ok(Chunk::Done) => break,
+                Err(error) => {
+                    // 超时或通道断开：已有音频就按结束处理，否则报错。
+                    if samples.is_empty() {
+                        bail!("语音合成没有产出音频：{error}");
+                    }
+                    break;
+                }
+            }
+        }
+        ensure!(!samples.is_empty(), "语音合成没有产出音频");
+        Ok(wav_from_f32_mono(&samples, sample_rate))
+    }
+
+    /// 把单声道 f32 样本编码成 16-bit PCM 的 WAV（标准的 44 字节头）。
+    fn wav_from_f32_mono(samples: &[f32], sample_rate: f64) -> Vec<u8> {
+        let sample_rate = sample_rate.max(1.0).round() as u32;
+        let channels = 1u16;
+        let bits = 16u16;
+        let byte_rate = sample_rate * u32::from(channels) * u32::from(bits) / 8;
+        let block_align = channels * bits / 8;
+        let data_bytes = (samples.len() * 2) as u32;
+
+        let mut wav = Vec::with_capacity(44 + data_bytes as usize);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&channels.to_le_bytes());
+        wav.extend_from_slice(&sample_rate.to_le_bytes());
+        wav.extend_from_slice(&byte_rate.to_le_bytes());
+        wav.extend_from_slice(&block_align.to_le_bytes());
+        wav.extend_from_slice(&bits.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_bytes.to_le_bytes());
+        for sample in samples {
+            let value = (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
+            wav.extend_from_slice(&value.to_le_bytes());
+        }
+        wav
     }
 }

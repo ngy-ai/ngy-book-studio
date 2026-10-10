@@ -5,12 +5,12 @@
 
 use super::*;
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use super::player::AudioPlayer;
 
 /// 播放链路的冒烟测试：真的把一段合成音频放到结束。会出声一次（很短），
 /// 但这是唯一能验证「点了有声音」的自动化方式。
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 #[test]
 fn the_player_plays_a_synthesized_clip_to_the_end() {
     let engine = platform_engine();
@@ -38,18 +38,18 @@ fn the_player_plays_a_synthesized_clip_to_the_end() {
     player.stop();
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 #[test]
 fn platform_engine_lists_voices_and_synthesizes_a_wav() {
     let engine = platform_engine();
     let voices = engine.voices().expect("枚举系统语音");
-    assert!(!voices.is_empty(), "Windows 至少应有一个可用语音");
+    assert!(!voices.is_empty(), "系统至少应有一个可用语音");
     for voice in &voices {
         assert!(!voice.id.trim().is_empty(), "语音必须有稳定的 ID");
         assert!(!voice.label.trim().is_empty(), "语音必须有名称");
     }
 
-    // 优先中文语音（本机已装 Huihui / Kangkang / Yaoyao），没有就用第一个。
+    // 优先中文语音（Windows 上有 Huihui 等，macOS 上有 Ting-Ting 等），没有就用第一个。
     let voice = voices
         .iter()
         .find(|voice| voice.language.to_ascii_lowercase().starts_with("zh"))
@@ -66,7 +66,7 @@ fn platform_engine_lists_voices_and_synthesizes_a_wav() {
     assert!(wav.len() > 44, "WAV 必须包含 44 字节头以外的采样数据");
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 #[test]
 fn an_unknown_voice_id_is_reported_instead_of_silently_falling_back() {
     let engine = platform_engine();
@@ -96,6 +96,10 @@ fn speech_rate_is_clamped_to_the_supported_range() {
 /// 倍率语义的回归测试：0.5x–2.0x（含界面全部预设档位）的实际朗读时长应与
 /// 1.0x 的时长成反比。2026-10-10 在 Huihui 与 David 上实测该关系由引擎保证、
 /// 与具体语音无关，各档误差 <1%；这里留 15% 容差，吸收机器间语音差异。
+///
+/// 只对 WinRT 成立：macOS 的 `AVSpeechUtterance.rate` 是 0.0–1.0 的绝对值
+/// 语义、应用层倍率按 0.5× 换算（见 `engine.rs` 的 `avf` 模块），尚未在
+/// macOS 上实测标定，所以这条断言不跟着平台扩展。
 #[cfg(target_os = "windows")]
 #[test]
 fn speech_rate_presets_scale_duration_inversely() {
