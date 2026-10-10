@@ -24,6 +24,14 @@ const LOCAL_ICONS: &[(&str, &[u8])] = &[
         "icons/refresh-cw.svg",
         include_bytes!("../../assets/icons/refresh-cw.svg"),
     ),
+    (
+        "icons/volume-2.svg",
+        include_bytes!("../../assets/icons/volume-2.svg"),
+    ),
+    (
+        "icons/square.svg",
+        include_bytes!("../../assets/icons/square.svg"),
+    ),
 ];
 
 pub struct AppAssets;

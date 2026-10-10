@@ -121,6 +121,106 @@ fn literal_message(content: &str) -> String {
     format!("{fence}text\n{content}\n{fence}\n")
 }
 
+/// One assistant answer's readable paragraphs for read-aloud.
+///
+/// The stored content is Markdown; reading the source aloud would voice the
+/// syntax itself. This walks the same GFM tree that drives the display
+/// projection and keeps only what a listener can use: link targets, code
+/// blocks, tables and raw HTML are dropped (the reader pages skip code and
+/// tables for the same reason), inline code and image alt texts stay, and
+/// every top-level block becomes one paragraph so the session can pause
+/// between them.
+pub(in crate::ui) fn assistant_read_aloud_paragraphs(content: &str) -> Vec<String> {
+    let Ok(tree) = to_mdast(content, &ParseOptions::gfm()) else {
+        return plain_read_aloud_paragraphs(content);
+    };
+    let mut paragraphs = Vec::new();
+    push_read_aloud_blocks(&tree, &mut paragraphs);
+    paragraphs
+}
+
+/// One user question's readable paragraphs for read-aloud.
+///
+/// A question renders as escaped plain text (never as Markdown), so it is
+/// read the same way: consecutive non-empty lines join into one paragraph and
+/// an empty line starts the next one.
+pub(in crate::ui) fn user_read_aloud_paragraphs(content: &str) -> Vec<String> {
+    plain_read_aloud_paragraphs(content)
+}
+
+fn plain_read_aloud_paragraphs(content: &str) -> Vec<String> {
+    let mut paragraphs = Vec::new();
+    let mut current = String::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            if !current.is_empty() {
+                paragraphs.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(line);
+    }
+    if !current.is_empty() {
+        paragraphs.push(current);
+    }
+    paragraphs
+}
+
+/// Split one block-level node into paragraphs. Containers descend; code,
+/// tables and raw HTML are skipped as a whole, because their text only makes
+/// sense on screen.
+fn push_read_aloud_blocks(node: &Node, paragraphs: &mut Vec<String>) {
+    match node {
+        Node::Paragraph(_) | Node::Heading(_) => {
+            let text = readable_text(node);
+            if !text.is_empty() {
+                paragraphs.push(text);
+            }
+        }
+        Node::Code(_) | Node::Table(_) | Node::Html(_) => {}
+        _ => {
+            if let Some(children) = node.children() {
+                for child in children {
+                    push_read_aloud_blocks(child, paragraphs);
+                }
+            }
+        }
+    }
+}
+
+/// The audible text inside one block, without Markdown syntax. Link and
+/// emphasis markup only contributes its label; images contribute their alt
+/// text; everything else falls back to the node's own text.
+fn readable_text(node: &Node) -> String {
+    let mut text = String::new();
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        match node {
+            Node::Link(_) | Node::LinkReference(_) => {
+                if let Some(children) = node.children() {
+                    pending.extend(children.iter().rev());
+                }
+            }
+            Node::Image(image) => text.push_str(&image.alt),
+            Node::ImageReference(image) => text.push_str(&image.alt),
+            Node::Break(_) => text.push(' '),
+            Node::Code(_) | Node::Table(_) | Node::Html(_) => {}
+            _ => {
+                if let Some(children) = node.children() {
+                    pending.extend(children.iter().rev());
+                } else {
+                    text.push_str(&node.to_string());
+                }
+            }
+        }
+    }
+    text.trim().to_string()
+}
+
 fn has_no_active_content(tree: &Node) -> bool {
     let mut pending = vec![tree];
     while let Some(node) = pending.pop() {
@@ -255,5 +355,50 @@ mod tests {
             panic!("the complete fallback must remain a single literal code block");
         };
         assert_eq!(code.value, content);
+    }
+
+    #[test]
+    fn read_aloud_keeps_text_and_drops_syntax() {
+        let content = "# 标题\n\n**粗体**、`行内代码` 和 [链接标签](https://example.test/secret)。\n\n![网络图片](https://example.test/tracker)\n\n- 第一项\n- 第二项\n";
+        let paragraphs = assistant_read_aloud_paragraphs(content);
+        assert_eq!(
+            paragraphs,
+            vec![
+                "标题",
+                "粗体、行内代码 和 链接标签。",
+                "网络图片",
+                "第一项",
+                "第二项"
+            ],
+            "syntax markers, link targets and image URLs must not be spoken"
+        );
+    }
+
+    #[test]
+    fn read_aloud_skips_code_tables_and_raw_html() {
+        let content = "读这段。\n\n```python\nprint('不读')\n```\n\n| 名称 | 值 |\n| --- | --- |\n| 示例 | 42 |\n\n<div>不读</div>\n\n结尾。\n";
+        assert_eq!(
+            assistant_read_aloud_paragraphs(content),
+            vec!["读这段。", "结尾。"],
+            "code blocks, tables and raw HTML are skipped as a whole"
+        );
+    }
+
+    #[test]
+    fn read_aloud_of_code_only_content_is_empty() {
+        let content = "```rust\nfn main() {}\n```\n";
+        assert!(
+            assistant_read_aloud_paragraphs(content).is_empty(),
+            "a message with nothing readable must produce no paragraphs"
+        );
+    }
+
+    #[test]
+    fn user_read_aloud_paragraphs_join_lines_and_split_on_blank_lines() {
+        let content = "第一行\n第二行\n\n第三行  \n\n\n第四行";
+        assert_eq!(
+            user_read_aloud_paragraphs(content),
+            vec!["第一行 第二行", "第三行", "第四行"]
+        );
     }
 }

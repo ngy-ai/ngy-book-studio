@@ -117,8 +117,12 @@
   AI 回复用与 `gpui-kit` 组件层相同的固定版 `markdown` 解析器生成展示投影，按消息
   缓存；链接、图片与原始 HTML 只显示文字，不能让模型正文自动加载资源或打开 URL。
   Markdown 渲染保留自然高度和外层会话滚动，复制与持久化使用原文；来源按钮继续走
-  宿主引用校验。  每条消息的气泡下方是操作条：用户问题提供复制、「修改」与「删除」，AI 回答提供
-  复制与「重新生成」（状态与错误提示没有操作条）。修改把问题原文放回输入框并聚焦，
+  宿主引用校验。  每条消息的气泡下方是操作条：两种角色都提供复制与朗读（正在朗读这条时图标
+  换成停止，再点一次停止），用户问题另提供「修改」与「删除」，AI 回答另提供「重新生成」
+  （状态与错误提示没有操作条）。朗读接入共享宿主层（`src/ui/ai_sidebar/speech.rs` 实现
+  `ReadAloudWindow`）：一条消息一个会话，块 id 以消息 id 为前缀，回答先经
+  `markdown::assistant_read_aloud_paragraphs` 去掉 Markdown 记号（代码块、表格与原始 HTML
+  跳过，链接与图片只读标签）；侧栏不做逐段高亮，按钮图标即状态。修改把问题原文放回输入框并聚焦，
   重新生成直接重问该回答对应的问题，两者都先把会话回卷到对应消息再用替换的一轮续写
   同一前缀，所以重新生成历史回答会一并替换它之后的对话；删除移除该问答对并保留其它
   轮次。三者都以消息的 `chat_messages.id` 为锚点（`ConversationState` 的
@@ -126,8 +130,9 @@
   实时回答由 `finish_persisted_answer` 回填）。删除走控制器在存储侧真正删掉之后重新
   加载会话再发布消息，因此存储失败不会让界面上出现一条其实没删掉的记录；编辑与重新
   生成把锚点随请求带出，拿不到锚点时只改本地投影，绝不用猜测的位置动词库里的其它
-  轮次。操作条的铅笔与圆形箭头是项目自有的 `assets/icons/pencil.svg`、
-  `refresh-cw.svg`，删除用 `gpui-kit` 组件层的 `IconName::Delete`；自有图标由
+  轮次。操作条的铅笔、圆形箭头与朗读/停止喇叭是项目自有的 `assets/icons/pencil.svg`、
+  `refresh-cw.svg`、`volume-2.svg`、`square.svg`，删除用 `gpui-kit` 组件层的
+  `IconName::Delete`；自有图标由
   `src/ui/assets.rs` 的 `AppAssets` 在 `gpui-kit` 图标之外补充，`main.rs` 必须
   以它注册资源。TextView 在 flex 消息列内必须获得扣除 padding 与边框后的明确像素
   宽度；仅用 `w_full()` 会使 Windows 上的短列表正文被裁掉，测试字体不一定复现。

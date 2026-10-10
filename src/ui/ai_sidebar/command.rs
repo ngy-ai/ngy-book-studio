@@ -7,6 +7,9 @@ impl AiSidebar {
     /// library window. The returned ID lets a future adapter cancel its task;
     /// stale callbacks are rejected by the state machine either way.
     pub(crate) fn cancel_for_window_close(&mut self, cx: &mut Context<Self>) -> Option<u64> {
+        // 宿主窗口要没了：朗读会话不能再继续（它占着音频输出，也持有本
+        // view 的登记项）。
+        self.stop_read_aloud(cx);
         let request_id = self.conversation.cancel();
         if let Some(request_id) = request_id {
             cx.emit(AiSidebarEvent::Cancel { request_id });
@@ -143,6 +146,8 @@ impl AiSidebar {
         if !self.begin_session_operation(cx) {
             return;
         }
+        // 消息列表即将整体替换：正在朗读的旧消息马上就不存在了。
+        self.stop_read_aloud(cx);
         cx.emit(AiSidebarEvent::NewSession);
     }
 
@@ -155,6 +160,8 @@ impl AiSidebar {
         if !self.begin_session_operation(cx) {
             return;
         }
+        // 同上：切会话会换掉整个消息列表。
+        self.stop_read_aloud(cx);
         cx.emit(AiSidebarEvent::SwitchSession {
             thread_id: thread_id.to_string(),
         });

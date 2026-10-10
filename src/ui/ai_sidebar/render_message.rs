@@ -7,6 +7,8 @@ use super::*;
 /// glyph, and a wrong existing icon reads worse than a dedicated one.
 const EDIT_ICON: &str = "icons/pencil.svg";
 const REGENERATE_ICON: &str = "icons/refresh-cw.svg";
+const READ_ALOUD_ICON: &str = "icons/volume-2.svg";
+const STOP_READ_ALOUD_ICON: &str = "icons/square.svg";
 
 impl AiSidebar {
     pub(super) fn render_message(
@@ -189,14 +191,15 @@ impl AiSidebar {
             .into_any_element()
     }
 
-    /// The action row under one bubble: copy plus edit and delete for a user
-    /// question, copy plus regenerate for an assistant answer.
+    /// The action row under one bubble: copy and read aloud on every message,
+    /// plus edit and delete for a user question, plus regenerate for an
+    /// assistant answer.
     ///
     /// Status and error notices carry no actions. While a request is running
     /// (or the session is changing) the mutating actions are disabled, because
     /// editing, regenerating or deleting rewrites the stored thread and must
-    /// never race an answer that is still being written. Copying stays
-    /// available.
+    /// never race an answer that is still being written. Copying and reading
+    /// stay available.
     fn render_message_actions(
         &self,
         index: usize,
@@ -210,6 +213,37 @@ impl AiSidebar {
                 message.id
             )))
             .value(message.content.clone()),
+        );
+        // Reading the message currently being read aloud stops it; any other
+        // message (including the other role's) starts a fresh session. The
+        // icon doubles as the state indicator, because the sidebar has no
+        // per-paragraph highlight.
+        let reading = self.is_reading_message(message.id);
+        let view = cx.entity().clone();
+        let selector = format!("ai-message-read-aloud-{}", message.id);
+        let message_id = message.id;
+        let role = message.role;
+        let content = message.content.clone();
+        row = row.child(
+            Button::new(SharedString::from(selector.clone()))
+                .debug_selector(move || selector)
+                .xsmall()
+                .ghost()
+                .icon(Icon::empty().path(if reading {
+                    STOP_READ_ALOUD_ICON
+                } else {
+                    READ_ALOUD_ICON
+                }))
+                .tooltip(if reading {
+                    "停止朗读"
+                } else {
+                    "朗读这条消息"
+                })
+                .on_click(move |_, _, cx| {
+                    view.update(cx, |this, cx| {
+                        this.toggle_message_read_aloud(message_id, role, &content, cx);
+                    });
+                }),
         );
         match message.role {
             AiMessageRole::User => {

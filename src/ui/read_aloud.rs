@@ -93,7 +93,8 @@ impl ReadAloudHost {
         self.state
     }
 
-    #[allow(dead_code)]
+    /// 当前朗读段；侧栏用它判断「正在读的是哪条消息」（动作条按钮据此换成
+    /// 停止图标）。
     pub(crate) fn current_block(&self) -> Option<&str> {
         self.current_block.as_deref()
     }

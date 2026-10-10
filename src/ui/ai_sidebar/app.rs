@@ -53,6 +53,8 @@ impl AiSidebar {
             expanded_width: px(AI_SIDEBAR_WIDTH),
             endpoint_status,
             input,
+            services,
+            read_aloud: ReadAloudHost::default(),
             _endpoint_refresh_task: endpoint_refresh_task,
             _subscriptions: subscriptions,
         }

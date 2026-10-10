@@ -47,6 +47,8 @@ mod session;
 
 mod session_ops;
 
+mod speech;
+
 pub(crate) use citation::*;
 
 pub(crate) use conversation::*;
@@ -76,6 +78,10 @@ pub(crate) struct AiSidebar {
     expanded_width: Pixels,
     endpoint_status: AiEndpointStatus,
     input: Entity<TextareaState>,
+    /// 朗读服务入口与共享朗读宿主（见 `ui::read_aloud`）：消息操作条上的
+    /// 朗读按钮也参与进程级的单会话约束。
+    services: Arc<AppServices>,
+    read_aloud: ReadAloudHost,
     _endpoint_refresh_task: Task<()>,
     _subscriptions: Vec<Subscription>,
 }

@@ -236,3 +236,54 @@ fn deleting_an_unpersisted_question_only_changes_the_transcript(cx: &mut TestApp
         assert!(!sidebar.sessions.busy);
     });
 }
+
+#[gpui_kit::test]
+fn every_message_renders_a_read_aloud_button(cx: &mut TestAppContext) {
+    let (sidebar, _, _subscription, visual) = open_sidebar(cx);
+    restore_one_turn(&sidebar, visual);
+
+    assert!(
+        visual.debug_bounds("ai-message-read-aloud-1").is_some(),
+        "a question must offer read aloud"
+    );
+    assert!(
+        visual.debug_bounds("ai-message-read-aloud-2").is_some(),
+        "an answer must offer read aloud"
+    );
+}
+
+#[gpui_kit::test]
+fn reading_a_message_without_readable_text_reports_instead_of_starting(cx: &mut TestAppContext) {
+    let (sidebar, _, _subscription, visual) = open_sidebar(cx);
+    sidebar.update(visual, |sidebar, cx| {
+        sidebar.conversation.messages.push(AiMessage {
+            id: 9,
+            role: AiMessageRole::Assistant,
+            content: "```rust\nfn main() {}\n```".to_string(),
+            sources: Vec::new(),
+            source_status: None,
+            request_id: None,
+            db_id: None,
+        });
+        cx.notify();
+    });
+    redraw(visual);
+
+    let read_aloud = visual
+        .debug_bounds("ai-message-read-aloud-9")
+        .expect("the answer must render its read aloud action");
+    visual.simulate_click(read_aloud.center(), Modifiers::none());
+    redraw(visual);
+
+    sidebar.read_with(visual, |sidebar, _| {
+        assert_eq!(
+            sidebar.sessions.error.as_deref(),
+            Some("这条消息没有可朗读的文字。"),
+            "a code-only answer must explain why nothing starts"
+        );
+        assert!(
+            !sidebar.read_aloud.is_active(),
+            "no session may start when there is nothing to read"
+        );
+    });
+}
