@@ -2,6 +2,14 @@
 
 use super::*;
 
+/// 分组树展开箭头占用的固定车道，等于 xsmall 图标按钮的实际边长。叶子行用同宽占位，
+/// 否则有无子节点的分组会把后面的文件夹图标顶到不同的列上。
+const GROUP_DISCLOSURE_LANE: f32 = 20.;
+/// 分组每深一级增加的行内缩进。
+pub(super) const GROUP_LEVEL_INDENT: f32 = 14.;
+/// 顶级分组行的行首留白：只做一两个像素的光学修正，分组树的缩进全部交给展开车道。
+const GROUP_ROW_LEADING: f32 = 2.;
+
 impl EpubReaderApp {
     /// The small folder button on a book card: opens the group tree dialog so
     /// the book can be filed under any group, or taken out of every group.
@@ -35,6 +43,10 @@ impl EpubReaderApp {
     pub(super) fn render_group_sidebar(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let view = cx.entity().clone();
 
+        // `Button` 的内容行按居中排布，只有可伸缩的子元素能把图标和文字压到起始边；
+        // 少这一个占位，整行就会缩到侧栏中间，和下面的书架行对不齐。
+        let nav_row_spine = || div().flex_1().into_any_element();
+
         let mut rows: Vec<gpui_kit::AnyElement> = vec![
             Button::new("open-learning-center")
                 .ghost()
@@ -42,6 +54,7 @@ impl EpubReaderApp {
                 .label("学习中心 · AI Agent")
                 .tooltip("亲手构建并修好一个资料研究 Agent")
                 .w_full()
+                .child(nav_row_spine())
                 .on_click({
                     let view = view.clone();
                     move |_, _, cx| view.update(cx, |this, cx| this.open_learning(cx))
@@ -53,6 +66,7 @@ impl EpubReaderApp {
                 .label("全部笔记")
                 .tooltip("查看所有图书的划线、人工想法和 AI 想法")
                 .w_full()
+                .child(nav_row_spine())
                 .on_click({
                     let view = view.clone();
                     move |_, _, cx| view.update(cx, |this, cx| this.open_all_notes(cx))
@@ -265,6 +279,8 @@ impl EpubReaderApp {
         let selected = self.group_filter.group_id() == Some(group.id.as_str());
         let count = self.library.group_subtree_book_count(&group.id);
         let row_id = SharedString::from(format!("group-row-{}", group.id));
+        // 分组名的文字列：侧栏对齐门禁按它断言「同级分组共用一条起始边」。
+        let name_id = SharedString::from(format!("group-select-text-{}", group.id));
         let accent = selected.then_some(rgb(palette(cx).accent));
 
         let toggle = if has_children {
@@ -273,6 +289,8 @@ impl EpubReaderApp {
             Button::new(SharedString::from(format!("group-toggle-{}", group.id)))
                 .ghost()
                 .xsmall()
+                .w(px(GROUP_DISCLOSURE_LANE))
+                .flex_none()
                 .icon(if expanded {
                     IconName::ChevronDown
                 } else {
@@ -283,7 +301,10 @@ impl EpubReaderApp {
                 })
                 .into_any_element()
         } else {
-            div().size(px(22.)).flex_none().into_any_element()
+            div()
+                .w(px(GROUP_DISCLOSURE_LANE))
+                .flex_none()
+                .into_any_element()
         };
 
         let select_view = view.clone();
@@ -306,7 +327,15 @@ impl EpubReaderApp {
                 .text_color(accent.unwrap_or(rgb(palette(cx).muted))),
             )
             .child(
+                // 可伸缩的标签把文件夹图标顶到展开车道之后的起始边：分组名长短不同时
+                // 图标仍留在同一列，长名字也才真的会按 `truncate()` 截断。
                 div()
+                    .id(name_id.clone())
+                    .debug_selector({
+                        let name_id = name_id.clone();
+                        move || name_id.to_string()
+                    })
+                    .flex_1()
                     .min_w(px(0.))
                     .truncate()
                     .text_sm()
@@ -374,7 +403,7 @@ impl EpubReaderApp {
             .h(px(34.))
             .items_center()
             .gap_0p5()
-            .pl(px(4. + depth as f32 * 16.))
+            .pl(px(GROUP_ROW_LEADING + depth as f32 * GROUP_LEVEL_INDENT))
             .pr_1()
             .rounded(px(8.))
             .when(selected, |this| {

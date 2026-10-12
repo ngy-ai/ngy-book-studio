@@ -853,3 +853,19 @@ LangGraph 依赖。CLI 课程验证与桌面接入的验证分别列出。
   epub_flow 6、translation_flow 19、multi_format_flow 4、multi_endpoint_flow 1、
   openai_compatible_flow 22（因产品在运行占用 `target/debug`，测试在 `target/verify` 执行）。
   未做人工 GUI 验证：需重新构建并重开章节后才能看到新样式。
+- [x] 2026-10-12 侧栏分组树的起始边修复（现场：分组行整片缩到侧栏中间，分组名越长反而越靠左）：
+  分组行标签用的是 `Button`，而 gpui-kit 0.6.6 的 `Button` 把内容行固定成居中排布，builder 上
+  的 `justify_start()` 落在根元素上、改不动这一层；同文件里的书架行看不出来，只是因为它的
+  文字 div 带 `flex_1()` 把留白吃掉、把图标顶在起始边。修法照抄这个既有写法：分组行文字
+  div 补 `flex_1()`（顺带让 `truncate()` 真的生效），展开车道由「叶子行 22px 占位 / 有子节点
+  行 xsmall 按钮 20px」统一成 `GROUP_DISCLOSURE_LANE` 常量，层级缩进从 `4 + depth*16` 收到
+  `2 + depth*14`；顶部两条导航行（学习中心、全部笔记）同样被居中，各补一个可伸缩占位。
+  回归：新增 GPUI 帧门禁 `ui::library::ui_test::group_rows_share_one_leading_spine`（名字
+  长短悬殊的两个同级分组的文字列必须相同、子分组只多一层缩进），在旧布局下实测报
+  「128.5px vs 86.5px」，把叶子占位改回 22px 时报「79px vs 81px」。验证：
+  `cargo fmt --all --check`、`cargo check --all-targets --locked`、`cargo clippy
+  --all-targets --locked`（触及范围无新增告警）与 `cargo test --all-targets --locked
+  --no-fail-fast` 全通过 —— lib 697、产品二进制 343、epub_flow 6、translation_flow 19、
+  multi_format_flow 4、multi_endpoint_flow 1、openai_compatible_flow 22、proxy_flow 1
+  （产品在运行占用 `target/debug`，测试在 `target/verify` 执行）。未做人工 GUI 验证：
+  需要关掉正在运行的墨页重新构建、重开书库窗口后才能看到新布局。
