@@ -121,10 +121,12 @@ ignored-only --test-threads=1` 对应 `cargo test --lib --locked learning:: -- -
 不触碰用户数据，`NGY_TEST_CHROMIUM` 可指定浏览器。改动 `src/ui/**/*.js` 的交互代码
 或 `web/pdf` 产物时建议跑对应门禁，并在 `ROADMAP.md` 或本文件记下结果。
 
-本机（2026-09-15 复核）可用组合：Node 22.22.2 用工作台自带的
-`C:\Users\admin\.workbuddy\binaries\node\versions\22.22.2-3\node.exe`，Playwright 1.63.0
-借自 `%TEMP%\moye-pw\node_modules`（临时目录，装 Playwright 1.63.0，里面另有 `*.cjs`
-诊断脚本，被清理后需换一处已安装的包），`NODE_PATH` 指向它。**浏览器必须显式指定**：
+本机（2026-10-10 复核）可用组合：Node 22.22.2 用工作台自带的
+`C:\Users\admin\.workbuddy\binaries\node\versions\22.22.2-6\node.exe`（工作台升级会换目录，
+旧版本路径随即失效），Playwright 1.63.0 借自 `%TEMP%\moye-pw\node_modules`（临时目录，里面
+另有 `*.cjs` 诊断脚本；被清理后用 `npm install playwright@1.63.0 --prefix %TEMP%\moye-pw`
+重装，先设 `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` 避免再下载浏览器），`NODE_PATH` 指向它。
+**浏览器必须显式指定**：
 Playwright 1.63 默认要 `chromium-1243`（本机只有 `chromium-1228`），不设
 `NGY_TEST_CHROMIUM` 会在 `before` 钩子里以 `Executable doesn't exist at ...1243` 失败全部用例：
 
@@ -139,6 +141,12 @@ Node 认不出来，`require("playwright")` 会 `MODULE_NOT_FOUND`）。
 
 门禁失败先分清产品缺陷与用例缺陷：XHTML 夹具必须带 `xmlns`（否则元素不再具备 HTML
 接口），异步重绘要用 `waitForFunction` 等，而不是在同一个任务里直接读结果。
+
+2026-10-10 首次在本机跑齐六个门禁：63 项全部通过（`reader/translations` 26、
+`reader/annotations` 20、`reader/read_aloud` 3、`pdf_reader/annotations` 4、
+`pdf_reader/viewer` 5、`pdf_reader/read_aloud` 5）。首轮的两个失败都定位成用例缺陷
+（滚动锚定补偿与缺等待），修法与证据见 `code-map-reader.md` 的 2026-10-10 记录，
+产品代码没有改动。
 
 ## AI 问答诊断日志
 

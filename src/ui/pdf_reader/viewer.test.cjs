@@ -416,9 +416,20 @@ test("ctrl + wheel changes the page scale without moving the reading position", 
       { type: "ngy-pdf-zoom", zoomMilli: 1000 },
       window.location.origin,
     ));
-    const shrunk = await settle(page);
+    await settle(page);
     assert.ok(await pageWidth() < widthBefore, "the pushed scale must re-lay the column out");
-    assert.equal(shrunk.anchor?.page, 12);
+    // The shell's reading anchor is the top of the page being read: it keeps the
+    // same fraction of that page's height on screen, so page 12's top must scale
+    // with the page height. At 100% this short page no longer covers the viewport
+    // centre, so the centre — a measurement, not the anchor — falls on page 13;
+    // what must not move is page 12 itself.
+    const pageTop = () => page.evaluate(() =>
+      document.querySelector('.pdf-page[data-page="12"]').getBoundingClientRect().top);
+    const expectedTop = before.anchor.top * (1000 / 1500);
+    assert.ok(
+      Math.abs(await pageTop() - expectedTop) < 12,
+      `page 12 top must keep its place: expected about ${expectedTop}, measured ${await pageTop()}`,
+    );
     await page.waitForTimeout(500);
     assert.equal(await reported(), reportsBefore,
       "the host's own scale must not come back as a change");

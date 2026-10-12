@@ -774,7 +774,9 @@ LangGraph 依赖。CLI 课程验证与桌面接入的验证分别列出。
   验证：`cargo test --lib` 597 项、`cargo test --bin ngy-book-studio` 全通过（含跨语言常量
   契约、IPC 越界拒绝、滚轮档位边界）；`web/pdf` 资源已重建并通过 `check-bundle.mjs`。
   两个 Playwright 门禁新增用例（`src/ui/reader/annotations.test.cjs`、
-  `src/ui/pdf_reader/viewer.test.cjs`）因本机未安装 Playwright **未执行**；
+  `src/ui/pdf_reader/viewer.test.cjs`）当时因本机未安装 Playwright 未执行；
+  2026-10-10 首次执行并修正两处用例缺陷（滚动锚定补偿、宿主推送缩放的锚点断言）后，
+  六个 DOM 门禁 63 项全部通过，细节见 `docs/agent/code-map-reader.md`；
   真实 Windows GUI 中的实际滚轮、触控板与不同鼠标设备仍需人工复验。
 - [x] 2026-09-24 文本块翻译失败不再中止整本翻译：删除「连续 5 个文本块的模型请求失败就停止整次
   运行」这条中止条件（原 `TRANSLATION_CONSECUTIVE_REQUEST_FAILURES`）—— 现场一次端点抖动让任务

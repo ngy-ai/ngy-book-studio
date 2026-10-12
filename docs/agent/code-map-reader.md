@@ -173,6 +173,16 @@
   1 项失败（`clicking a mark lists its thoughts…`：`result()` 之后直接取 `.mark.highlight`，
   而同一文件第一个用例是靠 `waitForFunction` 等划线渲染的），该文件与 `annotations.js`、
   初始化桥都与 HEAD 一致，待单独定位，不要当成手工译文引入的回归。
+  2026-10-10 复跑定位：该项失败是用例缺陷，不是产品缺陷——宿主的应答在后续任务里才画出
+  划线（实测 `result()` 返回 `true` 时影子根里还没有 `.mark.highlight`，25ms 内的下一次轮询
+  才出现），而该用例紧接着读取；补上与第一个用例一致的 `waitForFunction` 等待后通过。
+  同一轮首次执行 2026-09 新增、当时未跑的 Ctrl + wheel 两项：`reader/annotations` 的
+  fixture 未禁用滚动锚定，字号变化让 Chromium 把 scrollY 补偿了 +2px（实测不派发 wheel、
+  只改字号同样漂移），fixture 补 `html{overflow-anchor:none}` 后断言稳定；
+  `pdf_reader/viewer` 中「宿主推送 100% 缩放」一段与同用例第一段（页面顶部位置按缩放比例，
+  实测 -200 → -233px）互相矛盾——页面变矮后视口中心必然落到第 13 页，而产品语义
+  （`web/pdf/src/viewer.mjs` 的 `readingAnchor`：锚定「窗口顶部在页面内的相对深度」）并未
+  移动第 12 页，断言改为直接校验第 12 页顶部的位置。六个门禁合跑 63 项全部通过。
   2026-09-12 真实模型门禁：`tests/translation_flow.rs` 的
   `a_local_model_replays_the_previously_rejected_blocks` 默认 `#[ignore]`，把现场日志里的三个
   文本块（含 inline 边界，片段切分逐字一致）交给本机模型复跑真实翻译任务，需要

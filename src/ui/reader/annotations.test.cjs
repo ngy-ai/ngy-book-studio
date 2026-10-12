@@ -155,6 +155,9 @@ test("clicking a mark lists its thoughts when it has any and selects the mark wh
     const mark = await lastMessage(page, "highlight");
     await result(page, mark, { ok: true, notes: [{ id: "plain-mark", kind: "highlight", anchor: mark.anchor }] });
     const clickMark = async () => {
+      // The host's answer paints the mark on a later task; the first case in
+      // this file waits for the same paint before reading it.
+      await page.waitForFunction(() => !!window.__notesRoot.querySelector(".mark.highlight"));
       const point = await page.evaluate(() => {
         window.getSelection().removeAllRanges();
         const rect = window.__notesRoot.querySelector(".mark.highlight").getBoundingClientRect();
@@ -944,7 +947,12 @@ test("ctrl + wheel resizes the chapter text within the host range and reports it
   try {
     await page.route("http://epubreader.book/**", (route) => route.fulfill({
       status: 200, contentType: "text/html; charset=utf-8",
+      // Scroll anchoring must stay off: a font-size change reflows the page and
+      // Chromium otherwise compensates the scroll offset by a couple of pixels
+      // (measured +2px), which is layout drift, not the same wheel notch
+      // scrolling the chapter twice.
       body: `<!doctype html><html><head><style>:root{--ngy-font-size:18px}
+        html{overflow-anchor:none}
         body{font-size:var(--ngy-font-size);margin:0;height:4000px}</style></head>
         <body><p>正文</p></body></html>`,
       headers: { "content-security-policy": "default-src 'none';script-src 'none';style-src 'unsafe-inline'" },
