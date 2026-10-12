@@ -20,6 +20,14 @@
   文字层收集段落（只取已绘制页面，按行距把相邻行合并成段、超长段按句末标点切开、行序
   几何回跳时另起段），起点跟随视口；高亮走页面脚本 `ngyPdfReadAloud`，读到已绘制范围的
   末尾停止（滚出后续页面后再点一次即可继续）。PDF 不提供段落悬停按钮，只用工具栏入口。
+- `src/reader/mod.rs` 的 `READER_CSS`（配 `resource.rs` 的 `inject_css`）：每个章节的基线
+  样式表。`body` 字体链是「西文衬线在前，中文按存在且字重正规排序」：`Georgia,
+  "Times New Roman", "Noto Serif SC", "Noto Serif CJK SC", SimSun, "Source Han Serif SC",
+  "Microsoft YaHei", serif`。不要改回 CJK 字体最前：2026-10-12 查过，本机命中的
+  `Source Han Serif SC` 只有 Heavy(900) 一款（英文书全篇超粗）；西文交给 Georgia/Times
+  后与书作者常用的 `Georgia, "Times New Roman", serif` 一致，中文在 `SimSun` 之前优先
+  `Noto Serif SC`。验证要用 CDP `CSS.getPlatformFontsForNode` 在真实章节上看实际平台
+  字体，`document.fonts.check` 对未安装的名字也会返回 true，不能作依据。
 - `src/ui/reader/translations.rs`、`translations.js`：Reader 双语对照展示。宿主在
   `sync_loaded_page` 之后按当前书/单元从   `translations` 表读取与当前
   `(document_revision, unit_revision)`、翻译模型与翻译执行身份一致的译文，经 session/generation

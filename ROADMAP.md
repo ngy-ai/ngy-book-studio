@@ -838,3 +838,18 @@ LangGraph 依赖。CLI 课程验证与桌面接入的验证分别列出。
   --all-targets --locked`（触及范围无新增告警）与 `cargo test --all-targets --locked
   --no-fail-fast` 全通过 —— lib 681、产品二进制 310、translation_flow 19、epub_flow 6、
   multi_format_flow 4、multi_endpoint_flow 1、openai_compatible_flow 22。未做人工 GUI 验证。
+- [x] 2026-10-12 阅读器正文字体链修复（现场：英文书全篇「黑体加粗」）：`READER_CSS` 的
+  `body` 字体链原为 `"Noto Serif CJK SC", "Source Han Serif SC", "Microsoft YaHei", Georgia,
+  serif`，在本机命中的是系统里只装了 Heavy(900) 一款的 `Source Han Serif SC`，于是全书正文
+  超粗。改为「西文衬线在前 + 中文字体按存在且字重正规排序」：`Georgia, "Times New Roman",
+  "Noto Serif SC", "Noto Serif CJK SC", SimSun, "Source Han Serif SC", "Microsoft YaHei",
+  serif`。英文回到书作者常用的 Georgia（与该书自身 CSS 一致），中文优先本机真实存在的
+  `Noto Serif SC`（可变字体），`SimSun` 之后才轮到 `Source Han Serif SC`，不再可能命中
+  Heavy-only 安装。验证：用 CDP `CSS.getPlatformFontsForNode` 对真实章节
+  （AI Engineering from Scratch v1 / ch017，text/html 与 application/xhtml+xml 两种供给）
+  实测——修复前正文 `Source Han Serif SC Heavy`，修复后正文 `Georgia`(400)、标题
+  `Georgia-Bold`；`cargo fmt --all --check`、`cargo check --all-targets --locked`、
+  `cargo test --all-targets --locked --no-fail-fast` 全通过 —— lib 697、产品二进制 342、
+  epub_flow 6、translation_flow 19、multi_format_flow 4、multi_endpoint_flow 1、
+  openai_compatible_flow 22（因产品在运行占用 `target/debug`，测试在 `target/verify` 执行）。
+  未做人工 GUI 验证：需重新构建并重开章节后才能看到新样式。

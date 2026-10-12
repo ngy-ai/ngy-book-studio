@@ -45,7 +45,12 @@ pub(crate) const READER_CSS: &str = r#"
     padding: 48px 72px 96px !important;
     background: var(--ngy-paper) !important;
     color: var(--ngy-text) !important;
-    font-family: "Noto Serif CJK SC", "Source Han Serif SC", "Microsoft YaHei", Georgia, serif !important;
+    /* 西文衬线在前：拉丁字符用 Georgia / Times New Roman，不被 CJK 字体的
+       西文字形接管，这与书作者在书内 CSS 里的常见选择一致。中文字体按
+       “真实存在且字重正规”排序：Noto Serif SC（可变字体）→ Noto Serif CJK SC
+       → SimSun；Source Han Serif SC 必须排在 SimSun 之后——有些机器只装了
+       它的 Heavy(900) 字重，一旦命中就是全篇超粗的“黑体加粗”。 */
+    font-family: Georgia, "Times New Roman", "Noto Serif SC", "Noto Serif CJK SC", SimSun, "Source Han Serif SC", "Microsoft YaHei", serif !important;
     font-size: var(--ngy-font-size) !important;
     font-weight: normal !important;
     line-height: 1.85 !important;
