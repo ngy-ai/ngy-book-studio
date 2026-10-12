@@ -19,6 +19,8 @@ mod app;
 
 mod helpers;
 
+mod labels;
+
 mod load;
 
 mod manual;

@@ -1,6 +1,7 @@
 //! Manual translation, translation display and reader zoom.
 
 use super::*;
+use crate::ai::translation::{TranslationSegment, normalize_source_text};
 
 impl AppServices {
     /// Returns the current, revision-matched translations for one content unit
@@ -47,38 +48,13 @@ impl AppServices {
                         row.document_revision == book.revision && row.unit_revision == unit.revision
                     })
                     .filter_map(|row| {
-                        // A manual edit is displayed regardless of which model or
-                        // endpoint produced the machine text behind it: the reader
-                        // wrote it, and a model change must not hide it.
-                        let manual = row.manual_text.as_deref().and_then(|manual| {
-                            serde_json::from_str::<crate::ai::translation::StoredTranslation>(
-                                manual,
-                            )
-                            .ok()
-                        });
-                        if let Some(translation) = manual {
-                            return Some(TranslatedBlock {
-                                key: row.block_id,
-                                source: row.source_text,
-                                segments: translation.segments,
-                                manual: true,
-                            });
-                        }
-                        if row.model != translation_model {
-                            return None;
-                        }
-                        let translation = serde_json::from_str::<
-                            crate::ai::translation::StoredTranslation,
-                        >(&row.translated_text)
-                        .ok()?;
-                        if translation.execution_identity != execution_identity {
-                            return None;
-                        }
+                        let (segments, manual) =
+                            displayed_translation(&row, &translation_model, &execution_identity)?;
                         Some(TranslatedBlock {
                             key: row.block_id,
                             source: row.source_text,
-                            segments: translation.segments,
-                            manual: false,
+                            segments,
+                            manual,
                         })
                     })
                     .collect())
@@ -359,6 +335,125 @@ impl AppServices {
             .context("阅读页面大小保存线程异常退出")?
     }
 
+    /// Translations of a reading window's table-of-contents labels, aligned with
+    /// the request: index `i` answers `labels[i]`, and `None` keeps the label the
+    /// book itself carries.
+    ///
+    /// A label is matched by its exact, whitespace-normalized text, which is the
+    /// only key the reading window and the translation task share: the label of a
+    /// chapter entry is normally the chapter's own heading, so the译文 of that
+    /// block is the label's译文. The chapter the entry opens is preferred, and a
+    /// book-wide match is the fallback for entries whose label does not repeat a
+    /// heading of its chapter (navigation labels are written by hand, they do not
+    /// have to). Past [`MAX_READER_TOC_LABELS`] distinct label texts the remaining
+    /// entries simply keep the book's own label instead of turning this into an
+    /// unbounded query.
+    pub async fn translated_toc_labels(
+        &self,
+        book_id: String,
+        labels: Vec<ReaderTocLabel>,
+    ) -> Result<Vec<Option<String>>> {
+        if labels.is_empty() {
+            return Ok(Vec::new());
+        }
+        let settings = self.provider_settings()?;
+        let Some(target_language) = settings.default_language.clone() else {
+            return Ok(vec![None; labels.len()]);
+        };
+        let translation_model = settings.translation_model.clone();
+        let execution_identity = translation_execution_identity(&settings)?;
+        let db_path = self.db_path.clone();
+        self.runtime
+            .handle()
+            .spawn_blocking(move || {
+                let mut translated = vec![None; labels.len()];
+                let conn = db::open_conn(&db_path)?;
+                let Some(book) = db::books::get(&conn, &book_id)? else {
+                    return Ok(translated);
+                };
+                if book
+                    .language
+                    .as_deref()
+                    .is_some_and(|source| language_is_target(Some(source), &target_language))
+                {
+                    return Ok(translated);
+                }
+                // 标签文本先归一化再查：书内导航的空白与正文里的空白写法不同，
+                // 但同一段文字必须落到同一把键上。
+                let texts = labels
+                    .iter()
+                    .map(|label| normalize_source_text(&label.text))
+                    .filter(|text| !text.is_empty())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .take(MAX_READER_TOC_LABELS)
+                    .collect::<Vec<_>>();
+                if texts.is_empty() {
+                    return Ok(translated);
+                }
+                let rows = db::translations::list_with_source_texts(
+                    &conn,
+                    &book_id,
+                    &target_language,
+                    book.revision,
+                    &texts,
+                )?;
+                // 目录标签是短文本，同一段文字在一本书里可能出现在多处（同名小节、
+                // 导航页自身、正文里的同名标题）。读者自己改过的那一份永远优先，其余
+                // 取文档顺序里最靠前的一行；按单元再存一份，指向该章的条目因此优先
+                // 用这一章自己的译文。
+                let mut resolved = Vec::with_capacity(rows.len());
+                for row in &rows {
+                    let Some((segments, manual)) = displayed_translation(
+                        &row.translation,
+                        &translation_model,
+                        &execution_identity,
+                    ) else {
+                        continue;
+                    };
+                    let Some(text) = translation_display_text(&segments) else {
+                        continue;
+                    };
+                    resolved.push((row, text, manual));
+                }
+                let mut by_unit = BTreeMap::new();
+                let mut by_text = BTreeMap::new();
+                for manual in [true, false] {
+                    for (row, text, is_manual) in &resolved {
+                        if *is_manual != manual {
+                            continue;
+                        }
+                        by_unit
+                            .entry((
+                                row.content_unit_id.clone(),
+                                row.translation.source_text.clone(),
+                            ))
+                            .or_insert_with(|| text.clone());
+                        by_text
+                            .entry(row.translation.source_text.clone())
+                            .or_insert_with(|| text.clone());
+                    }
+                }
+                for (index, label) in labels.iter().enumerate() {
+                    let key = normalize_source_text(&label.text);
+                    if key.is_empty() {
+                        continue;
+                    }
+                    let translated_label = label
+                        .content_unit_id
+                        .as_ref()
+                        .and_then(|unit| by_unit.get(&(unit.clone(), key.clone())))
+                        .or_else(|| by_text.get(&key));
+                    if let Some(text) = translated_label {
+                        translated[index] = Some(text.clone());
+                    }
+                }
+                Ok(translated)
+            })
+            .await
+            .context("目录译文查询线程异常退出")?
+    }
+
     /// The translation engine a share import stamps shared machine译文 with.
     ///
     /// The reader hides machine译文 unless their model and execution identity
@@ -382,4 +477,60 @@ impl AppServices {
             target_language: settings.default_language.clone(),
         })
     }
+}
+
+/// Upper bound on the table-of-contents labels one reading window asks译文 for.
+/// A navigation document is written by hand and stays far below this in
+/// practice; a crafted one only loses译文 labels past the bound instead of
+/// turning the label lookup into an unbounded query.
+pub(crate) const MAX_READER_TOC_LABELS: usize = 4096;
+
+/// The译文 one row displays right now: the reader's own edit when there is one,
+/// otherwise the machine text that matches the active engine.
+///
+/// Both the chapter payload and the table-of-contents labels go through this, so
+/// a label can never display text the chapter itself would hide (and the
+/// "已手工修改" state survives a model or endpoint change in both places).
+fn displayed_translation(
+    row: &db::translations::Translation,
+    translation_model: &str,
+    execution_identity: &str,
+) -> Option<(Vec<TranslationSegment>, bool)> {
+    if let Some(translation) = row.manual_text.as_deref().and_then(|manual| {
+        serde_json::from_str::<crate::ai::translation::StoredTranslation>(manual).ok()
+    }) {
+        return Some((translation.segments, true));
+    }
+    if row.model != translation_model {
+        return None;
+    }
+    let translation =
+        serde_json::from_str::<crate::ai::translation::StoredTranslation>(&row.translated_text)
+            .ok()?;
+    if translation.execution_identity != execution_identity {
+        return None;
+    }
+    Some((translation.segments, false))
+}
+
+/// One block's译文 as a single line of text.
+///
+/// A block is translated leaf by leaf, so the译文 of a heading with inline markup
+/// arrives as several segments. The chapter renders each segment in place of its
+/// own leaf, which means the leaf's boundary whitespace belongs to the displayed
+/// text; recreating that here keeps two segments from running together
+/// (`函数` + `f(x)` must not become `函数f(x)` when the source had a space).
+/// Whitespace runs collapse back to single spaces and the ends are trimmed,
+/// because a label is one line.
+fn translation_display_text(segments: &[TranslationSegment]) -> Option<String> {
+    let mut text = String::new();
+    for segment in segments {
+        let leading = segment.source.len() - segment.source.trim_start().len();
+        let trailing = segment.source.len() - segment.source.trim_end().len();
+        text.push_str(&segment.source[..leading]);
+        text.push_str(segment.translated.trim());
+        text.push_str(&segment.source[segment.source.len() - trailing..]);
+    }
+    let text = normalize_source_text(&text);
+    (!text.is_empty()).then_some(text)
 }

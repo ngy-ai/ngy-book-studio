@@ -68,6 +68,8 @@ impl ReaderApp {
                 }
                 if translation_refresh_due(&mut this.translations.observed_progress, progress) {
                     this.load_translations(&url, false, cx);
+                    // 任务每推进一段，目录里就可能有新的标题译好。
+                    this.refresh_navigation_labels(cx);
                 }
             });
         })

@@ -79,6 +79,8 @@ impl ReaderApp {
         // nothing is republished and nothing typed is thrown away.
         if result.is_ok() {
             self.load_translations(url, true, cx);
+            // 手工改过的可能就是本章标题，目录随之换字。
+            self.refresh_navigation_labels(cx);
         }
     }
 

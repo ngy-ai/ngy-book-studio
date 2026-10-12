@@ -1,5 +1,5 @@
 use anyhow::{Context as _, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, params, params_from_iter, types::Value};
 
 /// One persisted, revision-scoped translation of a single block. Rows are keyed
 /// by `(book_id, content_unit_id, block_id, target_language)` so the reader can
@@ -63,6 +63,82 @@ pub(crate) struct TranslationRow {
 
 const SELECT: &str = "SELECT block_id, ordinal, document_revision, unit_revision,
     model, source_text, translated_text, manual_text FROM translations";
+
+/// One译文 row found by the text it translates, together with the unit it
+/// belongs to.
+///
+/// The reading window asks for these to translate the labels of its table of
+/// contents: a label names a block of the chapter it opens, and the unit keeps
+/// the answer tied to that chapter when the same text also appears elsewhere in
+/// the book.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SourceTextTranslation {
+    pub(crate) content_unit_id: String,
+    pub(crate) translation: Translation,
+}
+
+/// How many source texts one statement asks for. Labels are short and few, and
+/// keeping the list well below SQLite's default parameter limit means the query
+/// stays one prepared statement per chunk instead of a temporary table.
+const SOURCE_TEXT_CHUNK: usize = 128;
+
+/// Every译文 of the requested texts that is still current: the row belongs to
+/// the requested document revision and to a unit that still carries the revision
+/// the row was written for. A label that names no block of a current chapter
+/// simply has no row, which is the caller's "keep the book's own label".
+pub(crate) fn list_with_source_texts(
+    conn: &Connection,
+    book_id: &str,
+    target_language: &str,
+    document_revision: u64,
+    texts: &[String],
+) -> Result<Vec<SourceTextTranslation>> {
+    let mut found = Vec::new();
+    for chunk in texts.chunks(SOURCE_TEXT_CHUNK) {
+        let placeholders = (1..=chunk.len())
+            .map(|parameter| format!("?{}", parameter + 3))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT t.content_unit_id, t.block_id, t.ordinal, t.document_revision,
+                    t.unit_revision, t.model, t.source_text, t.translated_text, t.manual_text
+             FROM translations t
+             JOIN content_units u
+               ON u.id = t.content_unit_id AND u.revision = t.unit_revision
+             WHERE t.book_id = ?1 AND t.target_language = ?2 AND t.document_revision = ?3
+               AND t.source_text IN ({placeholders})
+             ORDER BY t.ordinal, t.block_id"
+        );
+        let values = std::iter::once(Value::Text(book_id.to_string()))
+            .chain(std::iter::once(Value::Text(target_language.to_string())))
+            .chain(std::iter::once(Value::Integer(document_revision as i64)))
+            .chain(chunk.iter().cloned().map(Value::Text))
+            .collect::<Vec<_>>();
+        let mut stmt = conn.prepare(&sql).context("无法准备目录译文查询")?;
+        let rows = stmt
+            .query_map(params_from_iter(values.iter()), |row| {
+                Ok(SourceTextTranslation {
+                    content_unit_id: row.get(0)?,
+                    translation: Translation {
+                        block_id: row.get(1)?,
+                        ordinal: row.get::<_, i64>(2)? as u64,
+                        document_revision: row.get::<_, i64>(3)? as u64,
+                        unit_revision: row.get::<_, i64>(4)? as u64,
+                        model: row.get(5)?,
+                        source_text: row.get(6)?,
+                        translated_text: row.get(7)?,
+                        manual_text: row.get(8)?,
+                    },
+                })
+            })
+            .context("无法读取目录译文")?;
+        found.extend(
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .context("无法解析目录译文记录")?,
+        );
+    }
+    Ok(found)
+}
 
 /// Every译文 row of one book, newest scope first. The share export walks these
 /// to write one portable section entry per row.
@@ -424,6 +500,113 @@ mod tests {
         assert_eq!(rows.len(), 2, "same scope must replace in place");
         assert_eq!(rows[0].translated_text, "甲二");
         assert_eq!(row_count(&conn), 2);
+    }
+
+    /// 目录标签按文本查译文：只有「文档版本仍是当前、所属单元仍带写入时的版本」的行
+    /// 才算当前译文；换语言、换版本的旧行都不能被目录借去显示。
+    #[test]
+    fn a_source_text_lookup_keeps_only_current_revision_rows() {
+        let (_temp, conn) = fixture();
+        conn.execute_batch(
+            "INSERT INTO content_units(id, book_id, source_id, ordinal, kind,
+                source_locator_json, block_json, revision, created_at, updated_at)
+                VALUES ('unit-2', 'book', 'source', 1, 'chapter', '{}',
+                        '{\"schema_version\":1,\"blocks\":[]}', 1, 1, 1);",
+        )
+        .unwrap();
+        let store = |block_id: &str, unit: &str, source: &str, translated: &str| {
+            let mut row = sample(block_id, 0, translated);
+            row.content_unit_id = unit.to_string();
+            row.source_text = source.to_string();
+            upsert(&conn, &row).unwrap();
+        };
+        store(
+            "block-a",
+            "unit",
+            "Linear Algebra Intuition",
+            "线性代数的直观理解",
+        );
+        // 旧文档版本：书的正文改过了，这一行不再对应当前版本。
+        let mut stale = sample("block-b", 1, "旧版译文");
+        stale.source_text = "Stale Document".into();
+        stale.document_revision = 0;
+        upsert(&conn, &stale).unwrap();
+        // 章节改版后行没有跟上：单元的版本已经不再等于行里的单元版本。
+        store("block-c", "unit-2", "Moved Unit", "改版前的译文");
+        conn.execute(
+            "UPDATE content_units SET revision = 2 WHERE id = 'unit-2'",
+            [],
+        )
+        .unwrap();
+        // 另一种目标语言是另一个 scope，中文目录不能借它。
+        let mut japanese = sample("block-d", 2, "日本語の訳");
+        japanese.source_text = "Japanese Only".into();
+        japanese.target_language = "ja".into();
+        upsert(&conn, &japanese).unwrap();
+
+        let texts = [
+            "Linear Algebra Intuition",
+            "Stale Document",
+            "Moved Unit",
+            "Japanese Only",
+            "Not A Block",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        let found = list_with_source_texts(&conn, "book", "zh-Hans", 1, &texts).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].content_unit_id, "unit");
+        assert_eq!(found[0].translation.source_text, "Linear Algebra Intuition");
+        assert_eq!(found[0].translation.translated_text, "线性代数的直观理解");
+
+        // 手工译文与机器译文在行里并排存放，查表必须一并带回，由调用方决定显示哪个。
+        set_manual_text(
+            &conn,
+            "book",
+            "unit",
+            "block-a",
+            "zh-Hans",
+            1,
+            1,
+            Some("读者自己的标题"),
+            20,
+        )
+        .unwrap();
+        let found = list_with_source_texts(
+            &conn,
+            "book",
+            "zh-Hans",
+            1,
+            &["Linear Algebra Intuition".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            found[0].translation.manual_text.as_deref(),
+            Some("读者自己的标题")
+        );
+    }
+
+    /// 一章几十个标签、一本几百章：分块查询不能漏掉任何一块里的文本。
+    #[test]
+    fn a_source_text_lookup_never_misses_a_chunk() {
+        let (_temp, conn) = fixture();
+        let total = SOURCE_TEXT_CHUNK + 2;
+        let mut texts = Vec::with_capacity(total);
+        for index in 0..total {
+            let source = format!("label-{index}");
+            let mut row = sample(
+                &format!("block-{index}"),
+                index as u64,
+                &format!("标签{index}"),
+            );
+            row.source_text = source.clone();
+            upsert(&conn, &row).unwrap();
+            texts.push(source);
+        }
+        let found = list_with_source_texts(&conn, "book", "zh-Hans", 1, &texts).unwrap();
+        assert_eq!(found.len(), total, "每个分块的结果都必须被收拢");
+        assert_eq!(found[total - 1].translation.source_text, texts[total - 1]);
+        assert!(found.iter().all(|row| row.content_unit_id == "unit"));
     }
 
     #[test]

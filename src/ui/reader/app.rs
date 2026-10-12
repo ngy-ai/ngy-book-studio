@@ -153,6 +153,7 @@ impl ReaderApp {
         }));
         reader.start_translation_refresh(cx);
         reader.load_translation_display_override(cx);
+        reader.refresh_navigation_labels(cx);
         reader.load_text_size(cx);
         reader
     }

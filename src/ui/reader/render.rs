@@ -19,10 +19,15 @@ impl Render for ReaderApp {
         let view = cx.entity().clone();
         let current = self.current_spine;
         let total = self.book.spine.len();
+        // 目录条目按显示方式取标签：译文/双语显示目录条目的译文，原文模式或还没有译文时
+        // 仍显示书里自己的写法。侧栏条目、窗口顶部与状态栏的章节名都取这一份，
+        // 三者不会互相矛盾。
+        let navigation_labels = (0..self.book.toc.len())
+            .map(|index| self.navigation_label(index))
+            .collect::<Vec<_>>();
         let chapter_label = self
             .selected_toc
-            .and_then(|index| self.book.toc.get(index))
-            .map(|item| item.label.clone())
+            .and_then(|index| navigation_labels.get(index).cloned())
             .unwrap_or_else(|| self.book.spine[current].title.clone());
         let progress = if total == 0 {
             0.0
@@ -362,7 +367,7 @@ impl Render for ReaderApp {
                                     } else {
                                         rgb(palette(cx).ink)
                                     })
-                                    .child(item.label.clone()),
+                                    .child(navigation_labels[index].clone()),
                             )
                             .into_any_element()
                     } else {
@@ -376,7 +381,7 @@ impl Render for ReaderApp {
                             .text_sm()
                             .font_semibold()
                             .text_color(rgb(palette(cx).muted))
-                            .child(div().line_clamp(2).child(item.label.clone()))
+                            .child(div().line_clamp(2).child(navigation_labels[index].clone()))
                             .into_any_element()
                     }
                 })

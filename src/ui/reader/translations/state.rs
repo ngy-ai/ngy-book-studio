@@ -20,6 +20,11 @@ pub(crate) struct ReaderTranslations {
     /// Mode currently applied to the page: the book's choice, or the global
     /// preference while the book has none.
     pub(crate) effective: TranslationDisplayMode,
+    /// 目录条目的译文，与 `book.toc` 一一对应；`None` 表示这一条没有译文，
+    /// 侧栏照旧显示书里的原文。
+    pub(crate) navigation_labels: Vec<Option<String>>,
+    /// 目录译文请求的代次：迟到的回答只能被丢弃，不能覆盖更新的那一份。
+    pub(crate) navigation_generation: u64,
     /// Keeps the refresh task alive for the window's lifetime.
     pub(crate) _refresh_task: Option<Task<()>>,
 }
@@ -34,6 +39,8 @@ impl ReaderTranslations {
             polling: false,
             override_mode: None,
             effective: global,
+            navigation_labels: Vec::new(),
+            navigation_generation: 0,
             _refresh_task: None,
         }
     }

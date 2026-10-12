@@ -132,6 +132,17 @@
     隐藏，标记需切到双语或原文才可见。解释译文时页面把所选译文作为 `displayed_text`
     回传（仅 `ai_explain`），提问按“请按译文解释”附上该译文，模型因此解释你读到的文字，
     而引用、来源与保存的 AI 想法仍是原文
+  - [x] 目录标签跟随显示方式：窗口打开、任务推进与手工保存译文后，把目录每个条目的标签连同
+    它指向的内容单元交给 `AppServices::translated_toc_labels`，侧栏条目、窗口顶部与状态栏的
+    章节名在译文/双语下显示该章标题的译文，原文模式或这一章还没有译文时保持书里自己的写法。
+    服务层按归一化后的标签文本精确查当前译文（`db::translations::list_with_source_texts`，
+    以 JOIN `content_units` 保证单元版本仍与行一致），本章自己的行优先于全书兜底，读者手工
+    改过的行优先于机器行，机器行沿用与页面完全相同的模型与执行身份过滤；请求数量上界
+    `MAX_READER_TOC_LABELS`，查询失败只写一条警告并保留原标签，不在阅读窗口报错。回归：
+    `toc_labels_prefer_the_entries_own_chapter_and_the_current_engine`、
+    `a_source_text_lookup_keeps_only_current_revision_rows`、
+    `a_source_text_lookup_never_misses_a_chunk`、
+    `the_table_of_contents_follows_the_display_mode`、`every_toc_entry_asks_for_its_own_chapter`
   - [x] 朗读（Windows WinRT 与 macOS AVFAudio 系统语音，零模型；macOS 只加了 objc2 绑定，
     **未在 macOS 上验证运行**）：三个阅读窗口与 AI 问答侧栏共用一套引擎、
     单会话约束与生命周期（宿主共享层 `src/ui/read_aloud.rs`）。EPUB 阅读窗口段落悬停出现朗读按钮，从该段

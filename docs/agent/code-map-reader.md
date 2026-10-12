@@ -202,6 +202,15 @@
   `translation_run_untranslated` 而非 `run_failed`；修复前同一批块是 3/3 `invalid_schema`、
   连续 3 块未译后整本任务失败（该中止条件已于 2026-09-15 取消）。换模型后重跑该门禁即可复验，
   不要把它并入默认测试。
+- `src/ui/reader/translations/labels.rs`：目录标签跟着显示方式走。窗口打开、后台任务推进与
+  手工保存译文后，把 `book.toc` 每个条目的标签连同它指向的内容单元（由 `progress_locators`
+  解析）交给 `AppServices::translated_toc_labels`；侧栏条目、窗口顶部与状态栏的章节名在
+  译文/双语下显示该章标题的译文，原文模式或还没有译文时保持书里自己的写法。服务层按
+  「归一化后的标签文本」精确查当前译文（`db::translations::list_with_source_texts`，
+  JOIN `content_units` 保证单元版本仍与行一致），先取该单元自己的行、再取全书兜底；读者
+  手工改过的行优先于机器行，机器行与页面用同一套模型与执行身份过滤（`displayed_translation`，
+  两处规则必须一致）。请求数量上界 `MAX_READER_TOC_LABELS`，答案按位置对齐 `book.toc`，
+  迟到的回答按代次丢弃；查询失败只写一条 `tracing::warn` 并保持原标签，不在阅读窗口报错。
 - `src/ui/pdf_reader/annotations.rs`、`annotations.js`：PDF 页面笔记宿主与页面桥接，
   复用同一张 `annotations` 表、互斥标记规则、人工/AI 想法流程与展示清洗。锚点作用域
   是单页的 PDF.js 文字层：宿主无法复刻该投影，因此

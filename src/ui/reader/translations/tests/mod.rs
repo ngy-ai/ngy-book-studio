@@ -3,6 +3,9 @@
 use super::super::*;
 
 use super::*;
+use ngy_book_studio::reader::TocItem;
+
+use super::labels::{toc_label, toc_label_requests};
 
 #[test]
 fn refresh_follows_task_progress_and_settles_when_idle() {
@@ -22,6 +25,78 @@ fn refresh_follows_task_progress_and_settles_when_idle() {
     assert!(translation_refresh_due(&mut observed, None));
     assert_eq!(observed, None);
     assert!(!translation_refresh_due(&mut observed, None));
+}
+
+/// 目录条目跟着显示方式走：译文/双语显示译文，原文模式显示书里自己的写法；还没有
+/// 译文的条目（任务没跑到那一章）在任何模式下都保持原样，绝不显示空白或猜测。
+#[test]
+fn the_table_of_contents_follows_the_display_mode() {
+    let original = "Linear Algebra Intuition";
+    let translated = "线性代数的直观理解";
+    for mode in [
+        TranslationDisplayMode::Bilingual,
+        TranslationDisplayMode::TranslationOnly,
+    ] {
+        assert_eq!(toc_label(original, Some(translated), mode), translated);
+        assert_eq!(toc_label(original, None, mode), original);
+    }
+    assert_eq!(
+        toc_label(
+            original,
+            Some(translated),
+            TranslationDisplayMode::OriginalOnly
+        ),
+        original,
+        "原文模式必须给出书里自己的标签，哪怕译文已经存在"
+    );
+}
+
+/// 每个目录条目要问的是「它指的那一章」的译文：章节标签靠这个单元发出，服务层才能
+/// 在全书范围内优先选这一章自己的那一份。指不到章节的条目（纯分组或陈旧索引）按
+/// 没有单元处理，不能把别的章节的译文顶到它身上。
+#[test]
+fn every_toc_entry_asks_for_its_own_chapter() {
+    let toc = vec![
+        TocItem {
+            label: "Part I — Setup & Tooling".to_string(),
+            href: Some("EPUB/text/part1.xhtml".to_string()),
+            depth: 0,
+            spine_index: Some(1),
+        },
+        TocItem {
+            label: "About This Volume".to_string(),
+            href: Some("EPUB/text/ch001.xhtml".to_string()),
+            depth: 1,
+            spine_index: Some(0),
+        },
+        TocItem {
+            label: "Cover".to_string(),
+            href: Some("EPUB/text/cover.xhtml".to_string()),
+            depth: 0,
+            spine_index: Some(9),
+        },
+        TocItem {
+            label: "未命名分组".to_string(),
+            href: None,
+            depth: 0,
+            spine_index: None,
+        },
+    ];
+    let locators = vec![
+        DocumentLocator::unit("book", "unit-1"),
+        DocumentLocator::unit("book", "unit-2"),
+    ];
+    let requests = toc_label_requests(&toc, &locators);
+    assert_eq!(requests.len(), toc.len(), "请求与目录条目一一对应");
+    assert_eq!(requests[0].text, "Part I — Setup & Tooling");
+    assert_eq!(requests[0].content_unit_id.as_deref(), Some("unit-2"));
+    assert_eq!(requests[1].content_unit_id.as_deref(), Some("unit-1"));
+    assert_eq!(
+        requests[2].content_unit_id, None,
+        "定位表里没有的章号只说明这一条问不到单元，不是错误"
+    );
+    assert_eq!(requests[3].content_unit_id, None);
+    assert_eq!(requests[3].text, "未命名分组");
 }
 
 #[test]

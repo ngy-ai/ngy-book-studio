@@ -82,6 +82,19 @@ pub struct TranslatedBlock {
     pub manual: bool,
 }
 
+/// One table-of-contents label of the reading window, asked for in the reader's
+/// language.
+///
+/// A label is the text the book itself shows for an entry; `content_unit_id` is
+/// the chapter the entry opens, so the译文 of that chapter's own heading wins
+/// over an identical text found somewhere else in the book. Entries that only
+/// group others have no unit and are matched book-wide.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReaderTocLabel {
+    pub content_unit_id: Option<String>,
+    pub text: String,
+}
+
 /// Whether a book's declared language already satisfies a target tag. Compares
 /// only the primary subtag so `en-US` matches `en` and `zh` matches `zh-Hans`.
 pub fn language_is_target(source: Option<&str>, target: &str) -> bool {

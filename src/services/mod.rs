@@ -87,7 +87,7 @@ pub(crate) use settings::*;
 // The public service surface, unchanged by the split.
 pub use jobs::{
     BackgroundJobAction, BackgroundJobProgress, BackgroundJobSnapshot, BackgroundJobStatus,
-    PublishedVisualPage, TranslatedBlock, VisualPageSourceKind,
+    PublishedVisualPage, ReaderTocLabel, TranslatedBlock, VisualPageSourceKind,
 };
 pub use mutation::LibraryMutation;
 pub use settings::{

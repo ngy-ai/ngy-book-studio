@@ -16,7 +16,7 @@ use ngy_book_studio::{
         READER_FONT_SIZE_MIN, ReaderResourceAuthorizations, ResourceResponse,
         load_resource_with_range, reader_appearance_script, reader_font_size,
     },
-    services::{AppServices, ReaderZoomSurface, TranslationDisplayMode},
+    services::{AppServices, ReaderTocLabel, ReaderZoomSurface, TranslationDisplayMode},
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
