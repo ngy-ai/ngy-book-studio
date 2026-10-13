@@ -79,6 +79,12 @@ impl SearchService {
         &self.embedding_model
     }
 
+    /// 只给装配测试：检索的查询向量走的是哪一套 provider（进而它的请求类别）。
+    #[cfg(test)]
+    pub(crate) fn embedding_provider_for_test(&self) -> &Arc<dyn OpenAiCompatibleProvider> {
+        &self.embedding_provider
+    }
+
     pub fn upsert_embedding(&self, embedding: &ChunkEmbedding) -> Result<()> {
         self.vector_index.upsert(&self.db_path, embedding)
     }

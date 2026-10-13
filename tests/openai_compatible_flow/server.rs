@@ -263,6 +263,69 @@ pub(crate) fn scripted_chat_http_server_at_path(
     (format!("http://{address}{base_path}"), requests, server)
 }
 
+/// 先回一发 429（带 `Retry-After`），再回一发正常的 chat SSE；记录每一发到达服务器的时刻。
+///
+/// 到达时刻是「这一发真的发出去了」的证据：本地限速只能把请求推迟，不能让它凭空消失。
+pub(crate) fn throttled_chat_server(
+    retry_after_secs: u64,
+) -> (
+    String,
+    Arc<Mutex<Vec<std::time::Instant>>>,
+    thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let arrivals = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&arrivals);
+    let server = thread::spawn(move || {
+        for round in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let request = read_request(&mut stream);
+            assert!(
+                request
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .starts_with("POST /v1/chat/completions ")
+            );
+            captured.lock().unwrap().push(std::time::Instant::now());
+            let (status, content_type, body) = if round == 0 {
+                (
+                    "429 Too Many Requests",
+                    "application/json",
+                    r#"{"error":{"message":"rate limited","type":"rate_limit_error"}}"#.to_string(),
+                )
+            } else {
+                (
+                    "200 OK",
+                    "text/event-stream",
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: [DONE]\n\n"
+                    )
+                    .to_string(),
+                )
+            };
+            let retry_after = if round == 0 {
+                format!("Retry-After: {retry_after_secs}\r\n")
+            } else {
+                String::new()
+            };
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n{retry_after}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        }
+    });
+    (format!("http://{address}/v1/"), arrivals, server)
+}
+
 pub(crate) fn read_request(stream: &mut TcpStream) -> String {
     let mut bytes = Vec::new();
     let mut buffer = [0u8; 4096];

@@ -42,6 +42,8 @@ mod d_test;
 
 mod e_test;
 
+mod f_test;
+
 pub(crate) use backend::*;
 
 pub(crate) use diagnostics::*;

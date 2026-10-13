@@ -54,6 +54,13 @@ pub(crate) fn load_provider_settings(db_path: &Path) -> Result<ProviderSettings>
         }
         None => EndpointRoutingSettings::default(),
     };
+    // Clamp instead of failing, like the background-job preference below: a hand-edited
+    // or truncated row must not prevent the library from opening. 保存路径仍然拒绝超限
+    // 的数字（`ProviderSettings::validate`），钳制只针对别人改过的行。
+    settings.requests_per_minute = settings.requests_per_minute.min(MAX_ENDPOINT_RPM);
+    for endpoint in &mut settings.endpoint_routing.additional_endpoints {
+        endpoint.requests_per_minute = endpoint.requests_per_minute.min(MAX_ENDPOINT_RPM);
+    }
     let background_jobs = match db::settings::get(&tx, BACKGROUND_JOB_SETTINGS_KEY)? {
         Some(row) => serde_json::from_str::<PersistedBackgroundJobSettings>(&row.value_json)
             .context("保存的后台任务设置无效")?,

@@ -253,4 +253,13 @@ pub trait OpenAiCompatibleProvider: Send + Sync {
     fn endpoint_origin(&self) -> Option<String> {
         None
     }
+
+    /// 这套连接所在的额度闸门（上限与请求类别）；`None` 表示它没接闸门（不受限速）。
+    ///
+    /// 与 `endpoint_origin` 一样是诊断/装配用的只读视图：装配层的测试用它确认每个角色
+    /// 都拿到了所属 Endpoint 的额度、以及它算交互请求还是后台任务；同一条 Endpoint 的
+    /// 额度本来就是同一份（见 [`EndpointRateLimits::slot`]）。
+    fn endpoint_budget(&self) -> Option<EndpointBudget> {
+        None
+    }
 }

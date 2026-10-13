@@ -37,7 +37,11 @@ impl AppServices {
         let settings = load_provider_settings(&db_path)?;
         auto_run_background_jobs.store(settings.auto_run_background_jobs, Ordering::Release);
         let api_keys = load_endpoint_api_keys(&settings, credentials.as_ref())?;
-        let ai = build_ai_services(&db_path, settings, &api_keys)?;
+        let endpoint_limits = Arc::new(EndpointRateLimits::new());
+        let ai = build_ai_services(&db_path, settings, &api_keys, Arc::clone(&endpoint_limits))?;
+        // 保存设置时发布的是列表里**每一条** Endpoint 的上限，启动时补齐同一份口径：
+        // 没被任何模型绑定的地址也不该等到下一次保存才有额度条目。
+        publish_endpoint_limits(&endpoint_limits, &ai.settings)?;
         let office: Arc<dyn OfficeEnhancer> = Arc::new(OfficeComWorker::start()?);
         let mut visual_renderers: Vec<Arc<dyn VisualRenderer>> =
             vec![Arc::new(StructuralPngRenderer)];
@@ -131,6 +135,7 @@ impl AppServices {
             chat,
             credentials,
             ai: Arc::new(RwLock::new(ai)),
+            endpoint_limits,
             ai_configuration: Arc::new(tokio::sync::Mutex::new(())),
             office,
             indexing,

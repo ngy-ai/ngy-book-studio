@@ -25,6 +25,7 @@ fn endpoint_fixture(name: &str, port: u16) -> EndpointSettings {
         allow_insecure_remote_http: false,
         confirmed_remote_endpoint: String::new(),
         request_timeout_secs: DEFAULT_AI_REQUEST_TIMEOUT_SECS,
+        requests_per_minute: 0,
     }
 }
 

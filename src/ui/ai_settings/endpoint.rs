@@ -69,6 +69,7 @@ impl EndpointSettingsWindow {
         settings.allow_insecure_remote_http = default_endpoint.allow_insecure_remote_http;
         settings.confirmed_remote_endpoint = default_endpoint.confirmed_remote_endpoint;
         settings.request_timeout_secs = default_endpoint.request_timeout_secs;
+        settings.requests_per_minute = default_endpoint.requests_per_minute;
         settings.endpoint_routing.default_endpoint_name = default_endpoint.name;
         settings.endpoint_routing.additional_endpoints = endpoints;
         settings.validate()?;
@@ -122,6 +123,7 @@ impl EndpointSettingsWindow {
             allow_insecure_remote_http: false,
             confirmed_remote_endpoint: String::new(),
             request_timeout_secs: DEFAULT_AI_REQUEST_TIMEOUT_SECS,
+            requests_per_minute: DEFAULT_ENDPOINT_REQUESTS_PER_MINUTE,
         };
         self.endpoints
             .push(new_endpoint_draft(endpoint, window, cx));
@@ -276,6 +278,13 @@ impl EndpointSettingsWindow {
                     "请求超时（秒）",
                     "可设置 1–600 秒，默认 120 秒。非流式请求按整段调用计时；流式回答按“多久没有新数据”计时，只要模型持续输出就不会被中途中断。",
                     &endpoint.request_timeout_input,
+                ),
+                render_input_field(
+                    theme,
+                    busy,
+                    "每分钟请求数上限（RPM）",
+                    "留空或 0 表示不限。服务商按 Endpoint 计量，所以同一个地址上的问答、翻译、向量、视觉与模型检测共用这一份额度：额度用满时请求在本地等待，问答与模型检测优先，不会硬撞服务商的限制。服务商返回 429 时整个 Endpoint 一起退避。",
+                    &endpoint.requests_per_minute_input,
                 ),
                 detection.unwrap_or_else(|| div().into_any_element()),
             ],
@@ -549,6 +558,43 @@ mod tests {
                 assert_eq!(view.endpoints.len(), 1);
                 assert_eq!(view.selected_endpoint_id, DEFAULT_ENDPOINT_ID);
             });
+        });
+    }
+
+    /// 「每分钟请求数上限」进出草稿：默认「不限」写成 0，超上限的值在保存前就被挡住。
+    #[gpui_kit::test]
+    fn the_request_limit_round_trips_and_rejects_values_over_the_cap(cx: &mut TestAppContext) {
+        use ngy_book_studio::ai::MAX_ENDPOINT_RPM;
+
+        let (_directory, settings, visual) = open_window(cx);
+        let input = settings.read_with(visual, |view, cx| {
+            assert_eq!(
+                view.selected_endpoint()
+                    .entered(cx)
+                    .unwrap()
+                    .requests_per_minute,
+                0
+            );
+            view.selected_endpoint().requests_per_minute_input.clone()
+        });
+
+        edit_input(visual, &input, "12");
+        settings.read_with(visual, |view, cx| {
+            assert_eq!(
+                view.selected_endpoint()
+                    .entered(cx)
+                    .unwrap()
+                    .requests_per_minute,
+                12
+            );
+        });
+
+        edit_input(visual, &input, &(MAX_ENDPOINT_RPM + 1).to_string());
+        settings.read_with(visual, |view, cx| {
+            assert!(
+                view.selected_endpoint().entered(cx).is_err(),
+                "超上限的数字必须在保存前被拒绝"
+            );
         });
     }
 

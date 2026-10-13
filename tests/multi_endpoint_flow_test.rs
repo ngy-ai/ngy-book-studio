@@ -112,6 +112,7 @@ impl MockEndpoint {
             allow_insecure_remote_http: false,
             confirmed_remote_endpoint: String::new(),
             request_timeout_secs: 10,
+            requests_per_minute: 0,
         }
     }
 }

@@ -100,6 +100,14 @@ pub struct EndpointSettings {
     pub allow_insecure_remote_http: bool,
     pub confirmed_remote_endpoint: String,
     pub request_timeout_secs: u64,
+    /// 这台 Endpoint 的每分钟请求数上限（RPM），`0` 表示不限。老版本的配置行里没有这个
+    /// 键，缺失时按不限读取，所以升级不会平白给用户的端点加上限速。
+    ///
+    /// 服务商按端点计量，所以额度按 `base_url` 共享：同一台服务器上的问答、整本翻译、
+    /// 向量索引、视觉理解与模型检测走的是同一份配额。限速只影响请求什么时候发出，
+    /// **不属于**任何执行身份，改它不会让已翻好的译文或已建好的索引失效。
+    #[serde(default)]
+    pub requests_per_minute: u32,
 }
 
 impl EndpointSettings {
@@ -123,6 +131,11 @@ impl EndpointSettings {
         self.provider_config(None)
             .validated_base_url()
             .with_context(|| format!("Endpoint「{}」配置无效", self.name))?;
+        ensure!(
+            self.requests_per_minute <= MAX_ENDPOINT_RPM,
+            "Endpoint「{}」的每分钟请求数上限不能超过 {MAX_ENDPOINT_RPM}",
+            self.name
+        );
         Ok(())
     }
 
@@ -508,6 +521,10 @@ pub struct ProviderSettings {
     /// were made. Changing the endpoint invalidates both booleans.
     pub confirmed_remote_endpoint: String,
     pub request_timeout_secs: u64,
+    /// 默认 Endpoint 的「每分钟请求数上限」（见 [`EndpointSettings::requests_per_minute`]）。
+    /// 老配置行里没有这个键，缺失时按不限读取。
+    #[serde(default)]
+    pub requests_per_minute: u32,
     // --- Host-performed web search (off by default) ---
     /// Opt-in internet fallback used only when the authorized books cannot
     /// ground an answer. Disabled by default, so no request is ever issued
@@ -574,6 +591,7 @@ impl Default for ProviderSettings {
             allow_insecure_remote_http: false,
             confirmed_remote_endpoint: String::new(),
             request_timeout_secs: DEFAULT_AI_REQUEST_TIMEOUT_SECS,
+            requests_per_minute: 0,
             web_search_enabled: false,
             web_search_url_template: String::new(),
             web_search_method: default_web_search_method(),
@@ -657,6 +675,7 @@ impl ProviderSettings {
             allow_insecure_remote_http: self.allow_insecure_remote_http,
             confirmed_remote_endpoint: self.confirmed_remote_endpoint.clone(),
             request_timeout_secs: self.request_timeout_secs,
+            requests_per_minute: self.requests_per_minute,
         });
         endpoints.extend(self.endpoint_routing.additional_endpoints.iter().cloned());
         endpoints

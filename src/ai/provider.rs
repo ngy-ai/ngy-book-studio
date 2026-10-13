@@ -7,6 +7,9 @@ pub struct OpenAiHttpProvider {
     pub(crate) config: ProviderConfig,
     pub(crate) client: Client,
     pub(crate) base_url: Url,
+    /// 这台 Endpoint 的请求额度与本次连接属于哪一类请求；`None` 表示这一发不受限速
+    /// （没接注册表的构造路径，例如协议测试）。
+    pub(crate) budget: Option<EndpointBudget>,
 }
 
 impl std::fmt::Debug for OpenAiHttpProvider {
@@ -44,7 +47,41 @@ impl OpenAiHttpProvider {
             config,
             client,
             base_url,
+            budget: None,
         })
+    }
+
+    /// 把这一发连接接到某个 Endpoint 的额度闸门上。
+    ///
+    /// 额度必须由外部注入：它按 `base_url` 在进程里共享（见 [`EndpointRateLimits`]），
+    /// 而 provider 会随设置保存整批重建，自己造一份就等于每次保存都重置限速。
+    pub fn with_endpoint_budget(mut self, budget: EndpointBudget) -> Self {
+        self.budget = Some(budget);
+        self
+    }
+
+    /// 等到这台 Endpoint 的额度允许发下一次请求。
+    ///
+    /// 排队可能长达一个窗口，所以它发生在请求超时**之外**：那是「端点多久不回话」的上限，
+    /// 不是本地等额度的上限。
+    async fn await_endpoint_budget(&self) {
+        if let Some(budget) = &self.budget {
+            budget.acquire().await;
+        }
+    }
+
+    /// 服务商明确说额度用尽（HTTP 429）时，让整个 Endpoint 一起退避。
+    ///
+    /// 同一台服务器上的其它角色（翻译、向量、视觉）共用一份额度，所以这条冷却对它们同样
+    /// 生效：要么一起等，要么一起撞墙。
+    fn note_endpoint_rate_limit(&self, response: &Response) {
+        if response.status() != StatusCode::TOO_MANY_REQUESTS {
+            return;
+        }
+        let Some(budget) = &self.budget else {
+            return;
+        };
+        budget.note_rate_limit(parse_retry_after(response.headers()));
     }
 
     /// Bounds one non-streaming provider call with the configured request
@@ -112,6 +149,10 @@ impl OpenAiCompatibleProvider for OpenAiHttpProvider {
         Some(endpoint_origin_label(&self.base_url))
     }
 
+    fn endpoint_budget(&self) -> Option<EndpointBudget> {
+        self.budget.clone()
+    }
+
     fn models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>>> {
         async move {
             #[derive(Deserialize)]
@@ -119,12 +160,14 @@ impl OpenAiCompatibleProvider for OpenAiHttpProvider {
                 data: Vec<ModelInfo>,
             }
 
+            self.await_endpoint_budget().await;
             self.within_request_timeout(async {
                 let response = self
                     .authorized(self.client.get(self.endpoint("models")?))
                     .send()
                     .await
                     .context("failed to query AI models")?;
+                self.note_endpoint_rate_limit(&response);
                 let response = checked_response(response).await?;
                 let bytes = read_success_body_limited(
                     response,
@@ -190,6 +233,7 @@ impl OpenAiCompatibleProvider for OpenAiHttpProvider {
                     .and_then(reqwest::Body::as_bytes)
                     .map_or(0, <[u8]>::len);
                 tracing::Span::current().record("request_body_bytes", request_body_bytes);
+                self.await_endpoint_budget().await;
                 tracing::debug!(target: "ngy_ai", stage = "http_send", "Sending AI chat request");
                 // Only the wait for the response headers is bounded by the
                 // configured request timeout; the body that follows is bounded by
@@ -201,6 +245,7 @@ impl OpenAiCompatibleProvider for OpenAiHttpProvider {
                             .execute(http_request)
                             .await
                             .context("failed to start streaming chat completion")?;
+                        self.note_endpoint_rate_limit(&response);
                         checked_response(response).await
                     })
                     .await?;
@@ -253,6 +298,7 @@ impl OpenAiCompatibleProvider for OpenAiHttpProvider {
                 expected <= MAX_EMBEDDING_COUNT,
                 "embedding request exceeds the {MAX_EMBEDDING_COUNT}-input limit"
             );
+            self.await_endpoint_budget().await;
             self.within_request_timeout(async {
                 let response = self
                     .authorized(self.client.post(self.endpoint("embeddings")?))
@@ -260,6 +306,7 @@ impl OpenAiCompatibleProvider for OpenAiHttpProvider {
                     .send()
                     .await
                     .context("failed to request embeddings")?;
+                self.note_endpoint_rate_limit(&response);
                 let response = checked_response(response).await?;
                 let bytes = read_success_body_limited(
                     response,

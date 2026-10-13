@@ -76,6 +76,12 @@ impl AppServices {
         Arc::clone(&self.indexing)
     }
 
+    /// 各 Endpoint 的请求额度表。它按 `base_url` 在进程里共享，设置保存与模型检测都
+    /// 经过它；诊断与测试用它确认上限保存之后到底生效了没有。
+    pub fn endpoint_limits(&self) -> Arc<EndpointRateLimits> {
+        Arc::clone(&self.endpoint_limits)
+    }
+
     pub fn visual_jobs(&self) -> Option<Arc<VisualJobCoordinator>> {
         self.visual_jobs
             .read()
@@ -283,6 +289,7 @@ impl AppServices {
         let db_path = self.db_path.clone();
         let credentials = Arc::clone(&self.credentials);
         let ai = Arc::clone(&self.ai);
+        let endpoint_limits = Arc::clone(&self.endpoint_limits);
         let configuration = Arc::clone(&self.ai_configuration);
         let indexing = Arc::clone(&self.indexing);
         let auto_run = Arc::clone(&self.auto_run_background_jobs);
@@ -312,6 +319,7 @@ impl AppServices {
                     .clone();
                 let worker_db = db_path.clone();
                 let worker_credentials = Arc::clone(&credentials);
+                let worker_limits = Arc::clone(&endpoint_limits);
                 let (next, previous_rows, previous_keys) = tokio::task::spawn_blocking(move || {
                     let previous_rows = snapshot_ai_settings(&worker_db)?;
                     let mut next_keys =
@@ -347,7 +355,12 @@ impl AppServices {
                         }
                     }
                     // Construct every role before mutating durable settings or keys.
-                    let services = build_ai_services(&worker_db, settings.clone(), &next_keys)?;
+                    let services = build_ai_services(
+                        &worker_db,
+                        settings.clone(),
+                        &next_keys,
+                        Arc::clone(&worker_limits),
+                    )?;
                     let previous_keys = changes
                         .keys()
                         .map(|target| {
@@ -426,6 +439,17 @@ impl AppServices {
                     next.settings.background_job_concurrency,
                     Duration::from_millis(next.settings.background_job_interval_ms),
                 );
+                // 请求上限与调度、自动运行开关一样是内存里的即时发布，放在提交点之后：
+                // 提交失败回滚之后，生效中的限速不能是新草稿的那一份。地址在这里不可能
+                // 解析失败（`settings.validate()` 在进入这个任务之前就跑过），所以走不通
+                // 只可能是内部状态坏了 —— 记一条告警，不让已经提交的设置变成一次失败。
+                if let Err(error) = publish_endpoint_limits(&endpoint_limits, &next.settings) {
+                    tracing::warn!(
+                        target: "ngy_ai",
+                        error = %format!("{error:#}"),
+                        "Endpoint 限速设置未能应用到内存"
+                    );
+                }
                 *ai.write().unwrap_or_else(|error| error.into_inner()) = next;
                 ai.clear_poison();
                 Ok(())
@@ -452,9 +476,24 @@ impl AppServices {
         api_key: ApiKeyUpdate,
     ) -> Result<Vec<ModelInfo>> {
         let credentials = Arc::clone(&self.credentials);
+        let limits = Arc::clone(&self.endpoint_limits);
         // Probing an endpoint is a network call like any other, so it respects
         // the system proxy preference of the saved settings.
-        let use_proxy = self.provider_settings()?.use_proxy;
+        let saved = self.provider_settings()?;
+        let use_proxy = saved.use_proxy;
+        // 检测用的是草稿里的配置，但草稿不该顺手改掉正在生效的限速：地址已经在已保存的
+        // 列表里就沿用它那份上限，只有还没保存过的新地址才按草稿建立额度条目。
+        let requests_per_minute = normalize_provider_base_url(&endpoint.base_url)
+            .ok()
+            .and_then(|draft| {
+                saved.endpoints().into_iter().find(|saved_endpoint| {
+                    normalize_provider_base_url(&saved_endpoint.base_url)
+                        .is_ok_and(|url| url == draft)
+                })
+            })
+            .map_or(endpoint.requests_per_minute, |saved_endpoint| {
+                saved_endpoint.requests_per_minute
+            });
         let provider = self
             .runtime
             .handle()
@@ -469,7 +508,16 @@ impl AppServices {
                     }
                     ApiKeyUpdate::Delete => None,
                 };
-                OpenAiHttpProvider::new_with_proxy(endpoint.provider_config(api_key), use_proxy)
+                let budget = EndpointBudget::new(
+                    limits.slot(&endpoint.base_url, requests_per_minute)?,
+                    // 检测是用户点一下、正等着看结果的请求，与问答同一类。
+                    RequestClass::Interactive,
+                );
+                Ok(OpenAiHttpProvider::new_with_proxy(
+                    endpoint.provider_config(api_key),
+                    use_proxy,
+                )?
+                .with_endpoint_budget(budget))
             })
             .await
             .context("AI provider probe setup worker stopped")??;

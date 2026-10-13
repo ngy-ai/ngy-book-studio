@@ -40,8 +40,9 @@ use crate::{
     ai::web_search::{HttpWebSearch, WebSearchConfig, normalize_web_endpoint},
     ai::{
         ChatGenerationSettings, DEFAULT_AI_REQUEST_TIMEOUT_SECS, DEFAULT_AI_USE_PROXY,
-        DEFAULT_OLLAMA_OPENAI_BASE_URL, ModelInfo, OpenAiCompatibleProvider, OpenAiHttpProvider,
-        ProviderConfig, TranslationGenerationSettings, normalize_provider_base_url,
+        DEFAULT_OLLAMA_OPENAI_BASE_URL, EndpointBudget, EndpointRateLimits, MAX_ENDPOINT_RPM,
+        ModelInfo, OpenAiCompatibleProvider, OpenAiHttpProvider, ProviderConfig, RequestClass,
+        TranslationGenerationSettings, normalize_provider_base_url,
     },
     db,
     formats::FormatRegistry,
@@ -117,6 +118,9 @@ pub struct AppServices {
     chat: ChatRepository,
     credentials: Arc<dyn CredentialStore>,
     ai: Arc<RwLock<AiServices>>,
+    /// 各 Endpoint 的请求额度。它按 `base_url` 在进程里共享、活得比任何一批 provider
+    /// 都久：设置保存会重建 provider，但已经记下的限速窗口不该跟着清零。
+    endpoint_limits: Arc<EndpointRateLimits>,
     ai_configuration: Arc<tokio::sync::Mutex<()>>,
     office: Arc<dyn OfficeEnhancer>,
     indexing: Arc<IndexingCoordinator>,

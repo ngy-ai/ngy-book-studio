@@ -41,6 +41,8 @@ mod http;
 
 mod provider;
 
+mod rate_limit;
+
 mod settings;
 
 mod sse;
@@ -60,6 +62,8 @@ pub use error::*;
 pub use provider::*;
 
 pub(crate) use provider::chat_request_body;
+
+pub use rate_limit::*;
 
 pub use settings::*;
 

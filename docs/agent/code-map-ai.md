@@ -8,6 +8,23 @@
   `agent_chat.rs`/`chat.rs` 是只读问答 Agent 与会话持久化，`search.rs`/`indexing/` 是检索与
   索引/翻译后台任务，`translation.rs`/`credentials.rs`/`web_search.rs`/`ai_diagnostics.rs`/
   `job_diagnostics.rs` 是分段协议、端点密钥、联网补充与诊断。
+- `src/ai/rate_limit.rs`：按 Endpoint 的每分钟请求数上限（RPM）。`EndpointRateLimits` 是
+  `AppServices` 生命周期的注册表，键为规范化后的 `base_url`，因此同一台服务器上的问答、
+  翻译、向量、视觉与模型检测共用同一份额度（provider 会随保存设置整批重建，额度不能挂在
+  provider 上）；`EndpointRateLimits::limit_for` 是只读视图（不会顺手建立条目），诊断与测试
+  用它确认保存后每条地址上生效的上限。`EndpointLimiter` 是滑动窗口闸门：窗口里还有位置就
+  直接放行，满了就在**发出请求之前**等待（`OpenAiHttpProvider::await_endpoint_budget`，位置在
+  `within_request_timeout` 之外，排队不计入请求超时）；交互请求（`RequestClass::Interactive`：
+  侧栏问答、Agent、检测模型，以及问答链路里检索用的查询向量）排在后台任务（`Background`：
+  翻译、向量索引、视觉）前面，两者共用额度，只有排队顺序不同。装配时检索走的是同一端点上的
+  另一个 provider 实例（`build_ai_services` 的 `search_provider`）：`EndpointRateLimits::slot`
+  按地址返回同一个 `EndpointLimiter`，所以「同一份额度、两种类别」是一条不变量，
+  `endpoint_budget()` 把它暴露给装配测试。等待者带 drop guard：请求被取消时把自己的号从队里
+  带走，否则队首会卡死整条队（`acquire` 返回之后它已是空操作）。服务商返回 429 时按
+  `Retry-After`（只认秒数，读不到用 60 秒，钳制在 1 秒–10 分钟）给整个端点写下冷却；
+  `acquire` 的快速路径必须同时看冷却 —— 上限「不限」不等于可以硬撞已经给出的 429。上限存在
+  端点自己的设置里（`EndpointSettings::requests_per_minute`，0＝不限），保存后由
+  `publish_endpoint_limits` 立即发布，读取时钳到 `MAX_ENDPOINT_RPM`。
 - `src/ai/search.rs`、`src/ai/indexing/`：作用域内 FTS5/`sqlite-vec` 精确 KNN、RRF 混合
   召回，以及可恢复的 embedding/vision 后台任务。`indexing/` 按职责分文件，不要把任何一个
   文件重新堆回大杂烩：`mod.rs` 是协调器、游标、共享类型与常量，`worker.rs` 是任务循环与

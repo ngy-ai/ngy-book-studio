@@ -9,11 +9,14 @@ use super::*;
 use ngy_book_studio::{
     ai::{
         DEFAULT_AI_REQUEST_TIMEOUT_SECS, DEFAULT_OLLAMA_OPENAI_BASE_URL,
-        MAX_AI_REQUEST_TIMEOUT_SECS, MIN_AI_REQUEST_TIMEOUT_SECS, ModelInfo,
+        MAX_AI_REQUEST_TIMEOUT_SECS, MAX_ENDPOINT_RPM, MIN_AI_REQUEST_TIMEOUT_SECS, ModelInfo,
         normalize_provider_base_url,
     },
     services::{ApiKeyUpdate, EndpointSettings, ModelRole},
 };
+
+/// 「每分钟请求数上限」留空时表示不限。
+pub(crate) const DEFAULT_ENDPOINT_REQUESTS_PER_MINUTE: u32 = 0;
 
 /// 一个 Endpoint 的可编辑草稿。密钥只以掩码输入框的形式存在，明文不回填。
 pub(crate) struct EndpointDraft {
@@ -21,6 +24,7 @@ pub(crate) struct EndpointDraft {
     pub(crate) name_input: Entity<InputState>,
     pub(crate) base_url_input: Entity<InputState>,
     pub(crate) request_timeout_input: Entity<InputState>,
+    pub(crate) requests_per_minute_input: Entity<InputState>,
     pub(crate) api_key_input: Entity<InputState>,
     pub(crate) remote_content_confirmed: bool,
     pub(crate) allow_insecure_remote_http: bool,
@@ -48,6 +52,9 @@ impl EndpointDraft {
             base_url: self.base_url_input.read(cx).value().trim().to_string(),
             request_timeout_secs: parse_request_timeout_secs(
                 self.request_timeout_input.read(cx).value().as_ref(),
+            )?,
+            requests_per_minute: parse_requests_per_minute(
+                self.requests_per_minute_input.read(cx).value().as_ref(),
             )?,
             remote_content_confirmed: self.remote_content_confirmed,
             allow_insecure_remote_http: self.allow_insecure_remote_http,
@@ -79,6 +86,12 @@ pub(crate) fn new_endpoint_draft<V: EndpointBackedWindow>(
         InputState::new(window, cx)
             .default_value(endpoint.request_timeout_secs.to_string())
             .placeholder(DEFAULT_AI_REQUEST_TIMEOUT_SECS.to_string())
+            .validate(|value, _| value.chars().all(|character| character.is_ascii_digit()))
+    });
+    let requests_per_minute_input = cx.new(|cx| {
+        InputState::new(window, cx)
+            .default_value(endpoint.requests_per_minute.to_string())
+            .placeholder("留空表示不限")
             .validate(|value, _| value.chars().all(|character| character.is_ascii_digit()))
     });
     let endpoint_id = endpoint.id.clone();
@@ -121,6 +134,7 @@ pub(crate) fn new_endpoint_draft<V: EndpointBackedWindow>(
         name_input,
         base_url_input,
         request_timeout_input,
+        requests_per_minute_input,
         api_key_input,
         remote_content_confirmed: endpoint.remote_content_confirmed,
         allow_insecure_remote_http: endpoint.allow_insecure_remote_http,
@@ -255,6 +269,10 @@ fn endpoint_matches_draft(draft: &EndpointDraft, saved: &EndpointSettings, cx: &
         && draft.base_url_input.read(cx).value().as_ref() == saved.base_url.as_str()
         && draft.request_timeout_input.read(cx).value().as_ref()
             == saved.request_timeout_secs.to_string().as_str()
+        // 上限按解析后的数字比：输入框里是「7」还是「07」说的是同一件事，不该因为
+        // 写法不同就把草稿连同检测结果一起重建。
+        && parse_requests_per_minute(draft.requests_per_minute_input.read(cx).value().as_ref())
+            .is_ok_and(|requests| requests == saved.requests_per_minute)
         && draft.remote_content_confirmed == saved.remote_content_confirmed
         && draft.allow_insecure_remote_http == saved.allow_insecure_remote_http
         && draft.confirmed_remote_endpoint == saved.confirmed_remote_endpoint
@@ -477,6 +495,24 @@ pub(crate) fn parse_request_timeout_secs(value: &str) -> Result<u64> {
     Ok(timeout)
 }
 
+/// 「每分钟请求数上限」：留空或 `0` 都表示不限。
+pub(crate) fn parse_requests_per_minute(value: &str) -> Result<u32> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(DEFAULT_ENDPOINT_REQUESTS_PER_MINUTE);
+    }
+    let requests = value.parse::<u32>().map_err(|_| {
+        anyhow::anyhow!(
+            "每分钟请求数上限必须是 0 到 {MAX_ENDPOINT_RPM} 之间的整数；留空或 0 表示不限"
+        )
+    })?;
+    anyhow::ensure!(
+        requests <= MAX_ENDPOINT_RPM,
+        "每分钟请求数上限必须是 0 到 {MAX_ENDPOINT_RPM} 之间的整数；留空或 0 表示不限"
+    );
+    Ok(requests)
+}
+
 pub(crate) fn canonical_endpoint(endpoint: &str) -> Option<String> {
     normalize_provider_base_url(endpoint.trim())
         .ok()
@@ -530,6 +566,26 @@ mod tests {
             ollama_pull_commands("http://localhost:11434", &missing).len(),
             2
         );
+    }
+
+    #[test]
+    fn request_per_minute_limit_is_optional_and_bounded() {
+        assert_eq!(parse_requests_per_minute("").unwrap(), 0);
+        assert_eq!(parse_requests_per_minute("   ").unwrap(), 0);
+        assert_eq!(parse_requests_per_minute("0").unwrap(), 0);
+        assert_eq!(parse_requests_per_minute("10").unwrap(), 10);
+        assert_eq!(parse_requests_per_minute(" 600 ").unwrap(), 600);
+        assert_eq!(
+            parse_requests_per_minute(&MAX_ENDPOINT_RPM.to_string()).unwrap(),
+            MAX_ENDPOINT_RPM
+        );
+        let above_max = (u64::from(MAX_ENDPOINT_RPM) + 1).to_string();
+        for invalid in ["-1", "1.5", "ten", "4294967296", above_max.as_str()] {
+            assert!(
+                parse_requests_per_minute(invalid).is_err(),
+                "{invalid:?} should be rejected"
+            );
+        }
     }
 
     #[test]

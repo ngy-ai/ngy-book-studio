@@ -150,6 +150,75 @@ fn background_job_scheduling_setting_is_validated_and_clamped_on_load() {
     );
 }
 
+/// 每分钟请求数上限：保存时拒绝超限的数字，读取时钳制别人改过的行，老行按「不限」读。
+#[test]
+fn the_endpoint_request_limit_is_validated_on_save_and_clamped_on_load() {
+    let out_of_range = ProviderSettings {
+        requests_per_minute: MAX_ENDPOINT_RPM + 1,
+        ..Default::default()
+    };
+    assert!(out_of_range.validate().is_err());
+    let mut routed = routed_settings();
+    routed.endpoint_routing.additional_endpoints[0].requests_per_minute = MAX_ENDPOINT_RPM + 1;
+    assert!(routed.validate().is_err());
+    routed.endpoint_routing.additional_endpoints[0].requests_per_minute = MAX_ENDPOINT_RPM;
+    routed.validate().unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join(db::DATABASE_FILE);
+    let conn = db::open_or_recreate(&db_path).unwrap();
+
+    // 手改过的行（超出上限）不能让图书库打不开：读进来的值被钳到上限。
+    let mut provider_json = serde_json::to_value(ProviderSettings::default()).unwrap();
+    provider_json["requests_per_minute"] = serde_json::json!(u32::MAX);
+    db::settings::upsert(
+        &conn,
+        &db::settings::Setting {
+            key: PROVIDER_SETTINGS_KEY.into(),
+            value_json: provider_json.to_string(),
+            updated_at: 1,
+        },
+    )
+    .unwrap();
+    let mut clamping = endpoint_fixture("clamped", 21439);
+    clamping.requests_per_minute = u32::MAX;
+    let mut routing_json = serde_json::to_value(EndpointRoutingSettings::default()).unwrap();
+    routing_json["additional_endpoints"] =
+        serde_json::json!([serde_json::to_value(&clamping).unwrap()]);
+    db::settings::upsert(
+        &conn,
+        &db::settings::Setting {
+            key: ENDPOINT_ROUTING_SETTINGS_KEY.into(),
+            value_json: routing_json.to_string(),
+            updated_at: 1,
+        },
+    )
+    .unwrap();
+
+    let loaded = load_provider_settings(&db_path).unwrap();
+    assert_eq!(loaded.requests_per_minute, MAX_ENDPOINT_RPM);
+    assert_eq!(loaded.endpoints()[1].requests_per_minute, MAX_ENDPOINT_RPM);
+
+    // 老行里根本没有这个键：按「不限」读，升级不会平白给端点加上限速。
+    let mut legacy = serde_json::to_value(ProviderSettings::default()).unwrap();
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("requests_per_minute");
+    db::settings::upsert(
+        &conn,
+        &db::settings::Setting {
+            key: PROVIDER_SETTINGS_KEY.into(),
+            value_json: legacy.to_string(),
+            updated_at: 2,
+        },
+    )
+    .unwrap();
+    let loaded = load_provider_settings(&db_path).unwrap();
+    assert_eq!(loaded.requests_per_minute, 0);
+    assert_eq!(loaded.endpoints()[1].requests_per_minute, MAX_ENDPOINT_RPM);
+}
+
 /// 翻译执行身份只由翻译模型与它的 Endpoint 派生：换问答模型（或换问答 Endpoint）
 /// 不该让已翻完的图书重翻，换翻译模型或翻译 Endpoint 才该。
 #[test]

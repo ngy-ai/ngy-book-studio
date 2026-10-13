@@ -156,7 +156,11 @@ Node 认不出来，`require("playwright")` 会 `MODULE_NOT_FOUND`）。
 过期锚点不动页面、位置没变时不重发、译文层上的采样映射回原文块。同批 Rust 门禁：
 `cargo test --lib` 706 项（701 通过 / 5 忽略，忽略项都是需要课程环境的 `learning` 用例）、
 `cargo test --bin ngy-book-studio` 351 项（350 通过 / 1 忽略，忽略项是需要外部样本的
-`xhtml_test`）、`cargo test --test epub_flow_test` 6 项通过。
+`xhtml_test`）、`cargo test --test epub_flow_test` 6 项通过。同日端点限速（RPM）改动新增
+16 项 lib 与 2 项 bin 测试后复跑全目标：`cargo test --lib` 722 项（717 通过 / 5 忽略）、
+`cargo test --bin ngy-book-studio` 353 项（352 通过 / 1 忽略）、
+`cargo test --test openai_compatible_flow` 23 项、`cargo test --test multi_endpoint_flow_test`
+1 项、`cargo test --test translation_flow` 20 项（19 通过 / 1 忽略）。
 
 ## AI 问答诊断日志
 

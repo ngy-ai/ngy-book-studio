@@ -1,5 +1,7 @@
 //! Shared fixtures and test doubles for the service tests.
 
+mod endpoint_limit_test;
+
 mod jobs_test;
 
 mod mutation_test;
@@ -130,6 +132,7 @@ fn endpoint_fixture(id: &str, port: u16) -> EndpointSettings {
         allow_insecure_remote_http: false,
         confirmed_remote_endpoint: String::new(),
         request_timeout_secs: 30,
+        requests_per_minute: 0,
     }
 }
 

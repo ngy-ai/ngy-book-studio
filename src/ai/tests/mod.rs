@@ -406,4 +406,6 @@ fn context_token_counts_reject_invalid_numeric_values_without_overflow() {
 
 mod limits_test;
 
+mod rate_limit_test;
+
 mod sse_test;
