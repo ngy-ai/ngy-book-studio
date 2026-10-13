@@ -2,10 +2,6 @@
 
 use super::*;
 
-/// 朗读语速的预设档位：分段按钮比滑杆更好点，也不会产生越界的取值。
-/// 中间那档（1.0x）是默认值，`selected_index` 的兜底下标因此是 1。
-const SPEECH_RATE_PRESETS: [f32; 5] = [0.75, 1.0, 1.25, 1.5, 2.0];
-
 impl SystemSettingsWindow {
     #[inline(never)]
     pub(crate) fn render_panel(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
@@ -156,6 +152,8 @@ impl SystemSettingsWindow {
                     menu
                 }
             });
+        // 档位与阅读窗口的语速下拉共用一份（`SPEECH_RATE_PRESETS`）；中间那档
+        // （1.0x）是默认值，认不出当前值时兜底选中它。
         let speech_rate_switch = TabBar::new("ai-speech-rate")
             .segmented()
             .selected_index(

@@ -191,6 +191,47 @@ fn provider_settings_survive_restart_without_persisting_the_api_key() {
     assert_eq!(reopened.search().unwrap().embedding_model(), "embed-test");
 }
 
+/// 阅读窗口的语速下拉走的是只写 `speech.preferences.v1` 的轻量路径：它要立刻作用于
+/// 内存快照（下一次朗读读的就是它）、保留同一条设置里的音色，并在重启后仍然存在。
+#[test]
+fn changing_the_speech_rate_updates_the_snapshot_and_survives_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let credentials = Arc::new(MemoryCredentialStore::default());
+    let services = AppServices::open_with_credentials(temp.path(), credentials.clone()).unwrap();
+    let mut settings = services.provider_settings().unwrap();
+    settings.speech_voice_id = "voice-keep".to_string();
+    settings.speech_rate = 0.75;
+    block_on_without_tokio(services.configure_providers(settings, BTreeMap::new())).unwrap();
+
+    block_on_without_tokio(services.set_speech_rate(1.5)).unwrap();
+    let snapshot = services.provider_settings().unwrap();
+    assert_eq!(snapshot.speech_rate, 1.5);
+    assert_eq!(snapshot.speech_voice_id, "voice-keep");
+
+    // 越界值按 `SpeechRequest` 的范围钳制，与读取设置时的口径一致。
+    block_on_without_tokio(services.set_speech_rate(99.0)).unwrap();
+    let clamped = crate::speech::SpeechRequest::RATE_MAX;
+    let row = db::settings::get(
+        &db::open_conn(services.database_path()).unwrap(),
+        SPEECH_SETTINGS_KEY,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        serde_json::from_str::<PersistedSpeechSettings>(&row.value_json).unwrap(),
+        PersistedSpeechSettings {
+            voice_id: "voice-keep".to_string(),
+            rate: clamped,
+        }
+    );
+    drop(services);
+
+    let reopened = AppServices::open_with_credentials(temp.path(), credentials).unwrap();
+    let saved = reopened.provider_settings().unwrap();
+    assert_eq!(saved.speech_rate, clamped);
+    assert_eq!(saved.speech_voice_id, "voice-keep");
+}
+
 #[test]
 fn endpoint_routing_rejects_missing_duplicate_and_unconfirmed_endpoints() {
     let settings = routed_settings();

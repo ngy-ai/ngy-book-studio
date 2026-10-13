@@ -124,6 +124,7 @@ impl ReaderApp {
             annotations: ReaderAnnotations::new(annotation_revisions),
             translations: ReaderTranslations::new(global_display_mode),
             read_aloud: ReadAloudHost::default(),
+            speech_rate_menu_open: false,
             _annotation_ai_subscription,
             _annotation_ai_submit_subscription,
             _annotation_ai_failure_subscription,

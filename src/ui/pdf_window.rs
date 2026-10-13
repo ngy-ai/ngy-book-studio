@@ -71,6 +71,33 @@ pub(crate) fn apply_translation_display_mode(cx: &mut App) {
     }
 }
 
+/// 朗读语速是应用级偏好：一个阅读窗口改了档位，已经打开的其它阅读窗口要跟着
+/// 显示新档位，而不是等下一次交互重绘才追上。
+///
+/// 窗口渲染时直接读共享的设置快照，所以这里只需要一次重绘；正在关闭的窗口
+/// 被跳过（它的状态不再由外部推动，见 `ReaderApp::closing`）。
+pub(crate) fn apply_speech_rate(cx: &mut App) {
+    if !cx.has_global::<SingletonWindowRegistry>() {
+        return;
+    }
+    let readers = cx
+        .global::<SingletonWindowRegistry>()
+        .readers
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    for weak in readers {
+        if let Some(reader) = weak.upgrade() {
+            reader.update(cx, |reader, cx| {
+                if reader.closing {
+                    return;
+                }
+                cx.notify();
+            });
+        }
+    }
+}
+
 pub(crate) struct Notice {
     pub(crate) text: String,
     pub(crate) error: bool,

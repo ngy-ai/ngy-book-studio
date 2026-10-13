@@ -57,7 +57,14 @@
     见 `src/ui/pdf_reader/viewer.rs`）只能画半透明层：不透明的底色会画在 canvas 之上，
     把正文整块盖住（选中一段文字后那里只剩一块纯色）。选中底色因此是叠了 alpha 的
     强调色，与 `Palette::selection()` 同一档，不要写回不透明的 `--ngy-accent-soft`。
-13. Windows 主线程栈默认只有 1 MiB，而组件层的 `request_layout`/`paint` 沿元素树递归，
+14. Reader、Editor 与 PDF Reader 的正文是原生子窗口 WebView，它画在 GPUI 画布之上：
+    任何落进正文区域的 GPUI 浮层（`Popover`、`PopupMenu`、tooltip，含 `deferred` 层）
+    都会被它整块盖住，不会报错，只是用户看不到。窗口顶部能完整显示浮层的只有工具栏
+    （阅读窗口 66px）加进度条（3px）与正文卡片上边距（12px）这条固定高度的缝。工具栏
+    上的弹层因此要么整体留在那条缝里（例如阅读窗口的语速档位：单行横排 +
+    `Anchor::BottomLeft`，被窗口边缘钳制后不会伸进正文），要么改用独立窗口或 WebView2
+    原生菜单；不要做成竖向下拉再指望它显示在正文上。
+15. Windows 主线程栈默认只有 1 MiB，而组件层的 `request_layout`/`paint` 沿元素树递归，
     每个节点还带着滚动容器、文本样式、交互层的包装，比旧版更深。`build.rs` 为 bin
     目标加的 `/STACK:16777216` 是必需的：删掉它，图书库窗口会在后台任务触发重绘时以
     `STATUS_STACK_OVERFLOW`（0xc00000fd）崩在 `render_library` 的布局递归里。需要看

@@ -48,9 +48,11 @@ impl SettingsWindowView for SystemSettingsWindow {
     }
 
     fn apply_saved_preferences(&mut self, cx: &mut App) {
-        // 提交成功后立刻把这三项推给已经打开的窗口；写入本身才是唯一事实来源。
+        // 提交成功后立刻把这几项推给已经打开的窗口；写入本身才是唯一事实来源。
+        // 语速与阅读窗口工具栏里的下拉是同一份设置，改完两边都要跟上。
         apply_pdf_compact_reading(self.pdf_compact_reading, cx);
         apply_translation_display_mode(cx);
+        apply_speech_rate(cx);
         set_appearance(self.appearance, cx);
     }
 }

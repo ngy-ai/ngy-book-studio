@@ -73,6 +73,32 @@ impl ReaderApp {
             tracing::warn!(%error, "cannot start read-aloud from the viewport");
         }
     }
+
+    /// 改朗读语速：工具栏的下拉与「系统配置」的档位是同一份应用级偏好
+    /// （`speech.preferences.v1`），所以这里保存的是全局值，对之后的朗读生效。
+    ///
+    /// 正在播放的这一段保持原来的速度：会话在开始时固定了音色与语速，中途换速度
+    /// 要么重读要么沉默，都会打断用户在听的内容。
+    pub(crate) fn set_speech_rate(&mut self, rate: f32, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
+        let services = Arc::clone(&self.services);
+        cx.spawn(async move |view, cx| {
+            let outcome = services.set_speech_rate(rate).await;
+            let _ = view.update(cx, |this, cx| {
+                match outcome {
+                    // 提交成功后刷新所有已打开阅读窗口的档位显示。广播不能在这个
+                    // 更新里直接做：当前窗口正被可变借用，再对它自己 `update` 会
+                    // panic；`App::defer` 把它排到这次借用释放之后。
+                    Ok(()) => cx.defer(apply_speech_rate),
+                    Err(error) => this.set_error(format!("无法保存朗读语速：{error:#}"), cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
 }
 
 /// 页面高亮脚本。页面侧对象可能还不存在（旧页面或脚本未注入完），调用要判空。

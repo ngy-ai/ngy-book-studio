@@ -40,7 +40,8 @@
 - `src/ui/`：按窗口/职责拆分的 GPUI 界面。`library/`、`reader/`、`pdf_reader/`、
   `editor/`、`page_image/` 分别管理对应窗口；`ai_sidebar/`、
   `ai_controller/`、`ai_settings/` 管理 AI 交互；`read_aloud.rs` 是三个阅读窗口共享的
-  朗读宿主层（会话状态机、进程级单会话登记与段落校验）；
+  朗读宿主层（会话状态机、进程级单会话登记与段落校验，以及朗读语速的预设档位
+  `SPEECH_RATE_PRESETS` 与显示文案 `speech_rate_label`）；
   `background_jobs/` 管理当前图书范围
   的派生任务；后台任务窗口全应用只有一个，重复打开时激活现有窗口并按新的库范围刷新，
   不打开第二个；`mod.rs` 只保留跨窗口主题、窗口打开与安全关闭基础设施，其中包含按

@@ -157,12 +157,27 @@ macOS 的 `AVSpeechUtterance.rate` 是 0.0–1.0 的绝对值语义（默认 0.5
 不按书记忆，因此不需要任何删书清理。EPUB 与 PDF 阅读窗口工具栏的朗读按钮旁有「设置」
 入口，直接打开这一段；音色与语速保存后立即对新的朗读生效。
 
+EPUB 阅读窗口工具栏在朗读/暂停按钮**前面**还有语速档位：受控 `Popover`，按钮显示当前
+值，展开是一行档位按钮（不是竖向下拉——正文的原生子窗口 WebView 会盖住落进正文区域的
+GPUI 浮层，见 `webview-and-window-constraints.md`）。它改的也是这份全局设置（不是
+每本书的）：档位与系统配置的分段按钮共用 `src/ui/read_aloud.rs` 的
+`SPEECH_RATE_PRESETS`（按钮文字由 `speech_rate_label` 生成，如 `1.0x`），写回走
+`AppServices::set_speech_rate` —— 只写 `speech.preferences.v1` 一行并更新内存快照
+（音色从当前快照原样带过去），不重建 provider、不重配置索引；它与
+`configure_providers` 共用同一把设置门闩，交错提交退回「最后保存者赢」。保存成功后
+`apply_speech_rate` 重绘所有已打开的阅读窗口（渲染时直接读共享快照）；「系统配置」窗口
+保存朗读段后也调用同一个广播，两处改动的传播一致。失败时在窗口的错误栏里报原因。
+**正在播放的会话不被打断**：会话在开始时固定音色与语速，新档位从下一次朗读生效。
+
 ## 验证
 
 - `cargo test --lib speech`：真实调用系统语音，验证语音列表、WAV 产物、未知音色报错、
   语速钳制、倍率语义（各档时长与 1.0 档成反比，只对 Windows 生效）与播放到结束
   （会出声一次，一秒以内）。macOS 上同样跑前三条与播放；macOS 侧的 WAV 编码、
   播放器与语速换算尚未在真实 macOS 上验证过。
+- `cargo test --lib changing_the_speech_rate`：语速的轻量保存（只改
+  `speech.preferences.v1` 一行、音色不丢、越界值按 `SpeechRequest` 钳制、重启后仍在）；
+  语速文案格式由 `cargo test --bin ngy-book-studio the_speech_rate_label` 覆盖。
 - `cargo test --bin ngy-book-studio ai_sidebar`（ui 在 bin 目标）：侧栏操作条渲染出朗读
   按钮、Markdown 朗读清洗与消息块切分；点击「没有可朗读文字」的消息只报错、不启动会话
   （不触发真实合成）。
@@ -175,4 +190,6 @@ macOS 的 `AVSpeechUtterance.rate` 是 0.0–1.0 的绝对值语义（默认 0.5
   高亮覆盖整段、滚动后起点跟随视口）。
 - 人工冒烟：三个中文音色各听一段、暂停与继续、点另一段切换、切章/翻页/切显示方式是否立即
   停止、双语与原文模式读的文字是否正确、PDF 滚动后朗读起点是否正确、DjVu 面板高亮是否跟随、
-  朗读中滚动是否跟随、朗读时笔记与选区是否照常。
+  朗读中滚动是否跟随、朗读时笔记与选区是否照常；EPUB 阅读窗口的语速档位展开后是否整行都
+  显示在工具栏里（不被正文 WebView 盖住、不伸进正文）、改档位后下一次朗读是否变快/变慢、
+  当前正在读的这一段不被中断、系统配置里的档位显示同一值、另一个已打开的阅读窗口跟着换档。

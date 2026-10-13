@@ -256,6 +256,31 @@ pub(crate) fn save_provider_settings(db_path: &Path, settings: &ProviderSettings
     Ok(())
 }
 
+/// 只写「朗读」那一行（`speech.preferences.v1`：音色 + 语速），不动其它设置行。
+///
+/// 阅读窗口拨语速档位走这条路径：改一个数字不该重写整份 AI 设置快照，也不该
+/// 触发 `configure_providers` 的 provider 重建与索引重配置。音色由调用方从当前
+/// 内存快照传进来，保证只改语速的那一次不会把音色写丢。
+pub(crate) fn save_speech_preferences(db_path: &Path, voice_id: &str, rate: f32) -> Result<()> {
+    let setting = db::settings::Setting {
+        key: SPEECH_SETTINGS_KEY.to_string(),
+        value_json: serde_json::to_string(&PersistedSpeechSettings {
+            voice_id: voice_id.to_string(),
+            rate,
+        })
+        .context("无法序列化朗读设置")?,
+        updated_at: unix_timestamp()?,
+    };
+    let mut conn = db::open_conn(db_path)?;
+    let tx = conn.transaction().context("无法开始保存朗读设置")?;
+    ensure!(
+        db::settings::upsert(&tx, &setting)? == 1,
+        "朗读设置未能保存"
+    );
+    tx.commit().context("无法提交朗读设置")?;
+    Ok(())
+}
+
 pub(crate) fn validate_model_name(kind: &str, model: &str) -> Result<()> {
     ensure!(
         !model.trim().is_empty()

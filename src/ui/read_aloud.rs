@@ -35,6 +35,26 @@ pub(crate) const MAX_READ_ALOUD_BLOCKS: usize = 2_000;
 pub(crate) const MAX_READ_ALOUD_BLOCK_BYTES: usize = 8 * 1024;
 pub(crate) const MAX_READ_ALOUD_TOTAL_BYTES: usize = 512 * 1024;
 
+/// 朗读语速的预设档位：阅读窗口的语速下拉与「系统配置」的分段按钮共用这一份，
+/// 两处显示与写回的值不会分叉。中间那档（1.0x）是默认值，全部落在系统语音的
+/// 原生表达能力内（见 `docs/agent/speech-and-read-aloud.md` 的「语速映射」）。
+pub(crate) const SPEECH_RATE_PRESETS: [f32; 5] = [0.75, 1.0, 1.25, 1.5, 2.0];
+
+/// 语速档位的显示文字：`1.0x`、`0.75x`、`2.0x`…… 去掉无意义的尾零，小数点后
+/// 至少保留一位。
+pub(crate) fn speech_rate_label(rate: f32) -> String {
+    let mut text = format!("{rate:.2}");
+    while text.ends_with('0')
+        && text
+            .split('.')
+            .nth(1)
+            .is_some_and(|fraction| fraction.len() > 1)
+    {
+        text.pop();
+    }
+    format!("{text}x")
+}
+
 impl ReadAloudPageBlock {
     pub(crate) fn valid(&self) -> bool {
         !self.id.trim().is_empty()
@@ -375,5 +395,19 @@ mod tests {
             .map(|index| block(&index.to_string(), "正文"))
             .collect::<Vec<_>>();
         assert!(!read_aloud_request_is_valid(&many));
+    }
+
+    #[test]
+    fn the_speech_rate_label_keeps_meaningful_decimals() {
+        assert_eq!(speech_rate_label(1.0), "1.0x");
+        assert_eq!(speech_rate_label(0.75), "0.75x");
+        assert_eq!(speech_rate_label(1.25), "1.25x");
+        assert_eq!(speech_rate_label(1.5), "1.5x");
+        assert_eq!(speech_rate_label(2.0), "2.0x");
+        assert_eq!(speech_rate_label(10.0), "10.0x");
+        // 非预设档位（别人手改过的行）也要读得出来。
+        assert_eq!(speech_rate_label(1.3), "1.3x");
+        // 默认语速必须是下拉里选得中的一档，否则按钮会显示一个选不中的值。
+        assert!(SPEECH_RATE_PRESETS.contains(&1.0));
     }
 }

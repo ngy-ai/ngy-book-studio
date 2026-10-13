@@ -55,16 +55,17 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use gpui_kit::component::{
-    Disableable as _, Icon, IconName, InteractiveElementExt as _, Root, Sizable as _,
-    StyledExt as _,
+    Disableable as _, Icon, IconName, InteractiveElementExt as _, Root, Selectable as _,
+    Sizable as _, StyledExt as _,
     button::{Button, ButtonCustomVariant, ButtonVariants as _},
     input::{Editor, EditorState, Input, InputEvent, InputState, Textarea, TextareaState},
     menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem},
+    popover::Popover,
     scroll::ScrollableElement as _,
     tab::{Tab, TabBar},
 };
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Bounds, Context, Entity, Image, ImageFormat,
+    Anchor, AnyWindowHandle, App, AppContext as _, Bounds, Context, Entity, Image, ImageFormat,
     InteractiveElement as _, IntoElement, ObjectFit, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription, Task,
     TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions, div, img,

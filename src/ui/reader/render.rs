@@ -70,6 +70,9 @@ impl Render for ReaderApp {
         let previous_view = view.clone();
         let next_view = view.clone();
         let notes_view = view.clone();
+        // 朗读控制与译文入口共用这一份设置快照：语速是应用级偏好，阅读窗口的下拉
+        // 与「系统配置」的档位改的是同一份（`speech.preferences.v1`）。
+        let provider_settings = self.services.provider_settings().ok();
         // 朗读控制：没有会话时是「朗读」，播放中换成暂停/继续与停止。段落文字由
         // 页面提供（跟随译文显示方式），这里只管播放状态。
         let read_aloud_controls = {
@@ -79,6 +82,33 @@ impl Render for ReaderApp {
                 Some(ngy_book_studio::speech::ReadAloudState::Paused)
             );
             let mut row = div().h_flex().gap_1();
+            // 语速档位贴着播放/暂停按钮：它改的是系统配置里的全局档位（不是每本书的），
+            // 播放中也能改 —— 新速度从下一次朗读开始生效，当前这一段不被打断。控制条
+            // 本身在 `rate_menu.rs`：一行档位是为了不被正文的 WebView 盖住。
+            if let Some(settings) = provider_settings.as_ref() {
+                let current_rate = settings.speech_rate;
+                let rate_view = view.clone();
+                let menu_view = view.clone();
+                row = row.child(speech_rate_menu(
+                    current_rate,
+                    self.speech_rate_menu_open,
+                    move |open, cx| {
+                        menu_view.update(cx, |this, cx| {
+                            if this.speech_rate_menu_open != open {
+                                this.speech_rate_menu_open = open;
+                                cx.notify();
+                            }
+                        });
+                    },
+                    move |preset, cx| {
+                        rate_view.update(cx, |this, cx| {
+                            // 选完就收起：正文区域的点击归 WebView，弹层不能靠点外面来关。
+                            this.speech_rate_menu_open = false;
+                            this.set_speech_rate(preset, cx);
+                        });
+                    },
+                ));
+            }
             if active {
                 let toggle = view.clone();
                 row = row
@@ -127,7 +157,7 @@ impl Render for ReaderApp {
                             start.update(cx, |this, cx| this.start_read_aloud_from_viewport(cx));
                         }),
                 );
-                // 音色与语速在「系统配置」里；入口贴着朗读按钮，省得用户去翻设置。
+                // 音色与试听在「系统配置」里；入口贴着朗读按钮，省得用户去翻设置。
                 let settings_view = view.clone();
                 row = row.child(
                     Button::new("reader-read-aloud-settings")
@@ -155,7 +185,6 @@ impl Render for ReaderApp {
         // stored per book, and "跟随全局" hands it back to that default. Without a
         // target language nothing is ever translated, so the switch stays hidden
         // instead of offering a no-op.
-        let provider_settings = self.services.provider_settings().ok();
         let global_display_mode = provider_settings
             .as_ref()
             .map(|settings| settings.translation_display_mode)

@@ -53,6 +53,8 @@ mod progress_io;
 
 mod protocol;
 
+mod rate_menu;
+
 mod reference;
 
 mod render;
@@ -85,6 +87,8 @@ pub(crate) use position::*;
 pub(crate) use progress::*;
 
 pub(crate) use protocol::*;
+
+pub(crate) use rate_menu::*;
 
 pub(crate) use reference::*;
 
@@ -134,6 +138,9 @@ pub struct ReaderApp {
     pub(crate) translations: ReaderTranslations,
     /// 朗读（系统语音）的会话状态。进程级资源：同一时刻只有一个窗口在朗读。
     pub(crate) read_aloud: ReadAloudHost,
+    /// 工具栏的语速档位弹层是否展开。`Popover::open` 是受控状态：档位要能「选完即收」，
+    /// 而正文区域的点击归原生 WebView，弹层收不到。
+    pub(crate) speech_rate_menu_open: bool,
     pub(crate) _annotation_ai_subscription: Subscription,
     pub(crate) _annotation_ai_submit_subscription: Subscription,
     pub(crate) _annotation_ai_failure_subscription: Subscription,

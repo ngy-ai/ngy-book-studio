@@ -1,6 +1,7 @@
 //! Provider configuration, endpoint routing and model probing.
 
 use super::*;
+use crate::speech::SpeechRequest;
 
 impl AppServices {
     pub fn provider(&self) -> Result<Arc<dyn OpenAiCompatibleProvider>> {
@@ -456,6 +457,41 @@ impl AppServices {
             })
             .await
             .context("AI configuration task stopped")?
+    }
+
+    /// 保存朗读语速这项应用级偏好，供阅读窗口工具栏的语速下拉使用。
+    ///
+    /// 这是一条**只写一行**的路径：改语速既不需要重建 provider，也不需要重配置索引，
+    /// 走 [`Self::configure_providers`] 只会为了一个数字去等索引门闩。两条写路径共用
+    /// 同一把设置门闩，串行化之后的语义是「最后保存者赢」——与各设置窗口之间已有的
+    /// 约定一致。提交成功后更新内存快照：新的朗读会话读的就是它（正在播放的会话不受
+    /// 影响）。
+    pub async fn set_speech_rate(&self, rate: f32) -> Result<()> {
+        let rate = rate.clamp(SpeechRequest::RATE_MIN, SpeechRequest::RATE_MAX);
+        let _transition = self.ai_configuration.lock().await;
+        let voice_id = self
+            .ai
+            .read()
+            .map_err(|_| anyhow::anyhow!("AI service lock is poisoned"))?
+            .settings
+            .speech_voice_id
+            .clone();
+        let db_path = self.db_path.clone();
+        // 用应用 runtime 的 handle 而不是 ambient Tokio：调用方可能像 GPUI 前台
+        // 执行器一样不带 Tokio 上下文（服务层测试也用 `block_on_without_tokio` 盯住
+        // 这条约束）。
+        self.runtime
+            .handle()
+            .spawn_blocking(move || save_speech_preferences(&db_path, &voice_id, rate))
+            .await
+            .context("朗读设置写入 worker 停止")??;
+        self.ai
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .settings
+            .speech_rate = rate;
+        self.ai.clear_poison();
+        Ok(())
     }
 
     /// Probes only the default Endpoint, independently of model or web drafts.

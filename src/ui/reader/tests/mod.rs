@@ -6,4 +6,6 @@ mod progress_test;
 
 mod protocol_test;
 
+mod rate_menu_test;
+
 use super::*;

@@ -31,7 +31,11 @@
   「高亮怎么呈现」。
 - `src/ui/reader/speech.rs`、`read_aloud.js`：EPUB 阅读窗口的朗读适配。页面按当前显示
   模式收集段落（有译文层就读译文）并发起朗读，宿主合成播放并把当前段落推回页面高亮；
-  切章、切显示方式与重新加载都会停止。详见 `docs/agent/speech-and-read-aloud.md`。
+  切章、切显示方式与重新加载都会停止。工具栏在朗读/暂停按钮前还有语速档位：受控
+  `Popover` 展开成一行档位按钮（留在工具栏里，避免被正文 WebView 盖住），改的是
+  `speech.preferences.v1` 这份应用级设置（`AppServices::set_speech_rate` 只写这一行，
+  `apply_speech_rate` 广播给已打开的阅读窗口）。详见
+  `docs/agent/speech-and-read-aloud.md`。
 - `src/ui/pdf_reader/speech.rs`、`read_aloud.js`：PDF 阅读窗口的朗读适配。页面从 PDF.js
   文字层收集段落（只取已绘制页面，按行距把相邻行合并成段、超长段按句末标点切开、行序
   几何回跳时另起段），起点跟随视口；高亮走页面脚本 `ngyPdfReadAloud`，读到已绘制范围的
