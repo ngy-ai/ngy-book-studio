@@ -77,6 +77,9 @@ pub(crate) use ipc::*;
 
 pub(crate) use pane::*;
 
+/// 章内位置的两个入口都是 `ReaderApp` 的方法，生产代码不需要这个模块的名字；
+/// 只有协议测试通过 `use super::*` 取 `position_restore_script`。
+#[cfg(test)]
 pub(crate) use position::*;
 
 pub(crate) use progress::*;
