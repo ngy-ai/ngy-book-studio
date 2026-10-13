@@ -109,7 +109,14 @@ pub(crate) fn list_queued(conn: &Connection, limit: usize) -> Result<Vec<IndexJo
         .prepare(&format!(
             "{SELECT} WHERE status = 'queued' AND kind IN ('embedding', 'vision', 'translation')
                AND (kind <> 'vision' OR id = 'vision:' || source_id)
-             ORDER BY created_at,
+             ORDER BY COALESCE(
+                          json_extract(
+                              CASE WHEN json_valid(cursor_json) THEN cursor_json END,
+                              '$.priority'
+                          ),
+                          0
+                      ) DESC,
+                      created_at,
                       CASE kind
                           WHEN 'embedding' THEN 0
                           WHEN 'vision' THEN 1

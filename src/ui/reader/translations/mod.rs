@@ -17,6 +17,8 @@ use ngy_book_studio::services::{BackgroundJobStatus, TranslatedBlock, Translatio
 /// Task kind of a whole-book translation job, as persisted in `index_jobs`.
 mod app;
 
+mod chapter;
+
 mod helpers;
 
 mod labels;

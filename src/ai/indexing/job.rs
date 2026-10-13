@@ -86,6 +86,13 @@ pub(crate) struct JobCursor {
     /// requested again.
     #[serde(default)]
     pub(crate) retry_ordinals: Vec<usize>,
+    /// 收窄结束后要回到的位置。「立即翻译本章」把推进点借给一章时写下它：最后一个目标
+    /// 块提交的那一刻，`next_ordinal` 回到这里继续整本（见 `TranslationRun::commit`）。
+    /// 为空表示这次收窄不回来 —— 现有的按块重试就是如此，它跑完停在集合之后。
+    ///
+    /// 连续点两章时保留更早的那个位置，否则第二章会把「原地到第一章之间」那一段丢掉。
+    #[serde(default)]
+    pub(crate) resume_ordinal: Option<usize>,
     /// Ordinals this execution has already sent to the provider and not committed
     /// yet, sorted. `任务并发` is how many of them one task keeps open at a time,
     /// and the task window reads the set as 「处理中」.
@@ -110,6 +117,14 @@ pub(crate) struct JobCursor {
     /// costs no requests.
     #[serde(default)]
     pub(crate) blocks_version: u32,
+    /// 用户「立即翻译本章」写下的排队优先级（请求时间戳，越大越靠前）。它只是调度
+    /// 提示：运行本身不看它，只有 `db::index_jobs::list_queued` 用它把这一本书的翻译
+    /// 排到其它待执行任务前面。为空表示没有插队请求，按 `created_at` 的既有顺序。
+    ///
+    /// 它随游标一起持久化，所以重启后依然生效；下一次点（任意一本书）写下更大的
+    /// 时间戳即可顶掉它，不需要清理。
+    #[serde(default)]
+    pub(crate) priority: Option<u64>,
 }
 
 impl JobCursor {
@@ -147,6 +162,8 @@ impl JobCursor {
             cursor.blocks_version = TRANSLATION_BLOCKS_VERSION;
             cursor.next_ordinal = 0;
             cursor.retry_ordinals.clear();
+            // 回到原位置说的是「旧编号里的哪一块」，块列表变了这个编号就不再指向同一处。
+            cursor.resume_ordinal = None;
             cursor.inflight.clear();
         }
         Ok(cursor)

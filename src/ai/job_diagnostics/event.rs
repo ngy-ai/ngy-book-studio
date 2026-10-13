@@ -35,6 +35,8 @@ pub enum JobLogEvent {
     RetryRequested,
     CancelRequested,
     RetranslateRequested,
+    /// 阅读窗口的「立即翻译本章」：把这一章排到最前，翻完回到原来的推进点。
+    ChapterRequested,
     Paused,
     Cancelled,
     Superseded,
@@ -88,6 +90,7 @@ impl JobLogEvent {
             Self::RetryRequested => (Info, "control", "已接受重试请求"),
             Self::CancelRequested => (Info, "control", "已接受取消请求"),
             Self::RetranslateRequested => (Info, "control", "已清除旧译文并重排翻译任务"),
+            Self::ChapterRequested => (Info, "control", "已把本章排到翻译队列最前"),
             Self::Paused => (Info, "run", "任务已暂停，保留执行进度"),
             Self::Cancelled => (Info, "run", "任务已取消"),
             Self::Superseded => (Warning, "identity", "任务身份已变化，停止本次执行"),

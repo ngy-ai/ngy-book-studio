@@ -800,3 +800,110 @@ pub(crate) fn a_truncated_block_is_skipped_and_the_run_still_finishes() {
     );
     assert_eq!(stats.fragment_fallback_blocks, 0);
 }
+
+/// 「立即翻译本章」把推进点借给一章：收窄到**本章**的块、记下借出前的位置、写下插队
+/// 优先级，并把任务重新排队。收窄结束之后回到借出位置由 walk 的用例固定
+/// （`translation_walk_test::a_chapter_jump_returns_the_cursor_to_the_borrowed_position`）。
+#[test]
+pub(crate) fn translating_a_chapter_narrows_the_walk_to_that_chapter_and_borrows_its_position() {
+    let mut fixture = Fixture::new();
+    let second_unit = fixture.add_second_unit("第二章");
+    // 模型快照活在 `IndexingInner` 里，而 `Fixture::indexing_inner()` 每次都新建一个：
+    // 配置与规划必须走同一个 inner，否则规划路径看不到翻译模型（会静默返回 false）。
+    let inner = fixture.indexing_inner();
+    let coordinator = IndexingCoordinator {
+        inner: Arc::clone(&inner),
+        workers: Mutex::new(Vec::new()),
+    };
+    let provider: Arc<dyn OpenAiCompatibleProvider> = Arc::new(MockProvider::default());
+    fixture
+        .runtime
+        .block_on(coordinator.configure_translation(
+            provider,
+            "chat-test".to_string(),
+            "translation-v2:chat-test".to_string(),
+            TranslationGenerationSettings::default(),
+            Some("zh-Hans".to_string()),
+            false,
+        ))
+        .unwrap();
+    let job_id = format!("translation:{}:zh-Hans", fixture.source_id);
+
+    let conn = db::open_conn(&fixture.db_path).unwrap();
+    let blocks = translation_blocks(&conn, &fixture.book_id, &fixture.source_id).unwrap();
+    let chapter: Vec<usize> = blocks
+        .iter()
+        .filter(|block| block.unit_id == second_unit)
+        .map(|block| block.ordinal)
+        .collect();
+    let other: Vec<usize> = blocks
+        .iter()
+        .filter(|block| block.unit_id != second_unit)
+        .map(|block| block.ordinal)
+        .collect();
+    assert!(!chapter.is_empty(), "第二章必须有文本块");
+    assert!(!other.is_empty(), "第一章必须有文本块");
+    let cursor: JobCursor = serde_json::from_str(
+        &db::index_jobs::get(&conn, &job_id)
+            .unwrap()
+            .expect("配置译文语言必须建出这一任务")
+            .cursor_json,
+    )
+    .unwrap();
+    let borrowed = cursor.next_ordinal;
+    assert!(
+        chapter.iter().all(|ordinal| *ordinal > borrowed),
+        "要借的位置在第二章之前，用例才有区分度"
+    );
+    // 运行中的执行器拥有游标，规划之前必须先让它落盘 —— 服务层会先请求暂停。
+    db::index_jobs::update_state(
+        &conn,
+        &job_id,
+        db::index_jobs::IndexJobStatus::Paused,
+        &cursor.encode().unwrap(),
+        None,
+        unix_timestamp().unwrap(),
+        Some(1),
+        None,
+    )
+    .unwrap();
+
+    assert!(
+        fixture
+            .runtime
+            .block_on(coordinator.translate_translation_chapter(&job_id, &second_unit))
+            .unwrap()
+    );
+
+    let planned = {
+        let job = db::index_jobs::get(&conn, &job_id).unwrap().unwrap();
+        assert_eq!(job.status, db::index_jobs::IndexJobStatus::Queued);
+        assert!(job.error.is_none());
+        let cursor: JobCursor = serde_json::from_str(&job.cursor_json).unwrap();
+        cursor
+    };
+    assert_eq!(planned.retry_ordinals, chapter, "收窄的必须正好是本章的块");
+    assert_eq!(planned.next_ordinal, chapter[0]);
+    assert_eq!(
+        planned.resume_ordinal,
+        Some(borrowed),
+        "借出推进点之前的位置必须留下来"
+    );
+    assert!(planned.priority.is_some(), "插队优先级必须写进游标");
+    assert!(
+        other
+            .iter()
+            .all(|ordinal| !planned.retry_ordinals.contains(ordinal)),
+        "别的章不该进收窄范围"
+    );
+
+    // 找不到这一章就报错，绝不顺手挑别的块充数。
+    let error = fixture
+        .runtime
+        .block_on(coordinator.translate_translation_chapter(&job_id, "unit-missing"))
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("找不到这一章的文本块"),
+        "{error:#}"
+    );
+}

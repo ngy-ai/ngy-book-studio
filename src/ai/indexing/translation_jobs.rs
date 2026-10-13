@@ -152,8 +152,10 @@ impl IndexingCoordinator {
                 input_execution_identity: None,
                 next_ordinal: 0,
                 retry_ordinals: Vec::new(),
+                resume_ordinal: None,
                 inflight: Vec::new(),
                 blocks_version: TRANSLATION_BLOCKS_VERSION,
+                priority: None,
             };
             let now = unix_timestamp()?;
             db::translations::delete_for_retranslation(
@@ -197,19 +199,7 @@ impl IndexingCoordinator {
     ) -> Result<bool> {
         ensure!(!content_unit_id.trim().is_empty(), "内容单元 ID 不能为空");
         ensure!(!block_id.trim().is_empty(), "文本块 ID 不能为空");
-        let job_id = job_id.to_string();
-        let db_path = self.inner.db_path.clone();
-        let lookup_id = job_id.clone();
-        let (book_id, source_id, revision) =
-            run_db_on(self.inner.runtime.clone(), db_path, move |conn| {
-                let job = db::index_jobs::get(&conn, &lookup_id)?.context("翻译任务已不存在")?;
-                ensure!(job.kind == TRANSLATION_JOB_KIND, "该任务不是整本翻译");
-                let source_id = job.source_id.clone().context("翻译任务缺少来源")?;
-                let source =
-                    db::book_sources::get(&conn, &source_id)?.context("翻译任务来源不存在")?;
-                Ok((job.book_id.clone(), source_id, source.revision))
-            })
-            .await?;
+        let (book_id, source_id, revision) = self.translation_target(job_id).await?;
         let blocks = load_translation_blocks(&self.inner, &book_id, &source_id, revision).await?;
         let ordinal = blocks
             .iter()
@@ -218,7 +208,55 @@ impl IndexingCoordinator {
             .with_context(|| {
                 format!("当前正文里找不到文本块 {block_id}，无法重新翻译（它可能已被改动）")
             })?;
-        self.retry_translation_blocks(&job_id, vec![ordinal]).await
+        self.retry_translation_blocks(job_id, vec![ordinal]).await
+    }
+
+    /// 「立即翻译本章」：把这一章的块排到最前翻完，然后回到原来的推进点继续整本。
+    ///
+    /// 与按块重试共用同一份规划（见 [`Self::plan_translation_range`]）：本章的块按序号交给
+    /// walk、不做前置过滤，已有译文的块按缓存命中重挂、缺的才发请求。阅读端只知道章，
+    /// 序号在这里由任务自己的文本块列表判定 —— 正文改动或块被合并导致本章找不到块就报错，
+    /// 绝不顺手挑别的块充数。
+    ///
+    /// 正在运行的执行器拥有游标，所以调用方必须先让它落盘
+    /// （`AppServices::translate_reader_chapter_now` 会请求暂停并等待），否则这次收窄会被
+    /// 执行器随后的写入覆盖。
+    pub async fn translate_translation_chapter(
+        &self,
+        job_id: &str,
+        content_unit_id: &str,
+    ) -> Result<bool> {
+        ensure!(!content_unit_id.trim().is_empty(), "内容单元 ID 不能为空");
+        let (book_id, source_id, revision) = self.translation_target(job_id).await?;
+        let blocks = load_translation_blocks(&self.inner, &book_id, &source_id, revision).await?;
+        let ordinals = blocks
+            .iter()
+            .filter(|block| block.unit_id == content_unit_id)
+            .map(|block| block.ordinal)
+            .collect::<Vec<_>>();
+        ensure!(
+            !ordinals.is_empty(),
+            "当前正文里找不到这一章的文本块，无法立即翻译（它可能已被改动）"
+        );
+        self.plan_translation_range(job_id, ordinals, TranslationRange::Chapter)
+            .await
+    }
+
+    /// 任务的书、来源与来源修订。
+    ///
+    /// 块序号只在这三者固定住的那一份修订里有意义，所以两条按序号规划翻译的路径都先解析
+    /// 它们，再交给 worker 的同一份提取规则去枚举文本块。
+    async fn translation_target(&self, job_id: &str) -> Result<(String, String, u64)> {
+        let db_path = self.inner.db_path.clone();
+        let lookup_id = job_id.to_string();
+        run_db_on(self.inner.runtime.clone(), db_path, move |conn| {
+            let job = db::index_jobs::get(&conn, &lookup_id)?.context("翻译任务已不存在")?;
+            ensure!(job.kind == TRANSLATION_JOB_KIND, "该任务不是整本翻译");
+            let source_id = job.source_id.clone().context("翻译任务缺少来源")?;
+            let source = db::book_sources::get(&conn, &source_id)?.context("翻译任务来源不存在")?;
+            Ok((job.book_id.clone(), source_id, source.revision))
+        })
+        .await
     }
 
     /// Re-runs only the requested blocks of a translation job.
@@ -243,6 +281,24 @@ impl IndexingCoordinator {
         &self,
         job_id: &str,
         ordinals: Vec<usize>,
+    ) -> Result<bool> {
+        self.plan_translation_range(job_id, ordinals, TranslationRange::Retry)
+            .await
+    }
+
+    /// 把一组序号收窄成一次运行，并按范围用途决定跑完之后去哪。
+    ///
+    /// 集合原样交给 walk，**不做前置过滤**：判定「这一块已经有译文」必须与 worker 的缓存
+    /// 规则完全一致（单元内容键 + 模型 + 执行身份），而这里只有 ordinal 和译文行，凭它
+    /// 判定会把阅读端其实看不到的行、或 ordinal 已经错位（块列表变过）的行当成「已有
+    /// 译文」，于是用户点了「重试」却一个请求都不发 —— 日志里既没有请求体也没有响应
+    /// （现场 2026-09-22）。交给 walk 之后两种情形都不会被误判：已有译文的块按缓存命中
+    /// 重挂到当前块，其余块正常发请求；`retranslate`（整本重做）保留原来的删除语义。
+    async fn plan_translation_range(
+        &self,
+        job_id: &str,
+        ordinals: Vec<usize>,
+        range: TranslationRange,
     ) -> Result<bool> {
         let diagnostic_id = job_id.to_string();
         let translation = self
@@ -282,7 +338,7 @@ impl IndexingCoordinator {
             if book.revision != source.revision {
                 return Ok(0);
             }
-            let cursor = JobCursor {
+            let mut cursor = JobCursor {
                 schema_version: 1,
                 book_id: job.book_id.clone(),
                 source_id: source_id.to_string(),
@@ -293,27 +349,46 @@ impl IndexingCoordinator {
                 input_execution_identity: None,
                 next_ordinal: first,
                 retry_ordinals: retry_ordinals.clone(),
+                resume_ordinal: None,
                 inflight: Vec::new(),
                 blocks_version: TRANSLATION_BLOCKS_VERSION,
+                priority: None,
             };
-            // 重试集合原样交给 walk，**不做前置过滤**：判定「这一块已经有译文」必须与
-            // worker 的缓存规则完全一致（单元内容键 + 模型 + 执行身份），而这里只有
-            // ordinal 和译文行，凭它判定会把阅读端其实看不到的行、或 ordinal 已经错位
-            // （块列表变过）的行当成「已有译文」，于是用户点了「重试」却一个请求都不发
-            // —— 日志里既没有请求体也没有响应（现场 2026-09-22）。
-            //
-            // 交给 walk 之后两种情形都不会被误判：已有译文的块按缓存命中重挂到当前块，
-            // 其余块正常发请求；`retranslate`（整本重做）保留原来的删除语义。
-            tracing::info!(
-                target: "ngy_ai",
-                stage = "translation_retry_plan",
-                job_id = %job_id,
-                requested = cursor.retry_ordinals.len(),
-                next_ordinal = first,
-                last_ordinal = cursor.retry_ordinals.last().copied().unwrap_or(first),
-                "Planned a per-block translation retry"
-            );
             let now = unix_timestamp()?;
+            if range == TranslationRange::Chapter {
+                // 把推进点借给这一章之前先记下原地位置：最后一个目标块提交时 walk 回到这里
+                // 继续整本（`TranslationRun::commit`）。已经有一次收窄在等回来时保留更早的
+                // 那一个 —— 连着点两章不该把中间那一段丢掉。
+                let current = JobCursor::from_job(
+                    &job,
+                    &translation.model,
+                    Some(&translation.execution_identity),
+                )?;
+                cursor.resume_ordinal = current.resume_ordinal.or(Some(current.next_ordinal));
+                cursor.priority = Some(now);
+            }
+            let last = cursor.retry_ordinals.last().copied().unwrap_or(first);
+            match range {
+                TranslationRange::Retry => tracing::info!(
+                    target: "ngy_ai",
+                    stage = "translation_retry_plan",
+                    job_id = %job_id,
+                    requested = cursor.retry_ordinals.len(),
+                    next_ordinal = first,
+                    last_ordinal = last,
+                    "Planned a per-block translation retry"
+                ),
+                TranslationRange::Chapter => tracing::info!(
+                    target: "ngy_ai",
+                    stage = "translation_chapter_plan",
+                    job_id = %job_id,
+                    requested = cursor.retry_ordinals.len(),
+                    next_ordinal = first,
+                    last_ordinal = last,
+                    resume_ordinal = ?cursor.resume_ordinal,
+                    "Planned a chapter-first translation jump"
+                ),
+            }
             db::index_jobs::reset_for_translation_block_retry(
                 &conn,
                 &job_id,
@@ -326,11 +401,29 @@ impl IndexingCoordinator {
             record_for_database(
                 &self.inner.db_path,
                 &diagnostic_id,
-                JobLogEvent::RetryRequested,
+                range.log_event(),
                 JobLogMetrics::default(),
             );
             self.inner.wake.notify_one();
         }
         Ok(changed == 1)
+    }
+}
+
+/// 一组收窄序号交给 walk 之后，跑完停在哪。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TranslationRange {
+    /// 按块重试（修失败块、阅读端逐块重翻）：停在集合之后，维持既有行为。
+    Retry,
+    /// 「立即翻译本章」：跑完回到借出推进点之前的位置继续整本，并把这本排到队首。
+    Chapter,
+}
+
+impl TranslationRange {
+    fn log_event(self) -> JobLogEvent {
+        match self {
+            Self::Retry => JobLogEvent::RetryRequested,
+            Self::Chapter => JobLogEvent::ChapterRequested,
+        }
     }
 }

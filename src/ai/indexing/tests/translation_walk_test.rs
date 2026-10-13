@@ -960,3 +960,129 @@ pub(crate) fn the_configured_interval_pauses_after_each_model_request() {
         );
     }
 }
+
+/// 「立即翻译本章」借出的推进点必须还回来：最后一个目标块提交时 `next_ordinal` 回到借出
+/// 之前的位置，借出点与本章之间的块因此照常被翻，而不是被永久跳过。同类的事故见
+/// 2026-09-20：只重试一块，其余几千块被当成「不必处理」一路推过去。
+#[test]
+pub(crate) fn a_chapter_jump_returns_the_cursor_to_the_borrowed_position() {
+    let provider = Arc::new(MockMergeProvider::default());
+    let mut fixture = Fixture::new();
+    // 要有一段「借出点」和一段「本章」才能区分「回到原位」与「跟着跳过去」：
+    // 默认模板只有两块，这里把第一章写长。
+    fixture.rewrite_first_unit("<p>One</p><p>Two</p><p>Three</p><p>Four</p><p>Five</p><p>Six</p>");
+    let (fixture, job, mut cursor, translation) =
+        translation_block_fixture_in(fixture, &provider, "translation-v2:chat-test");
+    let inner = fixture.indexing_inner();
+    let scheduler = IndexingCoordinator {
+        inner: Arc::clone(&inner),
+        workers: Mutex::new(Vec::new()),
+    };
+    scheduler.configure_scheduling(1, Duration::ZERO);
+    // 块数只认执行器那一份提取结果（任务窗口读的也是它）。
+    let total = fixture
+        .runtime
+        .block_on(scheduler.translation_blocks(&job.id))
+        .unwrap()
+        .total;
+    assert!(total >= 4, "这条用例需要至少四个文本块，实际 {total}");
+
+    // 第三、四块被借走，借出点是书首：这一章跑完之后 walk 必须回到 0 把前两块补上。
+    cursor.next_ordinal = 2;
+    cursor.retry_ordinals = vec![2, 3];
+    cursor.resume_ordinal = Some(0);
+    // 运行只认「库里那份就是我自己」的游标，所以先把收窄后的游标落盘（规划路径正是这么写的）。
+    {
+        let conn = db::open_conn(&fixture.db_path).unwrap();
+        db::index_jobs::update_state(
+            &conn,
+            &job.id,
+            db::index_jobs::IndexJobStatus::Running,
+            &cursor.encode().unwrap(),
+            None,
+            1,
+            Some(1),
+            None,
+        )
+        .unwrap();
+    }
+    let mut stats = TranslationRunStats::default();
+    let outcome = fixture
+        .runtime
+        .block_on(run_translation_blocks_inner(
+            &inner,
+            &job,
+            &translation,
+            "zh-Hans",
+            &mut cursor,
+            &mut stats,
+        ))
+        .expect("回到原位之后继续翻完整本，不该失败");
+
+    let finished = match outcome {
+        // 收窄跑完回到借出位置之后，这一章之外还没翻的块不在本次范围里，运行按既有的
+        // 有界规则停在借出位置并按「已暂停」发布（绝不把它们当成「不必处理」推过去）。
+        RunOutcome::Paused(cursor) => cursor,
+        _ => panic!("有界运行只在借出的位置上收尾"),
+    };
+    assert!(
+        finished.retry_ordinals.is_empty(),
+        "最后一个目标提交时就要清掉范围"
+    );
+    assert!(
+        finished.resume_ordinal.is_none(),
+        "回到位置之后不该再留着它"
+    );
+    assert_eq!(
+        finished.next_ordinal, 0,
+        "必须回到借出位置（书首），而不是停在借出范围之后"
+    );
+    assert_eq!(stats.saved, 2, "只翻借出的那两块，别的块一块都不碰");
+
+    // 借出位置之前的块仍然没有译文：任务停在那里，继续整本时从那里接着翻。
+    let conn = db::open_conn(&fixture.db_path).unwrap();
+    let rows =
+        db::translations::list_for_source(&conn, &fixture.book_id, "zh-Hans", fixture.revision)
+            .unwrap();
+    assert_eq!(rows.len(), 2, "本轮只翻借出的两块");
+
+    // 回到原位置之后按普通运行继续：没有任何收窄，剩下的块照常翻完。
+    let row = db::index_jobs::get(&conn, &job.id).unwrap().unwrap();
+    db::index_jobs::update_state(
+        &conn,
+        &job.id,
+        db::index_jobs::IndexJobStatus::Running,
+        &row.cursor_json,
+        None,
+        1,
+        Some(1),
+        None,
+    )
+    .unwrap();
+    let mut resumed = finished;
+    let mut stats = TranslationRunStats::default();
+    let outcome = fixture
+        .runtime
+        .block_on(run_translation_blocks_inner(
+            &inner,
+            &job,
+            &translation,
+            "zh-Hans",
+            &mut resumed,
+            &mut stats,
+        ))
+        .expect("回到原位之后继续整本不该失败");
+    let RunOutcome::Succeeded(resumed) = outcome else {
+        panic!("回到原位之后应该一路翻到书末");
+    };
+    assert_eq!(resumed.next_ordinal, total);
+    assert_eq!(
+        stats.saved + stats.cached,
+        total,
+        "本轮把剩下的块全部补上（本章两块走缓存）"
+    );
+    let rows =
+        db::translations::list_for_source(&conn, &fixture.book_id, "zh-Hans", fixture.revision)
+            .unwrap();
+    assert_eq!(rows.len(), total, "整本最终都有译文，一块都没被跳过");
+}

@@ -197,6 +197,29 @@ impl Render for ReaderApp {
                             .map(|mode| Tab::new().label(translation_display_mode_name(mode))),
                     )
             });
+        // 「立即翻译本章」：整本排着翻的时候，用户常常只等着某一章。条件与显示方式切换
+        // 相同 —— 没有目标语言时什么都不翻，入口就不出现。
+        let chapter_translate = provider_settings
+            .as_ref()
+            .is_some_and(|settings| settings.default_language.is_some())
+            .then(|| {
+                let translate_view = view.clone();
+                let pending = self.translations.chapter_pending;
+                Button::new("reader-translate-chapter")
+                    .ghost()
+                    .xsmall()
+                    .label(if pending {
+                        "正在排队…"
+                    } else {
+                        "立即翻译本章"
+                    })
+                    .tooltip("把这一章排到翻译队列最前，翻完回到原来的位置继续整本")
+                    .disabled(pending)
+                    .on_click(move |_, _, cx| {
+                        translate_view
+                            .update(cx, |this, cx| this.translate_current_chapter_now(cx));
+                    })
+            });
         let toolbar = div()
             .v_flex()
             .bg(rgb(palette(cx).surface))
@@ -266,6 +289,7 @@ impl Render for ReaderApp {
                             .h_flex()
                             .gap_2()
                             .child(read_aloud_controls)
+                            .when_some(chapter_translate, |row, button| row.child(button))
                             .when_some(display_switch, |row, switch| row.child(switch))
                             .when_some(follow_global, |row, button| row.child(button))
                             .child(

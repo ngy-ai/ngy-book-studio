@@ -27,8 +27,10 @@ pub(crate) fn duplicate_reconciliation_preserves_pending_cancel() {
         input_execution_identity: None,
         next_ordinal: 0,
         retry_ordinals: Vec::new(),
+        resume_ordinal: None,
         inflight: Vec::new(),
         blocks_version: TRANSLATION_BLOCKS_VERSION,
+        priority: None,
     }
     .encode()
     .unwrap();
@@ -228,8 +230,10 @@ pub(crate) fn manual_vision_retry_requires_current_execution_identity() {
         input_execution_identity: None,
         next_ordinal: 0,
         retry_ordinals: Vec::new(),
+        resume_ordinal: None,
         inflight: Vec::new(),
         blocks_version: TRANSLATION_BLOCKS_VERSION,
+        priority: None,
     };
     db::index_jobs::update_state(
         &conn,

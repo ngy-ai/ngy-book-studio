@@ -128,8 +128,10 @@ pub(crate) fn startup_reconciles_saved_endpoint_identity_before_worker_runs() {
         input_execution_identity: None,
         next_ordinal: 1,
         retry_ordinals: Vec::new(),
+        resume_ordinal: None,
         inflight: Vec::new(),
         blocks_version: TRANSLATION_BLOCKS_VERSION,
+        priority: None,
     }
     .encode()
     .unwrap();
@@ -213,8 +215,10 @@ pub(crate) fn post_vision_embedding_records_both_generations_and_rejects_stale_r
         input_execution_identity: None,
         next_ordinal: 1,
         retry_ordinals: Vec::new(),
+        resume_ordinal: None,
         inflight: Vec::new(),
         blocks_version: TRANSLATION_BLOCKS_VERSION,
+        priority: None,
     };
     let conn = db::open_conn(&fixture.db_path).unwrap();
     db::index_jobs::update_state(
@@ -318,8 +322,10 @@ pub(crate) fn endpoint_identity_change_requeues_same_named_vision_model() {
         input_execution_identity: None,
         next_ordinal: 3,
         retry_ordinals: Vec::new(),
+        resume_ordinal: None,
         inflight: Vec::new(),
         blocks_version: TRANSLATION_BLOCKS_VERSION,
+        priority: None,
     }
     .encode()
     .unwrap();
@@ -395,8 +401,10 @@ pub(crate) fn reconfigure_rolls_back_all_jobs_before_publishing_models() {
         input_execution_identity: None,
         next_ordinal: 1,
         retry_ordinals: Vec::new(),
+        resume_ordinal: None,
         inflight: Vec::new(),
         blocks_version: TRANSLATION_BLOCKS_VERSION,
+        priority: None,
     }
     .encode()
     .unwrap();
@@ -574,8 +582,10 @@ pub(crate) fn unknown_or_duplicate_vision_provenance_forces_clean_rebuild() {
         input_execution_identity: None,
         next_ordinal: 1,
         retry_ordinals: Vec::new(),
+        resume_ordinal: None,
         inflight: Vec::new(),
         blocks_version: TRANSLATION_BLOCKS_VERSION,
+        priority: None,
     }
     .encode()
     .unwrap();

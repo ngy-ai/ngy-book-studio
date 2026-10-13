@@ -3,6 +3,14 @@
 use super::*;
 use crate::ai::translation::{TranslationSegment, normalize_source_text};
 
+/// 等一个正在运行的整本翻译落盘的上限与轮询间隔。
+///
+/// 「立即翻译本章」只在它发布「已暂停」之后才规划新的推进点：运行中的执行器拥有游标，
+/// 直接改写会被它随后的写入覆盖。暂停请求在执行的请求之间被读到，所以上限给得比一轮
+/// 控制检查（`CONTROL_POLL_INTERVAL`）宽得多。
+const TRANSLATION_CHAPTER_PAUSE_TIMEOUT: Duration = Duration::from_secs(15);
+const TRANSLATION_CHAPTER_PAUSE_POLL: Duration = Duration::from_millis(100);
+
 impl AppServices {
     /// Returns the current, revision-matched translations for one content unit
     /// in the configured default display language. Returns an empty vector when
@@ -170,22 +178,7 @@ impl AppServices {
         let Some(target_language) = self.provider_settings()?.default_language.clone() else {
             anyhow::bail!("尚未配置默认译文语言，无法重新翻译");
         };
-        let db_path = self.db_path.clone();
-        let job_id = {
-            let book_id = book_id.clone();
-            let db_path = db_path.clone();
-            self.runtime
-                .handle()
-                .spawn_blocking(move || -> anyhow::Result<String> {
-                    let conn = db::open_conn(&db_path)?;
-                    let book = db::books::get(&conn, &book_id)?.context("图书不存在")?;
-                    let source = db::book_sources::get_revision(&conn, &book_id, book.revision)?
-                        .context("图书来源不存在")?;
-                    Ok(format!("translation:{}:{target_language}", source.id))
-                })
-                .await
-                .context("翻译任务查询线程异常退出")??
-        };
+        let job_id = self.translation_job_id(&book_id, &target_language).await?;
         let indexing = Arc::clone(&self.indexing);
         let retried = self
             .runtime
@@ -204,6 +197,91 @@ impl AppServices {
              请先暂停任务）"
         );
         Ok(())
+    }
+
+    /// 「立即翻译本章」：把这一章排到翻译队列最前，正在跑的整本翻译先落盘再让位。
+    ///
+    /// 整本翻译是一本书一条任务、游标按块顺序推进，所以「只翻这一章」是把任务的推进点借给
+    /// 这一章的块（`IndexingCoordinator::translate_translation_chapter`）：这一章翻完之后
+    /// walk 回到借出之前的位置继续整本，中间没翻的章节不会被跳过。同一次规划还把任务写到
+    /// 待执行队列的最前面（游标里的 `priority`），其它书的翻译、向量与视觉任务因此排在它后面。
+    ///
+    /// 运行中的执行器拥有游标，所以这里先请求暂停并等它发布「已暂停」再规划；等不到就明确
+    /// 报错，绝不与执行器抢游标。
+    pub async fn translate_reader_chapter_now(
+        &self,
+        book_id: String,
+        content_unit_id: String,
+    ) -> Result<()> {
+        ensure!(!book_id.trim().is_empty(), "图书 ID 不能为空");
+        ensure!(!content_unit_id.trim().is_empty(), "内容单元 ID 不能为空");
+        let Some(target_language) = self.provider_settings()?.default_language.clone() else {
+            anyhow::bail!("尚未配置默认译文语言，无法立即翻译本章");
+        };
+        let job_id = self.translation_job_id(&book_id, &target_language).await?;
+        self.pause_running_translation(&job_id).await?;
+        let indexing = Arc::clone(&self.indexing);
+        let planned = self
+            .runtime
+            .spawn(async move {
+                indexing
+                    .translate_translation_chapter(&job_id, &content_unit_id)
+                    .await
+            })
+            .await
+            .context("翻译任务规划线程异常退出")??;
+        ensure!(
+            planned,
+            "无法立即翻译本章：这本书没有可排队的翻译任务（尚未配置翻译，或任务已被重排）"
+        );
+        Ok(())
+    }
+
+    /// 这本书当前来源、这个目标语言的翻译任务 ID。
+    ///
+    /// 任务 ID 由**来源**与语言派生（不是图书）：重新导入会换来源，也就是换一条任务。
+    async fn translation_job_id(&self, book_id: &str, target_language: &str) -> Result<String> {
+        let db_path = self.db_path.clone();
+        let book_id = book_id.to_string();
+        let target_language = target_language.to_string();
+        self.runtime
+            .handle()
+            .spawn_blocking(move || -> anyhow::Result<String> {
+                let conn = db::open_conn(&db_path)?;
+                let book = db::books::get(&conn, &book_id)?.context("图书不存在")?;
+                let source = db::book_sources::get_revision(&conn, &book_id, book.revision)?
+                    .context("图书来源不存在")?;
+                Ok(format!("translation:{}:{target_language}", source.id))
+            })
+            .await
+            .context("翻译任务查询线程异常退出")?
+    }
+
+    /// 请求暂停一个正在运行的整本翻译，并等它把「已暂停」落盘。
+    ///
+    /// 已经是终态或已暂停的任务什么都不做：规划路径本来就能改写它们的游标。
+    async fn pause_running_translation(&self, job_id: &str) -> Result<()> {
+        if self.indexing.job(job_id).await?.map(|job| job.status)
+            != Some(IndexingJobStatus::Running)
+        {
+            return Ok(());
+        }
+        self.control_background_job(job_id.to_string(), BackgroundJobAction::Pause)
+            .await?;
+        let deadline = tokio::time::Instant::now() + TRANSLATION_CHAPTER_PAUSE_TIMEOUT;
+        loop {
+            if self.indexing.job(job_id).await?.map(|job| job.status)
+                != Some(IndexingJobStatus::Running)
+            {
+                return Ok(());
+            }
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "整本翻译还在处理当前文本块，暂时无法把本章排到最前（可以稍后再点一次，\
+                 或先到「后台任务」窗口暂停这本书的翻译）"
+            );
+            tokio::time::sleep(TRANSLATION_CHAPTER_PAUSE_POLL).await;
+        }
     }
 
     /// One book's own translation display choice, written by the reading window.

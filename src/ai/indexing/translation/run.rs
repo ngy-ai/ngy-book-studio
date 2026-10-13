@@ -202,6 +202,13 @@ impl TranslationRun {
             .is_some_and(|last| ordinal >= *last)
         {
             self.cursor.retry_ordinals.clear();
+            // 「立即翻译本章」只是把推进点借给一章用：最后一个目标块提交后要把位置还给
+            // 原来的推进点，否则这一本从本章之后继续，中间没翻的章节再也没人碰
+            // （同一个坑的另一半见上面的 2026-09-20 记录）。按块重试不带这个位置，
+            // 它跑完就停在集合之后，行为与以前逐字相同。
+            if let Some(resume) = self.cursor.resume_ordinal.take() {
+                self.cursor.next_ordinal = resume;
+            }
         }
         self.persist(inner, job).await
     }

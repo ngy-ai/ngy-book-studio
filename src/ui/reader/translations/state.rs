@@ -25,6 +25,9 @@ pub(crate) struct ReaderTranslations {
     pub(crate) navigation_labels: Vec<Option<String>>,
     /// 目录译文请求的代次：迟到的回答只能被丢弃，不能覆盖更新的那一份。
     pub(crate) navigation_generation: u64,
+    /// Set while「立即翻译本章」is in flight (它可能要先把正在跑的整本翻译停下来),
+    /// 按钮据此显示「正在排队…」并禁止重复点击。
+    pub(crate) chapter_pending: bool,
     /// Keeps the refresh task alive for the window's lifetime.
     pub(crate) _refresh_task: Option<Task<()>>,
 }
@@ -41,6 +44,7 @@ impl ReaderTranslations {
             effective: global,
             navigation_labels: Vec::new(),
             navigation_generation: 0,
+            chapter_pending: false,
             _refresh_task: None,
         }
     }

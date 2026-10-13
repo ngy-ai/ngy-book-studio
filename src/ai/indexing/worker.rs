@@ -348,8 +348,10 @@ pub(crate) async fn run_queued_job(
                         input_execution_identity: None,
                         next_ordinal: 0,
                         retry_ordinals: Vec::new(),
+                        resume_ordinal: None,
                         inflight: Vec::new(),
                         blocks_version: TRANSLATION_BLOCKS_VERSION,
+                        priority: None,
                     });
                     publish_outcome(
                         inner,

@@ -2,6 +2,8 @@
 
 use super::*;
 
+use crate::editing::{DocumentEditor, NewContentUnit};
+
 /// 单元测试里的连续失败冷却时长。
 ///
 /// 故意让整本书的请求都失败的用例必须真的等完冷却，所以这个值要短到不拖长用例；同时要
@@ -120,11 +122,38 @@ impl Fixture {
             .update_content_unit_source(&self.book_id, &self.unit_id, html)
             .unwrap();
         drop(library);
+        self.realign_after_edit();
+    }
+
+    /// 给 fixture 的图书补一章，并把 fixture 的来源指到新修订上；返回新章的 id。
+    ///
+    /// 「立即翻译本章」要有一章可以跳过去，而默认模板只有一章。
+    pub(crate) fn add_second_unit(&mut self, title: &str) -> String {
+        let data_dir = self
+            .db_path
+            .parent()
+            .expect("fixture database lives in the temporary data directory")
+            .to_path_buf();
+        let mut library =
+            LibraryStore::load_from_with_runtime(data_dir, self.runtime.clone()).unwrap();
+        let mut editor = DocumentEditor::new(library.document(&self.book_id).unwrap()).unwrap();
+        let unit_id = editor
+            .add_unit(NewContentUnit::html_chapter(title, 1))
+            .unwrap();
+        library.apply_document(editor.into_document()).unwrap();
+        drop(library);
+        self.realign_after_edit();
+        unit_id
+    }
+
+    /// 一次编辑之后的收尾：把 fixture 的来源与新修订对齐。
+    ///
+    /// 打开第二个 `LibraryStore` 会触发启动语言回填：这份模板生成的 EPUB 声明
+    /// `zh-CN`，于是这本书被补上一个与翻译目标 `zh-Hans` 同主语言的语言，整本翻译
+    /// 任务就再也不会被创建（`language_matches_source` 直接跳过它）。fixture 里的
+    /// 图书本来是「没有声明语言」，这里恢复成那个状态。
+    fn realign_after_edit(&mut self) {
         let conn = db::open_conn(&self.db_path).unwrap();
-        // 打开第二个 `LibraryStore` 会触发启动语言回填：这份模板生成的 EPUB 声明
-        // `zh-CN`，于是这本书被补上一个与翻译目标 `zh-Hans` 同主语言的语言，整本翻译
-        // 任务就再也不会被创建（`language_matches_source` 直接跳过它）。fixture 里的
-        // 图书本来是「没有声明语言」，这里恢复成那个状态。
         conn.execute(
             "UPDATE books SET language = NULL WHERE id = ?1",
             [&self.book_id],
