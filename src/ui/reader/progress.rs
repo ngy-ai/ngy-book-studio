@@ -4,18 +4,26 @@ use super::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ReadingProgressWrite {
-    Unit { spine_index: usize, unit_id: String },
+    /// 位置属于某个稳定内容单元；锚点是该章内的文字位置，`None` 表示只知道
+    /// 读到这一章（恢复时停在该章开头）。
+    Unit {
+        spine_index: usize,
+        unit_id: String,
+        anchor: Option<TextAnchor>,
+    },
 }
 
 pub(crate) fn reading_progress_for_locator(
     spine_index: usize,
     progress_locators: &[DocumentLocator],
+    anchor: Option<TextAnchor>,
 ) -> Option<ReadingProgressWrite> {
     progress_locators
         .get(spine_index)
         .map(|locator| ReadingProgressWrite::Unit {
             spine_index,
             unit_id: locator.unit_id.clone(),
+            anchor,
         })
 }
 
@@ -129,11 +137,13 @@ pub(crate) async fn run_reading_progress_writer(
             ReadingProgressWrite::Unit {
                 spine_index,
                 unit_id,
+                anchor,
             } => library
                 .update_progress_at_ordered(
                     &operation_book_id,
                     spine_index,
                     &unit_id,
+                    anchor.as_ref(),
                     book_incarnation,
                     operation_sequence,
                 )

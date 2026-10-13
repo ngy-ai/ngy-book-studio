@@ -45,6 +45,7 @@ pub(crate) const PROGRESS_COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("content_unit_id", "TEXT", false, 0),
     ColumnSpec::new("spine_index", "INTEGER", true, 0),
     ColumnSpec::new("locator_json", "TEXT", true, 0),
+    ColumnSpec::new("anchor_json", "TEXT", false, 0),
     ColumnSpec::new("fraction", "REAL", true, 0),
     ColumnSpec::new("updated_at", "INTEGER", true, 0),
 ];

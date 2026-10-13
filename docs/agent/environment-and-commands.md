@@ -114,9 +114,10 @@ ignored-only --test-threads=1` 对应 `cargo test --lib --locked learning:: -- -
 
 ## 可选 DOM 门禁（Node + 已安装 Playwright）
 
-`src/ui/reader/translations.test.cjs`、`src/ui/reader/annotations.test.cjs`、
-`src/ui/reader/read_aloud.test.cjs`、`src/ui/pdf_reader/annotations.test.cjs`、
-`src/ui/pdf_reader/viewer.test.cjs`、`src/ui/pdf_reader/read_aloud.test.cjs` 用
+`src/ui/reader/position.test.cjs`、`src/ui/reader/translations.test.cjs`、
+`src/ui/reader/annotations.test.cjs`、`src/ui/reader/read_aloud.test.cjs`、
+`src/ui/pdf_reader/annotations.test.cjs`、`src/ui/pdf_reader/viewer.test.cjs`、
+`src/ui/pdf_reader/read_aloud.test.cjs` 用
 `node --test <file>` 运行。它们只使用本机已安装的 Playwright，不为测试安装依赖、
 不触碰用户数据，`NGY_TEST_CHROMIUM` 可指定浏览器。改动 `src/ui/**/*.js` 的交互代码
 或 `web/pdf` 产物时建议跑对应门禁，并在 `ROADMAP.md` 或本文件记下结果。
@@ -147,6 +148,15 @@ Node 认不出来，`require("playwright")` 会 `MODULE_NOT_FOUND`）。
 `pdf_reader/viewer` 5、`pdf_reader/read_aloud` 5）。首轮的两个失败都定位成用例缺陷
 （滚动锚定补偿与缺等待），修法与证据见 `code-map-reader.md` 的 2026-10-10 记录，
 产品代码没有改动。
+
+2026-10-13 复核七个门禁：69 项全部通过（`reader/position` 6、`reader/translations` 26、
+`reader/annotations` 20、`reader/read_aloud` 3、`pdf_reader/annotations` 4、
+`pdf_reader/viewer` 5、`pdf_reader/read_aloud` 5）。新增的 `reader/position` 覆盖：折叠
+范围仍带行盒、首可见行随滚动前移且引文长度与范围自洽、恢复把位置滚回视口、
+过期锚点不动页面、位置没变时不重发、译文层上的采样映射回原文块。同批 Rust 门禁：
+`cargo test --lib` 706 项（701 通过 / 5 忽略，忽略项都是需要课程环境的 `learning` 用例）、
+`cargo test --bin ngy-book-studio` 351 项（350 通过 / 1 忽略，忽略项是需要外部样本的
+`xhtml_test`）、`cargo test --test epub_flow_test` 6 项通过。
 
 ## AI 问答诊断日志
 

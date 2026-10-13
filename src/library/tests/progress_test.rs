@@ -17,7 +17,7 @@ fn stale_reader_clone_persists_unit_progress_against_the_current_revision() {
     assert!(updated.revision > book.revision);
 
     stale_unit_reader
-        .update_progress_at(&book.id, 0, &unit_id)
+        .update_progress_at(&book.id, 0, &unit_id, None)
         .unwrap();
     let conn = db::open_conn(writer.database_path()).unwrap();
     let progress = db::progress::get(&conn, &book.id).unwrap().unwrap();
@@ -38,7 +38,7 @@ fn stale_reader_unit_progress_resolves_the_current_ordinal_after_reorder() {
 
     assert!(
         library
-            .update_progress_at_ordered(&book.id, 0, &first_unit_id, incarnation, 10)
+            .update_progress_at_ordered(&book.id, 0, &first_unit_id, None, incarnation, 10)
             .unwrap()
     );
     let conn = db::open_conn(library.database_path()).unwrap();
@@ -60,7 +60,7 @@ fn document_reorder_preserves_stable_progress_before_reopen() {
     let mut library = LibraryStore::load_from(data_dir.clone()).unwrap();
     let (book, first_unit_id, _) = create_two_unit_book(&mut library);
     library
-        .update_progress_at(&book.id, 0, &first_unit_id)
+        .update_progress_at(&book.id, 0, &first_unit_id, None)
         .unwrap();
 
     let mut editor = DocumentEditor::new(library.document(&book.id).unwrap()).unwrap();
@@ -87,7 +87,7 @@ fn deleted_progress_unit_falls_back_to_a_valid_current_unit() {
     let mut library = LibraryStore::load_from(temp.path().join("library")).unwrap();
     let (book, first_unit_id, second_unit_id) = create_two_unit_book(&mut library);
     library
-        .update_progress_at(&book.id, 1, &second_unit_id)
+        .update_progress_at(&book.id, 1, &second_unit_id, None)
         .unwrap();
 
     let mut editor = DocumentEditor::new(library.document(&book.id).unwrap()).unwrap();
@@ -113,7 +113,7 @@ fn older_cross_window_progress_action_cannot_overwrite_a_newer_one() {
 
     assert!(
         library
-            .update_progress_at_ordered(&book.id, 0, &second_unit_id, incarnation, 10)
+            .update_progress_at_ordered(&book.id, 0, &second_unit_id, None, incarnation, 10)
             .unwrap()
     );
     // Repeating the same position is still a newer action and must advance
@@ -121,22 +121,22 @@ fn older_cross_window_progress_action_cannot_overwrite_a_newer_one() {
     // arrive between the two sequence values and overwrite it.
     assert!(
         library
-            .update_progress_at_ordered(&book.id, 0, &second_unit_id, incarnation, 30)
+            .update_progress_at_ordered(&book.id, 0, &second_unit_id, None, incarnation, 30)
             .unwrap()
     );
     assert!(
         !library
-            .update_progress_at_ordered(&book.id, 0, &first_unit_id, incarnation, 20)
+            .update_progress_at_ordered(&book.id, 0, &first_unit_id, None, incarnation, 20)
             .unwrap()
     );
     assert!(
         !library
-            .update_progress_at_ordered(&book.id, 0, "missing-unit", incarnation, 50)
+            .update_progress_at_ordered(&book.id, 0, "missing-unit", None, incarnation, 50)
             .unwrap()
     );
     assert!(
         !library
-            .update_progress_at_ordered(&book.id, 0, &first_unit_id, incarnation, 40)
+            .update_progress_at_ordered(&book.id, 0, &first_unit_id, None, incarnation, 40)
             .unwrap()
     );
 
@@ -159,7 +159,7 @@ fn failed_newer_progress_does_not_block_an_older_success_or_a_later_retry() {
 
     assert!(
         library
-            .update_progress_at_ordered(&book.id, 1, &second_unit_id, incarnation, 10)
+            .update_progress_at_ordered(&book.id, 1, &second_unit_id, None, incarnation, 10)
             .unwrap()
     );
     let conn = db::open_conn(library.database_path()).unwrap();
@@ -175,7 +175,7 @@ fn failed_newer_progress_does_not_block_an_older_success_or_a_later_retry() {
 
     assert!(
         library
-            .update_progress_at_ordered(&book.id, 0, &first_unit_id, incarnation, 30)
+            .update_progress_at_ordered(&book.id, 0, &first_unit_id, None, incarnation, 30)
             .is_err()
     );
     assert_eq!(
@@ -191,12 +191,12 @@ fn failed_newer_progress_does_not_block_an_older_success_or_a_later_retry() {
     drop(conn);
     assert!(
         library
-            .update_progress_at_ordered(&book.id, 0, &first_unit_id, incarnation, 20)
+            .update_progress_at_ordered(&book.id, 0, &first_unit_id, None, incarnation, 20)
             .unwrap()
     );
     assert!(
         library
-            .update_progress_at_ordered(&book.id, 1, &second_unit_id, incarnation, 40)
+            .update_progress_at_ordered(&book.id, 1, &second_unit_id, None, incarnation, 40)
             .unwrap()
     );
 
@@ -248,7 +248,7 @@ fn deleted_and_reimported_book_rejects_the_old_reader_incarnation() {
 
     assert!(
         !library
-            .update_progress_at_ordered(&book.id, 1, &second_unit_id, old_incarnation, 100,)
+            .update_progress_at_ordered(&book.id, 1, &second_unit_id, None, old_incarnation, 100,)
             .unwrap()
     );
     let conn = db::open_conn(library.database_path()).unwrap();
@@ -264,7 +264,7 @@ fn deleted_and_reimported_book_rejects_the_old_reader_incarnation() {
     // not blocked even by a numerically lower action in this direct test.
     assert!(
         library
-            .update_progress_at_ordered(&book.id, 1, &second_unit_id, new_incarnation, 1,)
+            .update_progress_at_ordered(&book.id, 1, &second_unit_id, None, new_incarnation, 1,)
             .unwrap()
     );
     assert_eq!(library.book_record(&book.id).unwrap().last_spine, 1);
@@ -289,4 +289,53 @@ fn created_books_keep_only_the_current_normalized_source() {
     assert_eq!(sources.len(), 1);
     assert_eq!(sources[0].revision, latest.revision);
     assert_eq!(sources[0].source_kind, "normalized");
+}
+
+/// 修订重装时章内位置只在仍指向同一个内容单元时保留：同一批内容单元的新修订
+/// 继续回到上次停下的位置，当前位置所在单元被换掉的章节回到章节开头。
+#[test]
+fn revision_reinstall_keeps_the_chapter_position_only_for_the_same_unit() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut library = LibraryStore::load_from(temp.path().join("library")).unwrap();
+    let (book, first_unit_id, second_unit_id) = create_two_unit_book(&mut library);
+    let anchor = TextAnchor {
+        quote: "第一章".to_string(),
+        start: 0,
+        end: 3,
+    };
+    library
+        .update_progress_at(&book.id, 0, &first_unit_id, Some(&anchor))
+        .unwrap();
+    assert_eq!(
+        library.reading_position(&book.id).unwrap(),
+        Some((first_unit_id.clone(), anchor.clone()))
+    );
+
+    // 仍然指向同一个内容单元的修订：位置与锚点都保留。
+    let updated = library
+        .update_content_unit_source(
+            &book.id,
+            &second_unit_id,
+            "<h1>第二章</h1><p>改过的正文</p>",
+        )
+        .unwrap();
+    assert!(updated.revision > book.revision);
+    assert_eq!(
+        library.reading_position(&book.id).unwrap(),
+        Some((first_unit_id.clone(), anchor))
+    );
+
+    // 换掉当前位置所在单元：进度回落到仍然有效的章节，锚点不再套用到新内容上。
+    let mut editor = DocumentEditor::new(library.document(&book.id).unwrap()).unwrap();
+    editor.remove_unit(&first_unit_id).unwrap();
+    library.apply_document(editor.into_document()).unwrap();
+
+    let conn = db::open_conn(library.database_path()).unwrap();
+    let progress = db::progress::get(&conn, &book.id).unwrap().unwrap();
+    assert_eq!(
+        progress.content_unit_id.as_deref(),
+        Some(second_unit_id.as_str())
+    );
+    assert!(progress.anchor.is_none(), "换掉内容单元后必须丢弃锚点");
+    assert!(library.reading_position(&book.id).unwrap().is_none());
 }

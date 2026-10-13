@@ -24,7 +24,11 @@ impl ReaderApp {
     }
 
     pub(crate) fn current_progress_write(&self) -> Option<ReadingProgressWrite> {
-        reading_progress_for_locator(self.current_spine, &self.progress_locators)
+        reading_progress_for_locator(
+            self.current_spine,
+            &self.progress_locators,
+            self.current_anchor.clone(),
+        )
     }
 
     pub(crate) fn queue_current_progress(&mut self, cx: &mut Context<Self>) {

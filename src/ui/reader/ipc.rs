@@ -20,6 +20,12 @@ pub(crate) enum ReaderIpcMessage {
     SelectionChanged {
         selected_text: String,
     },
+    /// Sent by the chapter runtime once scrolling stops: the chapter-internal
+    /// reading position, in the same whitespace-free UTF-16 coordinates as note
+    /// anchors.
+    ReadingPosition {
+        anchor: TextAnchor,
+    },
     /// 页面请求从某一段开始朗读：列表是当前显示模式下的段落（id + 文字）。
     ReadAloudStart {
         start_block: String,
@@ -61,6 +67,10 @@ pub(crate) enum ReaderWebEvent {
     SelectionChanged {
         url: String,
         selected_text: Option<String>,
+    },
+    ReadingPosition {
+        url: String,
+        anchor: TextAnchor,
     },
     ReadAloudStart {
         url: String,

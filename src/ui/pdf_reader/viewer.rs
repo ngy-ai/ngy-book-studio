@@ -110,6 +110,7 @@ pub(crate) fn pdf_progress_write(
     Ok(ReadingProgressWrite::Unit {
         spine_index,
         unit_id: unit_id.to_string(),
+        anchor: None,
     })
 }
 

@@ -82,6 +82,7 @@ impl Fixture {
                 content_unit_id: Some("unit-1".to_string()),
                 spine_index: 2,
                 locator_json: r#"{"spine":2}"#.to_string(),
+                anchor: None,
                 fraction: 0.4,
                 updated_at: 2,
             },

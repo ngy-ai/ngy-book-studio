@@ -139,6 +139,7 @@ pub(crate) fn pdf_progress_requires_the_exact_canonical_unit_locator() {
         Ok(ReadingProgressWrite::Unit {
             spine_index: 7,
             unit_id: "unit-3".to_string(),
+            anchor: None,
         })
     );
     assert!(pdf_progress_write(2, Some(&canonical)).is_err());

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use ngy_book_studio::{
     ai::agent::PassageRecord,
     ai::search::{SearchMode, SearchRequest},
-    annotations::Annotation,
+    annotations::{Annotation, TextAnchor},
     document::{BookDocument, BookFormat, BookSource as CanonicalBookSource, DocumentLocator},
     office_com::OfficeCancellation,
     preview::VisualJobState,

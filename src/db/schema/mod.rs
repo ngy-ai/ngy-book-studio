@@ -41,4 +41,4 @@ mod tests;
 /// Identifies SQLite files owned by this application (ASCII "NGYB").
 pub(crate) const APPLICATION_ID: i64 = 0x4E47_5942;
 /// Development schemas are deliberately rebuilt instead of migrated.
-pub(crate) const SCHEMA_VERSION: i64 = 14;
+pub(crate) const SCHEMA_VERSION: i64 = 15;

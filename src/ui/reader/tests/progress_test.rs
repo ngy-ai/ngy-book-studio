@@ -30,6 +30,7 @@ pub(crate) fn progress_writer_updates_the_shared_store_and_flushes_the_final_pos
     let progress = |spine_index: usize| ReadingProgressWrite::Unit {
         spine_index,
         unit_id: document.units[spine_index].id.clone(),
+        anchor: None,
     };
     let incarnation = stale_window_snapshot
         .progress_incarnation(&book.id)
@@ -69,6 +70,94 @@ pub(crate) fn progress_writer_updates_the_shared_store_and_flushes_the_final_pos
             .last_spine,
         3
     );
+}
+
+#[test]
+pub(crate) fn progress_writer_persists_the_chapter_reading_position() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let services = Arc::new(AppServices::open(data_dir.path()).unwrap());
+    let runtime = services.runtime();
+    let book = runtime.block_on(async {
+        services
+            .spawn_library(|library| library.create_book("测试图书", "作者"))
+            .await
+            .unwrap()
+            .unwrap()
+    });
+    let snapshot = services.library_snapshot().unwrap();
+    let document = snapshot.document(&book.id).unwrap();
+    let unit_id = document.units[0].id.clone();
+    let anchor = TextAnchor {
+        quote: "段落文字".to_string(),
+        start: 24,
+        end: 28,
+    };
+    let incarnation = snapshot.progress_incarnation(&book.id).unwrap();
+    let (writer, _events) =
+        ReadingProgressWriter::start(book.id.clone(), incarnation, Arc::clone(&services));
+    let (queued, completion) = writer.finish(ReadingProgressWrite::Unit {
+        spine_index: 0,
+        unit_id: unit_id.clone(),
+        anchor: Some(anchor.clone()),
+    });
+    queued.unwrap();
+    runtime.block_on(async {
+        assert!(completion.recv().await.unwrap().unwrap().is_some());
+    });
+
+    let stored = services
+        .library_snapshot()
+        .unwrap()
+        .reading_position(&book.id)
+        .unwrap();
+    assert_eq!(stored, Some((unit_id, anchor)));
+}
+
+#[test]
+pub(crate) fn reading_position_anchor_requires_a_self_consistent_quote() {
+    let valid = TextAnchor {
+        quote: "段落文字".to_string(),
+        start: 8,
+        end: 12,
+    };
+    assert!(reading_position_anchor_is_valid(&valid));
+    for broken in [
+        // 空引文
+        TextAnchor {
+            quote: String::new(),
+            start: 0,
+            end: 0,
+        },
+        // 范围倒置
+        TextAnchor {
+            quote: "文字".to_string(),
+            start: 9,
+            end: 8,
+        },
+        // 引文长度与范围不一致
+        TextAnchor {
+            quote: "文字".to_string(),
+            start: 8,
+            end: 11,
+        },
+        // 引文含空白：去空白坐标系里不存在这样的切片
+        TextAnchor {
+            quote: "段落 文字".to_string(),
+            start: 8,
+            end: 13,
+        },
+    ] {
+        assert!(
+            !reading_position_anchor_is_valid(&broken),
+            "accepted {broken:?}"
+        );
+    }
+    let oversized = TextAnchor {
+        quote: "字".repeat(MAX_READING_POSITION_QUOTE_BYTES),
+        start: 0,
+        end: MAX_READING_POSITION_QUOTE_BYTES as u32,
+    };
+    assert!(!reading_position_anchor_is_valid(&oversized));
 }
 
 #[test]
@@ -119,6 +208,7 @@ pub(crate) fn progress_writer_reports_a_final_persistence_failure() {
     let (queued, completion) = writer.finish(ReadingProgressWrite::Unit {
         spine_index: 0,
         unit_id: unit_id.clone(),
+        anchor: None,
     });
     queued.unwrap();
 
@@ -137,6 +227,7 @@ pub(crate) fn progress_writer_reports_a_final_persistence_failure() {
         ReadingProgressWrite::Unit {
             spine_index: 0,
             unit_id,
+            anchor: None,
         }
     );
     assert!(
@@ -170,6 +261,7 @@ pub(crate) fn progress_writer_discards_a_removed_canonical_position() {
     let (queued, completion) = writer.finish(ReadingProgressWrite::Unit {
         spine_index: 0,
         unit_id: "removed-unit".to_string(),
+        anchor: None,
     });
     queued.unwrap();
 
@@ -188,13 +280,27 @@ pub(crate) fn epub_progress_is_derived_from_the_stable_opened_unit_locator() {
         DocumentLocator::unit("book-1", "unit-b"),
     ];
     assert_eq!(
-        reading_progress_for_locator(1, &locators),
+        reading_progress_for_locator(1, &locators, None),
         Some(ReadingProgressWrite::Unit {
             spine_index: 1,
             unit_id: "unit-b".to_string(),
+            anchor: None,
         })
     );
-    assert_eq!(reading_progress_for_locator(2, &locators), None);
+    let anchor = TextAnchor {
+        quote: "正文".to_string(),
+        start: 4,
+        end: 6,
+    };
+    assert_eq!(
+        reading_progress_for_locator(0, &locators, Some(anchor.clone())),
+        Some(ReadingProgressWrite::Unit {
+            spine_index: 0,
+            unit_id: "unit-a".to_string(),
+            anchor: Some(anchor),
+        })
+    );
+    assert_eq!(reading_progress_for_locator(2, &locators, None), None);
 }
 
 #[test]

@@ -8,6 +8,22 @@
   闭合 Shadow DOM 隔离正文 CSS，覆盖层绘制而不改写正文节点。
   `src/ui/reader/selection_menu.rs` 是 EPUB 与 PDF 共用的 WebView2 原生「AI解释」菜单，
   由调用方提供私有文档判定与事件构造，仍要求 page/frame 为同一私有文档。
+- `src/ui/reader/position.rs`、`position.js`：章内阅读位置（重新打开回到上次停下的位置）。
+  页面在滚动停止 400ms 后用 `caretRangeFromPoint` 采样「视口顶部第一个可见字符」（多列
+  多行重试，采样插入点必须真的在视口内），换算成与笔记同一套**去空白 UTF-16 偏移**加
+  24 个 code unit 引文，经 `reading_position` IPC 上报；`pagehide` 再同步补一次。
+  落在译文层上的采样先经 `ngyTranslations.originalRange` 映射回原文叶子，正文索引排除
+  `[data-ngy-translation]` 与脚本样式；记录只认原文，译文只是显示层。宿主把锚点写入
+  `progress.anchor_json`（NULL 表示只记到章节，仍按章节恢复），
+  `protocol.rs::reading_position_anchor_is_valid` 校验引文非空、≤512 字节、无 ECMAScript
+  空白且长度等于范围（去空白坐标系自洽）。重新打开图书时 `open.rs` 只在「从书架打开」
+  （无引用/笔记/目录目标、且锚点所属单元正是要打开的章节）时随 payload 传 `initial_anchor`；
+  首章加载完成后 `run_pending_position_restore` 注入
+  `window.ngyPosition.restore(anchor)`，页面复验引文与当前正文一致才滚动，不一致保持
+  章开头、绝不猜测位置（恢复失败不丢锚点：恢复前 `current_anchor` 就是保存的锚点，
+  换章才清成 `None`）。两种写入共用有序进度写入器，窗口关闭的最终位置取自最后一条上报。
+  可选 DOM 门禁 `node --test src/ui/reader/position.test.cjs`（需已安装 Playwright，
+  `NGY_TEST_CHROMIUM` 可指定浏览器，不为测试装依赖）。
 - `src/ui/read_aloud.rs`：朗读的宿主共享层（Windows/macOS 系统语音，macOS 未验证运行）——会话状态机
   `ReadAloudHost`、进程级单会话登记表 `ReadAloudRegistry`（登记的是弱引用与停止入口，
   新会话开始前先停旧窗口）、段落容量校验与 `ReadAloudWindow` 的默认流程（读设置、起

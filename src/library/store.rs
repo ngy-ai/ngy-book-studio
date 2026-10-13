@@ -360,8 +360,9 @@ impl LibraryStore {
         id: &str,
         last_spine: usize,
         content_unit_id: &str,
+        anchor: Option<&TextAnchor>,
     ) -> Result<()> {
-        self.update_progress_at_inner(id, last_spine, content_unit_id, None)
+        self.update_progress_at_inner(id, last_spine, content_unit_id, anchor, None)
             .map(|_| ())
     }
 
@@ -371,6 +372,7 @@ impl LibraryStore {
         id: &str,
         last_spine: usize,
         content_unit_id: &str,
+        anchor: Option<&TextAnchor>,
         book_incarnation: u64,
         write_sequence: u64,
     ) -> Result<bool> {
@@ -378,6 +380,7 @@ impl LibraryStore {
             id,
             last_spine,
             content_unit_id,
+            anchor,
             Some((book_incarnation, write_sequence)),
         )
     }
@@ -387,6 +390,7 @@ impl LibraryStore {
         id: &str,
         _last_spine: usize,
         content_unit_id: &str,
+        anchor: Option<&TextAnchor>,
         ordered_write: Option<(u64, u64)>,
     ) -> Result<bool> {
         if self.progress_action_is_stale(id, ordered_write) {
@@ -410,6 +414,7 @@ impl LibraryStore {
             id,
             content_unit_id,
             &locator_json,
+            anchor,
             now_secs(),
         )? {
             db::transactions::CurrentProgressWrite::Updated {
@@ -443,6 +448,21 @@ impl LibraryStore {
                 bail!("阅读位置不属于指定图书的当前版本")
             }
         }
+    }
+
+    /// The chapter-internal reading position saved for a book: the anchor and
+    /// the stable content unit it was recorded in. `None` means only a chapter
+    /// was recorded (or nothing at all). Callers must still check that the unit
+    /// is the one they are about to open.
+    pub fn reading_position(&self, book_id: &str) -> Result<Option<(String, TextAnchor)>> {
+        let conn = db::open_conn(&self.db_path)?;
+        let Some(progress) = db::progress::get(&conn, book_id)? else {
+            return Ok(None);
+        };
+        Ok(match (progress.content_unit_id, progress.anchor) {
+            (Some(unit_id), Some(anchor)) => Some((unit_id, anchor)),
+            _ => None,
+        })
     }
 
     pub fn create_group(&mut self, name: &str, parent_id: Option<&str>) -> Result<BookGroup> {

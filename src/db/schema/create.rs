@@ -73,6 +73,7 @@ pub(crate) fn create_schema(conn: &mut Connection) -> Result<()> {
              content_unit_id TEXT REFERENCES content_units(id) ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED,
              spine_index INTEGER NOT NULL DEFAULT 0 CHECK(spine_index >= 0),
              locator_json TEXT NOT NULL DEFAULT '{}',
+             anchor_json TEXT,
              fraction REAL NOT NULL DEFAULT 0.0 CHECK(fraction >= 0.0 AND fraction <= 1.0),
              updated_at INTEGER NOT NULL CHECK(updated_at >= 0)
          );

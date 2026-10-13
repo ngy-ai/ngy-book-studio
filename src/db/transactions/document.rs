@@ -1,6 +1,7 @@
 //! Progress writes, document installation and revision replacement.
 
 use super::*;
+use crate::annotations::TextAnchor;
 
 /// Resolves a stable unit against the currently published source and writes
 /// its canonical ordinal without releasing the SQLite write lock.
@@ -9,6 +10,7 @@ pub(crate) fn update_current_unit_progress(
     book_id: &str,
     content_unit_id: &str,
     locator_json: &str,
+    anchor: Option<&TextAnchor>,
     updated_at: u64,
 ) -> Result<CurrentProgressWrite> {
     let tx = conn
@@ -33,6 +35,7 @@ pub(crate) fn update_current_unit_progress(
             content_unit_id: Some(content_unit_id.to_string()),
             spine_index: unit.ordinal,
             locator_json: locator_json.to_string(),
+            anchor: anchor.cloned(),
             fraction: 0.0,
             updated_at,
         },

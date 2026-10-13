@@ -95,6 +95,10 @@ impl EpubReaderApp {
             if let (Some(requested), Some(exact)) = (requested_spine, source_index) {
                 ensure!(requested == exact, "引用内容单元与请求的阅读位置不匹配");
             }
+            // 只有从书架打开这本书才回到上次停下的章内位置；引用、笔记和显式
+            // 章节目标都必须落在目标处，而不是旧位置。
+            let restore_position =
+                requested_spine.is_none() && annotation_index.is_none() && source_index.is_none();
             let requested_spine = annotation_index.or(requested_spine);
             if record.format == "pdf" {
                 let pages = document
@@ -202,11 +206,27 @@ impl EpubReaderApp {
                 .or(requested_spine)
                 .unwrap_or(record.last_spine)
                 .min(opened.spine.len().saturating_sub(1));
+            // 保存的锚点只在它属于正要打开的章节时才用于恢复；章节换了就只
+            // 落到章节开头。
+            let initial_anchor = if restore_position {
+                library
+                    .reading_position(&book_id)?
+                    .and_then(|(unit_id, anchor)| {
+                        (progress_locators
+                            .get(initial_spine)
+                            .map(|locator| locator.unit_id.as_str())
+                            == Some(unit_id.as_str()))
+                        .then_some(anchor)
+                    })
+            } else {
+                None
+            };
             Ok::<_, anyhow::Error>(OpenReaderPayload::Reflowable {
                 record,
                 book_incarnation,
                 opened,
                 initial_spine,
+                initial_anchor,
                 initial_citation,
                 progress_locators,
                 annotation_revisions: (
@@ -306,6 +326,7 @@ impl EpubReaderApp {
                     book_incarnation,
                     opened,
                     initial_spine: current_spine,
+                    initial_anchor,
                     initial_citation,
                     progress_locators,
                     annotation_revisions,
@@ -385,6 +406,7 @@ impl EpubReaderApp {
                                             progress_locators,
                                             annotation_revisions,
                                             initial_citation,
+                                            initial_anchor.clone(),
                                             library.clone(),
                                             Arc::clone(&services),
                                             library_view.clone(),
@@ -435,6 +457,7 @@ impl EpubReaderApp {
                                     progress_locators.clone(),
                                     annotation_revisions.clone(),
                                     initial_citation.clone(),
+                                    initial_anchor.clone(),
                                     library.clone(),
                                     Arc::clone(&services),
                                     library_view.clone(),

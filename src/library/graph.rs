@@ -210,16 +210,22 @@ pub(crate) fn build_persisted_graph(
         source_name,
         created_at: now,
     };
+    let content_unit_id = units.get(progress_spine).map(|unit| unit.id.clone());
     let progress = db::progress::ReadingProgress {
         book_id: book.id.clone(),
         source_revision: revision,
-        content_unit_id: units.get(progress_spine).map(|unit| unit.id.clone()),
+        content_unit_id: content_unit_id.clone(),
         spine_index: progress_spine,
         locator_json: units
             .get(progress_spine)
             .map(|unit| serde_json::to_string(&DocumentLocator::unit(&book.id, &unit.id)))
             .transpose()?
             .unwrap_or_else(|| "{}".to_string()),
+        // 章内位置只在仍指向同一个内容单元时保留：章节内容换了以后回到章节
+        // 开头，不把旧位置套用到新内容上。
+        anchor: previous_progress
+            .filter(|progress| progress.content_unit_id == content_unit_id)
+            .and_then(|progress| progress.anchor.clone()),
         fraction: previous_progress
             .map(|progress| progress.fraction)
             .unwrap_or(0.0),

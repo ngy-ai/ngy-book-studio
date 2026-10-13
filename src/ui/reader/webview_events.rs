@@ -183,6 +183,9 @@ impl ReaderApp {
             ReaderWebEvent::SelectionChanged { url, selected_text } => {
                 self.sync_selection(&url, selected_text, cx)
             }
+            ReaderWebEvent::ReadingPosition { url, anchor } => {
+                self.sync_reading_position(&url, anchor, cx)
+            }
             ReaderWebEvent::ReadAloudStart {
                 url,
                 start_block,
@@ -226,6 +229,10 @@ impl ReaderApp {
         let Some(spine_index) = self.book.spine_index_for_url(url) else {
             return;
         };
+        if self.current_spine != spine_index {
+            // 换章后位置未定：进度先记到章节级，直到页面报告新的章内位置。
+            self.current_anchor = None;
+        }
         self.current_spine = spine_index;
         self.current_reader_url = Some(url.to_string());
         self.selected_toc = self
@@ -234,6 +241,14 @@ impl ReaderApp {
             .iter()
             .position(|item| item.spine_index == Some(spine_index));
         self.selected_text = None;
+        // 打开书后的首个章节：数据库里的章内位置仍然有效，直到用户滚出新的
+        // 位置。带着它写入可以避免恢复失败时丢失保存的位置。
+        if self.current_anchor.is_none()
+            && let Some((spine, anchor)) = self.pending_position_restore.as_ref()
+            && *spine == spine_index
+        {
+            self.current_anchor = Some(anchor.clone());
+        }
         self.sync_ai_reference(cx);
         self.notice = None;
         self.queue_current_progress(cx);
@@ -241,6 +256,7 @@ impl ReaderApp {
         self.configure_annotations(cx);
         self.configure_translations(url, cx);
         self.apply_reading_appearance(cx);
+        self.run_pending_position_restore(url, cx);
         cx.notify();
     }
 

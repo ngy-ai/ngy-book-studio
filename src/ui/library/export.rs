@@ -29,6 +29,9 @@ pub(crate) enum OpenReaderPayload {
         book_incarnation: u64,
         opened: OpenedBook,
         initial_spine: usize,
+        /// 上次阅读留下的章内位置；只从书架打开这本书时才有，用于首个章节
+        /// 加载后的滚动恢复。
+        initial_anchor: Option<TextAnchor>,
         initial_citation: Option<reader::ReflowableCitationTarget>,
         progress_locators: Vec<DocumentLocator>,
         annotation_revisions: (u64, Vec<u64>),

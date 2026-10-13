@@ -1,6 +1,7 @@
 //! Serving reader resources, media and IPC requests.
 
 use super::*;
+use ngy_book_studio::annotations::compact_text;
 
 pub(crate) fn spawn_reader_media(
     services: &Arc<AppServices>,
@@ -107,6 +108,11 @@ pub(crate) fn reader_ipc_event(uri: &wry::http::Uri, body: &str) -> Option<Reade
                 selected_text,
             })
         }
+        ReaderIpcMessage::ReadingPosition { anchor } => reading_position_anchor_is_valid(&anchor)
+            .then(|| ReaderWebEvent::ReadingPosition {
+                url: uri.to_string(),
+                anchor,
+            }),
         ReaderIpcMessage::ReadAloudStart {
             start_block,
             blocks,
@@ -159,4 +165,20 @@ pub(crate) fn normalize_reader_selection(value: &str) -> Option<Option<String>> 
     }
     let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
     Some((!normalized.is_empty()).then_some(normalized))
+}
+
+/// A reading position is a short slice of the whitespace-free chapter text, so
+/// the host can check it without the chapter itself: the quote must carry no
+/// whitespace and its length must equal the reported range. A message that does
+/// not satisfy both is dropped rather than stored as a position the page could
+/// never have chosen.
+pub(crate) const MAX_READING_POSITION_QUOTE_BYTES: usize = 512;
+
+pub(crate) fn reading_position_anchor_is_valid(anchor: &TextAnchor) -> bool {
+    let quote_units = anchor.quote.encode_utf16().count() as u32;
+    !anchor.quote.is_empty()
+        && anchor.quote.len() <= MAX_READING_POSITION_QUOTE_BYTES
+        && anchor.start < anchor.end
+        && anchor.end - anchor.start == quote_units
+        && compact_text(&anchor.quote).encode_utf16().count() as u32 == quote_units
 }

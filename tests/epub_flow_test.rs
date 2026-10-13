@@ -67,7 +67,7 @@ fn imports_reads_and_restores_a_real_epub() {
 
     let second_unit_id = library.document(&imported.id).unwrap().units[1].id.clone();
     library
-        .update_progress_at(&imported.id, 1, &second_unit_id)
+        .update_progress_at(&imported.id, 1, &second_unit_id, None)
         .unwrap();
     drop(library);
     let restored = LibraryStore::load_from(library_dir).unwrap();

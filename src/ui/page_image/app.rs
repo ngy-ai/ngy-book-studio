@@ -104,6 +104,7 @@ impl PageImageApp {
         let progress = ReadingProgressWrite::Unit {
             spine_index: self.current,
             unit_id: page.locator.unit_id.clone(),
+            anchor: None,
         };
         if let Err(error) = writer.enqueue(progress) {
             tracing::warn!(%error, "failed to queue page image reading progress");

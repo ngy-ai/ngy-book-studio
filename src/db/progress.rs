@@ -1,3 +1,4 @@
+use crate::annotations::TextAnchor;
 use anyhow::{Context as _, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -8,13 +9,16 @@ pub(crate) struct ReadingProgress {
     pub(crate) content_unit_id: Option<String>,
     pub(crate) spine_index: usize,
     pub(crate) locator_json: String,
+    /// 章内阅读位置锚点。`None` 表示只知道读到哪一章：恢复时停在该章开头。
+    /// 锚点与笔记共用去空白 UTF-16 坐标系，但只由阅读位置记录，不参与笔记。
+    pub(crate) anchor: Option<TextAnchor>,
     pub(crate) fraction: f64,
     pub(crate) updated_at: u64,
 }
 
 pub(crate) fn get(conn: &Connection, book_id: &str) -> Result<Option<ReadingProgress>> {
     conn.query_row(
-        "SELECT book_id, source_revision, content_unit_id, spine_index, locator_json, fraction, updated_at
+        "SELECT book_id, source_revision, content_unit_id, spine_index, locator_json, anchor_json, fraction, updated_at
          FROM progress WHERE book_id = ?1",
         [book_id],
         progress_from_row,
@@ -24,15 +28,22 @@ pub(crate) fn get(conn: &Connection, book_id: &str) -> Result<Option<ReadingProg
 }
 
 pub(crate) fn upsert(conn: &Connection, progress: &ReadingProgress) -> Result<usize> {
+    let anchor_json = progress
+        .anchor
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .context("无法序列化章内阅读位置")?;
     conn.execute(
         "INSERT INTO progress
-         (book_id, source_revision, content_unit_id, spine_index, locator_json, fraction, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         (book_id, source_revision, content_unit_id, spine_index, locator_json, anchor_json, fraction, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(book_id) DO UPDATE SET
              source_revision = excluded.source_revision,
              content_unit_id = excluded.content_unit_id,
              spine_index = excluded.spine_index,
              locator_json = excluded.locator_json,
+             anchor_json = excluded.anchor_json,
              fraction = excluded.fraction,
              updated_at = excluded.updated_at",
         params![
@@ -41,6 +52,7 @@ pub(crate) fn upsert(conn: &Connection, progress: &ReadingProgress) -> Result<us
             progress.content_unit_id,
             progress.spine_index as i64,
             progress.locator_json,
+            anchor_json,
             progress.fraction,
             progress.updated_at as i64,
         ],
@@ -54,13 +66,26 @@ pub(crate) fn delete(conn: &Connection, book_id: &str) -> Result<usize> {
 }
 
 fn progress_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReadingProgress> {
+    let anchor = row
+        .get::<_, Option<String>>(5)?
+        .map(|json| {
+            serde_json::from_str::<TextAnchor>(&json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        })
+        .transpose()?;
     Ok(ReadingProgress {
         book_id: row.get(0)?,
         source_revision: row.get::<_, i64>(1)? as u64,
         content_unit_id: row.get(2)?,
         spine_index: row.get::<_, i64>(3)? as usize,
         locator_json: row.get(4)?,
-        fraction: row.get(5)?,
-        updated_at: row.get::<_, i64>(6)? as u64,
+        anchor,
+        fraction: row.get(6)?,
+        updated_at: row.get::<_, i64>(7)? as u64,
     })
 }

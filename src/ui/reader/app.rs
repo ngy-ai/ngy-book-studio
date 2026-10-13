@@ -11,6 +11,7 @@ impl ReaderApp {
         progress_locators: Vec<DocumentLocator>,
         annotation_revisions: (u64, Vec<u64>),
         initial_citation: Option<ReflowableCitationTarget>,
+        initial_anchor: Option<TextAnchor>,
         library: LibraryStore,
         services: Arc<AppServices>,
         library_view: Entity<EpubReaderApp>,
@@ -85,6 +86,12 @@ impl ReaderApp {
                     focus,
                 })
         });
+        // 打开书时进度里的章内位置在首个章节加载后恢复一次；在恢复之前它就
+        // 是当前锚点，这样窗口提前关闭也不会把保存的位置覆盖成章节级。
+        let pending_position_restore = initial_anchor.map(|anchor| (current_spine, anchor));
+        let current_anchor = pending_position_restore
+            .as_ref()
+            .map(|(_, anchor)| anchor.clone());
         let global_display_mode = services
             .provider_settings()
             .map(|settings| settings.translation_display_mode)
@@ -122,6 +129,8 @@ impl ReaderApp {
             _annotation_ai_failure_subscription,
             citation_request_id: u64::from(pending_citation_navigation.is_some()),
             pending_citation_navigation,
+            current_anchor,
+            pending_position_restore,
             _search_subscription,
             _ai_subscription,
             _ai_layout_subscription,

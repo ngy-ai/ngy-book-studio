@@ -9,6 +9,7 @@ use anyhow::ensure;
 use gpui_kit::{DragMoveEvent, EmptyView, Pixels};
 use ngy_book_studio::{
     ai::chat::ChatWindowKind,
+    annotations::TextAnchor,
     document::{BookDocument, DocumentLocator, SourceLocator},
     media::MediaService,
     reader::{
@@ -44,6 +45,8 @@ mod navigation;
 
 mod pane;
 
+mod position;
+
 mod progress;
 
 mod progress_io;
@@ -73,6 +76,8 @@ pub(crate) use gate::*;
 pub(crate) use ipc::*;
 
 pub(crate) use pane::*;
+
+pub(crate) use position::*;
 
 pub(crate) use progress::*;
 
@@ -131,6 +136,11 @@ pub struct ReaderApp {
     pub(crate) _annotation_ai_failure_subscription: Subscription,
     pub(crate) citation_request_id: u64,
     pub(crate) pending_citation_navigation: Option<PendingReaderCitationNavigation>,
+    /// 章内阅读位置：滚动停止后由章节页上报，随进度一起写入数据库。
+    pub(crate) current_anchor: Option<TextAnchor>,
+    /// 打开书时待恢复的章内位置（初始章节 + 锚点）。首次加载该章节后消费
+    /// 一次；引用导航优先，恢复失败时保持章节开头。
+    pub(crate) pending_position_restore: Option<(usize, TextAnchor)>,
     pub(crate) _search_subscription: Subscription,
     pub(crate) _ai_subscription: Subscription,
     pub(crate) _ai_layout_subscription: Subscription,
