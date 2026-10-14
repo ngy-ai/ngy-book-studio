@@ -13,6 +13,17 @@
   const SKIPPED = new Set(["script", "style", "noscript", "template"]);
   const PRESERVED = new Set(["code", "pre"]);
   const MEDIA = "img,picture,svg,math,video,audio,canvas,iframe,object,embed,input,select,textarea,button";
+  // The reader's own chrome lives inside book blocks too: the read-aloud speaker
+  // is a `<button>` carrying an inline `<svg>`, so every block that has one
+  // matches `MEDIA`. It is not book media — the speaker follows the visible text,
+  // so `read_aloud.js` has to keep working when the original is hidden — and
+  // counting it would keep the original of every single block on screen in
+  // 「译文」 mode. Keep this selector in step with the scripts that inject chrome
+  // into blocks (`read_aloud.js`).
+  const CHROME = ".ngy-read-aloud-button";
+  // 列表项与表格单元格的原文包装（`display:contents`）上的标记：朗读脚本按它把段落
+  // 末尾的小喇叭挂回原文末尾，而不是落到包装外面（见 `read_aloud.js`）。
+  const ORIGINAL_ATTR = "data-ngy-translation-original";
   const INLINE_TAGS = new Set([
     "span", "b", "strong", "i", "em", "u", "s", "strike", "del", "ins",
     "sub", "sup", "code", "pre", "br", "small", "mark", "kbd", "samp",
@@ -140,6 +151,10 @@
   const tag = (element) => element.localName?.toLowerCase() || "";
   const isCell = (element) => tag(element) === "td" || tag(element) === "th";
   const create = (name) => document.createElementNS(XHTML, name);
+  // Book media of the block's own: an image, a control, a math/formula node. The
+  // reader's chrome is skipped, so a block stays collapsible while it carries it.
+  const hasBookMedia = (element) => Array.from(element.querySelectorAll(MEDIA))
+    .some((node) => !node.closest(CHROME));
 
   const copyStyles = (source, target, includeBox) => {
     const style = getComputedStyle(source);
@@ -602,6 +617,8 @@
       event.preventDefault();
       event.stopPropagation();
       setCollapsed(state, !state.hidden);
+      // 展开/收起换的是「哪份文字可见」：朗读的小喇叭要跟着回到正文，或退回译文末尾。
+      syncReadAloud();
     });
     state.reveal = { element, show, hide };
     text.append(element);
@@ -643,6 +660,9 @@
       // inside the same element, so hiding the element would hide it too.
       // `display:contents` keeps the moved nodes in the original box.
       wrapper = create("span");
+      // 原文住在这个包装里（朗读脚本按它把「段落末尾的小喇叭」挂回原文末尾，而不是
+      // 落到包装外面去，见 `read_aloud.js`）。
+      wrapper.setAttribute(ORIGINAL_ATTR, "1");
       wrapper.style.setProperty("display", "contents", "important");
       wrapper.append(...element.childNodes);
       element.append(wrapper);
@@ -664,10 +684,10 @@
     layerStates.set(layer, state);
     // 「译文」is the only mode that hides the original, so the reveal icon only
     // exists there, and a block that may not be collapsed at all — one carrying
-    // media — stays bilingual without one. Decided before any chrome is
-    // inserted: the icon is a `<button>` and `MEDIA` matches buttons, so a
-    // later check would disable itself.
-    const revealable = translateOnly && !element.querySelector(MEDIA);
+    // the book's own media — stays bilingual without one. Decided before any
+    // chrome is inserted: the icon is a `<button>` and `MEDIA` matches buttons,
+    // so a later check would disable itself.
+    const revealable = translateOnly && !hasBookMedia(element);
     if (inPlace) element.insertBefore(layer, element.firstChild);
     else element.parentNode.insertBefore(layer, element);
     if (revealable) appendReveal(state, text);
@@ -717,6 +737,13 @@
     renderControls(state);
   };
 
+  /// 「译文」模式隐藏原文后，读者看到的文字是译文层：朗读脚本的按钮与高亮要跟着落到
+  /// 译文上（`read_aloud.js` 自己按「哪份文字可见」重新定位）。译文层重建、折叠状态
+  /// 改变之后叫一次；页面里没有朗读脚本时（夹具或旧页面）自然是空操作。
+  const syncReadAloud = () => {
+    window.ngyReadAloud?.refresh?.();
+  };
+
   const applyPayload = (payload) => {
     session = typeof payload.session === "string" ? payload.session : "";
     revision = Number.isSafeInteger(payload.revision) ? payload.revision : 0;
@@ -729,7 +756,12 @@
       if (!queues.has(key)) queues.set(key, []);
       queues.get(key).push(entry);
     }
-    if (!queues.size || !document.body) return;
+    if (!queues.size || !document.body) {
+      // 空载荷（「原文」模式、还没翻译的章节）刚拆掉旧层：层里的那只小喇叭要还给
+      // 正文块，否则整章都没有朗读入口。
+      syncReadAloud();
+      return;
+    }
     for (const element of candidateElements()) {
       const source = inspect(element);
       // The host does not emit code-only blocks. They must not consume a
@@ -747,6 +779,7 @@
       if (!validated || getComputedStyle(element).display === "none") continue;
       insert(element, entry, validated, payload.displayMode === "translation-only");
     }
+    syncReadAloud();
   };
 
   const editing = () => applied.some((state) => state.editing || state.request > 0);
@@ -811,7 +844,13 @@
   window.ngyTranslations = Object.freeze({
     configure,
     result: applyResult,
-    clear: () => { session = ""; deferred = null; clear(); },
+    clear: () => {
+      session = "";
+      deferred = null;
+      clear();
+      // 层与折叠状态一起没了：朗读按钮回到正文块自己身上。
+      syncReadAloud();
+    },
     applied: () => applied.length,
     session: () => session,
     originalRange,

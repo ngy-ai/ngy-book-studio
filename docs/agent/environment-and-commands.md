@@ -162,6 +162,16 @@ Node 认不出来，`require("playwright")` 会 `MODULE_NOT_FOUND`）。
 `cargo test --test openai_compatible_flow` 23 项、`cargo test --test multi_endpoint_flow_test`
 1 项、`cargo test --test translation_flow` 20 项（19 通过 / 1 忽略）。
 
+2026-10-13 修「译文」模式原文未隐藏（朗读小喇叭被当成书里的媒体），并把朗读的小喇叭、高亮与
+视口起读改按「读者看得见的那份文字」落位，之后重跑 `reader` 四个门禁：59 项全部通过
+（`reader/translations` 26、`reader/annotations` 20、`reader/position` 6、`reader/read_aloud` 7，
+朗读门禁从 3 项增到 7 项）。`reader/translations` 现在与生产同框加载朗读脚本、并断言页面确实
+带着这枚 chrome，所以「两个门禁各看一半」这条回归以后会被它拦住。反向验证过两次：把
+`hasBookMedia()` 临时改回 `element.querySelector(MEDIA)`，「译文」两项立刻失败；把
+`visibleHost()` 临时改回「永远返回块本身」并去掉高亮的内联覆盖，朗读门禁 7 项里 6 项立刻失败。
+本次只改 `src/ui/**/*.js` 与文档，没有跑 Rust 门禁；未做真实 Windows GUI 手工复验（见
+`ROADMAP.md` 同日两条记录）。
+
 ## AI 问答诊断日志
 
 AI 日志统一使用 `ngy_ai` target。未设置 `RUST_LOG` 时，默认

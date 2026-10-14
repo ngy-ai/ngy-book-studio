@@ -918,3 +918,29 @@ LangGraph 依赖。CLI 课程验证与桌面接入的验证分别列出。
   multi_format_flow 4、multi_endpoint_flow 1、openai_compatible_flow 22、proxy_flow 1
   （产品在运行占用 `target/debug`，测试在 `target/verify` 执行）。未做人工 GUI 验证：
   需要关掉正在运行的墨页重新构建、重开书库窗口后才能看到新布局。
+- [x] 2026-10-13 「译文」模式原文没被隐藏（现场：译文模式下每一段都原文与译文并排，连「显示原文」
+  图标都没有）：朗读脚本会给每个候选块插一枚小喇叭（`<button>` 里内联 `<svg>`，落在段落文字里），
+  而译文层
+  判「这一块能不能折叠」用的是 `MEDIA` 里的 `button`/`svg`，于是每一块都被判成「含媒体、不能隐藏
+  原文」，`setCollapsed(state, false)` 把整章原文都留在页面上（2026-10-09 朗读落地引入的回归：
+  `translations.test.cjs` 不装朗读脚本，`read_aloud.test.cjs` 装了却不看折叠，两个门禁各差一半）。
+  修法：`translations.js` 新增 `CHROME = ".ngy-read-aloud-button"` 与 `hasBookMedia()`，落在宿主
+  chrome 内的 `MEDIA` 节点不算书里的媒体，书自己的图片与控件仍保持双语（README 的「含图片等媒体
+  的段落保留双语」不变）。门禁：`translations.test.cjs` 现在与生产同框加载朗读脚本，并断言页面
+  确实带着这枚 chrome。验证：把 `hasBookMedia(element)` 临时改回 `element.querySelector(MEDIA)`，
+  「译文」的两项用例立刻失败（expected `'none'` / actual `''`），确认门禁真能拦住这条。
+- [x] 2026-10-13 同日续：朗读的小喇叭与高亮改按「读者看得见的那份文字」落位（`read_aloud.js` 的
+  `visibleHost()`）。双语、原文模式与含媒体而保持双语的段落仍是正文块自己；「译文」模式原文是
+  `display:none`，按钮与高亮因此落到译文层译文的末尾——段落悬停入口与可见高亮在这个默认模式下
+  也成立（此前只剩工具栏「朗读」，且高亮挂在被隐藏的原文块上，看不见）。两条坑都实测过：译文层
+  把原文 computed style 逐条写成内联 `!important`（含 `background-color`），只加
+  `.ngy-read-aloud-active` 类读出来仍是 `rgba(0, 0, 0, 0)`，高亮因此补一条内联颜色并在清除时
+  还原；列表项与表格单元格的原文住在 `display:contents` 包装里（包装新增
+  `data-ngy-translation-original` 标记），按钮要挂进包装（挂到块上会落到包装外面、改变 DOM
+  顺序），而包装不生成盒子、收不到 `mouseenter`，悬停由块与承载元素一起接。一段始终只有一枚：
+  层重建、折叠切换、`clear()` 与「原文」模式的空载荷都调一次 `ngyReadAloud.refresh()` 重新落位
+  （空载荷这条原本会在 `applyPayload` 提前返回时把整章的朗读入口一起丢掉）。验证：
+  `reader/translations` 26、`reader/annotations` 20、`reader/position` 6、`reader/read_aloud` 7
+  共 59 项全部通过（朗读门禁从 3 项增到 7 项：落点、实测高亮颜色、视口起读、悬停可达）；把
+  `visibleHost()` 临时改回「永远返回块本身」并去掉高亮的内联覆盖，朗读门禁 7 项里 6 项立刻失败。
+  未做真实 Windows GUI 手工复验。

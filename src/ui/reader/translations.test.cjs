@@ -8,6 +8,10 @@ const { chromium } = require("playwright");
 
 const translationsSource = fs.readFileSync(path.join(__dirname, "translations.js"), "utf8");
 const annotationsSource = fs.readFileSync(path.join(__dirname, "annotations.js"), "utf8");
+// 生产页面同时装朗读脚本：它给每个候选块末尾插一枚小喇叭（`<button>` + 内联 `<svg>`），
+// 两个名字都落在译文层的 `MEDIA` 里。少了它，门禁就看不见「宿主 chrome 被当成书里的
+// 媒体」这一类缺陷：那样「译文」模式下每一段都会保住原文（2026-10-13 修复）。
+const readAloudSource = fs.readFileSync(path.join(__dirname, "read_aloud.js"), "utf8");
 // 选区桥与初始化脚本现在住在 `reader/script.rs`：阅读器拆成目录模块之后，这里还指着
 // 旧的 `reader.rs`，门禁因此在加载阶段就 ENOENT（2026-09-22 修正）。
 const readerSource = fs.readFileSync(path.join(__dirname, "script.rs"), "utf8");
@@ -72,6 +76,7 @@ async function pageWithFixture(html = fixture, contentType = "text/html; charset
     ${selectionBridge}
     ${annotationsSource}
     ${translationsSource}
+    ${readAloudSource}
   ` });
   await page.goto("http://epubreader.book/chapter.html");
   await page.evaluate(() => window.ngyAnnotations.configure({ session: "chapter-session", revision: 1, notes: [] }));
@@ -218,8 +223,12 @@ test("the trailing icon is the only toggle between translation-only and bilingua
         label: layer.querySelector("[data-ngy-translation-reveal]").getAttribute("aria-label"),
         text: layer.querySelector(".ngy-translation-text").textContent,
         layerText: layer.textContent,
+        // The read-aloud speaker sits inside every candidate block: the collapse
+        // decision must look past that chrome or nothing hides at all.
+        chrome: document.querySelectorAll(".ngy-read-aloud-button").length,
       };
     });
+    assert.ok(initial.chrome > 0, "the gate must run with the reader chrome the real page carries");
     assert.equal(initial.display, "none", "translation-only mode hides the original");
     assert.equal(initial.icons, 7, "every collapsible translated block carries one reveal icon, the table cell included");
     assert.equal(initial.label, "显示原文", "the icon names the action it offers");
@@ -542,7 +551,10 @@ for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; c
     const page = await pageWithFixture(formattedFixture, contentType);
     try {
       const before = await page.evaluate(() => {
-        window.__originalLiNodes = Array.from(document.getElementById("one").childNodes);
+        // 只记原书节点：朗读小喇叭是宿主 chrome，它在「译文」模式下要跟着可见的译文
+        // 走（藏在原文里就点不到了），不是「包装是否保住原文节点」这件事的一部分。
+        window.__originalLiNodes = Array.from(document.getElementById("one").childNodes)
+          .filter((node) => !node.classList?.contains("ngy-read-aloud-button"));
         window.__originalImage = document.getElementById("original-image");
         const result = {};
         for (const [name, selector, properties] of [
