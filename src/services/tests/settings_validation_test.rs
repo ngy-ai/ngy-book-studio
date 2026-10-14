@@ -150,7 +150,7 @@ fn background_job_scheduling_setting_is_validated_and_clamped_on_load() {
     );
 }
 
-/// 每分钟请求数上限：保存时拒绝超限的数字，读取时钳制别人改过的行，老行按「不限」读。
+/// 每分钟请求数上限：保存时拒绝超限的数字，读取时钳制别人改过的行，老行按「自动」读。
 #[test]
 fn the_endpoint_request_limit_is_validated_on_save_and_clamped_on_load() {
     let out_of_range = ProviderSettings {
@@ -199,7 +199,7 @@ fn the_endpoint_request_limit_is_validated_on_save_and_clamped_on_load() {
     assert_eq!(loaded.requests_per_minute, MAX_ENDPOINT_RPM);
     assert_eq!(loaded.endpoints()[1].requests_per_minute, MAX_ENDPOINT_RPM);
 
-    // 老行里根本没有这个键：按「不限」读，升级不会平白给端点加上限速。
+    // 老行里根本没有这个键：读成「自动」（`0`），具体数字按地址在装配时解析。
     let mut legacy = serde_json::to_value(ProviderSettings::default()).unwrap();
     legacy
         .as_object_mut()

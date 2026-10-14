@@ -100,8 +100,10 @@ pub struct EndpointSettings {
     pub allow_insecure_remote_http: bool,
     pub confirmed_remote_endpoint: String,
     pub request_timeout_secs: u64,
-    /// 这台 Endpoint 的每分钟请求数上限（RPM），`0` 表示不限。老版本的配置行里没有这个
-    /// 键，缺失时按不限读取，所以升级不会平白给用户的端点加上限速。
+    /// 这台 Endpoint 的每分钟请求数上限（RPM）。`0`（含缺键的老行）是「自动」：本机端点
+    /// 不限、远程端点按 [`crate::ai::DEFAULT_ENDPOINT_RPM`] 节流，由 [`Self::resolved_requests_per_minute`]
+    /// 按 `base_url` 解析 —— 开箱直撞服务商的计量，代价是整台端点一起退避，而「慢一点」
+    /// 用户自己就能调大。正数就是固定上限。
     ///
     /// 服务商按端点计量，所以额度按 `base_url` 共享：同一台服务器上的问答、整本翻译、
     /// 向量索引、视觉理解与模型检测走的是同一份配额。限速只影响请求什么时候发出，
@@ -150,6 +152,14 @@ impl EndpointSettings {
             allow_insecure_remote_http: self.allow_insecure_remote_http && confirmation_matches,
             request_timeout_secs: self.request_timeout_secs,
         }
+    }
+
+    /// 真正接进额度闸门的每分钟请求数上限：`0` 是「自动」，按地址解析成具体的数字。
+    ///
+    /// 读这个字段的地方（装配 provider、保存后发布额度、模型检测）都必须走这里，
+    /// 直接读 [`Self::requests_per_minute`] 拿到的是没解析过的「自动」。
+    pub fn resolved_requests_per_minute(&self) -> u32 {
+        resolve_requests_per_minute(self.requests_per_minute, &self.base_url)
     }
 }
 
@@ -216,6 +226,16 @@ pub(crate) fn default_background_job_interval_ms() -> u64 {
 
 pub(crate) fn default_embedding_dimensions() -> usize {
     DEFAULT_EMBEDDING_DIMENSIONS
+}
+
+/// `0` 是「自动」：交给地址决定（本机不限、远程 [`crate::ai::DEFAULT_ENDPOINT_RPM`]），
+/// 正数是固定上限。
+pub(crate) fn resolve_requests_per_minute(configured: u32, base_url: &str) -> u32 {
+    if configured > 0 {
+        configured
+    } else {
+        default_endpoint_requests_per_minute(base_url)
+    }
 }
 
 pub(crate) fn default_translation_model() -> String {
@@ -522,7 +542,7 @@ pub struct ProviderSettings {
     pub confirmed_remote_endpoint: String,
     pub request_timeout_secs: u64,
     /// 默认 Endpoint 的「每分钟请求数上限」（见 [`EndpointSettings::requests_per_minute`]）。
-    /// 老配置行里没有这个键，缺失时按不限读取。
+    /// 与那里一样：`0`（含缺键的老行）是「自动」，正数是固定上限。
     #[serde(default)]
     pub requests_per_minute: u32,
     // --- Host-performed web search (off by default) ---
@@ -696,6 +716,12 @@ impl ProviderSettings {
             ModelRole::Vision => &self.endpoint_routing.vision_endpoint_id,
         };
         self.endpoint_by_id(id)
+    }
+
+    /// 默认 Endpoint 真正接进额度闸门的上限（`0`＝自动，见
+    /// [`EndpointSettings::resolved_requests_per_minute`]）。
+    pub fn resolved_requests_per_minute(&self) -> u32 {
+        resolve_requests_per_minute(self.requests_per_minute, &self.base_url)
     }
 
     /// Builds the validated web-search configuration, or `None` when the

@@ -321,8 +321,8 @@
     无新数据的静默计时）与远程/非 HTTPS 确认；
     聊天、embedding、vision 模型分别绑定 Endpoint 并按该端点检测模型；模型仍引用的
     Endpoint 不可删除，切换保留草稿；请求按角色路由，问答开始时固定模型与端点
-  - [x] 2026-10-13 每个 Endpoint 可配“每分钟请求数上限（RPM）”（Endpoint 窗口，0 或留空
-    ＝不限，上限 10000）：服务商按端点计量请求，额度也按规范化后的 `base_url` 在进程里
+  - [x] 2026-10-13 每个 Endpoint 可配“每分钟请求数上限（RPM）”（Endpoint 窗口，留空或 0＝
+    自动：本机地址不限、远程地址按 10，上限 10000）：服务商按端点计量请求，额度也按规范化后的 `base_url` 在进程里
     共享（`src/ai/rate_limit.rs` 的 `EndpointRateLimits` 活在 `AppServices` 生命周期里 ——
     provider 会随保存设置整批重建，额度不能挂在 provider 上，否则每次保存都把窗口清零），
     同一地址上的问答、翻译、向量、视觉与“检测模型”共用一份；超出额度的请求在**发出之前**
@@ -337,7 +337,7 @@
     `endpoint_rate_limit_released` / `endpoint_rate_limit_cooldown`）。上限保存后立即生效
     （`publish_endpoint_limits` 覆盖列表里每条 Endpoint，包括没被模型绑定的那一条），
     不进任何执行身份，所以改它不会让已翻好的译文或已建索引重做；读取时钳制而不是报错，
-    老行缺这个键按“不限”读，升级不给端点平白加上限速。回归：`ai::tests::rate_limit_test`
+    缺键当时按“不限”读（2026-10-14 改成按地址决定的“自动”，见下一条）。回归：`ai::tests::rate_limit_test`
     9 项（额度与窗口补充、交互插队、取消的等待者不堵队、冷却只延长不缩短、读不到
     `Retry-After` 也退避、不限额度也守冷却、同地址共用一份额度、`Retry-After` 只认秒数）、
     `services::tests::endpoint_limit_test` 2 项（角色上限、保存后发布含未绑定端点）、
@@ -352,6 +352,27 @@
     `translation_flow` 19 通过 1 忽略、`epub_flow` 6、`multi_format_flow` 4、
     `multi_endpoint_flow` 1、`proxy_flow` 1）。未做人工 GUI 验证：需要在真实窗口里给一台
     端点填一次 RPM（例如 10）并观察整本翻译的请求真的按分钟排队、问答仍然立即发出
+  - [x] 2026-10-14 每分钟请求数上限的默认值从“不限”改为按地址决定的“自动”
+    （`ai::default_endpoint_requests_per_minute`）：前一天开箱“不限”的默认在真实中转端点上
+    直接撞上服务商的限流（整本翻译先是成片 422，随后 503“No available channel”），对用户是
+    错误而不是“更快的选择”。缺键、老行里的 `0`、新建端点与输入框留空现在都读作「自动」：
+    远程端点按 `ai::DEFAULT_ENDPOINT_RPM`＝10 节流一次，本机（回环）端点不限 —— 本机没有
+    服务商额度可撞，设 10 等于把整本翻译压到每分钟十块（压本机 GPU 占用的旋钮是“任务
+    间隔”）；地址解析不出来时按远程处理，填 1–10000 才是固定上限。回归：
+    `settings_validation_test::the_endpoint_request_limit_is_validated_on_save_and_clamped_on_load`
+    （老行缺键现在读 `0`＝「自动」）、`request_per_minute_limit_is_optional_and_bounded`（留空与
+    `0` 都读「自动」）、`the_request_limit_round_trips_and_rejects_values_over_the_cap`（草稿留空
+    在输入框里显示为「自动」）、新增
+    `services::tests::endpoint_limit_test::automatic_limits_resolve_by_address_before_they_reach_the_budget`
+    （远程留空进闸门解析成 10、本机留空是 0、显式数字优先于地址规则）。验证：
+    `cargo fmt --all --check`、`cargo clippy --all-targets --locked`（lib 50 条告警，均为既有
+    类别）、`cargo test --locked --all-targets --no-fail-fast` 全通过（lib 720 通过 5 忽略、
+    产品二进制 356 通过 1 忽略、`openai_compatible_flow` 24、`translation_flow` 19 通过 1 忽略、
+    `epub_flow` 6、`multi_format_flow` 4、`multi_endpoint_flow` 1、`proxy_flow` 1）；同一命令
+    第一次跑到
+    `services::tests::visual::jobs_test::structural_visual_jobs_use_the_shared_library_and_object_store`
+    失败，单项重跑与第二次全量均通过，未保留失败输出、未定位根因（不排除并行负载下的波动）。
+    未做人工 GUI 验证
   - [x] AI 设置窗口为应用级单例，重复打开时激活并恢复现有窗口，关闭后可重新创建
   - [x] AI 设置按 Endpoint、对话模型、联网搜索、后台任务、系统配置分为五个标签；切换
     保留未保存输入，各页独立滚动，统一保存全部配置；模型检测在对话模型页展示结果

@@ -10,7 +10,7 @@ fn every_role_reports_the_limit_of_the_endpoint_it_is_bound_to() {
     db::open_or_recreate(&db_path).unwrap();
 
     // 三个角色两处地址：默认 Endpoint 上跑问答与翻译（12 RPM），embedding 那台配 5，
-    // vision 那一台不限。
+    // vision 那一台留空（本机地址 → 自动解析成不限）。
     let mut settings = routed_settings();
     settings.requests_per_minute = 12;
     settings.endpoint_routing.additional_endpoints[0].requests_per_minute = 5;
@@ -39,7 +39,7 @@ fn every_role_reports_the_limit_of_the_endpoint_it_is_bound_to() {
     assert_eq!(
         budget(&services.vision_provider).limit().requests(),
         0,
-        "不限也是「接了额度闸门、上限为 0」，而不是没有闸门"
+        "本机地址的「自动」解析成 0（不限），但闸门仍然接着"
     );
 
     // 同一处地址的角色共用**同一份**额度（同一份额度、不同的排队类别）。
@@ -85,6 +85,65 @@ fn every_role_reports_the_limit_of_the_endpoint_it_is_bound_to() {
     }
 }
 
+/// 上限留空（`0`＝「自动」）时要按地址解析成具体数字再进闸门：远程端点默认节流、本机端点
+/// 默认不限。直接把原始字段塞给闸门会让远程端点跑成「不限」—— 那正是 2026-10-13 的现场。
+#[test]
+fn automatic_limits_resolve_by_address_before_they_reach_the_budget() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join(db::DATABASE_FILE);
+    db::open_or_recreate(&db_path).unwrap();
+
+    let mut settings = routed_settings();
+    settings.base_url = "https://relay.example.com/v1".into();
+    settings.remote_content_confirmed = true;
+    settings.confirmed_remote_endpoint = normalize_provider_base_url(&settings.base_url)
+        .unwrap()
+        .to_string();
+    settings.requests_per_minute = 0;
+    settings.validate().unwrap();
+    assert_eq!(
+        settings.resolved_requests_per_minute(),
+        DEFAULT_ENDPOINT_RPM,
+        "远程端点留空要按默认值节流"
+    );
+    assert_eq!(
+        settings.endpoints()[1].resolved_requests_per_minute(),
+        0,
+        "本机端点留空就是不限"
+    );
+
+    let limits = Arc::new(EndpointRateLimits::new());
+    let services = build_ai_services(
+        &db_path,
+        settings.clone(),
+        &BTreeMap::new(),
+        Arc::clone(&limits),
+    )
+    .unwrap();
+    let budget = |provider: &Arc<dyn OpenAiCompatibleProvider>| {
+        provider
+            .endpoint_budget()
+            .expect("每个角色都必须接额度闸门")
+    };
+    assert_eq!(
+        budget(&services.provider).limit().requests(),
+        DEFAULT_ENDPOINT_RPM
+    );
+    assert_eq!(
+        budget(&services.translation_provider).limit().requests(),
+        DEFAULT_ENDPOINT_RPM
+    );
+    assert_eq!(budget(&services.embedding_provider).limit().requests(), 0);
+
+    // 显式数字优先于地址规则，本机端点也一样。
+    let mut explicit_remote = settings;
+    explicit_remote.requests_per_minute = 25;
+    assert_eq!(explicit_remote.resolved_requests_per_minute(), 25);
+    let mut explicit_loopback = routed_settings();
+    explicit_loopback.requests_per_minute = 3;
+    assert_eq!(explicit_loopback.resolved_requests_per_minute(), 3);
+}
+
 /// 保存设置后上限立即生效，不需要重启；列表里没被任何模型绑定的地址也在发布范围内。
 #[test]
 fn saving_settings_publishes_every_endpoint_limit_including_unbound_ones() {
@@ -109,7 +168,7 @@ fn saving_settings_publishes_every_endpoint_limit_including_unbound_ones() {
             &settings.endpoint_routing.additional_endpoints[0].base_url,
             7,
         ),
-        // vision 那一台没配上限，仍然要有条目（值就是「不限」）。
+        // vision 那一台留空（本机地址 → 自动解析成不限），仍然要有条目。
         (
             &settings.endpoint_routing.additional_endpoints[1].base_url,
             0,

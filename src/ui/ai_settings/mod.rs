@@ -34,8 +34,8 @@ mod web_search;
 use background_jobs::BackgroundJobsSettingsWindow;
 use endpoint::EndpointSettingsWindow;
 use endpoint_draft::{
-    DEFAULT_ENDPOINT_REQUESTS_PER_MINUTE, EndpointDraft, detect_models, new_endpoint_draft,
-    refresh_endpoint_drafts, render_model_detection, set_delete_endpoint_key,
+    EndpointDraft, detect_models, new_endpoint_draft, refresh_endpoint_drafts,
+    render_model_detection, set_delete_endpoint_key,
 };
 use models::ModelsSettingsWindow;
 use system::SystemSettingsWindow;

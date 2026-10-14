@@ -8,15 +8,12 @@ use super::*;
 
 use ngy_book_studio::{
     ai::{
-        DEFAULT_AI_REQUEST_TIMEOUT_SECS, DEFAULT_OLLAMA_OPENAI_BASE_URL,
+        DEFAULT_AI_REQUEST_TIMEOUT_SECS, DEFAULT_ENDPOINT_RPM, DEFAULT_OLLAMA_OPENAI_BASE_URL,
         MAX_AI_REQUEST_TIMEOUT_SECS, MAX_ENDPOINT_RPM, MIN_AI_REQUEST_TIMEOUT_SECS, ModelInfo,
         normalize_provider_base_url,
     },
     services::{ApiKeyUpdate, EndpointSettings, ModelRole},
 };
-
-/// 「每分钟请求数上限」留空时表示不限。
-pub(crate) const DEFAULT_ENDPOINT_REQUESTS_PER_MINUTE: u32 = 0;
 
 /// 一个 Endpoint 的可编辑草稿。密钥只以掩码输入框的形式存在，明文不回填。
 pub(crate) struct EndpointDraft {
@@ -89,9 +86,14 @@ pub(crate) fn new_endpoint_draft<V: EndpointBackedWindow>(
             .validate(|value, _| value.chars().all(|character| character.is_ascii_digit()))
     });
     let requests_per_minute_input = cx.new(|cx| {
+        // `0` 是「自动」：输入框里显示成留空，省得把「自动」看成一个固定的 0。
+        let configured = match endpoint.requests_per_minute {
+            0 => String::new(),
+            requests => requests.to_string(),
+        };
         InputState::new(window, cx)
-            .default_value(endpoint.requests_per_minute.to_string())
-            .placeholder("留空表示不限")
+            .default_value(configured)
+            .placeholder("留空＝自动：本机不限，远程 10")
             .validate(|value, _| value.chars().all(|character| character.is_ascii_digit()))
     });
     let endpoint_id = endpoint.id.clone();
@@ -495,20 +497,21 @@ pub(crate) fn parse_request_timeout_secs(value: &str) -> Result<u64> {
     Ok(timeout)
 }
 
-/// 「每分钟请求数上限」：留空或 `0` 都表示不限。
+/// 「每分钟请求数上限」：留空或 `0` 都表示「自动」—— 由地址决定（本机不限、远程
+/// [`DEFAULT_ENDPOINT_RPM`]）；填 1–[`MAX_ENDPOINT_RPM`] 表示固定上限。
 pub(crate) fn parse_requests_per_minute(value: &str) -> Result<u32> {
     let value = value.trim();
     if value.is_empty() {
-        return Ok(DEFAULT_ENDPOINT_REQUESTS_PER_MINUTE);
+        return Ok(0);
     }
     let requests = value.parse::<u32>().map_err(|_| {
         anyhow::anyhow!(
-            "每分钟请求数上限必须是 0 到 {MAX_ENDPOINT_RPM} 之间的整数；留空或 0 表示不限"
+            "每分钟请求数上限必须是 0 到 {MAX_ENDPOINT_RPM} 之间的整数；留空或 0 表示自动（本机不限、远程 {DEFAULT_ENDPOINT_RPM}）"
         )
     })?;
     anyhow::ensure!(
         requests <= MAX_ENDPOINT_RPM,
-        "每分钟请求数上限必须是 0 到 {MAX_ENDPOINT_RPM} 之间的整数；留空或 0 表示不限"
+        "每分钟请求数上限必须是 0 到 {MAX_ENDPOINT_RPM} 之间的整数；留空或 0 表示自动（本机不限、远程 {DEFAULT_ENDPOINT_RPM}）"
     );
     Ok(requests)
 }
@@ -570,6 +573,7 @@ mod tests {
 
     #[test]
     fn request_per_minute_limit_is_optional_and_bounded() {
+        // 留空与 `0` 都是「自动」（具体数字由地址决定）；显式数字才是固定上限。
         assert_eq!(parse_requests_per_minute("").unwrap(), 0);
         assert_eq!(parse_requests_per_minute("   ").unwrap(), 0);
         assert_eq!(parse_requests_per_minute("0").unwrap(), 0);

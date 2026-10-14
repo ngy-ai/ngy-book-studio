@@ -527,9 +527,10 @@ impl AppServices {
                         .is_ok_and(|url| url == draft)
                 })
             })
-            .map_or(endpoint.requests_per_minute, |saved_endpoint| {
-                saved_endpoint.requests_per_minute
-            });
+            .map_or_else(
+                || endpoint.resolved_requests_per_minute(),
+                |saved_endpoint| saved_endpoint.resolved_requests_per_minute(),
+            );
         let provider = self
             .runtime
             .handle()

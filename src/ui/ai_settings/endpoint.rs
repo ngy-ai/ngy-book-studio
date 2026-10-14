@@ -123,7 +123,8 @@ impl EndpointSettingsWindow {
             allow_insecure_remote_http: false,
             confirmed_remote_endpoint: String::new(),
             request_timeout_secs: DEFAULT_AI_REQUEST_TIMEOUT_SECS,
-            requests_per_minute: DEFAULT_ENDPOINT_REQUESTS_PER_MINUTE,
+            // 新端点从「自动」起步：地址填成远程时会自己带上默认的节流。
+            requests_per_minute: 0,
         };
         self.endpoints
             .push(new_endpoint_draft(endpoint, window, cx));
@@ -283,7 +284,7 @@ impl EndpointSettingsWindow {
                     theme,
                     busy,
                     "每分钟请求数上限（RPM）",
-                    "留空或 0 表示不限。服务商按 Endpoint 计量，所以同一个地址上的问答、翻译、向量、视觉与模型检测共用这一份额度：额度用满时请求在本地等待，问答与模型检测优先，不会硬撞服务商的限制。服务商返回 429 时整个 Endpoint 一起退避。",
+                    "留空或 0＝自动：本机地址不限，远程地址按 10 节流。服务商按 Endpoint 计量，所以同一个地址上的问答、翻译、向量、视觉与模型检测共用这一份额度：额度用满时请求在本地等待，问答与模型检测优先，不会硬撞服务商的限制。想固定上限就填数字（最多 10000），急着跑完可以调大；服务商返回 429 时整个 Endpoint 一起退避。",
                     &endpoint.requests_per_minute_input,
                 ),
                 detection.unwrap_or_else(|| div().into_any_element()),
@@ -561,19 +562,20 @@ mod tests {
         });
     }
 
-    /// 「每分钟请求数上限」进出草稿：默认「不限」写成 0，超上限的值在保存前就被挡住。
+    /// 「每分钟请求数上限」进出草稿：没填过就是「自动」写成 0（输入框显示为留空），
+    /// 超上限的值在保存前就被挡住。
     #[gpui_kit::test]
     fn the_request_limit_round_trips_and_rejects_values_over_the_cap(cx: &mut TestAppContext) {
         use ngy_book_studio::ai::MAX_ENDPOINT_RPM;
 
         let (_directory, settings, visual) = open_window(cx);
         let input = settings.read_with(visual, |view, cx| {
+            let endpoint = view.selected_endpoint();
+            assert_eq!(endpoint.entered(cx).unwrap().requests_per_minute, 0);
             assert_eq!(
-                view.selected_endpoint()
-                    .entered(cx)
-                    .unwrap()
-                    .requests_per_minute,
-                0
+                endpoint.requests_per_minute_input.read(cx).value().as_str(),
+                "",
+                "「自动」在输入框里显示成留空"
             );
             view.selected_endpoint().requests_per_minute_input.clone()
         });

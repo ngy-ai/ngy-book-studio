@@ -23,8 +23,11 @@
   带走，否则队首会卡死整条队（`acquire` 返回之后它已是空操作）。服务商返回 429 时按
   `Retry-After`（只认秒数，读不到用 60 秒，钳制在 1 秒–10 分钟）给整个端点写下冷却；
   `acquire` 的快速路径必须同时看冷却 —— 上限「不限」不等于可以硬撞已经给出的 429。上限存在
-  端点自己的设置里（`EndpointSettings::requests_per_minute`，0＝不限），保存后由
-  `publish_endpoint_limits` 立即发布，读取时钳到 `MAX_ENDPOINT_RPM`。
+  端点自己的设置里（`EndpointSettings::requests_per_minute`：`0`（含缺键的老行）＝「自动」，
+  由 `default_endpoint_requests_per_minute` 按地址解析成具体数字 —— 回环端点不限（本机没有
+  服务商额度，只有 GPU 负担），远程端点按 `DEFAULT_ENDPOINT_RPM`＝10；正数是固定上限）。
+  读它的地方必须走 `EndpointSettings::resolved_requests_per_minute`（装配 provider、
+  `publish_endpoint_limits`、模型检测），保存后立即发布，读取时钳到 `MAX_ENDPOINT_RPM`。
 - `src/ai/search.rs`、`src/ai/indexing/`：作用域内 FTS5/`sqlite-vec` 精确 KNN、RRF 混合
   召回，以及可恢复的 embedding/vision 后台任务。`indexing/` 按职责分文件，不要把任何一个
   文件重新堆回大杂烩：`mod.rs` 是协调器、游标、共享类型与常量，`worker.rs` 是任务循环与

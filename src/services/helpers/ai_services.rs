@@ -13,7 +13,8 @@ pub(crate) fn build_ai_services(
         let endpoint = settings.endpoint_for(role)?;
         let api_key = api_keys.get(&endpoint.id).cloned().flatten();
         let budget = EndpointBudget::new(
-            endpoint_limits.slot(&endpoint.base_url, endpoint.requests_per_minute)?,
+            // 「自动」在这里解析成具体数字：本机不限，远程按默认值节流。
+            endpoint_limits.slot(&endpoint.base_url, endpoint.resolved_requests_per_minute())?,
             class,
         );
         Ok(Arc::new(
@@ -61,7 +62,7 @@ pub(crate) fn publish_endpoint_limits(
     settings: &ProviderSettings,
 ) -> Result<()> {
     for endpoint in settings.endpoints() {
-        endpoint_limits.slot(&endpoint.base_url, endpoint.requests_per_minute)?;
+        endpoint_limits.slot(&endpoint.base_url, endpoint.resolved_requests_per_minute())?;
     }
     Ok(())
 }

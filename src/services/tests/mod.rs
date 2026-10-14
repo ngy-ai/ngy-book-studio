@@ -16,8 +16,8 @@ mod visual;
 
 use super::*;
 use crate::{
-    ai::DEFAULT_OLLAMA_OPENAI_BASE_URL, ai::credentials::MemoryCredentialStore,
-    library::ImportOutcome, preview::VisualJobState,
+    ai::DEFAULT_ENDPOINT_RPM, ai::DEFAULT_OLLAMA_OPENAI_BASE_URL,
+    ai::credentials::MemoryCredentialStore, library::ImportOutcome, preview::VisualJobState,
 };
 #[cfg(target_os = "windows")]
 use crate::{

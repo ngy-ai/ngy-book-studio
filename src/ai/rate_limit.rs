@@ -19,6 +19,22 @@ use std::sync::{Arc, Mutex, MutexGuard};
 /// 的条目。超出的值按它钳制，而不是让设置无法保存。
 pub const MAX_ENDPOINT_RPM: u32 = 10_000;
 
+/// 上限设为「自动」（`0`）时，远程端点用的默认值：开箱就有一次温和的节流。服务商按端点
+/// 计量，撞上去的代价是整台端点一起退避（甚至被拒），而「慢一点」用户自己就能调大。
+pub const DEFAULT_ENDPOINT_RPM: u32 = 10;
+
+/// 没配过上限（`0`＝自动）时按地址决定的默认值。
+///
+/// 本机端点不限：本机没有服务商额度可撞，只有 GPU 负担（那是「后台任务间隔」的事），给本机
+/// 设 10 等于把整本翻译压到每分钟十块。远程端点给 [`DEFAULT_ENDPOINT_RPM`]，地址解析不出来
+/// 时也按远程处理 —— 上限本身不花代价，宁可保留一次温和的节流。
+pub fn default_endpoint_requests_per_minute(base_url: &str) -> u32 {
+    match normalize_provider_base_url(base_url) {
+        Ok(url) if endpoint_is_loopback(&url) => 0,
+        _ => DEFAULT_ENDPOINT_RPM,
+    }
+}
+
 /// 服务商没说 `Retry-After` 时，429 之后默认退避多久。
 const RATE_LIMIT_COOLDOWN_DEFAULT: Duration = Duration::from_secs(60);
 /// 单次冷却的下限：`Retry-After: 0` 的意思是「马上再来」，而那正是刚被拒绝的那一发。
