@@ -32,6 +32,55 @@ fn typed_http_rejection_preserves_display_and_exposes_only_numeric_diagnostics()
     assert!(!serialized.contains("secret"));
 }
 
+/// 端点拒绝时要能点出是**我们自己的**哪个请求字段被拒（422 的参数值问题只有这样才
+/// 看得出是哪一个），而服务端文本一个字节都不进日志。
+#[test]
+fn rejected_request_parameter_names_only_our_own_fields() {
+    // OpenAI 风格：参数名在 `error.param` / `error.message` 里。
+    let openai = serde_json::json!({
+        "error": {
+            "message": "Unsupported parameter: reasoning_effort",
+            "type": "invalid_request_error",
+            "param": "reasoning_effort",
+            "code": "unsupported_parameter"
+        }
+    });
+    // FastAPI 风格 422：参数名在 `detail[].loc` 里，`msg` 只说合法取值。
+    let fastapi = serde_json::json!({
+        "detail": [{
+            "type": "literal_error",
+            "loc": ["body", "reasoning_effort"],
+            "msg": "Input should be 'low', 'medium' or 'xhigh'",
+            "input": "none"
+        }]
+    });
+    for envelope in [&openai, &fastapi] {
+        assert_eq!(
+            crate::ai::http::rejected_request_parameter(envelope),
+            Some("reasoning_effort")
+        );
+    }
+
+    // 回显的请求正文里带着我们的键名（`max_tokens`、`temperature`），那不是点名。
+    let echoed = serde_json::json!({
+        "error": {"message": "invalid request"},
+        "request": {"model": "test-model", "max_tokens": 8192, "temperature": 0.0}
+    });
+    assert_eq!(crate::ai::http::rejected_request_parameter(&echoed), None);
+
+    // 只说「不可处理」但没点名，以及根本解析不出信封时都不猜。
+    assert_eq!(
+        crate::ai::http::rejected_request_parameter(
+            &serde_json::json!({"error": {"message": "Unprocessable Entity"}})
+        ),
+        None
+    );
+    assert_eq!(
+        crate::ai::http::rejected_request_parameter(&serde_json::json!({})),
+        None
+    );
+}
+
 /// 翻译自己的生成参数：默认是确定性的（温度 0、输出上限 4096），边界与问答完全一致，
 /// 未知字段一律拒绝。
 #[test]

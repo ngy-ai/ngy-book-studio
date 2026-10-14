@@ -122,7 +122,10 @@ fn the_rate_menu_stays_above_the_webview_area(cx: &mut TestAppContext) {
         visual.debug_bounds(MENU).is_none(),
         "档位弹层初始必须是收起的"
     );
-    assert!(visual.debug_bounds(TRIGGER).is_some(), "按钮要一直显示当前档位");
+    assert!(
+        visual.debug_bounds(TRIGGER).is_some(),
+        "按钮要一直显示当前档位"
+    );
 
     click(visual, TRIGGER);
     let menu = visual

@@ -17,6 +17,7 @@ pub(crate) async fn checked_response(response: reqwest::Response) -> Result<reqw
             .and_then(serde_json::Value::as_str)
             .map(provider_error_label)
     };
+    let provider_param = envelope.as_ref().and_then(rejected_request_parameter);
     tracing::warn!(
         target: "ngy_ai",
         stage = "http_rejected",
@@ -26,6 +27,7 @@ pub(crate) async fn checked_response(response: reqwest::Response) -> Result<reqw
         error_json_valid = envelope.is_some(),
         provider_code = ?provider_field("code"),
         provider_type = ?provider_field("type"),
+        provider_param = ?provider_param,
         "AI endpoint rejected the request"
     );
     if let Some(error) = parse_context_window_error(status, &body) {
@@ -78,6 +80,65 @@ pub(crate) fn provider_error_label(value: &str) -> &'static str {
         "insufficient_quota" => "insufficient_quota",
         _ => "other",
     }
+}
+
+/// 我们发出去的传输字段里，拒绝信封可能点名的那些。
+///
+/// 全是蛇形、带下划线的传输字段名：普通图书正文不会逐字出现，回显的请求正文里的
+/// `model`、`messages`、`temperature` 这类同时是日常英文词的名字因此不在其中。
+const REJECTED_PARAMETER_NAMES: [&str; 9] = [
+    "reasoning_effort",
+    "stream_options",
+    "include_usage",
+    "max_tokens",
+    "top_p",
+    "presence_penalty",
+    "frequency_penalty",
+    "chat_template_kwargs",
+    "enable_thinking",
+];
+
+/// 拒绝信封点名了哪个**我们自己的**请求字段。
+///
+/// 返回值只可能是 [`REJECTED_PARAMETER_NAMES`] 里的名字 —— 与 `provider_error_label`
+/// 同一条规则：服务端控制的文本一个字节都不进日志。只读「说明为什么被拒」的固定路径
+/// （OpenAI 风格的 `error.param` / `error.message`，FastAPI 风格 422 的 `detail[].loc`
+/// 与 `detail[].msg`），不扫整个 JSON：回显的请求正文里本来就有这些键名，扫进去会把
+/// 回显当成点名。认不出来返回 `None`，不猜。
+pub(crate) fn rejected_request_parameter(envelope: &serde_json::Value) -> Option<&'static str> {
+    let mut texts = Vec::new();
+    for source in [Some(envelope), envelope.get("error")]
+        .into_iter()
+        .flatten()
+    {
+        for field in ["param", "message"] {
+            if let Some(text) = source.get(field).and_then(serde_json::Value::as_str) {
+                texts.push(text);
+            }
+        }
+    }
+    match envelope.get("detail") {
+        // FastAPI 风格 422：`[{"loc":["body","reasoning_effort"],"msg":"…"}]`。
+        Some(serde_json::Value::Array(items)) => {
+            for item in items {
+                for field in ["loc", "msg"] {
+                    match item.get(field) {
+                        Some(serde_json::Value::String(text)) => texts.push(text),
+                        Some(serde_json::Value::Array(parts)) => {
+                            texts.extend(parts.iter().filter_map(serde_json::Value::as_str));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Some(serde_json::Value::String(text)) => texts.push(text),
+        _ => {}
+    }
+    REJECTED_PARAMETER_NAMES
+        .iter()
+        .copied()
+        .find(|name| texts.iter().any(|text| text.contains(name)))
 }
 
 pub(crate) fn parse_incomplete_tool_arguments(

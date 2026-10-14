@@ -97,6 +97,8 @@ pub(crate) async fn ai_diagnostics_correlate_http_retry_without_logging_private_
         "error_kind=\"incomplete_tool_arguments\"",
         "provider_code=Some(\"other\")",
         "provider_type=Some(\"other\")",
+        // 信封里的 `param` 是服务商自己的字符串（`PRIVATE_ERROR_PARAM`），不进日志。
+        "provider_param=None",
         "error_json_valid=true",
         "attempt=1",
         "attempt=2",
@@ -110,6 +112,55 @@ pub(crate) async fn ai_diagnostics_correlate_http_retry_without_logging_private_
         logs.matches("retrying AI stream start once after incomplete tool arguments")
             .count(),
         1
+    );
+}
+
+/// 422 这类「参数值不对」的拒绝要在诊断里点名**我们自己的**哪个字段被拒：服务商只认
+/// 顶层 `reasoning_effort` 的 `low`/`medium`、而我们发 `none` 时，不点名就只能靠猜。
+/// 名字只从固定列表里取，服务端自己的文本（这里故意塞了 `PRIVATE_`）一个字节都不出来。
+#[tokio::test]
+pub(crate) async fn http_rejection_names_our_own_rejected_parameter_only() {
+    let rejected = serde_json::json!({
+        "detail": [{
+            "type": "literal_error",
+            "loc": ["body", "reasoning_effort"],
+            "msg": "Input should be 'low', 'medium' or 'xhigh'",
+            "input": "PRIVATE_REJECTED_VALUE"
+        }]
+    });
+    let (base_url, requests, server) = scripted_chat_http_server(vec![(
+        "422 Unprocessable Entity",
+        "application/json",
+        rejected.to_string(),
+    )]);
+    let search = RecordingSearch::default();
+    let logs = AiLogCapture::default();
+    let error = async {
+        diagnostic_test_runtime(base_url, &search)
+            .answer(
+                diagnostic_test_question(),
+                None,
+                AgentCancellation::default(),
+            )
+            .await
+    }
+    .with_subscriber(logs.subscriber())
+    .await
+    .unwrap_err();
+    server.join().unwrap();
+    assert!(format!("{error:#}").contains("422"), "{error:#}");
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    assert!(search.requests.lock().unwrap().is_empty());
+
+    let logs = logs.text();
+    assert!(
+        !logs.contains("PRIVATE_"),
+        "private data appeared in logs: {logs}"
+    );
+    assert!(logs.contains("http_status=422"), "{logs}");
+    assert!(
+        logs.contains("provider_param=Some(\"reasoning_effort\")"),
+        "missing provider_param: {logs}"
     );
 }
 

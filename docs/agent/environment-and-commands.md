@@ -199,7 +199,10 @@ cargo run --locked --bin ngy-book-studio 2>&1 | Tee-Object -FilePath $aiLog
 - `http_id` 标识一次 HTTP 调用；`round` 是工具轮次，`attempt` 是该轮启动流的尝试。
   `stage` 与 `error_kind` 区分 HTTP 拒绝、流读取、JSON/工具校验、来源校验和保存失败。
   `AI request token invalidated` 也会在正常释放请求时出现，不代表用户取消。
-- HTTP 记录主机、端口、模型、请求字节数、超时、状态码和受控错误类型；流结束记录
+- HTTP 记录主机、端口、模型、请求字节数、超时、状态码和受控错误类型；4xx/5xx 的
+  `http_rejected` 额外记录 `provider_param`：拒绝信封点名的**自有请求字段**。它只可能是
+  固定列表里的名字（`reasoning_effort`、`stream_options`、`max_tokens` 这类蛇形传输字段
+  名），服务端的文本一个字节都不进日志；认不出来时为 `-`。流结束记录
   事件数、首事件等待、耗时、`finish_reason` 与 provider 实际返回的 token usage。
   `length` 可作为输出达到限制的排查线索，不能单独证明 JSON 截断的根因。
 - 工具仅记录允许的名称、参数字节数、JSON 类型/字段数量、已知数组长度和解析错误
