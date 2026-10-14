@@ -102,7 +102,7 @@ fn copy_selected(cx: &mut VisualTestContext) -> String {
     // 0.6 的 TextView 把拖动选择放在窗口级的 `TextSelection` 里，键盘 Copy 的
     // 分发需要原生键盘输入路径（无头测试窗口没有），所以这里直接读窗口选择：
     // 断言的内容仍是「拖动选中的正文」，与生产里的复制内容同源。
-    let copied = cx.update(|window, cx| gpui_kit::base::TextSelection::selected_text(window, cx));
+    let copied = cx.update(gpui_kit::base::TextSelection::selected_text);
     assert!(!copied.is_empty(), "selection must contain actual text");
     copied
 }

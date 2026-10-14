@@ -235,7 +235,7 @@ impl IndexingCoordinator {
             finish_reason = collected.finish_reason.unwrap_or("-"),
             response_bytes = collected.text.len(),
             decode_error_kind = decode_error
-                .map(|error| crate::ai::job_diagnostics::classify_error(error))
+                .map(crate::ai::job_diagnostics::classify_error)
                 .map(|kind| kind.label())
                 .unwrap_or("-"),
             elapsed_ms,
