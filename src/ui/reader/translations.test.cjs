@@ -289,6 +289,74 @@ test("the trailing icon is the only toggle between translation-only and bilingua
   } finally { await page.close(); }
 });
 
+// 读者真的能碰到它吗：图标默认透明且不吃指针事件，悬停在这一段上才出现（与朗读小喇叭同一套交互）。
+test("the reveal icon fades in while the pointer rests on the block", async () => {
+  const page = await pageWithFixture();
+  try {
+    await page.evaluate((value) => window.ngyTranslations.configure(value), {
+      ...payload, displayMode: "translation-only",
+    });
+    // 「译文」模式下原文块没有盒子，指针能落到的可见文字是译文层，图标也在层内。
+    const revealState = (id) => page.evaluate((id) => {
+      const icon = document.getElementById(id).previousElementSibling
+        .querySelector("[data-ngy-translation-reveal]");
+      const style = getComputedStyle(icon);
+      return { opacity: style.opacity, pointerEvents: style.pointerEvents };
+    }, id);
+    const revealOpacity = () => page.evaluate(() => getComputedStyle(document.getElementById("a")
+      .previousElementSibling.querySelector("[data-ngy-translation-reveal]")).opacity);
+    const hoverPoint = await page.evaluate(() => {
+      const text = document.getElementById("a").previousElementSibling
+        .querySelector(".ngy-translation-text");
+      const rect = text.getBoundingClientRect();
+      return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+    });
+    assert.deepEqual(await revealState("a"), { opacity: "0", pointerEvents: "none" },
+      "默认不显示，也不吃指针事件（点击穿透到文字上）");
+
+    await page.mouse.move(hoverPoint.x, hoverPoint.y);
+    await page.waitForFunction(() => getComputedStyle(document.getElementById("a")
+      .previousElementSibling.querySelector("[data-ngy-translation-reveal]"))
+      .opacity === "0.5", undefined, { timeout: 2000 });
+    assert.equal((await revealState("a")).pointerEvents, "auto", "显现中的图标可以点");
+
+    // 翻译推进时载荷会整章重推、译文层整体重建，而鼠标可能仍停在这一段上：新层里的图标
+    // 必须跟着重新出现，不能从鼠标下面消失。
+    await page.evaluate((value) => window.ngyTranslations.configure(value), {
+      ...payload, session: "republished-session", revision: 1, displayMode: "translation-only",
+    });
+    await page.waitForFunction(() => getComputedStyle(document.getElementById("a")
+      .previousElementSibling.querySelector("[data-ngy-translation-reveal]"))
+      .opacity === "0.5", undefined, { timeout: 2000 });
+
+    await page.mouse.move(hoverPoint.x, 0);
+    await page.waitForFunction(() => getComputedStyle(document.getElementById("a")
+      .previousElementSibling.querySelector("[data-ngy-translation-reveal]"))
+      .opacity === "0", undefined, { timeout: 2000 });
+
+    // 点开原文后译文与原文同屏：指针落到原文那一半上，图标仍算「指着这一段」，
+    // 不会在段内从译文移到原文时消失。
+    await page.evaluate(() => document.getElementById("a").previousElementSibling
+      .querySelector("[data-ngy-translation-reveal]").click());
+    const originalPoint = await page.evaluate(() => {
+      const rect = document.getElementById("a").getBoundingClientRect();
+      return { x: rect.x + 20, y: rect.y + rect.height / 2 };
+    });
+    await page.mouse.move(originalPoint.x, originalPoint.y);
+    await page.waitForFunction(() => getComputedStyle(document.getElementById("a")
+      .previousElementSibling.querySelector("[data-ngy-translation-reveal]"))
+      .opacity === "0.5", undefined, { timeout: 2000 });
+
+    // 键盘用户 Tab 到图标时同样看得见：图标留在 Tab 序列里，不像 `visibility:hidden`
+    // 那样把它移出去。
+    await page.evaluate(() => document.getElementById("a").previousElementSibling
+      .querySelector("[data-ngy-translation-reveal]").focus());
+    await page.waitForFunction(() => getComputedStyle(document.getElementById("a")
+      .previousElementSibling.querySelector("[data-ngy-translation-reveal]"))
+      .opacity === "0.5", undefined, { timeout: 2000 });
+  } finally { await page.close(); }
+});
+
 test("the original-only mode clears the layer and brings the hidden text back", async () => {
   const page = await pageWithFixture();
   try {

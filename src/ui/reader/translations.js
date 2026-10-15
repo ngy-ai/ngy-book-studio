@@ -69,11 +69,17 @@
   // The icon is a `<button>` carrying an inline SVG and no text node at all, so
   // it can sit in the flow without joining the block's text: the layer's
   // `textContent` must stay exactly the translation it displays.
+  //
+  // Like the read-aloud speaker it stays out of the reader's way: it is faded
+  // in only while the pointer rests on the block (or the icon itself holds
+  // keyboard focus) and is click-through otherwise — see
+  // `bindRevealVisibility`.
   const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
   const REVEAL_STYLE = "display:inline-block!important;width:1em!important;height:1em!important;" +
     "margin:0 0 0 0.25em!important;padding:0!important;border:0!important;background:transparent!important;" +
-    "color:inherit!important;opacity:0.45!important;cursor:pointer!important;vertical-align:-0.12em!important;" +
-    "font:inherit!important;line-height:1!important;";
+    "color:inherit!important;opacity:0!important;pointer-events:none!important;cursor:pointer!important;" +
+    "vertical-align:-0.12em!important;font:inherit!important;line-height:1!important;" +
+    "transition:opacity 0.12s ease-out;";
   const REVEAL_STROKE = "M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12z";
   // Shown while the original is hidden: an open eye reads as 「显示原文」.
   const REVEAL_SHOW = [REVEAL_STROKE, "M12 9.4a2.6 2.6 0 1 0 0 5.2 2.6 2.6 0 0 0 0-5.2z"];
@@ -316,6 +322,66 @@
     const label = state.hidden ? "显示原文" : "收起原文";
     reveal.element.setAttribute("aria-label", label);
     reveal.element.setAttribute("title", label);
+  };
+
+  /// The icon is chrome the reader does not have to read past: it stays
+  /// transparent and click-through until it is worth showing. Same value as
+  /// the read-aloud speaker, so the two trailing controls fade in together.
+  const setRevealShown = (state, shown) => {
+    const reveal = state.reveal;
+    if (!reveal) return;
+    reveal.element.style.setProperty("opacity", shown ? "0.5" : "0", "important");
+    reveal.element.style.setProperty("pointer-events", shown ? "auto" : "none", "important");
+  };
+
+  const syncReveal = (state) =>
+    setRevealShown(state, state.revealHover || state.revealBlockHover || state.revealFocus);
+
+  /// Hover is driven by the two halves of one block, exactly like the
+  /// read-aloud speaker: in 「译文」 mode the original block has no box, so the
+  /// translation layer is the text the pointer can reach; in 「双语」 mode both
+  /// halves are on screen and either one counts as 「the pointer is on this
+  /// paragraph」. The two hosts keep separate flags on purpose — moving from
+  /// the translation onto the original fires `mouseleave` and `mouseenter` of
+  /// different hosts, and a single flag would blink. The icon lives inside the
+  /// layer, so moving onto the icon itself never fires `mouseleave`.
+  ///
+  /// Keyboard focus is tracked separately: the icon keeps its place in the tab
+  /// order while faded out, and a reader who tabs to it must be able to see
+  /// where they are (the manual-edit row follows the same rule, see
+  /// `CONTROLS_STYLE`).
+  const bindRevealVisibility = (state) => {
+    const track = (host, key) => {
+      host.addEventListener("mouseenter", () => {
+        state[key] = true;
+        syncReveal(state);
+      });
+      host.addEventListener("mouseleave", () => {
+        state[key] = false;
+        syncReveal(state);
+      });
+    };
+    track(state.layer, "revealHover");
+    if (state.block !== state.layer) track(state.block, "revealBlockHover");
+    const element = state.reveal.element;
+    element.addEventListener("focus", () => {
+      state.revealFocus = true;
+      syncReveal(state);
+    });
+    element.addEventListener("blur", () => {
+      state.revealFocus = false;
+      syncReveal(state);
+    });
+    // A republished payload rebuilds the whole layer while the pointer may
+    // still rest on it. Nothing would fire `mouseenter` again, so the icon
+    // would stay invisible under the cursor: seed the state from the pointer.
+    if (state.layer.matches(":hover")) {
+      state.revealHover = true;
+      syncReveal(state);
+    } else if (state.block.matches(":hover")) {
+      state.revealBlockHover = true;
+      syncReveal(state);
+    }
   };
 
   const setCollapsed = (state, collapsed) => {
@@ -603,7 +669,8 @@
 
   /// Appends the reveal icon to the end of one block's translated text. The
   /// block is addressed through the state it was built with, so the icon only
-  /// ever collapses the paragraph it belongs to.
+  /// ever collapses the paragraph it belongs to. It starts faded out and is
+  /// driven by `bindRevealVisibility` from then on.
   const appendReveal = (state, text) => {
     const element = create("button");
     element.type = "button";
@@ -623,6 +690,7 @@
     state.reveal = { element, show, hide };
     text.append(element);
     renderReveal(state);
+    bindRevealVisibility(state);
   };
 
   const insert = (element, entry, validated, translateOnly) => {
@@ -669,7 +737,10 @@
       original = wrapper;
     }
     const state = {
-      original, wrapper, layer, divider, pairs, hidden: false,
+      // `block` is the book element itself; `original` is what shows the
+      // original text (the same element, or the `display:contents` wrapper an
+      // in-place block keeps its text in).
+      original, block: element, wrapper, layer, divider, pairs, hidden: false,
       // The source of each translated leaf, in the same order as `pairs`. The
       // host revalidates a manual edit against these exact strings.
       sources: validated.sources,
@@ -677,6 +748,7 @@
       manual: entry.manual === true,
       editing: false, request: 0, requestKind: null, error: "", notice: "", hovering: false,
       controls: null, showControls: null, reveal: null,
+      revealHover: false, revealBlockHover: false, revealFocus: false,
       display: original.style.getPropertyValue("display"),
       priority: original.style.getPropertyPriority("display"),
       hadStyle: original.hasAttribute("style"),
