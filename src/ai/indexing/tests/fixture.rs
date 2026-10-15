@@ -211,6 +211,8 @@ impl Fixture {
             transitions: AsyncMutex::new(()),
             wake: Notify::new(),
             reconcile_translations: AtomicBool::new(false),
+            reconcile_progress: Mutex::new(None),
+            progress_watch: Mutex::new(ProgressWatch::default()),
             shutdown: AtomicBool::new(false),
         })
     }

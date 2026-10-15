@@ -138,6 +138,19 @@ const TRANSLATION_REQUEST_FAILURE_STREAK_LIMIT: usize = 5;
 /// `CONTROL_POLL_INTERVAL` 醒来复查控制请求，命中就立刻按终态发布，不睡满整段时间。
 const TRANSLATION_REQUEST_FAILURE_COOLDOWN: Duration = Duration::from_secs(60);
 
+/// 「已领取但无进展」的判定线：任务被领取后这么久没有任何任务日志事件，静默看门狗
+/// 就写一条报告（2026-10-15 用户反馈「显示运行中，处理中恒为 0，重启后翻几块又没
+/// 动静了」）。
+///
+/// 必须大于「一个块最坏能安静多久」：单发请求的静默上限是 [`PROVIDER_STEP_TIMEOUT`]
+/// （180 秒），连续失败后的冷却是 [`TRANSLATION_REQUEST_FAILURE_COOLDOWN`]（60 秒），
+/// 再留出提交与重新发请求的余量；低于这个量级没有新事件是正常慢模型，不是卡住。
+const NO_PROGRESS_WATCHDOG_THRESHOLD: Duration = Duration::from_secs(300);
+
+/// 看门狗的检查间隔。它独立于 job worker，所以 concurrency 设成 1、或所有 worker
+/// 都卡在任务里时也照常检查。
+const NO_PROGRESS_WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
+
 /// 一个文本块整轮失败后再重发的次数。一轮 = 两次严格尝试 + 一次协议纠正，最后一轮
 /// 还包含逐片段回退，所以一个块最多发出 `TRANSLATION_BLOCK_RETRIES + 1` 轮请求。
 /// 只有协议类失败（模型答了、但形状不对）才重发；provider、数据库与取消照旧让整次

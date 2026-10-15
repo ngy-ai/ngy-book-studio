@@ -266,6 +266,16 @@ pub(crate) fn consecutive_failed_block_requests_cool_down_and_do_not_stop_the_ru
         "每连续 {} 块失败冷却一次，冷却后连续计数清零",
         TRANSLATION_REQUEST_FAILURE_STREAK_LIMIT
     );
+    // 冷却同时进任务日志（2026-10-15）：任务窗口要能看出「任务不是死了，是在等端点
+    // 缓过来」。书末那次按设计不等待，因此也不留记录。
+    assert_eq!(
+        recorded_events(&fixture, &job.id)
+            .iter()
+            .filter(|entry| entry.event == JobLogEvent::Cooldown)
+            .count(),
+        stats.cooldowns,
+        "每一次真正等过的冷却都要在任务日志里留下一条"
+    );
 }
 
 /// 运行期间保存了新的 Endpoint/密钥（模型与执行身份不变）时，剩下的块必须换用新 provider，

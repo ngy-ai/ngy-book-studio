@@ -359,3 +359,58 @@ fn djvu_sources_select_the_portable_djvu_renderer() {
     let selected = renderer_for_source(&conn, &fixture.source, &descriptors).unwrap();
     assert_eq!(selected.renderer, DJVU_RENDERER_NAME);
 }
+
+/// 分步对账（计划 + 一次一个单位）与一次性对账共用同一份判定，收敛到同一份任务。
+/// worker 的常规对账走前者（`advance_translation_reconcile`），保存设置与启动走后者。
+#[test]
+fn staged_translation_reconcile_converges_with_the_one_shot_run() {
+    let (_temp, mut conn) = open_database();
+    let fixture = Fixture::new();
+    insert_document(&mut conn, &fixture.graph(), true).unwrap();
+
+    assert_eq!(
+        reconfigure_translation_jobs(
+            &mut conn,
+            Some("en"),
+            "chat-1",
+            "translation-v1:a",
+            true,
+            10
+        )
+        .unwrap(),
+        1
+    );
+
+    // 换模型：计划里只有一条需要对齐的任务，逐个单位执行 —— 这正是 worker 分步入口
+    // 每轮做的事情。
+    let units =
+        plan_translation_reconcile(&conn, Some("en"), "chat-2", "translation-v1:b", true).unwrap();
+    assert_eq!(units.len(), 1, "一本书只需要一个对齐单位");
+    for unit in &units {
+        apply_translation_reconcile_unit(&mut conn, unit, 11).unwrap();
+    }
+    let job = index_jobs::get(&conn, "translation:source-1:en")
+        .unwrap()
+        .unwrap();
+    let cursor = serde_json::from_str::<PersistedIndexCursor>(&job.cursor_json).unwrap();
+    assert_eq!(cursor.model.as_deref(), Some("chat-2"));
+
+    // 对齐之后既没有新单位，一次性对账也没有变化 —— 两条路径的收敛点一致。
+    assert!(
+        plan_translation_reconcile(&conn, Some("en"), "chat-2", "translation-v1:b", true)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        reconfigure_translation_jobs(
+            &mut conn,
+            Some("en"),
+            "chat-2",
+            "translation-v1:b",
+            true,
+            12
+        )
+        .unwrap(),
+        0
+    );
+}

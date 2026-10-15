@@ -1007,3 +1007,41 @@ LangGraph 依赖。CLI 课程验证与桌面接入的验证分别列出。
   悬停淡入且可点、重推重建后仍显示、移开隐藏、展开后悬停原文仍显示、聚焦可见），27 项通过；
   `read_aloud.test.cjs` 7 项、`position.test.cjs` 6 项通过。未做人工 GUI 验证：需要在真实
   窗口里悬停确认图标淡入与朗读小喇叭一致。
+- [x] 2026-10-15 翻译任务对账改「一步一个单位」、失败诊断带端点来源、冷却与「已领取但无进展」
+  进任务日志、静默看门狗（现场 2026-10-15：整本翻译任务「显示运行中、处理中恒为 0」，重启后
+  翻几块又停住，任务窗口里除了进度就不再变化）：
+  1）`db::transactions::translation_job` 拆成只读计划
+  （`plan_translation_reconcile`，一个当前来源加目标语言一条任务，已对齐的不进计划）与单单位
+  执行（`apply_translation_reconcile_unit`，各自一个 `IMMEDIATE` 事务，执行前重读当前行，
+  过时单位安静跳过）；全量入口 `reconfigure_translation_jobs`（保存设置、启动）改为
+  「计划 + 逐个单位」，判定只有一份。worker 侧新增
+  `advance_translation_reconcile`：库每次写入置位的 `reconcile_translations` 由它按步推进，
+  每步之前重新扫描队列，队首是本计划之外的任务时让路（`Yielded`，不消费请求，外部任务跑完
+  继续）；对账自己刚插入的任务不算外部工作 —— 给它们让路会让一次对账被整本书的翻译拖住，
+  其余单位再也建不出来。`worker_loop` 每轮先试对账一步、再跑队列任务。
+  2）失败请求诊断带端点来源标签：`translation_raw_output`（失败尝试的原始内容预览）新增
+  `endpoint`（`endpoint_origin_label`，`scheme://host[:port]`，与转储行同一套；mock 打
+  `endpoint=-`），`translation_stream` 的 `interrupted`/`failed`、`translation_stream_silent`
+  与 `translation_response_salvaged` 同样带上它。
+  3）任务日志新增 `JobLogEvent::Cooldown`（真正等待过的冷却写一条，带游标与冷却时长；书末
+  跳过的那次不写）与 `ClaimedNoProgress`；静默看门狗（`watchdog_loop`，随协调器启动，每
+  `NO_PROGRESS_WATCHDOG_INTERVAL`＝30 秒检查一次）在任务被领取后超过
+  `NO_PROGRESS_WATCHDOG_THRESHOLD`＝300 秒（单发流静默上限 180 秒 + 冷却 60 秒再留余量）
+  没有任何任务日志事件时写一条，带无进展时长与当前游标；只报告，不取消不重排。事件本身
+  刷新观察时间戳（`IndexingInner::note_progress`，每次 `record_index_event` 都经过），
+  同一段无进展每个阈值周期最多一条。
+  回归：`reconcile_test` 新增 4 项（`translation_reconcile_creates_one_job_per_step` 三本书
+  三步建三条、每步产出的任务留在队列里；`translation_reconcile_yields_to_queued_work`
+  外部排队任务让路且请求不被吃掉；`no_progress_is_reported_exactly_at_the_watchdog_threshold`
+  边界；`watchdog_reports_a_claimed_job_without_progress` 未到阈值/到阈值/不重复/非运行态
+  四段），`db::transactions::tests::translation_test` 新增
+  `staged_translation_reconcile_converges_with_the_one_shot_run`（分步与一次性收敛一致），
+  `translation_walk_test` 的冷却回归补断言：任务日志里的 `Cooldown` 条数等于
+  `TranslationRunStats::cooldowns`。验证：`cargo fmt --all --check`、
+  `cargo clippy --all-targets --locked`（110 条既有告警，与改动前同数、无新增）与
+  `cargo test --locked --all-targets --no-fail-fast` 全通过 —— lib 732 项（727 通过 5 忽略）、
+  产品二进制 357 项（356 通过 1 忽略）、`openai_compatible_flow` 24、`translation_flow` 20
+  项（19 通过 1 忽略）、`epub_flow` 6、`multi_format_flow` 4、`multi_endpoint_flow` 1、
+  `proxy_flow` 1。未做人工 GUI 验证：需要在真实窗口里让一轮对账与排队任务同时发生（观察
+  对账不再独占工人）、并制造一个卡住的任务确认任务日志出现「已领取但长时间没有任何进展」与
+  「连续模型请求失败」记录。

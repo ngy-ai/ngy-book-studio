@@ -22,6 +22,7 @@ use crate::{
 mod embedding_test;
 mod endpoints_test;
 mod job_control_test;
+mod reconcile_test;
 mod scheduling_test;
 mod translation_retry_test;
 mod translation_test;

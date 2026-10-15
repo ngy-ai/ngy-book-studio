@@ -258,6 +258,66 @@ pub(crate) fn dump_raw_translation_response(
     );
 }
 
+/// 失败尝试的原始内容预览上限（字节）。
+///
+/// 完整字节日志仍由 `NGY_DUMP_TRANSLATION_RAW` 提供；这里给的是失败当场就能抓到的
+/// 线索，所以截到固定长度，避免一个块的失败把日志文件撑大。
+pub(crate) const RAW_OUTPUT_PREVIEW_BYTES: usize = 4096;
+
+/// 端点拒绝这一发时返回的错误封套（HTTP 4xx/5xx 响应体的前缀）。
+///
+/// `ProviderHttpError` 是唯一保留服务端字节的错误类型；传输与超时类错误没有任何响应
+/// 可看，返回 `None`。调用方只把它交给 [`log_raw_model_output`] 与
+/// [`dump_raw_translation_response`]，不写数据库、也不进任务窗口。
+pub(crate) fn provider_error_body(error: &anyhow::Error) -> Option<&str> {
+    error
+        .downcast_ref::<crate::ai::ProviderHttpError>()
+        .map(|error| error.detail.as_str())
+        .filter(|body| !body.is_empty())
+}
+
+/// 失败那一刻模型/端点返回的原始内容预览（`debug` 级）。
+///
+/// 「这一块到底答了什么」只有原始字节能回答，所以每条失败尝试都留一份可读快照；
+/// `origin` 是固定标签，说明字节来自哪里：`stream`（已经收到的模型流）、
+/// `http_error_body`（端点拒绝这一发时返回的错误封套）、`rejected`（没有通过格式
+/// 校验的完整答案）。`endpoint` 是这一发实际发给的端点来源
+/// （`scheme://host[:port]`，见 [`crate::ai::endpoint_origin_label`]）：失败请求
+/// 的持久诊断只有带上它才能回答「是哪个端点在拒绝/超时」，多端点或中途保存过设置的
+/// 现场尤其需要；拿不到地址的实现（mock 等）打 `endpoint=-`。
+///
+/// 默认过滤（`ngy_ai=info`）不记录它 —— 内容可能回显正文，只有把 `ngy_ai` 调到
+/// `debug` 排障时才输出，且超过 [`RAW_OUTPUT_PREVIEW_BYTES`] 的部分被截掉；完整原文
+/// 仍由 `NGY_DUMP_TRANSLATION_RAW` 转储。
+pub(crate) fn log_raw_model_output(
+    span: &tracing::Span,
+    block_ordinal: usize,
+    attempt: usize,
+    endpoint: Option<&str>,
+    origin: &'static str,
+    body: &str,
+) {
+    // 默认过滤下连截断都不做：这条日志只服务排障，正常运行时不该为一个不会输出的
+    // 事件复制响应字节。
+    if body.is_empty() || !tracing::enabled!(target: "ngy_ai", tracing::Level::DEBUG) {
+        return;
+    }
+    let preview = truncate_utf8_bytes(body, RAW_OUTPUT_PREVIEW_BYTES);
+    tracing::debug!(
+        target: "ngy_ai",
+        parent: span,
+        stage = "translation_raw_output",
+        block_ordinal,
+        attempt,
+        endpoint = endpoint.unwrap_or("-"),
+        origin,
+        body_bytes = body.len(),
+        truncated = preview.len() < body.len(),
+        body = %preview,
+        "Raw model output of a failed translation attempt"
+    );
+}
+
 /// One ad-hoc replay's collected answer.
 pub(crate) struct ProbeStream {
     pub(crate) text: String,

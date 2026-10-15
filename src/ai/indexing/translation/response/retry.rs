@@ -257,19 +257,32 @@ pub(crate) async fn translate_block_round(
             {
                 Ok(BlockStep::Value(stream)) => stream,
                 Ok(BlockStep::Stopped(stop)) => return Ok(BlockStep::Stopped(stop)),
-                // 传输层失败（连接被拒、端点 4xx/5xx、流建立之前就到期的超时）没有响应
-                // 可以 dump，但请求体正是这种时候唯一能回答「我们发了什么」的读数，所以
-                // 用同一个开关打出来，reason 换成固定错误分类。
+                // 传输层失败（连接被拒、端点 4xx/5xx、流建立之前就到期的超时）没有响应流
+                // 可转储，但请求体正是这种时候唯一能回答「我们发了什么」的读数，所以用
+                // 同一个开关打出来，reason 换成固定错误分类。端点拒绝这一发时服务端还
+                // 返回了错误封套，那正是「端点答了什么」：它进同一个转储行，并额外留一份
+                // debug 预览（其余没有响应可看的错误照旧只有请求体）。
                 Err(error) => {
+                    let error_body = provider_error_body(&error);
                     dump_raw_translation_response(
                         &span,
                         scope.ordinal,
                         attempt,
                         endpoint.as_deref(),
                         &request_body,
-                        None,
+                        error_body,
                         crate::ai::ai_diagnostics::error_kind(&error),
                     );
+                    if let Some(body) = error_body {
+                        log_raw_model_output(
+                            &span,
+                            scope.ordinal,
+                            attempt,
+                            endpoint.as_deref(),
+                            "http_error_body",
+                            body,
+                        );
+                    }
                     return Err(error);
                 }
             };
@@ -419,6 +432,17 @@ pub(crate) async fn translate_block_round(
                         retry = false,
                         "Translation response failed before format validation"
                     );
+                    // 这类错误来自解码前的形状校验（不是 `ResponseError`），但完整响应
+                    // 就在手上：与拒绝路径同一份 debug 预览，失败当场能看到模型答了
+                    // 什么。转储行仍只由 `ResponseError` 路径产生。
+                    log_raw_model_output(
+                        &span,
+                        scope.ordinal,
+                        attempt,
+                        endpoint.as_deref(),
+                        "rejected",
+                        &response,
+                    );
                     return Err(error);
                 };
                 let retry = attempt < TRANSLATION_RESPONSE_ATTEMPTS;
@@ -469,6 +493,16 @@ pub(crate) async fn translate_block_round(
                     &request_body,
                     Some(&response),
                     "protocol_rejected",
+                );
+                // 被拒的完整答案同样留一份 debug 预览：格式哪里不对要看原文，而转储
+                // 需要开关，失败当场排障时这条默认（`ngy_ai=debug`）就能抓到。
+                log_raw_model_output(
+                    &span,
+                    scope.ordinal,
+                    attempt,
+                    endpoint.as_deref(),
+                    "rejected",
+                    &response,
                 );
                 if !retry {
                     // 回退在每个片段前会重新取同一把转换锁，所以必须先释放本次迭代持有的

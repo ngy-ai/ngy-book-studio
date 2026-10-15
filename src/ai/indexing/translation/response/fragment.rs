@@ -140,17 +140,29 @@ pub(crate) async fn translate_block_by_fragment(
         {
             Ok(BlockStep::Value(stream)) => stream,
             Ok(BlockStep::Stopped(stop)) => return Ok(BlockWalk::Stopped(stop)),
-            // 与主路径同一条规则：传输层失败没有响应，但请求体仍要打出来。
+            // 与主路径同一条规则：传输层失败没有响应流，但请求体仍要打出来；端点拒绝
+            // 时返回的错误封套同时进转储行与 debug 预览。
             Err(error) => {
+                let error_body = provider_error_body(&error);
                 dump_raw_translation_response(
                     &span,
                     scope.ordinal,
                     index + 1,
                     endpoint.as_deref(),
                     &request_body,
-                    None,
+                    error_body,
                     crate::ai::ai_diagnostics::error_kind(&error),
                 );
+                if let Some(body) = error_body {
+                    log_raw_model_output(
+                        &span,
+                        scope.ordinal,
+                        index + 1,
+                        endpoint.as_deref(),
+                        "http_error_body",
+                        body,
+                    );
+                }
                 return Err(error);
             }
         };
@@ -209,6 +221,14 @@ pub(crate) async fn translate_block_by_fragment(
                     &request_body,
                     Some(&response),
                     "fragment_rejected",
+                );
+                log_raw_model_output(
+                    &span,
+                    scope.ordinal,
+                    index + 1,
+                    endpoint.as_deref(),
+                    "rejected",
+                    &response,
                 );
                 return Err(error.context(format!(
                     "逐片段回退时第 {} 个片段（共 {fragments} 个）仍不符合分段协议",

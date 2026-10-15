@@ -74,6 +74,8 @@ impl IndexingCoordinator {
                 transitions: AsyncMutex::new(()),
                 wake: Notify::new(),
                 reconcile_translations: AtomicBool::new(false),
+                reconcile_progress: Mutex::new(None),
+                progress_watch: Mutex::new(ProgressWatch::default()),
                 shutdown: AtomicBool::new(false),
             }),
             workers: Mutex::new(Vec::new()),
@@ -89,6 +91,11 @@ impl IndexingCoordinator {
                 let inner = Arc::clone(&coordinator.inner);
                 workers.push(runtime.spawn(async move { worker_loop(inner, index).await }));
             }
+            // 静默看门狗独立于 job worker：所有槽位都在跑任务（或 concurrency 设成 1
+            // 并且那一个 worker 卡住）时，它仍按自己的节奏把「已领取但无进展」写进任务
+            // 日志。它与 worker 一样随协调器一起中止。
+            let inner = Arc::clone(&coordinator.inner);
+            workers.push(runtime.spawn(async move { watchdog_loop(inner).await }));
         }
         Ok(coordinator)
     }

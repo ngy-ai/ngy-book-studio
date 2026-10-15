@@ -35,12 +35,29 @@
   暂停/取消观察与结果发布，`inspection.rs` 是只读的任务窗口块检查器，`support.rs` 是共用
   小工具，`translation/` 是整本翻译任务（`mod.rs` 走位与提交、`blocks.rs` 取块、
   `prompt.rs` 请求体、`response.rs` 应答收集与校验）。`tests/mod.rs` 只放共用夹具与可计数的
-  mock 提供方，用例按主题分文件：`unit`（纯请求/应答形状）、`embedding`、`job_control`、
+  mock 提供方，  用例按主题分文件：`unit`（纯请求/应答形状）、`embedding`、`job_control`、
   `endpoints`、`vision`、`scheduling`、`translation`、`translation_retry`、
-  `translation_walk`；新增用例放进对应主题的文件，不要再往夹具文件里塞用例。
+  `translation_walk`、`reconcile`（对账一步一个单位、让路与静默看门狗）；
+  新增用例放进对应主题的文件，不要再往夹具文件里塞用例。
   子模块一律用 `use super::*;` 取得上面的共享项，跨模块引用按 `pub(crate)`（测试夹具用
   `pub(super)`）收口；协调器
-  的 `impl` 块可以分散在 `mod.rs` 与 `inspection.rs`。执行器固定启动
+  的 `impl` 块可以分散在 `mod.rs` 与 `inspection.rs`。
+  库每次写入后经 `wake()` 置位 `reconcile_translations`，worker 把翻译任务对账
+  **按「一步一个单位」** 推进（2026-10-15）：`advance_translation_reconcile` 每轮只应用
+  一个单位（一条任务的插入、重置或取消，各自一个小事务，见
+  `db::transactions::apply_translation_reconcile_unit`），每步之前重新扫描队列；队首排着
+  **本计划之外**的任务时这一步让路（`Yielded`），worker 先去跑它。让路不消费对账请求
+  （外部任务跑完继续推进），也不会被对账自己刚插入的任务拖住 —— 给它们让路等于让一次
+  对账等整本书翻完，其余单位就再也建不出来。全量入口
+  `db::transactions::reconfigure_translation_jobs`（保存设置、启动）与分步入口共用同一份
+  计划（`plan_translation_reconcile`）与判定，只差不等 worker 的下一轮。
+  「已领取但无进展」由独立的静默看门狗报告：`watchdog_loop` 随协调器启动，每
+  `NO_PROGRESS_WATCHDOG_INTERVAL`（= 30 秒）检查一次；任务被领取后超过
+  `NO_PROGRESS_WATCHDOG_THRESHOLD`（= 300 秒，容纳单发 180 秒流静默上限加 60 秒冷却）
+  没有任何任务日志事件时，写一条 `ClaimedNoProgress`（带无进展时长与当前游标）。
+  它只报告、不取消不重排；事件本身走 `record_index_event`，因此会刷新观察时间戳，
+  同一段无进展每个阈值周期最多报一条。
+  执行器固定启动
   `MAX_BACKGROUND_JOB_CONCURRENCY` 个 worker，只有序号小于当前并发的 worker 扫描队列；
   并发上限与间隔由 AI 设置的「后台任务」窗口经
   `IndexingCoordinator::configure_scheduling` 实时发布，写坏的值按范围钳制。
@@ -177,6 +194,8 @@
   `TRANSLATION_REQUEST_FAILURE_STREAK_LIMIT`（= 5）不是中止条件：连续失败凑满它时发一条
   `translation_request_failure_streak` 警告并**冷却** `TRANSLATION_REQUEST_FAILURE_COOLDOWN`
   （= 60 秒，2026-09-24 用户要求）再继续，然后把连续计数清零：下一组连续失败重新累计、再冷却一次。
+  冷却同时往任务日志写一条 `Cooldown`（2026-10-15）：任务窗口里要能看出任务是在等端点缓过来，
+  而不是看起来死了；书末那次按设计直接跳过、不等待的冷却不写这条。
   冷却在提交循环之外进行（不持有 `transitions` 门闩），按 `CONTROL_POLL_INTERVAL` 醒来复查控制请求，
   暂停/取消/换版本照常立刻生效；冷却期间一个请求都不发，端点恢复后剩下的块照常翻；书末已经没有
   新请求要发时那次冷却直接跳过（`frontier >= total`），不让任务在最后一分钟里白等。运行照旧走到
@@ -287,12 +306,13 @@
   事件的静默、正文块数/字节数、完整 JSON 容器数、未闭合容器、片段标记数、思考块状态、
   答案重复标记），流结束时把同一组形状计数写进 `translation_stream`，失败时另存
   `translation_response_salvaged`。这些计数只说明“模型没写出答案 / 思考没结束 / 答案重复
-  输出 / 容器被打断”，不含任何正文；`NGY_DUMP_TRANSLATION_RAW` 仍是唯一会打印响应与
-  请求正文的开关，并且现在也覆盖流失败、**每一个被采用的答案**
+  输出 / 容器被打断”，不含任何正文；`NGY_DUMP_TRANSLATION_RAW` 仍是唯一会打印**完整**
+  响应与请求正文的开关，并且现在也覆盖流失败、**每一个被采用的答案**
   （`reason = accepted` / `fragment_accepted`，与拒绝路径同一对
-  `translation_request_dump` + `translation_response_dump`）以及**没有任何响应的传输层失败**
-  （连接被拒、端点 4xx/5xx、流建立之前到期的超时：只打 `translation_request_dump`，
-  `reason` 换成固定错误分类）——「这一块真的翻过吗」只能靠
+  `translation_request_dump` + `translation_response_dump`）以及**传输层失败**
+  （连接被拒、端点 4xx/5xx、流建立之前到期的超时：请求体照旧打
+  `translation_request_dump`、`reason` 换成固定错误分类；端点 4xx/5xx 的服务端错误封套
+  同时作为 `response=` 进 `translation_response_dump`，它正是「端点答了什么」）——「这一块真的翻过吗」只能靠
   这一对原始字节回答，聚合计数证明不了（现场 2026-09-20：任务显示「已处理 18168」，库里
   只有 71 行译文）。反过来说，**没有转储不等于开关失效**：重试范围外的块走 `BlockPlan::Pass`、
   内容与已有译文相同的块走缓存命中，这些路径一个请求都不发；重试本身不再有前置过滤
@@ -306,7 +326,18 @@
   （`scheme://host[:port]`，由 `endpoint_origin_label` 从 provider 自己的 `base_url` 现取，
   因此运行中保存设置换端点后下一发立刻改标新地址；路径不进日志，与 `ai_http` span 同一条
   规则）。翻译执行身份只是哈希，同一个模型名绑在多个端点上时，只有这个字段能说明转储行
-  属于谁；mock 等不标注地址的实现打 `endpoint=-`。开关默认关闭，产品运行永远不打开。收流还有一条自己的**静默**上限
+  属于谁；mock 等不标注地址的实现打 `endpoint=-`。开关默认关闭，产品运行永远不打开。
+  不必开这个开关也有线索：`translation_raw_output`（`debug` 级）在每一次失败的尝试上留
+  一份原始内容预览，`origin` 说明字节来自哪里 —— `stream`（已收到的模型流，含半截 JSON）、
+  `http_error_body`（端点 4xx/5xx 返回的错误封套）、`rejected`（没通过格式校验的完整答案）；
+  同一行还有 `endpoint`（这一发实际发给的端点来源，与转储行同一套
+  `endpoint_origin_label`；多端点或中途保存过设置的现场靠它定位是哪个端点在拒绝/超时，
+  mock 等没有地址的实现打 `endpoint=-`）、`body_bytes`、`truncated` 与 `body`（超过
+  `RAW_OUTPUT_PREVIEW_BYTES`＝4 KB 截断）。失败路径的另外几条诊断
+  （`translation_stream` 的 `interrupted`/`failed`、`translation_stream_silent`、
+  `translation_response_salvaged`）同样带 `endpoint=`。默认过滤（`ngy_ai=info`）不记录
+  `translation_raw_output` —— 内容可能回显正文，只有把 `ngy_ai` 调到 `debug` 排障时才输出，
+  完整原文仍以转储为准。收流还有一条自己的**静默**上限
   （`TRANSLATION_STREAM_SILENCE_LIMIT`，与 `PROVIDER_STEP_TIMEOUT` 同值）：provider 层的
   静默计时兜不住「流不再产生任何事件」——现场 2026-09-17 的整本翻译在开出 8 个块请求后
   彻底静默（job-logs 无写入、进程没有任何 TCP 连接、`await_translation_step` 的 180 秒

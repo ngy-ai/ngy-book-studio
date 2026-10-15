@@ -3,6 +3,8 @@
 
 use super::*;
 
+use std::collections::VecDeque;
+
 #[derive(Clone)]
 pub(crate) struct ModelServices {
     pub(crate) embedding_provider: Arc<dyn OpenAiCompatibleProvider>,
@@ -66,7 +68,47 @@ pub(crate) struct IndexingInner {
     /// Set on every successful library mutation so the worker reconciles
     /// missing whole-book translation jobs before going idle again.
     pub(crate) reconcile_translations: AtomicBool,
+    /// 分步对账的剩余单位。worker 一步取一个；取空即这一轮对账完成。
+    ///
+    /// 计划在第一次推进时按当时的配置构建，之后只在库/配置变化
+    /// （`reconcile_translations` 再次置位）时丢弃重建 —— 已处理的单位因为行已经对齐
+    /// 不会重新出现在新计划里。
+    pub(crate) reconcile_progress: Mutex<Option<TranslationReconcileProgress>>,
+    /// 「已领取但无进展」看门狗读的最近一次进展（任何任务日志事件都算）。
+    pub(crate) progress_watch: Mutex<ProgressWatch>,
     pub(crate) shutdown: AtomicBool,
+}
+
+/// 一轮分步对账的剩余单位，以及「哪些排队任务是自己刚产出的」。
+#[derive(Debug, Default)]
+pub(crate) struct TranslationReconcileProgress {
+    units: VecDeque<db::transactions::TranslationReconcileUnit>,
+    /// 本计划会触碰的任务 id（插入的、要重置的、要取消的）。
+    ///
+    /// 它们出现在队列里不算「外部工作」，不给它们让路 —— 否则对账会被自己刚插入
+    /// 的任务拖住：那个任务排在队首，worker 会去翻整本书，剩下的单位要等它跑完。
+    own_ids: HashSet<String>,
+}
+
+impl TranslationReconcileProgress {
+    fn new(units: Vec<db::transactions::TranslationReconcileUnit>) -> Self {
+        let own_ids = units.iter().map(|unit| unit.job_id().to_string()).collect();
+        Self {
+            units: units.into(),
+            own_ids,
+        }
+    }
+
+    fn owns(&self, job_id: &str) -> bool {
+        self.own_ids.contains(job_id)
+    }
+}
+
+/// 后台任务最近一次进展。看门狗据此把「领取后长期没有动静」的任务写进任务日志。
+#[derive(Debug, Default)]
+pub(crate) struct ProgressWatch {
+    job_id: Option<String>,
+    last_event_at: Option<Instant>,
 }
 
 impl IndexingInner {
@@ -87,5 +129,79 @@ impl IndexingInner {
             .read()
             .unwrap_or_else(|error| error.into_inner())
             .clone()
+    }
+
+    /// 记一次任务进展：任何任务日志事件都算（见 `record_index_event`）。
+    ///
+    /// 看门狗把这条时间戳当作「任务还活着」的证据；它自己写的事件同样会经过这里，
+    /// 因此「已领取但无进展」每个阈值周期最多报一次，而不是每次检查都刷一条。
+    pub(crate) fn note_progress(&self, job_id: &str, at: Instant) {
+        let mut watch = self
+            .progress_watch
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        watch.job_id = Some(job_id.to_string());
+        watch.last_event_at = Some(at);
+    }
+
+    /// 当前「已领取但没有新事件」的任务与时长；还没有任何进展记录时为 `None`。
+    pub(crate) fn progress_idle(&self) -> Option<(String, Duration)> {
+        let watch = self
+            .progress_watch
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let job_id = watch.job_id.clone()?;
+        let elapsed = Instant::now().saturating_duration_since(watch.last_event_at?);
+        Some((job_id, elapsed))
+    }
+
+    pub(crate) fn clear_translation_reconcile(&self) {
+        *self
+            .reconcile_progress
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+    }
+
+    pub(crate) fn has_translation_reconcile(&self) -> bool {
+        self.reconcile_progress
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_some()
+    }
+
+    pub(crate) fn set_translation_reconcile(
+        &self,
+        units: Vec<db::transactions::TranslationReconcileUnit>,
+    ) {
+        *self
+            .reconcile_progress
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) =
+            Some(TranslationReconcileProgress::new(units));
+    }
+
+    /// 待推进的计划里是否有这条任务（本计划自己的产出）。
+    pub(crate) fn reconcile_plan_owns(&self, job_id: &str) -> bool {
+        self.reconcile_progress
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .is_some_and(|progress| progress.owns(job_id))
+    }
+
+    /// 取出下一个对账单位；取尽即认为这一轮对账完成（计划随之清空，下次按最新状态
+    /// 重新构建）。
+    pub(crate) fn take_translation_reconcile_unit(
+        &self,
+    ) -> Option<db::transactions::TranslationReconcileUnit> {
+        let mut progress = self
+            .reconcile_progress
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let unit = progress.as_mut()?.units.pop_front();
+        if unit.is_none() {
+            *progress = None;
+        }
+        unit
     }
 }

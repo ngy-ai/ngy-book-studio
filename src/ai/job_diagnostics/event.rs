@@ -21,6 +21,10 @@ pub enum JobLogEvent {
     /// 原文。与 `ProtocolSkipped` 分开，是因为两者要说的话不一样 —— 一个是「模型答得
     /// 不对」，一个是「根本没答上来」，用户据此判断该换模型还是该查端点。
     ProviderSkipped,
+    /// 连续请求失败凑满阈值后的冷却（等一段时间再继续开新请求）。
+    Cooldown,
+    /// 静默看门狗：任务已被领取，但超过阈值没有任何新事件（进展）。
+    ClaimedNoProgress,
     /// 多片段文本块在两次严格尝试后改用逐片段请求重新翻译。
     SegmentFallback,
     /// 整个文本块在协议纠正后仍不合格，按冻结输入重发一轮（最后一轮才带逐片段回退）。
@@ -69,6 +73,16 @@ impl JobLogEvent {
                 Warning,
                 "model",
                 "模型请求失败（端点或模型不可用），已跳过当前文本块并保留原文",
+            ),
+            Self::Cooldown => (
+                Warning,
+                "model",
+                "连续模型请求失败，已暂停一段时间后继续，等完会继续翻后面的文本块",
+            ),
+            Self::ClaimedNoProgress => (
+                Warning,
+                "run",
+                "任务已被领取但长时间没有任何进展，可能卡在请求或等待上（详情见运行日志）",
             ),
             Self::SegmentFallback => (
                 Info,

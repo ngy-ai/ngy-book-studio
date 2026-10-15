@@ -26,6 +26,9 @@ pub(crate) fn record_index_event(
     metrics.run_id = INDEXING_LOG_RUN.try_with(|(id, _)| *id).ok();
     metrics.attempt.get_or_insert(u64::from(job.attempts));
     record_for_database(&inner.db_path, &job.id, event, metrics);
+    // 每次事件都是「任务还活着」的证据，静默看门狗据此判断「已领取但无进展」。
+    // 放在记录之后：写失败也不影响事件本身已经尽力落盘。
+    inner.note_progress(&job.id, Instant::now());
 }
 
 pub(crate) fn cursor_without_model(job: &db::index_jobs::IndexJob) -> Result<JobCursor> {

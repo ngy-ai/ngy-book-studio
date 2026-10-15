@@ -280,6 +280,30 @@ pub(crate) fn stream_silence_is_reported_exactly_at_the_limit() {
     assert_eq!(classify_error(&error), JobLogErrorKind::Timeout);
 }
 
+/// 端点拒绝这一发时的错误封套是失败日志里唯一的「端点答了什么」。它必须能从
+/// 错误链里取出来（外层的分类包装不能挡住它），而连接、超时类错误没有响应可看。
+#[test]
+pub(crate) fn provider_error_body_only_comes_from_a_rejected_endpoint() {
+    let envelope = "{\"error\":{\"message\":\"model crashed\"}}";
+    let rejected = anyhow::Error::new(crate::ai::ProviderHttpError {
+        status: 500,
+        detail: envelope.to_string(),
+    })
+    .context("failed to start streaming chat completion");
+    assert_eq!(provider_error_body(&rejected), Some(envelope));
+
+    // 传输层错误（连接被拒、超时）没有响应封套。
+    let refused = anyhow::anyhow!("failed to start streaming chat completion");
+    assert_eq!(provider_error_body(&refused), None);
+
+    // 状态被拒但正文为空：不产生预览行。
+    let empty = anyhow::Error::new(crate::ai::ProviderHttpError {
+        status: 502,
+        detail: String::new(),
+    });
+    assert_eq!(provider_error_body(&empty), None);
+}
+
 #[test]
 pub(crate) fn an_unfinished_stream_is_only_salvaged_by_one_complete_valid_answer() {
     let source = TranslationSource {

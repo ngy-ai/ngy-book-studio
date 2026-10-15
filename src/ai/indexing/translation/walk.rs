@@ -405,6 +405,18 @@ async fn cool_down_after_request_failure_streak(
     if cooldown.is_zero() {
         return Ok(None);
     }
+    // 进任务日志：用户需要在任务窗口里看到「任务不是死了，是在等端点缓过来」，
+    // 而不是一个只有运行日志才知道原因的静止进度。
+    record_index_event(
+        inner,
+        job,
+        JobLogEvent::Cooldown,
+        JobLogMetrics {
+            ordinal: Some(run.cursor.next_ordinal as u64),
+            duration_ms: Some(cooldown.as_millis() as u64),
+            ..JobLogMetrics::default()
+        },
+    );
     tracing::info!(
         target: "ngy_ai",
         stage = "translation_failure_cooldown_start",

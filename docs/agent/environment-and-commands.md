@@ -172,6 +172,17 @@ Node 认不出来，`require("playwright")` 会 `MODULE_NOT_FOUND`）。
 本次只改 `src/ui/**/*.js` 与文档，没有跑 Rust 门禁；未做真实 Windows GUI 手工复验（见
 `ROADMAP.md` 同日两条记录）。
 
+2026-10-15 翻译任务对账改「一步一个单位」与让路、失败诊断带端点来源、冷却与「已领取但无
+进展」进任务日志并加静默看门狗（实现与回归见 `ROADMAP.md` 同日记录）之后复跑 Rust 门禁：
+`cargo fmt --all --check` 通过，`cargo clippy --all-targets --locked` 110 条既有告警
+（与改动前同数、无新增），`cargo test --locked --all-targets --no-fail-fast` 全通过 ——
+lib 732 项（727 通过 / 5 忽略）、产品二进制 357 项（356 通过 / 1 忽略）、
+`openai_compatible_flow` 24、`translation_flow` 20 项（19 通过 / 1 忽略）、
+`epub_flow_test` 6、`multi_format_flow_test` 4、`multi_endpoint_flow_test` 1、
+`proxy_flow_test` 1、`format_corpus_gate_test` 1 忽略。2026-10-13 观察到的
+`services::tests::` 并发预算假失败本次没有复现（同一批用例在默认并发下通过）。
+未做人工 GUI 验证（见 `ROADMAP.md`）。
+
 ## AI 问答诊断日志
 
 AI 日志统一使用 `ngy_ai` target。未设置 `RUST_LOG` 时，默认

@@ -27,6 +27,15 @@ pub(crate) async fn worker_loop(inner: Arc<IndexingInner>, index: usize) {
             tokio::time::sleep(IDLE_POLL_INTERVAL).await;
             continue;
         }
+        // 先推进翻译任务对账一步（一步一个单位）。队列里有**本计划之外**的排队
+        // 工作时它返回 `Yielded`，这一轮就去跑那个任务；本计划自己刚插入的任务不算
+        // 外部工作，它们排队不会阻塞后面的单位（见 `advance_translation_reconcile`）。
+        match advance_translation_reconcile(&inner).await {
+            Ok(TranslationReconcileStep::Advanced) => continue,
+            Ok(TranslationReconcileStep::Yielded | TranslationReconcileStep::Idle) => {}
+            Err(error) => tracing::warn!(%error, "翻译任务对账失败"),
+        }
+
         let db_path = inner.db_path.clone();
         let jobs = match run_db(db_path, move |conn| {
             db::index_jobs::list_queued(&conn, QUEUE_SCAN_LIMIT)
@@ -42,11 +51,6 @@ pub(crate) async fn worker_loop(inner: Arc<IndexingInner>, index: usize) {
         };
 
         let Some(job) = jobs.into_iter().next() else {
-            if inner.reconcile_translations.swap(false, Ordering::AcqRel)
-                && let Err(error) = reconcile_translation_jobs(&inner).await
-            {
-                tracing::warn!(%error, "翻译任务对账失败");
-            }
             wait_for_work(&inner).await;
             continue;
         };
@@ -65,36 +69,146 @@ pub(crate) async fn worker_loop(inner: Arc<IndexingInner>, index: usize) {
     }
 }
 
-/// Rebuilds the durable whole-book translation jobs from the active target
-/// language and model. Runs only when the queue is empty so a burst of library
-/// mutations cannot starve already queued model work.
-pub(crate) async fn reconcile_translation_jobs(inner: &Arc<IndexingInner>) -> Result<()> {
-    let translation = inner
-        .models
-        .read()
-        .map_err(|_| anyhow::anyhow!("indexing model lock is poisoned"))?
-        .translation
-        .clone();
-    let Some(translation) = translation else {
-        return Ok(());
+/// 分步对账的一次推进结果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TranslationReconcileStep {
+    /// 这一步处理了一个对账单位；计划里可能还有下一步。
+    Advanced,
+    /// 队列里已经有排队任务：这一步先不推进，把执行权让给它。
+    Yielded,
+    /// 没有待推进的计划：没有配置翻译，或者任务已经与当前配置一致。
+    Idle,
+}
+
+/// 推进翻译任务对账的一步：一次只处理一个单位，动手之前先看队列。
+///
+/// 「一步一个单位」是 2026-10-15 的现场要求：库变更后的对账要遍历整个书库，原先
+/// 一次事务做完，期间新入队的任务只能干等。现在每个单位一个小事务（
+/// [`db::transactions::apply_translation_reconcile_unit`]），每步之前重新扫描队列，
+/// 排队中的**外部**工作因此可以先跑。
+///
+/// 让路只针对本计划之外的任务：本计划自己插入/重置的任务同样排进队列，它们是这一步的
+/// 产物，给它们让路等于让一次对账等整本书翻完，其余单位就再也建不出来。计划之外的
+/// 任务（例如同时排队的 embedding、视觉，或用户手动排的翻译）会让这一步返回
+/// [`TranslationReconcileStep::Yielded`]。
+///
+/// 计划在第一次推进时按当时的配置构建；`reconcile_translations` 再次置位（库或配置
+/// 又变了）时丢弃重建 —— 已处理的单位在新计划里因为行已经对齐而不会出现。
+pub(crate) async fn advance_translation_reconcile(
+    inner: &Arc<IndexingInner>,
+) -> Result<TranslationReconcileStep> {
+    if !inner.reconcile_translations.load(Ordering::Acquire) && !inner.has_translation_reconcile() {
+        // 没有待办也没有计划：这一步不碰数据库（worker 每轮都会经过这里）。
+        return Ok(TranslationReconcileStep::Idle);
+    }
+
+    // 让路：队列里有本计划之外的任务时，本步不推进（调用方下一件事就是跑它）。
+    // 注意这里**不消费**对账请求：让路之后请求仍然挂着，外部任务跑完再推进。
+    let db_path = inner.db_path.clone();
+    let queued = run_db(db_path, move |conn| db::index_jobs::list_queued(&conn, 1)).await?;
+    if let Some(job) = queued.first()
+        && !inner.reconcile_plan_owns(&job.id)
+    {
+        return Ok(TranslationReconcileStep::Yielded);
+    }
+
+    if inner.reconcile_translations.swap(false, Ordering::AcqRel) {
+        // 库或配置刚变过：丢弃旧计划，下一次按当前状态重建。已处理的单位在新计划里
+        // 因为行已经对齐而不会出现，所以丢弃不会重复劳动。
+        inner.clear_translation_reconcile();
+    }
+
+    if !inner.has_translation_reconcile() {
+        let Some(translation) = inner.models_snapshot().translation else {
+            return Ok(TranslationReconcileStep::Idle);
+        };
+        let db_path = inner.db_path.clone();
+        let units = run_db(db_path, move |conn| {
+            db::transactions::plan_translation_reconcile(
+                &conn,
+                translation.target_language.as_deref(),
+                &translation.model,
+                &translation.execution_identity,
+                translation.auto_run,
+            )
+        })
+        .await?;
+        if units.is_empty() {
+            return Ok(TranslationReconcileStep::Idle);
+        }
+        inner.set_translation_reconcile(units);
+    }
+
+    let Some(unit) = inner.take_translation_reconcile_unit() else {
+        return Ok(TranslationReconcileStep::Idle);
     };
     let db_path = inner.db_path.clone();
+    let now = unix_timestamp()?;
     let changed = run_db_mut(db_path, move |mut conn| {
-        let now = unix_timestamp()?;
-        db::transactions::reconfigure_translation_jobs(
-            &mut conn,
-            translation.target_language.as_deref(),
-            &translation.model,
-            &translation.execution_identity,
-            translation.auto_run,
-            now,
-        )
+        db::transactions::apply_translation_reconcile_unit(&mut conn, &unit, now)
     })
     .await?;
     if changed != 0 {
+        // 新建/重置的任务可能就是下一个要跑的工作：叫醒还在等信号的 worker。
         inner.wake.notify_one();
     }
+    Ok(TranslationReconcileStep::Advanced)
+}
+
+/// 静默看门狗的一个周期：任务被领取后超过 [`NO_PROGRESS_WATCHDOG_THRESHOLD`]
+/// 没有任何新事件（进展）时，往任务日志写一条「已领取但无进展」。
+///
+/// 看门狗只报告、不干预：它不取消、不重排任务，只是让「任务显示运行中但处理中恒为 0」
+/// 这类现场（2026-10-15 用户反馈）在任务窗口里有据可查，而不是一片沉默。写入的事件
+/// 走 [`record_index_event`]，因此它同时刷新观察时间戳：同一段无进展每个阈值周期最多
+/// 报一条，不会刷屏。
+pub(crate) async fn watchdog_tick(inner: &Arc<IndexingInner>) -> Result<()> {
+    let Some((job_id, idle)) = inner.progress_idle() else {
+        return Ok(());
+    };
+    if !no_progress_exceeded(idle) {
+        return Ok(());
+    }
+    let db_path = inner.db_path.clone();
+    let lookup = job_id.clone();
+    let Some(job) = run_db(db_path, move |conn| db::index_jobs::get(&conn, &lookup)).await? else {
+        return Ok(());
+    };
+    if job.status != db::index_jobs::IndexJobStatus::Running {
+        return Ok(());
+    }
+    let ordinal = serde_json::from_str::<JobCursor>(&job.cursor_json)
+        .ok()
+        .map(|cursor| cursor.next_ordinal as u64);
+    record_index_event(
+        inner,
+        &job,
+        JobLogEvent::ClaimedNoProgress,
+        JobLogMetrics {
+            ordinal,
+            duration_ms: Some(idle.as_millis() as u64),
+            ..JobLogMetrics::default()
+        },
+    );
     Ok(())
+}
+
+pub(crate) async fn watchdog_loop(inner: Arc<IndexingInner>) {
+    loop {
+        if inner.shutdown.load(Ordering::Acquire) {
+            break;
+        }
+        if let Err(error) = watchdog_tick(&inner).await {
+            tracing::warn!(%error, "后台任务看门狗检查失败");
+        }
+        tokio::time::sleep(NO_PROGRESS_WATCHDOG_INTERVAL).await;
+    }
+}
+
+/// 静默看门狗的判定线。单独成函数是为了把边界钉在测试里 —— 差一毫秒就该继续等，
+/// 到达就该报告。
+pub(crate) fn no_progress_exceeded(idle: Duration) -> bool {
+    idle >= NO_PROGRESS_WATCHDOG_THRESHOLD
 }
 
 pub(crate) async fn wait_for_work(inner: &IndexingInner) {

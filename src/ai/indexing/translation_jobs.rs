@@ -67,6 +67,9 @@ impl IndexingCoordinator {
         self.inner
             .reconcile_translations
             .store(false, Ordering::Release);
+        // 配置换了：丢弃 worker 手里可能还在推进的分步计划（它携带旧模型与执行
+        // 身份）。这里已经按新配置整体对过一次账，下一次推进按现状重建即可。
+        self.inner.clear_translation_reconcile();
         if changed != 0 {
             self.inner.wake.notify_one();
         }

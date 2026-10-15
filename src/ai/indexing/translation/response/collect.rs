@@ -140,6 +140,7 @@ pub(crate) async fn collect_translation_response(
                         stage = "translation_stream_silent",
                         block_ordinal = scope.ordinal,
                         request_attempt,
+                        endpoint = endpoint.unwrap_or("-"),
                         since_last_event_ms = stats.since_last_event_ms(),
                         events = stats.events,
                         response_bytes = response.len(),
@@ -216,6 +217,7 @@ pub(crate) async fn collect_translation_response(
                 parent: &span,
                 stage = "translation_stream",
                 outcome = "interrupted",
+                endpoint = endpoint.unwrap_or("-"),
                 end = stats.end,
                 events = stats.events,
                 content_events = stats.content_events,
@@ -240,6 +242,7 @@ pub(crate) async fn collect_translation_response(
                 parent: &span,
                 stage = "translation_stream",
                 outcome = "failed",
+                endpoint = endpoint.unwrap_or("-"),
                 error_kind = crate::ai::ai_diagnostics::error_kind(&error),
                 end = stats.end,
                 events = stats.events,
@@ -271,6 +274,16 @@ pub(crate) async fn collect_translation_response(
                 Some(&response),
                 stats.end,
             );
+            // 流中断时已收到的字节往往就是失败原因的全部证据（半截 JSON、
+            // 提前结束的回答），这条 debug 预览让失败当场不必先去开转储开关。
+            log_raw_model_output(
+                &span,
+                scope.ordinal,
+                request_attempt,
+                endpoint,
+                "stream",
+                &response,
+            );
             // 流没有正常结束，但已经收到的字节可能包含一个完整、能通过全部片段校验的
             // 答案（模型答完继续啰嗦、或服务端在收尾前断开）。整段文本仍走原来的严格
             // 解码：只有一个完整容器、id 不多不少时才会被采用，不会猜模型意图。
@@ -281,6 +294,7 @@ pub(crate) async fn collect_translation_response(
                     stage = "translation_response_salvaged",
                     block_ordinal = scope.ordinal,
                     request_attempt,
+                    endpoint = endpoint.unwrap_or("-"),
                     end = stats.end,
                     response_bytes = response.len(),
                     containers = shape.containers,
