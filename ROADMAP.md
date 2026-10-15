@@ -1045,3 +1045,54 @@ LangGraph 依赖。CLI 课程验证与桌面接入的验证分别列出。
   `proxy_flow` 1。未做人工 GUI 验证：需要在真实窗口里让一轮对账与排队任务同时发生（观察
   对账不再独占工人）、并制造一个卡住的任务确认任务日志出现「已领取但长时间没有任何进展」与
   「连续模型请求失败」记录。
+- [x] 2026-10-15 阅读端逐块「重新翻译」真的重发、运行中的整本翻译先落盘、模型原样抄回原文不算
+  译文（现场两条：整本翻译正在跑时点「重新翻译这一块」，报「无法重新翻译该文本块：这本书没有
+  可重试的翻译任务」；`Type: Build Language: Python Prerequisites: …` 这类元信息段落被模型原样
+  返回，系统当成有效译文落盘 —— 阅读端显示的仍是英文，而游标已经走过去、缓存又把它算作「已翻」，
+  除了用户自己点「重新翻译」没有任何入口会再碰它）：
+  1）`TranslationRange::Retry { force }`：阅读端的逐块「重新翻译」为 `true`，即使这一块已有可
+  显示的译文也要重新发给模型（用户对译文不满意、或换了更好的模型想重做这一块），新译文覆盖旧
+  机器行、手工行照旧不受影响；任务窗口的「重试失败块」保持 `false` —— 那些块本来就没有译文，
+  命中缓存是「别为同一块重复付费」的保护。`force_retry` 随游标持久化（`JobCursor`，
+  `#[serde(default)]`），与 `retry_ordinals` 同生共死：最后一个目标块提交时
+  （`TranslationRun::commit`）或块列表版本变化导致收窄作废时一起清掉 —— 少了这一条，这份收窄
+  跑完之后整本剩下的块都会被强制重发。任务日志新增 `JobLogEvent::BlockRetranslateRequested`
+  （「已接受重新翻译请求：这一块会重新发给模型」，并注明旧译文保留到新译文写入为止）。
+  2）运行中的执行器拥有游标，所以「重新翻译这一块」与「立即翻译本章」走同一条服务层路径：先
+  `pause_running_translation` 等「已暂停」落盘，再规划收窄（新增的 `hint` 只进等待超时文案，
+  两条入口因此各自报得出是哪一个操作在等）。少了这一步，规划对 `running` 的行静默落空
+  （`reset_for_translation_block_retry` 的 `WHERE` 只匹配非 running 的状态），用户看到的却是
+  「这本书没有可重试的翻译任务」—— 现场 2026-10-15 的报错即此。同一条语句现在也接受 `queued`
+  （还没有执行器拥有这条游标，现在写下的收窄就是下一次领取读到的那一份），`running` 仍然拒绝
+  而不是覆盖：调用方看到拒绝后先暂停再问一次。
+  3）`StoredTranslation::is_passthrough`：拼起来的译文与原文逐字相同（忽略空白）就按「还没有
+  译文」处理，缓存不再算命中，walk 继续走请求路径重新翻一次；任务日志新增
+  `JobLogEvent::SourceEchoed`（警告级：「模型把这一块的原文原样抄了回来，不算翻译；可以重新
+  翻译或重试这一块」）。它**不进**明细的失败列表：紧接着那次重发要么翻好这一块、要么按
+  `ProtocolSkipped` / `ProviderSkipped` 进列表，算成失败会让刚翻好的块一直挂在「失败」上。
+  判定保守到「逐字相同（忽略空白）」：保留人名、URL、代码片段等局部原样是正常翻译的一部分，
+  绝不能被误判。
+  回归：`translation_retry_test` 新增
+  `retranslating_a_translated_block_by_id_re_sends_it_and_a_plain_retry_keeps_the_cache`（整本
+  跑完 → 普通重试一个请求都不发 → 把旧行换成哨兵后强制重跑，请求数上涨且哨兵被新答案覆盖 →
+  收窄用完后 `force_retry` 与 `retry_ordinals` 一并清空）、
+  `a_stored_translation_that_echoes_the_source_is_re_sent_instead_of_cache_hit`（真译文照旧
+  缓存命中、一个请求都不发，抄回来的块重发并留下唯一一条 `SourceEchoed`，行被新答案改写、
+  真译文那一块不动），`retrying_works_on_a_paused_task_and_refuses_a_running_one` 补「排队中的
+  任务仍可被重新规划」；`ai::translation::tests::segment_test` 新增 2 项（抄回来的三种形状：
+  逐片段相同、只差空白、拼接后只差空白；真译文不被误判：换词、只有一个片段原样、只多一个标点）；
+  `services::tests::translation_test` 新增
+  `retranslating_one_reader_block_waits_for_a_running_task_to_pause`（运行中的任务先落盘再规划，
+  调用者没有 Tokio 上下文）；`ui::background_jobs::layout_tests::blocks_test::
+  translation_block_inspector_names_the_blocks_that_failed` 补一条 `SourceEchoed` 断言（它不算
+  失败块，状态与计数都不动）。验证：`cargo fmt --all --check` 通过，
+  `cargo clippy --all-targets --locked` 与改动前同数、本次触及的文件无新增告警，
+  `cargo test --locked --all-targets --no-fail-fast` 全通过 —— lib 737 项（732 通过 5 忽略）、
+  产品二进制 357 项（356 通过 1 忽略）、`openai_compatible_flow` 24、`translation_flow` 20 项
+  （19 通过 1 忽略）、`epub_flow` 6、`multi_format_flow` 4、`multi_endpoint_flow` 1、
+  `proxy_flow` 1。（首轮全目标运行里
+  `services::tests::visual::jobs_test::startup_requeues_legacy_renderer_and_reclaims_its_visual_object`
+  因等待视觉任务在并发下超时失败了一次，单独复跑与随后的两次全量复跑都通过 —— 与
+  `docs/agent/environment-and-commands.md` 记的「紧截止夹具在默认并发下假失败」同一类，不是
+  本次回归。）人工 GUI 验证（2026-10-15，用户实测）：整本翻译运行中点「重新翻译这一块」的现场
+  路径通过，不再报「这本书没有可重试的翻译任务」。

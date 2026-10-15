@@ -96,6 +96,10 @@ pub(crate) fn translation_block_inspector_names_the_blocks_that_failed() {
     let logs = log_snapshot(vec![
         log_entry(JobLogEvent::RunStarted, None, None),
         log_entry(JobLogEvent::ItemSaved, Some(1), None),
+        // 「模型把原文原样抄回来」不算失败块：它只说明库里那一行不算译文、walk 会重发
+        // 这一块，紧接着那次请求要么翻好它、要么按下面两条跳过事件进列表。把它算成失败
+        // 会让刚翻好的块一直挂在「失败」上（`docs/agent/code-map-ui.md`）。
+        log_entry(JobLogEvent::SourceEchoed, Some(5), None),
         log_entry(
             JobLogEvent::ProtocolSkipped,
             Some(58),
@@ -139,6 +143,9 @@ pub(crate) fn translation_block_inspector_names_the_blocks_that_failed() {
     assert_eq!(inspector.state(60), BlockState::Pending);
     assert_eq!(inspector.reason(1), None);
     assert_eq!(inspector.state(1), BlockState::Done);
+    // 「原样抄回来」那一块同样不是失败块：它没有译文这件事由紧接着那次重发的结果决定。
+    assert_eq!(inspector.reason(5), None);
+    assert_eq!(inspector.state(5), BlockState::Done);
 
     // The failed blocks leave the state the cursor gave them, so the header
     // still adds up to the number of blocks.

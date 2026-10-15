@@ -179,6 +179,11 @@ impl AppServices {
             anyhow::bail!("尚未配置默认译文语言，无法重新翻译");
         };
         let job_id = self.translation_job_id(&book_id, &target_language).await?;
+        // 运行中的执行器拥有游标：先请它落盘再收窄（与「立即翻译本章」同一条路径）。
+        // 少了这一步，正在跑的整本翻译会让下面的规划静默落空，用户看到的是「这本书
+        // 没有可重试的翻译任务」—— 现场 2026-10-15 的报错就是它。
+        self.pause_running_translation(&job_id, "重新翻译这一块")
+            .await?;
         let indexing = Arc::clone(&self.indexing);
         let retried = self
             .runtime
@@ -189,12 +194,12 @@ impl AppServices {
             })
             .await
             .context("翻译重试线程异常退出")??;
-        // 拒绝的三种情形都说清楚：这本书没有翻译任务、重跑的那一块在正文里找不到、
-        // 或者任务此刻正在运行（重试路径不打断执行器，得先把任务暂停）。
+        // 走到这里的两种拒绝都说清楚：这本书没有翻译任务（或已被取消/重排），
+        // 或者重跑的那一块不属于它当前的身份（来源修订变了）。
         ensure!(
             retried,
-            "无法重新翻译该文本块：这本书没有可重试的翻译任务（尚未配置翻译，或任务正在运行，\
-             请先暂停任务）"
+            "无法重新翻译该文本块：这本书没有可重试的翻译任务（尚未配置翻译，\
+             或任务已被取消、正文已改动）"
         );
         Ok(())
     }
@@ -219,7 +224,8 @@ impl AppServices {
             anyhow::bail!("尚未配置默认译文语言，无法立即翻译本章");
         };
         let job_id = self.translation_job_id(&book_id, &target_language).await?;
-        self.pause_running_translation(&job_id).await?;
+        self.pause_running_translation(&job_id, "把本章排到最前")
+            .await?;
         let indexing = Arc::clone(&self.indexing);
         let planned = self
             .runtime
@@ -261,12 +267,15 @@ impl AppServices {
     ///
     /// 已经是终态或已暂停的任务什么都不做：规划路径本来就能改写它们的游标。
     ///
+    /// `hint` 只进超时文案（「把本章排到最前」／「重新翻译这一块」），让用户知道
+    /// 是哪一个操作在等。
+    ///
     /// 这一等必须能在没有 Tokio 上下文的调用者上跑：阅读窗口是从 GPUI 的前台执行器调用
     /// 这个入口的（`docs/agent/code-map.md` 的约定，`services` 测试里的
     /// `block_on_without_tokio` 复现的正是这种环境）。现场 2026-10-14：这里直接用
     /// `tokio::time::sleep`，在 GPUI 回调里 panic（`there is no reactor running`），而 GPUI
     /// 回调不可 unwind，整个进程随之退出 —— 等待因此派到应用 I/O runtime 自己的阻塞池上。
-    async fn pause_running_translation(&self, job_id: &str) -> Result<()> {
+    async fn pause_running_translation(&self, job_id: &str, hint: &str) -> Result<()> {
         if self.indexing.job(job_id).await?.map(|job| job.status)
             != Some(IndexingJobStatus::Running)
         {
@@ -283,7 +292,7 @@ impl AppServices {
             }
             ensure!(
                 std::time::Instant::now() < deadline,
-                "整本翻译还在处理当前文本块，暂时无法把本章排到最前（可以稍后再点一次，\
+                "整本翻译还在处理当前文本块，暂时无法{hint}（可以稍后再点一次，\
                  或先到「后台任务」窗口暂停这本书的翻译）"
             );
             self.wait_before_pause_poll().await?;

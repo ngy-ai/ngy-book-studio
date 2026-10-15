@@ -183,6 +183,21 @@ lib 732 项（727 通过 / 5 忽略）、产品二进制 357 项（356 通过 / 
 `services::tests::` 并发预算假失败本次没有复现（同一批用例在默认并发下通过）。
 未做人工 GUI 验证（见 `ROADMAP.md`）。
 
+2026-10-15 阅读端逐块「重新翻译」改「已有译文也强制重发」、运行中的整本翻译先落盘再规划、模型
+原样抄回原文不再算译文（实现与回归见 `ROADMAP.md` 同日记录）之后复跑 Rust 门禁：
+`cargo fmt --all --check` 通过，`cargo clippy --all-targets --locked` 与改动前同数、本次触及的
+文件无新增告警，`cargo test --locked --all-targets --no-fail-fast` 全通过 —— lib 737 项
+（732 通过 / 5 忽略，比上一批多 5 项：`translation_retry_test` 2、
+`ai::translation::tests::segment_test` 2、`services::tests::translation_test` 1）、
+产品二进制 357 项（356 通过 / 1 忽略）、`openai_compatible_flow` 24、
+`translation_flow` 20 项（19 通过 / 1 忽略）、`epub_flow_test` 6、`multi_format_flow_test` 4、
+`multi_endpoint_flow_test` 1、`proxy_flow_test` 1、`format_corpus_gate_test` 1 忽略。
+首轮全目标运行里有一项失败：`services::tests::visual::jobs_test::
+startup_requeues_legacy_renderer_and_reclaims_its_visual_object` 等待视觉任务进入 `Succeeded`
+超时（当时状态仍为 `Running`），单独复跑与随后的两次全量复跑都通过，属上面 2026-09-17 记的
+「`services::tests::` 紧截止预算在默认并发下假失败」那一类。人工 GUI 验证（2026-10-15，用户
+实测）：整本翻译运行中点「重新翻译这一块」，先暂停再重排，不再报「这本书没有可重试的翻译任务」。
+
 ## AI 问答诊断日志
 
 AI 日志统一使用 `ngy_ai` target。未设置 `RUST_LOG` 时，默认

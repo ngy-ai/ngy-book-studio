@@ -466,6 +466,7 @@ pub(crate) async fn run_queued_job(
                         inflight: Vec::new(),
                         blocks_version: TRANSLATION_BLOCKS_VERSION,
                         priority: None,
+                        force_retry: false,
                     });
                     publish_outcome(
                         inner,

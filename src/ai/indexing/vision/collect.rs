@@ -108,6 +108,7 @@ pub(crate) async fn enqueue_post_vision_embedding(
             inflight: Vec::new(),
             blocks_version: TRANSLATION_BLOCKS_VERSION,
             priority: None,
+            force_retry: false,
         };
         let cursor_json = job_cursor.encode()?;
         let row = db::index_jobs::IndexJob {

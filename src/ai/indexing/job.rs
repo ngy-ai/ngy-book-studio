@@ -125,6 +125,16 @@ pub(crate) struct JobCursor {
     /// 时间戳即可顶掉它，不需要清理。
     #[serde(default)]
     pub(crate) priority: Option<u64>,
+    /// 用户显式要求「重新翻译」这一批目标块：命中缓存也要重发一次。
+    ///
+    /// 只有阅读端的逐块「重新翻译」写下它（2026-10-15：这一块的译文不满意，或者换了
+    /// 更好的模型想把这一块重做一遍）。任务窗口的「重试失败块」保持缓存规则 —— 那些块
+    /// 本来就没有译文，命中缓存是「别为同一块重复付费」的保护。
+    ///
+    /// 与 `retry_ordinals` 同生共死：最后一个目标块提交时一起清掉（见
+    /// `TranslationRun::commit`），块列表版本变化导致收窄作废时同样清掉。
+    #[serde(default)]
+    pub(crate) force_retry: bool,
 }
 
 impl JobCursor {
@@ -162,6 +172,8 @@ impl JobCursor {
             cursor.blocks_version = TRANSLATION_BLOCKS_VERSION;
             cursor.next_ordinal = 0;
             cursor.retry_ordinals.clear();
+            // 这份收窄连同它的「强制重发」一起作废：块列表变了，序号也不再指向同一块。
+            cursor.force_retry = false;
             // 回到原位置说的是「旧编号里的哪一块」，块列表变了这个编号就不再指向同一处。
             cursor.resume_ordinal = None;
             cursor.inflight.clear();

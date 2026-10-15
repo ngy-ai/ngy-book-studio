@@ -417,6 +417,7 @@ pub(crate) fn startup_collapses_legacy_model_specific_vision_job_into_canonical_
         inflight: Vec::new(),
         blocks_version: TRANSLATION_BLOCKS_VERSION,
         priority: None,
+        force_retry: false,
     }
     .encode()
     .unwrap();

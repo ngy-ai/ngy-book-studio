@@ -1,6 +1,7 @@
 //! Tests for response decoding, wrapping and repair.
 
 mod repair_test;
+mod segment_test;
 
 pub(crate) use super::*;
 

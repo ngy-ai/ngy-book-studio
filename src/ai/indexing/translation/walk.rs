@@ -237,6 +237,7 @@ pub(crate) async fn walk_translation_blocks(
                     revision,
                     &retry_targets,
                     retry_last,
+                    run.cursor.force_retry,
                     &mut unit_cache,
                     stats,
                 )
@@ -532,6 +533,7 @@ pub(crate) async fn plan_translation_block<'a>(
     revision: u64,
     retry_targets: &HashSet<usize>,
     retry_last: Option<usize>,
+    force_retry: bool,
     unit_cache: &mut HashMap<String, HashMap<String, StoredTranslation>>,
     stats: &mut TranslationRunStats,
 ) -> Result<BlockPlan<'a>> {
@@ -618,11 +620,40 @@ pub(crate) async fn plan_translation_block<'a>(
         unit_cache.insert(block.unit_id.clone(), stored);
     }
     let cache_key = block_cache_key(&block.source);
-    if let Some(stored) = unit_cache
+    let cached = unit_cache
         .get(&block.unit_id)
         .and_then(|unit| unit.get(&cache_key))
-    {
-        return Ok(BlockPlan::Cached(Box::new(stored.clone())));
+        .cloned();
+    // 阅读端逐块「重新翻译」把这一块标成强制重发：命中缓存也要重新请求一次，新译文
+    // 覆盖旧行（用户对译文不满意、或换了更好的模型重做这一块）。
+    let forced = force_retry && retry_targets.contains(&ordinal);
+    match &cached {
+        Some(stored) if !forced && !stored.is_passthrough() => {
+            return Ok(BlockPlan::Cached(Box::new(stored.clone())));
+        }
+        Some(_) if !forced => {
+            // 模型把整块原样抄了回来：这一块其实还没有译文（现场 2026-10-15，阅读端
+            // 显示的仍是英文）。它不再算缓存命中，继续往下走请求路径重新翻一次。
+            // 只在本次运行真的要处理它时留读数：重试范围之外的块既不请求也不记录。
+            if !beyond_retry {
+                tracing::info!(
+                    target: "ngy_ai",
+                    stage = "translation_source_echoed",
+                    block_ordinal = block.ordinal,
+                    "Model echoed the source text back; treating the block as untranslated"
+                );
+                record_index_event(
+                    inner,
+                    job,
+                    JobLogEvent::SourceEchoed,
+                    JobLogMetrics {
+                        ordinal: Some(block.ordinal as u64),
+                        ..JobLogMetrics::default()
+                    },
+                );
+            }
+        }
+        _ => {}
     }
     if beyond_retry {
         // 不在本次重试里、又没有译文：既不发请求，也不许提交。调用方会停在

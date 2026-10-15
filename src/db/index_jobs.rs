@@ -504,8 +504,15 @@ pub(crate) fn reset_terminal(
 ///
 /// Unlike [`reset_terminal`], this also accepts `paused`: new translation jobs
 /// start paused (auto-run is off by default), and repairing a failed block before
-/// resuming the task is the normal case. A running job is still refused — the
-/// caller must pause it first rather than race the executor's own cursor writes.
+/// resuming the task is the normal case.
+///
+/// `queued` is accepted too (2026-10-15): nothing owns the cursor yet, so a retry
+/// planned now is exactly what the next claim reads. The update stays guarded
+/// by its `WHERE` clause, so a worker that claims the row in the same moment
+/// makes this statement match nothing instead of overwriting a running cursor —
+/// the caller sees a refusal and can pause the task and ask again. A `running`
+/// job is still refused outright: the executor owns the cursor and the caller
+/// must pause it first.
 pub(crate) fn reset_for_translation_block_retry(
     conn: &Connection,
     job_id: &str,
@@ -516,7 +523,7 @@ pub(crate) fn reset_for_translation_block_retry(
         "UPDATE index_jobs SET status = 'queued', pause_requested = 0,
          cancel_requested = 0, cursor_json = ?2, error = NULL, updated_at = ?3,
          started_at = NULL, finished_at = NULL
-         WHERE id = ?1 AND status IN ('succeeded', 'failed', 'cancelled', 'paused')",
+         WHERE id = ?1 AND status IN ('succeeded', 'failed', 'cancelled', 'paused', 'queued')",
         params![job_id, cursor_json, updated_at as i64],
     )
     .context("无法为重试文本块重新投递翻译任务")

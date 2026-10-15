@@ -31,6 +31,7 @@ pub(crate) fn duplicate_reconciliation_preserves_pending_cancel() {
         inflight: Vec::new(),
         blocks_version: TRANSLATION_BLOCKS_VERSION,
         priority: None,
+        force_retry: false,
     }
     .encode()
     .unwrap();
@@ -234,6 +235,7 @@ pub(crate) fn manual_vision_retry_requires_current_execution_identity() {
         inflight: Vec::new(),
         blocks_version: TRANSLATION_BLOCKS_VERSION,
         priority: None,
+        force_retry: false,
     };
     db::index_jobs::update_state(
         &conn,

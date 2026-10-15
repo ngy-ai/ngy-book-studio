@@ -159,6 +159,7 @@ impl IndexingCoordinator {
                 inflight: Vec::new(),
                 blocks_version: TRANSLATION_BLOCKS_VERSION,
                 priority: None,
+                force_retry: false,
             };
             let now = unix_timestamp()?;
             db::translations::delete_for_retranslation(
@@ -211,7 +212,15 @@ impl IndexingCoordinator {
             .with_context(|| {
                 format!("当前正文里找不到文本块 {block_id}，无法重新翻译（它可能已被改动）")
             })?;
-        self.retry_translation_blocks(job_id, vec![ordinal]).await
+        // force：这是用户看着这一块点下的「重新翻译」，命中缓存也要重新发给模型。
+        // 任务窗口的「重试失败块」走 `retry_translation_blocks`（不强制）——那些块本来
+        // 就没有译文，命中缓存是「别为同一块重复付费」的保护。
+        self.plan_translation_range(
+            job_id,
+            vec![ordinal],
+            TranslationRange::Retry { force: true },
+        )
+        .await
     }
 
     /// 「立即翻译本章」：把这一章的块排到最前翻完，然后回到原来的推进点继续整本。
@@ -285,12 +294,14 @@ impl IndexingCoordinator {
         job_id: &str,
         ordinals: Vec<usize>,
     ) -> Result<bool> {
-        self.plan_translation_range(job_id, ordinals, TranslationRange::Retry)
+        self.plan_translation_range(job_id, ordinals, TranslationRange::Retry { force: false })
             .await
     }
 
     /// 把一组序号收窄成一次运行，并按范围用途决定跑完之后去哪。
     ///
+    /// `range` 决定目标块命中缓存时怎么办：阅读端的「重新翻译」强制重发（用户对着
+    /// 这一块点的，译文不满意、或换了更好的模型想重做），其余入口保持缓存规则。
     /// 集合原样交给 walk，**不做前置过滤**：判定「这一块已经有译文」必须与 worker 的缓存
     /// 规则完全一致（单元内容键 + 模型 + 执行身份），而这里只有 ordinal 和译文行，凭它
     /// 判定会把阅读端其实看不到的行、或 ordinal 已经错位（块列表变过）的行当成「已有
@@ -356,6 +367,7 @@ impl IndexingCoordinator {
                 inflight: Vec::new(),
                 blocks_version: TRANSLATION_BLOCKS_VERSION,
                 priority: None,
+                force_retry: range.force_retry(),
             };
             let now = unix_timestamp()?;
             if range == TranslationRange::Chapter {
@@ -372,13 +384,14 @@ impl IndexingCoordinator {
             }
             let last = cursor.retry_ordinals.last().copied().unwrap_or(first);
             match range {
-                TranslationRange::Retry => tracing::info!(
+                TranslationRange::Retry { force } => tracing::info!(
                     target: "ngy_ai",
                     stage = "translation_retry_plan",
                     job_id = %job_id,
                     requested = cursor.retry_ordinals.len(),
                     next_ordinal = first,
                     last_ordinal = last,
+                    force,
                     "Planned a per-block translation retry"
                 ),
                 TranslationRange::Chapter => tracing::info!(
@@ -417,15 +430,28 @@ impl IndexingCoordinator {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TranslationRange {
     /// 按块重试（修失败块、阅读端逐块重翻）：停在集合之后，维持既有行为。
-    Retry,
+    ///
+    /// `force` 说命中缓存的目标块要不要重发：阅读端的「重新翻译」为 `true`（用户对着
+    /// 这一块点的，译文不满意或换了更好的模型想重做），任务窗口的「重试失败块」为
+    /// `false`（那些块本来就没有译文，缓存命中是别重复付费的保护）。
+    Retry { force: bool },
     /// 「立即翻译本章」：跑完回到借出推进点之前的位置继续整本，并把这本排到队首。
     Chapter,
 }
 
 impl TranslationRange {
+    /// 这次收窄要不要让目标块越过缓存命中。
+    fn force_retry(self) -> bool {
+        match self {
+            Self::Retry { force } => force,
+            Self::Chapter => false,
+        }
+    }
+
     fn log_event(self) -> JobLogEvent {
         match self {
-            Self::Retry => JobLogEvent::RetryRequested,
+            Self::Retry { force: false } => JobLogEvent::RetryRequested,
+            Self::Retry { force: true } => JobLogEvent::BlockRetranslateRequested,
             Self::Chapter => JobLogEvent::ChapterRequested,
         }
     }

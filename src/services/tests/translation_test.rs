@@ -916,6 +916,152 @@ fn waiting_for_a_running_translation_does_not_need_an_ambient_tokio_runtime() {
         .expect("执行器必须观察到暂停请求并落盘");
 }
 
+/// 任务正在运行时，阅读端的「重新翻译这一块」也要先等执行器把「已暂停」落盘再规划 ——
+/// 与「立即翻译本章」同一条 `pause_running_translation` 路径。
+///
+/// 现场 2026-10-15：整本翻译正在跑时点「重新翻译这一块」，规划对一条运行中的任务静默
+/// 落空（`reset_for_translation_block_retry` 拒绝 `running` 的游标），而调用方没有先暂停，
+/// 用户看到的因此是「无法重新翻译该文本块：这本书没有可重试的翻译任务」。这条用例钉住
+/// 「先暂停、后规划」：调用者仍然没有 Tokio 上下文，等待照旧落在应用 I/O runtime 上。
+#[test]
+fn retranslating_one_reader_block_waits_for_a_running_task_to_pause() {
+    let temp = tempfile::tempdir().unwrap();
+    let services =
+        AppServices::open_with_credentials(temp.path(), Arc::new(MemoryCredentialStore::default()))
+            .unwrap();
+    let runtime = services.runtime();
+
+    // 与另外两条用例同一套准备：先关掉翻译把书建出来，再打开。
+    let mut settings = services.provider_settings().unwrap();
+    settings.default_language = None;
+    block_on_without_tokio(services.configure_provider(settings, ApiKeyUpdate::Keep)).unwrap();
+    let book_id = runtime
+        .block_on(async {
+            services
+                .spawn_library(|library| {
+                    Ok(library.create_book("Running block book", "Author")?.id)
+                })
+                .await
+                .context("library test worker stopped")?
+        })
+        .unwrap();
+    let source_id = {
+        let conn = db::open_conn(services.database_path()).unwrap();
+        db::book_sources::list_for_book(&conn, &book_id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .context("the created book has no source")
+            .unwrap()
+            .id
+    };
+    let mut settings = services.provider_settings().unwrap();
+    settings.default_language = Some("zh-Hans".to_string());
+    block_on_without_tokio(services.configure_provider(settings, ApiKeyUpdate::Keep)).unwrap();
+    let job_id = format!("translation:{source_id}:zh-Hans");
+
+    // 手工把任务写成「运行中」：worker 只扫 queued，所以这条行不会被它接手（确定性），
+    // 而要测的正是「等运行中的任务落盘」那一段。
+    let cursor_json = {
+        let conn = db::open_conn(services.database_path()).unwrap();
+        let job = db::index_jobs::get(&conn, &job_id).unwrap().unwrap();
+        let mut cursor: serde_json::Value = serde_json::from_str(&job.cursor_json).unwrap();
+        cursor["blocks_version"] = serde_json::json!(1);
+        let cursor_json = serde_json::to_string(&cursor).unwrap();
+        // 先落一次「已暂停」把可能残留的暂停请求清掉（`update_state` 只在写成 paused 时
+        // 清这个标志），再写成「运行中」。
+        db::index_jobs::update_state(
+            &conn,
+            &job_id,
+            db::index_jobs::IndexJobStatus::Paused,
+            &cursor_json,
+            None,
+            1,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            db::index_jobs::update_state(
+                &conn,
+                &job_id,
+                db::index_jobs::IndexJobStatus::Running,
+                &cursor_json,
+                None,
+                1,
+                Some(1),
+                None,
+            )
+            .unwrap(),
+            1,
+            "任务必须真的处于运行中"
+        );
+        cursor_json
+    };
+
+    // 执行器在两次请求之间读到暂停请求后落盘「已暂停」；这里按同一个条件触发，不按固定
+    // 延时 —— 等待因此确定性地经过至少一个轮询。
+    let db_path = services.database_path().to_path_buf();
+    let published = services.runtime().handle().spawn_blocking({
+        let job_id = job_id.clone();
+        let cursor_json = cursor_json.clone();
+        move || -> anyhow::Result<()> {
+            loop {
+                let requested = {
+                    let conn = db::open_conn(&db_path)?;
+                    db::index_jobs::get(&conn, &job_id)?.is_some_and(|job| job.pause_requested)
+                };
+                if requested {
+                    // 落盘比「服务层发出请求」晚一点，保证服务层那次「还在运行」的检查
+                    // 确定跑过。
+                    std::thread::sleep(Duration::from_millis(30));
+                    let conn = db::open_conn(&db_path)?;
+                    db::index_jobs::update_state(
+                        &conn,
+                        &job_id,
+                        db::index_jobs::IndexJobStatus::Paused,
+                        &cursor_json,
+                        None,
+                        2,
+                        Some(1),
+                        None,
+                    )?;
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    });
+
+    // 阅读端只说得出块标识，这里用与它同一个读取路径拿到「标题 + 一段」里的段落（序号 1）。
+    let detail = block_on_without_tokio(services.background_job_translation_block_detail(
+        job_id.clone(),
+        1,
+        vec![book_id.clone()],
+    ))
+    .unwrap();
+    assert_eq!(detail.ordinal, 1);
+    block_on_without_tokio(services.retranslate_reader_translation_block(
+        book_id.clone(),
+        detail.unit_id.clone(),
+        detail.block_id.clone(),
+    ))
+    .expect("等到运行中的翻译落盘之后必须能重跑这一块");
+
+    runtime
+        .block_on(published)
+        .expect("等待暂停落盘的任务异常退出")
+        .expect("执行器必须观察到暂停请求并落盘");
+
+    let job = db::index_jobs::get(&db::open_conn(services.database_path()).unwrap(), &job_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.status, db::index_jobs::IndexJobStatus::Queued);
+    let cursor: serde_json::Value = serde_json::from_str(&job.cursor_json).unwrap();
+    assert_eq!(cursor["retry_ordinals"], serde_json::json!([1]));
+    assert_eq!(cursor["next_ordinal"], serde_json::json!(1));
+}
+
 #[test]
 fn per_book_translation_display_override_beats_the_global_preference_and_leaves_with_the_book() {
     let temp = tempfile::tempdir().unwrap();

@@ -81,6 +81,7 @@ pub(crate) fn unchanged_embedding_execution_does_not_create_or_reset_model_job()
         inflight: Vec::new(),
         blocks_version: TRANSLATION_BLOCKS_VERSION,
         priority: None,
+        force_retry: false,
     }
     .encode()
     .unwrap();
@@ -282,6 +283,7 @@ pub(crate) fn stale_embedding_generation_cannot_publish_after_endpoint_reconcile
         inflight: Vec::new(),
         blocks_version: TRANSLATION_BLOCKS_VERSION,
         priority: None,
+        force_retry: false,
     };
     db::index_jobs::update_state(
         &conn,

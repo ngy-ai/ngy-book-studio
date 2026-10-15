@@ -21,6 +21,11 @@ pub enum JobLogEvent {
     /// 原文。与 `ProtocolSkipped` 分开，是因为两者要说的话不一样 —— 一个是「模型答得
     /// 不对」，一个是「根本没答上来」，用户据此判断该换模型还是该查端点。
     ProviderSkipped,
+    /// 模型把这一块原样抄了回来（译文与原文一致）：按「还没有译文」处理 —— 命中的缓存
+    /// 不让路，walk 继续走请求路径重新发一次。这条事件因此**不进**明细的失败列表（
+    /// `BlockFailures::from_logs`）：它只说明库里那一行不算译文，紧接着的那次请求要么
+    /// 把这一块翻好，要么按 `ProtocolSkipped` / `ProviderSkipped` 落进那份列表。
+    SourceEchoed,
     /// 连续请求失败凑满阈值后的冷却（等一段时间再继续开新请求）。
     Cooldown,
     /// 静默看门狗：任务已被领取，但超过阈值没有任何新事件（进展）。
@@ -41,6 +46,8 @@ pub enum JobLogEvent {
     RetranslateRequested,
     /// 阅读窗口的「立即翻译本章」：把这一章排到最前，翻完回到原来的推进点。
     ChapterRequested,
+    /// 阅读窗口的逐块「重新翻译」：这一块命中缓存也要重新发给模型。
+    BlockRetranslateRequested,
     Paused,
     Cancelled,
     Superseded,
@@ -74,6 +81,11 @@ impl JobLogEvent {
                 "model",
                 "模型请求失败（端点或模型不可用），已跳过当前文本块并保留原文",
             ),
+            Self::SourceEchoed => (
+                Warning,
+                "model",
+                "模型把这一块的原文原样抄了回来，不算翻译；可以重新翻译或重试这一块",
+            ),
             Self::Cooldown => (
                 Warning,
                 "model",
@@ -105,6 +117,11 @@ impl JobLogEvent {
             Self::CancelRequested => (Info, "control", "已接受取消请求"),
             Self::RetranslateRequested => (Info, "control", "已清除旧译文并重排翻译任务"),
             Self::ChapterRequested => (Info, "control", "已把本章排到翻译队列最前"),
+            Self::BlockRetranslateRequested => (
+                Info,
+                "control",
+                "已接受重新翻译请求：这一块会重新发给模型（旧译文保留到新译文写入为止）",
+            ),
             Self::Paused => (Info, "run", "任务已暂停，保留执行进度"),
             Self::Cancelled => (Info, "run", "任务已取消"),
             Self::Superseded => (Warning, "identity", "任务身份已变化，停止本次执行"),
