@@ -260,6 +260,12 @@ impl AppServices {
     /// 请求暂停一个正在运行的整本翻译，并等它把「已暂停」落盘。
     ///
     /// 已经是终态或已暂停的任务什么都不做：规划路径本来就能改写它们的游标。
+    ///
+    /// 这一等必须能在没有 Tokio 上下文的调用者上跑：阅读窗口是从 GPUI 的前台执行器调用
+    /// 这个入口的（`docs/agent/code-map.md` 的约定，`services` 测试里的
+    /// `block_on_without_tokio` 复现的正是这种环境）。现场 2026-10-14：这里直接用
+    /// `tokio::time::sleep`，在 GPUI 回调里 panic（`there is no reactor running`），而 GPUI
+    /// 回调不可 unwind，整个进程随之退出 —— 等待因此派到应用 I/O runtime 自己的阻塞池上。
     async fn pause_running_translation(&self, job_id: &str) -> Result<()> {
         if self.indexing.job(job_id).await?.map(|job| job.status)
             != Some(IndexingJobStatus::Running)
@@ -268,7 +274,7 @@ impl AppServices {
         }
         self.control_background_job(job_id.to_string(), BackgroundJobAction::Pause)
             .await?;
-        let deadline = tokio::time::Instant::now() + TRANSLATION_CHAPTER_PAUSE_TIMEOUT;
+        let deadline = std::time::Instant::now() + TRANSLATION_CHAPTER_PAUSE_TIMEOUT;
         loop {
             if self.indexing.job(job_id).await?.map(|job| job.status)
                 != Some(IndexingJobStatus::Running)
@@ -276,12 +282,26 @@ impl AppServices {
                 return Ok(());
             }
             ensure!(
-                tokio::time::Instant::now() < deadline,
+                std::time::Instant::now() < deadline,
                 "整本翻译还在处理当前文本块，暂时无法把本章排到最前（可以稍后再点一次，\
                  或先到「后台任务」窗口暂停这本书的翻译）"
             );
-            tokio::time::sleep(TRANSLATION_CHAPTER_PAUSE_POLL).await;
+            self.wait_before_pause_poll().await?;
         }
+    }
+
+    /// 两次轮询之间的一次等待，落在应用 I/O runtime 的阻塞池上。
+    ///
+    /// 不能用 `tokio::time::sleep`：它要求调用方自己处在 Tokio 上下文里（没有反应堆时
+    /// panic），而这个入口的调用者是 GPUI 的前台执行器。`spawn_blocking` 只需要运行时
+    /// 句柄，等待期间也不占 GPUI 的线程。
+    async fn wait_before_pause_poll(&self) -> Result<()> {
+        self.runtime
+            .handle()
+            .spawn_blocking(|| std::thread::sleep(TRANSLATION_CHAPTER_PAUSE_POLL))
+            .await
+            .context("等待整本翻译落盘的线程异常退出")?;
+        Ok(())
     }
 
     /// One book's own translation display choice, written by the reading window.

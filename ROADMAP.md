@@ -965,3 +965,32 @@ LangGraph 依赖。CLI 课程验证与桌面接入的验证分别列出。
   共 59 项全部通过（朗读门禁从 3 项增到 7 项：落点、实测高亮颜色、视口起读、悬停可达）；把
   `visibleHost()` 临时改回「永远返回块本身」并去掉高亮的内联覆盖，朗读门禁 7 项里 6 项立刻失败。
   未做真实 Windows GUI 手工复验。
+- [x] 2026-10-15 「立即翻译本章」与它的崩溃修复（这条功能 `b6f7c36` 当时没在这里留记录，本次补上）：
+  阅读窗口把**当前这一章**排到翻译队列最前。整本翻译是一本书一条任务、游标按块顺序推进，
+  「只翻这一章」因此是把任务的推进点借给这一章的块
+  （`IndexingCoordinator::translate_translation_chapter`）：记下借出前的位置（`resume_ordinal`）、
+  把 `retry_ordinals` 收窄成这一章的块、写下游标里的 `priority` 让任务排到队列最前；这一章翻完
+  walk 回到借出位置继续整本，中间没翻的章节不会被跳过。回归：`translation_retry_test` 的
+  `translating_a_chapter_narrows_the_walk_to_that_chapter_and_borrows_its_position`（收窄范围、
+  留下借出点、写下优先级）、`translation_walk_test` 的
+  `a_chapter_jump_returns_the_cursor_to_the_borrowed_position`（翻完回到借出位置）、
+  `scheduling_test` 的 `a_prioritized_translation_job_is_listed_before_older_work`（优先级随
+  游标持久化），服务层入口那条「先暂停再规划」见 `services::tests::translation_test` 的
+  `translating_the_readers_chapter_narrows_its_task_and_prioritizes_it`。
+  现场 2026-10-14：整本翻译正在跑的时候点这个按钮，进程直接退出（`panicked at
+  src/services/translation_service.rs:283: there is no reactor running`，退出码
+  `0xc0000409` / `STATUS_STACK_BUFFER_OVERRUN`）—— 「等运行中的任务落盘」那一段用了
+  `tokio::time::sleep`，而这个入口是阅读窗口从 GPUI 的前台执行器调用的（`chapter.rs` 的
+  `cx.spawn`），那里不是 Tokio 上下文；GPUI 回调不可 unwind，一次 panic 就终止整个进程。做法：
+  这一等派到应用 I/O runtime 自己的阻塞池上（`AppServices::wait_before_pause_poll` 里的
+  `spawn_blocking`），deadline 改用 `std::time::Instant`，这个入口里不再出现 `tokio::time::*` ——
+  与 `docs/agent/code-map.md` 里「UI 可达的服务方法必须把依赖 runtime 的工作派到 `IoRuntime` 上
+  再 await」同一条约定。回归：新增
+  `services::tests::translation_test::waiting_for_a_running_translation_does_not_need_an_ambient_tokio_runtime`
+  （任务手工写成运行中，另一个线程观察到 `pause_requested` 后落盘「已暂停」，再用
+  `block_on_without_tokio` 调入口）：修之前它按同一行号 panic，修之后通过。验证：
+  `cargo fmt --all --check`、`cargo clippy --all-targets --locked`（lib 50 条既有告警，无新增）与
+  `cargo test --locked --all-targets --no-fail-fast` 全通过 —— lib 721 通过 5 忽略、产品二进制
+  356 通过 1 忽略、`openai_compatible_flow` 24、`translation_flow` 19 通过 1 忽略、`epub_flow` 6、
+  `multi_format_flow` 4、`multi_endpoint_flow` 1、`proxy_flow` 1。未做人工 GUI 验证：需要在真实
+  窗口里让整本翻译跑起来，再点一次「立即翻译本章」确认进程不再退出。
