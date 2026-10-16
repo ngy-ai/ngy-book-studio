@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use super::*;
 
 use crate::{
-    ai::translation::StoredTranslation,
+    ai::translation::{StoredTranslation, normalize_source_text},
     annotations::{
         Annotation, MAX_ANNOTATION_QUOTE_BYTES, TextAnchor, compact_text, validate_anchor,
         validate_comment,
@@ -40,6 +40,11 @@ pub(crate) struct ShareApplyRequest<'a> {
     pub(crate) units: &'a [ShareUnitTarget],
     /// Reader body text per unit ordinal, present for reflowable chapters.
     pub(crate) unit_texts: &'a HashMap<usize, String>,
+    /// The receiving document's own translation-block text per unit ordinal, in
+    /// exactly the numbering its translation job derives (EPUB sources count
+    /// the reading chapters, every other source its canonical HTML). Present
+    /// for units an incoming译文 references.
+    pub(crate) unit_blocks: &'a HashMap<usize, Vec<String>>,
     pub(crate) notes: &'a [SharedNote],
     pub(crate) chats: &'a [SharedChatThread],
     pub(crate) translations: &'a [SharedTranslation],
@@ -475,6 +480,18 @@ fn insert_shared_translation(
         || translation.translated_text.len() > crate::share::MAX_SHARE_TRANSLATION_BYTES
         || translation.target_language.trim().is_empty()
     {
+        return Ok(false);
+    }
+    // The row may only land on the block it describes: the receiving unit's own
+    // block at that position must still carry the shared source text. Storing it
+    // anywhere else would overwrite the receiver's own译文 of a different
+    // paragraph (the scope key is book + unit + block + language) and leave a row
+    // the reading window's text pairing can never display.
+    let source_text = normalize_source_text(&translation.source_text);
+    let Some(blocks) = request.unit_blocks.get(&translation.unit.ordinal) else {
+        return Ok(false);
+    };
+    if source_text.is_empty() || blocks.get(translation.block_index) != Some(&source_text) {
         return Ok(false);
     }
     let model = match request.stamp {

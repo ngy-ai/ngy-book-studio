@@ -110,7 +110,10 @@ pub struct SharedChatThread {
 /// `block_index` is the sender's position of the block inside its unit
 /// (`<unit>::h<index>`). The receiving side restores that shape against its own
 /// unit so the reading window can still address the block; the text itself is
-/// matched by `source_text`, which is what the reader pairs译文 with.
+/// matched by `source_text`, which is what the reader pairs译文 with. A row is
+/// only accepted where the receiving unit's own block at that position still
+/// carries `source_text` — anything else would overwrite the receiver's译文 of
+/// a different paragraph and could never be displayed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SharedTranslation {

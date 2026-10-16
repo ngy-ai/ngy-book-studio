@@ -120,7 +120,10 @@
   引用只在复用路上保留发送方的块级 `locator_json`（`preserve_locators`，经
   `validate_current_chat_citation` 逐条复验），否则重建为章级 `DocumentLocator`；
   两条路都丢掉发送方的 `search_chunk_id`（接收方索引是本地派生的），译文按接收方
-  `{unit}::h{index}` 形状重挂；对不上的条目逐条跳过并在结果里计数，不按引文搜索重定位。
+  `{unit}::h{index}` 形状重挂，且只在接收方该位置的文本块仍携带同一 `source_text` 时才
+  写入（块文本按接收方翻译任务的同一编号方式派生：EPUB 来源按阅读章节，其它来源按规范
+  HTML），否则会用别的段落盖掉接收方自己的译文并留下永远显示不出的行；对不上的条目
+  逐条跳过并在结果里计数，不按引文搜索重定位。
   **章节数不一致（`manifest.book.units` ≠ 本地 `document.units.len()`）时整批放弃分区**，
   只把书写进库，并在 `ShareImportOutcome::sections_note` 里说明——序号会指向别的章节；
   这条闸门对复用路和落投影路都生效（复用命中的书可能被本地编辑过）。

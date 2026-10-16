@@ -366,7 +366,7 @@ fn sender_with_translations(root: &Path, languages: &[&str]) -> PathBuf {
             &NewTranslation {
                 book_id: book.id.clone(),
                 content_unit_id: unit_id.clone(),
-                block_id: format!("{unit_id}::h0"),
+                block_id: format!("{unit_id}::h1"),
                 ordinal: 0,
                 document_revision,
                 unit_revision,
@@ -448,4 +448,54 @@ fn shared_translations_adopt_the_receiving_language_only_when_the_package_has_on
         vec![("zh-Hans", 1), ("ja", 1), ("en", 0)],
         "each shared language stays its own row"
     );
+}
+
+#[test]
+fn a_shared_translation_never_lands_on_a_block_with_different_text() {
+    let temp = tempfile::tempdir().unwrap();
+    let target = sender_with_translations(&temp.path().join("sender"), &["zh-Hans"]);
+    let bytes = std::fs::read(&target).unwrap();
+
+    let mut receiver = LibraryStore::load_from(temp.path().join("receiver")).unwrap();
+    let first = receiver.import_share_package(&target, None, None).unwrap();
+    assert_eq!(first.translations_imported, 1);
+
+    let document = receiver.document(&first.record.id).unwrap();
+    let unit_id = document.units[0].id.clone();
+    let conn = crate::db::open_conn(&receiver.database_path()).unwrap();
+    let before = crate::db::translations::list_for_unit(&conn, &unit_id, "zh-Hans").unwrap();
+    assert_eq!(before.len(), 1);
+
+    // The receiving block at `h1` carries "开始写作……". A row aimed at another
+    // position, a row carrying another text, and a row past the chapter's last
+    // block all describe a paragraph this library does not have; none of them
+    // may be imported as current, and none may displace the row already here.
+    let variants = [
+        (0usize, "开始写作……"),
+        (1usize, "完全不同的一段文字"),
+        (99usize, "开始写作……"),
+    ];
+    for (block_index, source_text) in variants {
+        let mut package = crate::share::read_share_package(&bytes).unwrap();
+        package.translations[0].block_index = block_index;
+        package.translations[0].source_text = source_text.to_string();
+        let outcome = receiver
+            .import_share_package_contents(package, None, None)
+            .unwrap();
+        assert_eq!(
+            (outcome.translations_imported, outcome.translations_skipped),
+            (0, 1),
+            "block_index {block_index} with source {source_text:?} must be skipped"
+        );
+    }
+
+    let after = crate::db::translations::list_for_unit(&conn, &unit_id, "zh-Hans").unwrap();
+    assert_eq!(
+        after.len(),
+        1,
+        "a mismatched row must not displace the receiver's own译文"
+    );
+    assert_eq!(after[0].block_id, before[0].block_id);
+    assert_eq!(after[0].source_text, before[0].source_text);
+    assert_eq!(after[0].translated_text, before[0].translated_text);
 }

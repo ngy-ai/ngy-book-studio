@@ -325,6 +325,7 @@ impl LibraryStore {
             })
             .collect::<Vec<_>>();
         let unit_texts = self.shared_unit_texts(record, notes, &document)?;
+        let unit_blocks = self.shared_unit_blocks(record, translations, &document)?;
         let mut conn = db::open_conn(&self.db_path)?;
         let report = db::transactions::apply_shared_sections(
             &mut conn,
@@ -333,6 +334,7 @@ impl LibraryStore {
                 document_revision: record.revision,
                 units: &units,
                 unit_texts: &unit_texts,
+                unit_blocks: &unit_blocks,
                 notes,
                 chats,
                 translations,
@@ -379,6 +381,58 @@ impl LibraryStore {
             texts.insert(ordinal, crate::annotations::reader_body_text(html));
         }
         Ok(texts)
+    }
+
+    /// Derives the receiving document's own translation-block texts, numbered
+    /// exactly as its translation job numbers them: an EPUB source counts the
+    /// reading chapters, every other source its canonical HTML. The importer
+    /// accepts a shared译文 only where the block at its recorded position still
+    /// carries its source text, so this must be the same derivation the block
+    /// ids on this side describe.
+    fn shared_unit_blocks(
+        &self,
+        record: &BookRecord,
+        translations: &[SharedTranslation],
+        document: &crate::document::BookDocument,
+    ) -> Result<HashMap<usize, Vec<String>>> {
+        let wanted = translations
+            .iter()
+            .filter(|translation| document.units.get(translation.unit.ordinal).is_some())
+            .map(|translation| translation.unit.ordinal)
+            .collect::<HashSet<_>>();
+        let mut blocks = HashMap::with_capacity(wanted.len());
+        if wanted.is_empty() {
+            return Ok(blocks);
+        }
+        if record.format == "epub" {
+            let opened =
+                crate::reader::OpenedBook::open_bytes(self.reader_epub_bytes(&record.id)?)?;
+            ensure!(
+                opened.spine.len() == document.units.len(),
+                "阅读章节与图书结构不一致，无法还原分享译文"
+            );
+            for ordinal in wanted {
+                let href = &opened.spine[ordinal].href;
+                let response = crate::reader::load_resource(&opened.epub, href)?;
+                let html =
+                    std::str::from_utf8(&response.bytes).context("无法解码分享译文所在章节")?;
+                let texts = crate::markup::translation_blocks_from_document_html(html)?
+                    .into_iter()
+                    .map(|block| block.text)
+                    .collect();
+                blocks.insert(ordinal, texts);
+            }
+        } else {
+            for ordinal in wanted {
+                let source = crate::markup::serialize_source(&document.units[ordinal].document)?;
+                let texts = crate::markup::translation_blocks_from_html(&source)?
+                    .into_iter()
+                    .map(|block| block.text)
+                    .collect();
+                blocks.insert(ordinal, texts);
+            }
+        }
+        Ok(blocks)
     }
 }
 
