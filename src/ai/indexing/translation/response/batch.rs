@@ -381,7 +381,29 @@ async fn send_batch_round(
         read_translation_stream(inner, job, &blocks[0].scope, read, stream).await
     }
     .instrument(span.clone())
-    .await?;
+    .await;
+    let response = match response {
+        Ok(response) => response,
+        // 端点收流之前直接拒绝，且原因是超出上下文长度（HTTP 400 的 context-length
+        // 封套）：这是**容量**问题，不是端点坏了 —— 与 `batch_verdict` 里流内报同一
+        // 理由的处理同一条规则：拆半重发，递归到一块时交给单块路径。整批按 `Err` 返回
+        // 的话，walk 会把这一批的每一块都按请求级失败逐块跳过：小批本来能翻完的块白白
+        // 丢译文。
+        Err(error) if classify_error(&error) == JobLogErrorKind::ContextWindowExceeded => {
+            tracing::warn!(
+                target: "ngy_ai",
+                parent: &span,
+                stage = "translation_batch_rejected",
+                reason = "context_window_exceeded",
+                batch_blocks = blocks.len(),
+                "Translation batch request was rejected for context length; splitting it in half"
+            );
+            return Ok(BlockStep::Value(BatchRound::Split(
+                "context_window_exceeded",
+            )));
+        }
+        Err(error) => return Err(error),
+    };
     let read = match response {
         BlockStep::Value(read) => read,
         BlockStep::Stopped(stop) => return Ok(BlockStep::Stopped(stop)),
