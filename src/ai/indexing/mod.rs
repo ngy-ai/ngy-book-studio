@@ -115,6 +115,12 @@ const MAX_TRANSLATION_REQUEST_BYTES: usize = 64 * 1024;
 
 const MAX_TRANSLATION_RESPONSE_BYTES: usize = 64 * 1024;
 
+/// 一次**批请求**的响应字节上限。单块的上限不变；批按它最多能装的块数放宽，但仍然留
+/// 天花板：8 个块各自接近单块上限时，整批响应可以是几百 KiB，收流不能没有上界。
+/// 超过它按「这一批太大」处理 —— 拆半重发，越小的批越有机会装下。
+const MAX_TRANSLATION_BATCH_RESPONSE_BYTES: usize =
+    MAX_TRANSLATION_RESPONSE_BYTES * crate::ai::translation::MAX_TRANSLATION_BATCH_BLOCKS;
+
 const MAX_TRANSLATION_BLOCKS: usize = 500_000;
 
 /// Display-only preview length of one block in the task window.

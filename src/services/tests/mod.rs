@@ -133,6 +133,7 @@ fn endpoint_fixture(id: &str, port: u16) -> EndpointSettings {
         confirmed_remote_endpoint: String::new(),
         request_timeout_secs: 30,
         requests_per_minute: 0,
+        blocks_per_request: 0,
     }
 }
 

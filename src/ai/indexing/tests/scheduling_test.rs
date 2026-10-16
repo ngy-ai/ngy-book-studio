@@ -79,6 +79,7 @@ pub(crate) fn a_prioritized_translation_job_is_listed_before_older_work() {
             "chat-test".to_string(),
             "translation-v1:chat-test".to_string(),
             TranslationGenerationSettings::default(),
+            NO_BATCHING,
             Some("zh-Hans".to_string()),
             // 自动运行打开，新建的翻译任务才是 queued —— 队列里才有它可插队。
             true,

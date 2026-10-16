@@ -6,8 +6,15 @@
 
 - `src/ai/`：AI 后端包。`mod.rs` 是 OpenAI-compatible 模型访问，`agent.rs`/`agent_runtime.rs`/
   `agent_chat.rs`/`chat.rs` 是只读问答 Agent 与会话持久化，`search.rs`/`indexing/` 是检索与
-  索引/翻译后台任务，`translation.rs`/`credentials.rs`/`web_search.rs`/`ai_diagnostics.rs`/
+  索引/翻译后台任务，`translation/`/`credentials.rs`/`web_search.rs`/`ai_diagnostics.rs`/
   `job_diagnostics.rs` 是分段协议、端点密钥、联网补充与诊断。
+- `src/ai/translation/`：分段协议按职责分文件，不要重新堆回一个文件：`protocol.rs`（格式说明与
+  两个请求体构造：单块 `request_input`、批 `batch_request_input`）、`decode.rs`（找答案：围栏/
+  思考块/裸片段列表）、`parse.rs`（`parse_response`、`restore_segments` 与字符分类）、
+  `repair.rs`（一次结构标点归一）、`error.rs`（`ResponseError` 分类）、`segment.rs`（落库形状）、
+  `source.rs`（`TranslationSource` 与 `TranslationContext`）、`batch.rs`（批信封、打包预算与
+  逐块解析）。`tests/` 按主题分文件（`mod.rs` 只放共用夹具与包装用例，其余是 `repair_test`、
+  `segment_test`、`batch_test`），子模块用 `use super::*;`。
 - `src/ai/rate_limit.rs`：按 Endpoint 的每分钟请求数上限（RPM）。`EndpointRateLimits` 是
   `AppServices` 生命周期的注册表，键为规范化后的 `base_url`，因此同一台服务器上的问答、
   翻译、向量、视觉与模型检测共用同一份额度（provider 会随保存设置整批重建，额度不能挂在
@@ -62,13 +69,16 @@
   并发上限与间隔由 AI 设置的「后台任务」窗口经
   `IndexingCoordinator::configure_scheduling` 实时发布，写坏的值按范围钳制。
   「任务间隔」有两个作用点：① 任务粒度 —— `worker_loop` 在每个任务提交后休眠一次（视觉与
-  向量任务靠它节流）；② **请求粒度** —— 整本翻译的每个并发槽位在自己的 `translate_block`
-  收尾后、接下块之前再休眠一次（`pause_after_translation_request`，停止请求不休眠）。
+  向量任务靠它节流）；② **请求粒度** —— 整本翻译的每个并发槽位在自己的 `translate_block_batch`
+  收尾后、接下批之前再休眠一次（`pause_after_translation_request`，停止请求不休眠；一发批请求
+  里的多块共用这一次休息，缓存命中与「不必处理」的块不发请求也就不休眠）。
   只有②能约束一本书内部的请求频率：一整本书是一个任务，①对它等于不存在（现场 2026-09-20：
   本机模型连续请求把 GPU 吃到满载、桌面黑屏，用户把间隔调到 5000 毫秒也不起作用）。
-  同一个「任务并发」既是任务上限，也是**单个整本翻译的块窗口上限**：一轮里最多同时开
-  `concurrency` 个文本块请求（`walk_translation_blocks` 的窗口，每轮重读设置，所以运行中
-  调大只让 walk 走得更前、不打断任何在飞请求），因此一本翻译自己也会出现多个「处理中」。
+  同一个「任务并发」既是任务上限，也是**单个整本翻译的请求窗口上限**：一轮里最多同时开
+  `concurrency` 发请求，每发带走几块由翻译端点的「每请求文本块数」决定（攒批在 `walk.rs`、
+  打包预算在 `batch.rs`），所以在飞的文本块最多是「任务并发 × 每请求块数」
+  （`walk_translation_blocks` 的窗口，每轮重读设置，所以运行中调大只让 walk 走得更前、不打断
+  任何在飞请求），因此一本翻译自己也会出现多个「处理中」。
   `ai/indexing/translation/` 另实现整本图书翻译任务
   `kind="translation"`：任务标识为 `translation:<source_id>:<target_language>`，游标用
   `next_ordinal` 记录「第一块尚未提交的文本块」，并按序调用**翻译模型** `chat_stream` 写入
@@ -114,7 +124,7 @@
   原生 EPUB 必须从当前 source blob 用 `OpenedBook`/`load_resource` 提取实际阅读章节的
   body；校验 spine 数量、单元顺序与归属。不能用导入后的 AST 代替原生章节，它可能合并
   链接、span 或列表文字叶节点。其它格式使用规范化 HTML；解析在后台执行。
-  `src/ai/translation.rs` 定义只含文字的分段协议：每次提供整段上下文与整数 ID，模型必须
+  `src/ai/translation/` 定义只含文字的分段协议：每次提供整段上下文与整数 ID，模型必须
   返回完整、唯一的 ID 集合；按原文顺序回排并恢复片段边界空白，不能用模型 HTML 替换正文。
   每个请求的用户 JSON 还带 `book`（书名）与 `chapter`（章节标题）两个语境字段，供模型消歧：
   它们从冻结的文本块取（`TranslationBlock.book_title` / `unit_title`，经
@@ -166,6 +176,31 @@
   分段协议校验失败时使用冻结的原始输入和服务额外纠正一次，不回传模型的错误输出，
   不把纯文本猜分段，也不为 HTTP、流中断这类 provider 失败做协议纠正。重试前后检查任务
   控制与身份，失败沿用本执行游标，不能读取新任务游标后将新任务标为失败。
+  **批信封（2026-10-16 起，`src/ai/translation/batch.rs`）**：多个文本块可以装进一次请求，
+  但批只是**传输信封**：`batch_request_input` 里每个块带自己的批内 `id`、`source` 与
+  `segments`（块负载由 `TranslationSource::payload_fields` 生成，与单块 `request_input`
+  里的那一份逐字节相同），`book`/`chapter` 取批内第一块且只允许同一章的块进一批；回复按块还原成
+  `StoredTranslation`，缓存键、重试单位与游标仍按块，所以 `EXECUTION_IDENTITY_PROTOCOL`
+  不升版、已存译文照旧命中。打包同时受三个上限约束（`TranslationBatchBudget` /
+  `TranslationBatchPacker`）：输出上限的 `TRANSLATION_BATCH_OUTPUT_SHARE_PERCENT`＝60%、
+  块数与 `MAX_TRANSLATION_BATCH_REQUEST_BYTES`＝256 KiB；**空批永远收下第一块**
+  （「装不下也要翻」），`estimate_batch_block` 用源文字符数当输出 token 上界（宁保守，顶到
+  输出上限等于白花一次请求）。端点策略 `batch_block_limit`：端点的「每请求文本块数」
+  `0`＝自动（本机＝1、远程＝`MAX_TRANSLATION_BATCH_BLOCKS`）、`1`＝关闭、`>1` 为上限并钳到
+  `MAX_TRANSLATION_BATCH_BLOCKS_SETTING`。`parse_batch_response` 把**信封**错误
+  （`batch_block_count_mismatch`、`batch_block_ids`，以及不是批形状时的 `invalid_schema`、
+  `ambiguous_json`、`incomplete_json`）整批退回单块路径由调用方拆半重发，**块自己的**片段形状
+  错误（`segment_count_mismatch`、`keep_with_text` 等）只拒绝那一块、同批其它块照常落库；
+  批这一层不重试、不纠正，宽容解码只做单块路径上那几件必要的事。**调用方是 walk**
+  （2026-10-16 起）：`TranslationServices::batch_blocks`（端点「每请求文本块数」的解析结果，
+  见 `EndpointSettings::resolved_blocks_per_request`）大于 1 时 `walk.rs` 按同一个内容单元
+  攒批、受上面三个上限约束，窗口仍按**请求**计（同时在飞的块最多「任务并发 × 每请求块数」）；
+  批里每一块照旧落回它自己的块号，拆半重发、块级回退单块与整发失败逐块跳过都由
+  `response/batch.rs` 内部完成，`TranslationRunStats::batched_requests`/`batched_blocks` 只记
+  walk 打包的那几发（拆半重发的几发不进这项读数）。回归用例：协议形状在
+  `ai::translation::tests::batch_test`，调用方语义在 `ai::indexing::tests::translation_batch_test`
+  （按批成包与逐块归位、坏块回退单块、坏批拆半、截断一直拆到单块、整发失败逐块跳过、
+  跨章不混批、收窄重试只发目标块）。
   **块级重发（2026-09-15 起，`TRANSLATION_BLOCK_RETRIES = 5`）**：一个文本块的一轮失败后，
   整块按同一份冻结输入重发，最多 5 次，所以一个块最多 6 轮（一轮 = 两次严格尝试 + 一次协议
   纠正）。重发轮的第一发带着上一轮的失败分类，因此重发不是逐字相同的请求；每轮开始时先在

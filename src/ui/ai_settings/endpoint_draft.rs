@@ -11,6 +11,7 @@ use ngy_book_studio::{
         DEFAULT_AI_REQUEST_TIMEOUT_SECS, DEFAULT_ENDPOINT_RPM, DEFAULT_OLLAMA_OPENAI_BASE_URL,
         MAX_AI_REQUEST_TIMEOUT_SECS, MAX_ENDPOINT_RPM, MIN_AI_REQUEST_TIMEOUT_SECS, ModelInfo,
         normalize_provider_base_url,
+        translation::{MAX_TRANSLATION_BATCH_BLOCKS, MAX_TRANSLATION_BATCH_BLOCKS_SETTING},
     },
     services::{ApiKeyUpdate, EndpointSettings, ModelRole},
 };
@@ -22,6 +23,7 @@ pub(crate) struct EndpointDraft {
     pub(crate) base_url_input: Entity<InputState>,
     pub(crate) request_timeout_input: Entity<InputState>,
     pub(crate) requests_per_minute_input: Entity<InputState>,
+    pub(crate) blocks_per_request_input: Entity<InputState>,
     pub(crate) api_key_input: Entity<InputState>,
     pub(crate) remote_content_confirmed: bool,
     pub(crate) allow_insecure_remote_http: bool,
@@ -52,6 +54,9 @@ impl EndpointDraft {
             )?,
             requests_per_minute: parse_requests_per_minute(
                 self.requests_per_minute_input.read(cx).value().as_ref(),
+            )?,
+            blocks_per_request: parse_blocks_per_request(
+                self.blocks_per_request_input.read(cx).value().as_ref(),
             )?,
             remote_content_confirmed: self.remote_content_confirmed,
             allow_insecure_remote_http: self.allow_insecure_remote_http,
@@ -96,6 +101,19 @@ pub(crate) fn new_endpoint_draft<V: EndpointBackedWindow>(
             .placeholder("留空＝自动：本机不限，远程 10")
             .validate(|value, _| value.chars().all(|character| character.is_ascii_digit()))
     });
+    let blocks_per_request_input = cx.new(|cx| {
+        // `0` 是「自动」：与 RPM 一样显示成留空，省得把「自动」看成一个固定的 0。
+        let configured = match endpoint.blocks_per_request {
+            0 => String::new(),
+            blocks => blocks.to_string(),
+        };
+        InputState::new(window, cx)
+            .default_value(configured)
+            .placeholder(format!(
+                "留空＝自动：本机一次一块，远程最多 {MAX_TRANSLATION_BATCH_BLOCKS} 块"
+            ))
+            .validate(|value, _| value.chars().all(|character| character.is_ascii_digit()))
+    });
     let endpoint_id = endpoint.id.clone();
     let url_subscription = cx.subscribe_in(
         &base_url_input,
@@ -137,6 +155,7 @@ pub(crate) fn new_endpoint_draft<V: EndpointBackedWindow>(
         base_url_input,
         request_timeout_input,
         requests_per_minute_input,
+        blocks_per_request_input,
         api_key_input,
         remote_content_confirmed: endpoint.remote_content_confirmed,
         allow_insecure_remote_http: endpoint.allow_insecure_remote_http,
@@ -275,6 +294,10 @@ fn endpoint_matches_draft(draft: &EndpointDraft, saved: &EndpointSettings, cx: &
         // 写法不同就把草稿连同检测结果一起重建。
         && parse_requests_per_minute(draft.requests_per_minute_input.read(cx).value().as_ref())
             .is_ok_and(|requests| requests == saved.requests_per_minute)
+        && parse_blocks_per_request(
+            draft.blocks_per_request_input.read(cx).value().as_ref(),
+        )
+        .is_ok_and(|blocks| blocks == saved.blocks_per_request)
         && draft.remote_content_confirmed == saved.remote_content_confirmed
         && draft.allow_insecure_remote_http == saved.allow_insecure_remote_http
         && draft.confirmed_remote_endpoint == saved.confirmed_remote_endpoint
@@ -516,6 +539,26 @@ pub(crate) fn parse_requests_per_minute(value: &str) -> Result<u32> {
     Ok(requests)
 }
 
+/// 「每请求文本块数」：留空或 `0` 都表示「自动」—— 由地址决定（本机一次一块、远程
+/// [`MAX_TRANSLATION_BATCH_BLOCKS`]）；`1` 是显式关闭打包，2–[`MAX_TRANSLATION_BATCH_BLOCKS_SETTING`]
+/// 是固定上限。
+pub(crate) fn parse_blocks_per_request(value: &str) -> Result<u32> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(0);
+    }
+    let blocks = value.parse::<u32>().map_err(|_| {
+        anyhow::anyhow!(
+            "每请求文本块数必须是 0 到 {MAX_TRANSLATION_BATCH_BLOCKS_SETTING} 之间的整数；留空或 0 表示自动（本机一次一块、远程最多 {MAX_TRANSLATION_BATCH_BLOCKS} 块）"
+        )
+    })?;
+    anyhow::ensure!(
+        blocks <= MAX_TRANSLATION_BATCH_BLOCKS_SETTING,
+        "每请求文本块数必须是 0 到 {MAX_TRANSLATION_BATCH_BLOCKS_SETTING} 之间的整数；留空或 0 表示自动（本机一次一块、远程最多 {MAX_TRANSLATION_BATCH_BLOCKS} 块）"
+    );
+    Ok(blocks)
+}
+
 pub(crate) fn canonical_endpoint(endpoint: &str) -> Option<String> {
     normalize_provider_base_url(endpoint.trim())
         .ok()
@@ -587,6 +630,27 @@ mod tests {
         for invalid in ["-1", "1.5", "ten", "4294967296", above_max.as_str()] {
             assert!(
                 parse_requests_per_minute(invalid).is_err(),
+                "{invalid:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn blocks_per_request_is_optional_and_bounded() {
+        // 留空与 `0` 都是「自动」（具体数字由地址决定）；1 是显式关掉打包。
+        assert_eq!(parse_blocks_per_request("").unwrap(), 0);
+        assert_eq!(parse_blocks_per_request("   ").unwrap(), 0);
+        assert_eq!(parse_blocks_per_request("0").unwrap(), 0);
+        assert_eq!(parse_blocks_per_request("1").unwrap(), 1);
+        assert_eq!(parse_blocks_per_request(" 8 ").unwrap(), 8);
+        assert_eq!(
+            parse_blocks_per_request(&MAX_TRANSLATION_BATCH_BLOCKS_SETTING.to_string()).unwrap(),
+            MAX_TRANSLATION_BATCH_BLOCKS_SETTING
+        );
+        let above_max = (u64::from(MAX_TRANSLATION_BATCH_BLOCKS_SETTING) + 1).to_string();
+        for invalid in ["-1", "1.5", "eight", above_max.as_str()] {
+            assert!(
+                parse_blocks_per_request(invalid).is_err(),
                 "{invalid:?} should be rejected"
             );
         }

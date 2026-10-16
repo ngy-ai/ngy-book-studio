@@ -45,6 +45,13 @@ pub(crate) struct TranslationServices {
     /// 翻译请求的生成参数（温度、采样、输出上限…）。它随每次请求发送，但**不进执行
     /// 身份**：调它不会让已翻好的译文失效，也不会让任务重跑。
     pub(crate) generation: TranslationGenerationSettings,
+    /// 这个端点「每请求文本块数」的**解析结果**：`1` 表示一块一请求（本机端点的自动
+    /// 档，或用户显式关掉），`> 1` 表示一次请求最多带走这么多块。它随每次装配重新
+    /// 解析（`batch_block_limit`），所以改设置、换端点都即时生效，且**不进执行身份**：
+    /// 打包方式不改变译文内容与落库形状，已翻好的块不会因此失效。
+    ///
+    /// 它必须始终是一个合法值：装配方没有可用端点配置时给 `1`（一块一请求 = 老行为）。
+    pub(crate) batch_blocks: usize,
     pub(crate) target_language: Option<String>,
     pub(crate) auto_run: bool,
 }

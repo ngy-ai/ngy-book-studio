@@ -101,6 +101,7 @@ impl AppServices {
             ai.settings.translation_model.clone(),
             translation_execution_identity(&ai.settings)?,
             ai.settings.translation_generation.clone(),
+            ai.settings.resolved_translation_blocks_per_request()?,
             ai.settings.default_language.clone(),
             ai.settings.auto_run_background_jobs,
         ))?;

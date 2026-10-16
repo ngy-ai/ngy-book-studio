@@ -240,4 +240,9 @@ pub(crate) struct TranslationRunStats {
     pub(crate) fragment_fallback_requests: usize,
     /// 真正等过的冷却次数（书末没有新请求要发时那次不算）。
     pub(crate) cooldowns: usize,
+    /// 带走了多于一个文本块的请求数（端点的「每请求文本块数」大于 1 时才可能非零）。
+    pub(crate) batched_requests: usize,
+    /// 这些批量请求一共带走了多少块。与 [`Self::batched_requests`] 一起给出「省了多少
+    /// 发请求」的读数：单块请求数 = 总请求数 - `batched_requests`。
+    pub(crate) batched_blocks: usize,
 }

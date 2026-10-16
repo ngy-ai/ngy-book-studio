@@ -2,6 +2,10 @@
 
 use super::*;
 
+use crate::ai::translation::{
+    TranslationBatchBudget, TranslationBatchPacker, estimate_batch_block,
+};
+
 /// Walks the blocks of one whole-book translation with up to `任务并发` requests
 /// open at the same time.
 ///
@@ -93,8 +97,7 @@ pub(crate) async fn walk_translation_blocks(
     // is either finished (`resolved`) or waiting on a request (`in_flight`).
     let mut frontier = run.cursor.next_ordinal;
     let mut resolved: BTreeMap<usize, BlockSlot> = BTreeMap::new();
-    let mut in_flight: FuturesUnordered<BoxFuture<'_, (usize, Result<BlockWalk>)>> =
-        FuturesUnordered::new();
+    let mut in_flight: FuturesUnordered<TranslationRequestFuture<'_>> = FuturesUnordered::new();
     // A block the model never answered in the required shape — or whose request
     // failed outright — is left untranslated and the run continues: one
     // pathological block must not block a whole book, and neither must any number
@@ -210,86 +213,146 @@ pub(crate) async fn walk_translation_blocks(
         // 2) Fill the window. The configured concurrency is re-read every round, so
         //    a saved change applies to a run that is already going — raising it does
         //    not interrupt anything, it only lets the walk run further ahead.
+        //
+        //    窗口按**请求**计：一轮里最多同时打开「任务并发」个请求。端点的「每请求
+        //    文本块数」（`request_services.batch_blocks`）大于 1 时，同一个请求可以带走
+        //    一批块（`TranslationBatchPacker` 的三个上限：输出预算、块数、请求体字节），
+        //    所以一轮里同时打开的文本块最多是「并发 × 每请求块数」—— 任务窗口的
+        //    「处理中」列的是块，请求数是另一件事。
         let window = inner.scheduling().concurrency.max(1);
-        while in_flight.len() + resolved.len() < window && frontier < total {
-            let ordinal = frontier;
-            // The control check, the decision and the cursor write share one
-            // transition: releasing the lock in between would let a settings
-            // change (for example a per-block retry that resets the task) install
-            // a new cursor, only for this round to overwrite it with the old one.
-            {
-                let _transition = inner.transitions.lock().await;
-                if let Some(outcome) = requested_outcome(inner, job, &run.cursor).await? {
-                    return run.interrupt(inner, job, outcome).await;
-                }
-                if !source_is_current(inner, job, revision).await? {
-                    let outcome = run.stopped(StopRequest::SourceChanged);
-                    return run.interrupt(inner, job, outcome).await;
-                }
-                match plan_translation_block(
-                    inner,
-                    job,
-                    &book_id,
-                    translation,
-                    target_language,
-                    &blocks,
-                    ordinal,
-                    revision,
-                    &retry_targets,
-                    retry_last,
-                    run.cursor.force_retry,
-                    &mut unit_cache,
-                    stats,
-                )
-                .await?
-                {
-                    // Nothing to send and nothing to publish: outside the retried set.
-                    BlockPlan::Pass | BlockPlan::NoSegments => {
-                        resolved.insert(ordinal, BlockSlot::Pass);
-                    }
-                    BlockPlan::Cached(stored) => {
-                        resolved.insert(ordinal, BlockSlot::Cached(*stored));
-                    }
-                    // 重试范围之外还没有译文的块：不发请求，也绝不提交。停止打开
-                    // 窗口，把已经解析出来的槽位提交完之后收尾。
-                    BlockPlan::Untouched => {
-                        retry_stopped = true;
-                        break;
-                    }
-                    BlockPlan::Request { source, context } => {
-                        // The window is part of the durable cursor: the task window
-                        // reads it as 「处理中」, so it is published before the request
-                        // goes out.
-                        run.cursor.open_inflight(ordinal);
-                        run.persist(inner, job).await?;
-                        let scope = run.scope(ordinal);
-                        let inner = Arc::clone(inner);
-                        let services = request_services.clone();
-                        let source_language = source_language.as_deref();
-                        in_flight.push(
-                            async move {
-                                let walk = translate_block(
-                                    &inner,
-                                    job,
-                                    &scope,
-                                    &services,
-                                    target_language,
-                                    source_language,
-                                    source,
-                                    context,
-                                )
-                                .await;
-                                // 这一发收尾后才轮到本槽位休息，所以休眠永远发生在请求
-                                // 之后，不会挤占模型的响应时间。
-                                pause_after_translation_request(&inner, &walk).await;
-                                (ordinal, walk)
+        let batch_blocks = request_services.batch_blocks.max(1);
+        let batch_budget = TranslationBatchBudget::new(
+            request_services.generation.max_output_tokens,
+            batch_blocks,
+        );
+        // 预算装不下、留给下一批的那一块。它的计划（含 `ItemStarted` 读数与
+        // `translation_block_start` 日志）已经做过了，重做会重复记账，所以连它的冻结
+        // 输入一起带过去，下一批直接用。
+        let mut carried: Option<&TranslationBlock> = None;
+        'window: while in_flight.len() + resolved.len() < window && frontier < total {
+            // 攒一批：一个请求最多装「每请求文本块数」块，只装同一个内容单元的块，
+            // 装到预算上限为止。缓存命中与「不必处理」的块不进批，也不打断这一批。
+            let mut pending: Vec<TranslationBatchBlock<'_>> = Vec::new();
+            let mut packer = TranslationBatchPacker::new(batch_budget);
+            loop {
+                // 这一块：通常现规划（缓存命中、跳过、重试范围之外都在这里定），
+                // 预算或单元拒收过的那一块直接复用上一次的计划。
+                let block = match carried.take() {
+                    Some(block) => block,
+                    None => {
+                        if frontier >= total {
+                            break;
+                        }
+                        let ordinal = frontier;
+                        // The control check, the decision and the cursor write share one
+                        // transition: releasing the lock in between would let a settings
+                        // change (for example a per-block retry that resets the task)
+                        // install a new cursor, only for this round to overwrite it with
+                        // the old one.
+                        let _transition = inner.transitions.lock().await;
+                        if let Some(outcome) = requested_outcome(inner, job, &run.cursor).await? {
+                            return run.interrupt(inner, job, outcome).await;
+                        }
+                        if !source_is_current(inner, job, revision).await? {
+                            let outcome = run.stopped(StopRequest::SourceChanged);
+                            return run.interrupt(inner, job, outcome).await;
+                        }
+                        match plan_translation_block(
+                            inner,
+                            job,
+                            &book_id,
+                            translation,
+                            target_language,
+                            &blocks,
+                            ordinal,
+                            revision,
+                            &retry_targets,
+                            retry_last,
+                            run.cursor.force_retry,
+                            &mut unit_cache,
+                            stats,
+                        )
+                        .await?
+                        {
+                            // Nothing to send and nothing to publish: outside the retried set.
+                            BlockPlan::Pass | BlockPlan::NoSegments => {
+                                resolved.insert(ordinal, BlockSlot::Pass);
+                                frontier += 1;
+                                continue;
                             }
-                            .boxed(),
-                        );
+                            BlockPlan::Cached(stored) => {
+                                resolved.insert(ordinal, BlockSlot::Cached(*stored));
+                                frontier += 1;
+                                continue;
+                            }
+                            // 重试范围之外还没有译文的块：不发请求，也绝不提交。停止打开
+                            // 窗口，把已经解析出来的槽位提交完之后收尾。
+                            BlockPlan::Untouched => {
+                                retry_stopped = true;
+                                break;
+                            }
+                            BlockPlan::Request => &blocks[ordinal],
+                        }
                     }
+                };
+                let ordinal = block.ordinal;
+                // 同一个内容单元（同一章）的块才能进同一批：`book`/`chapter` 语境字段
+                // 是每批一份，混进另一章的块会让这两个字段撒谎。
+                if let Some(first) = pending.first()
+                    && first.unit_id != block.unit_id
+                {
+                    carried = Some(block);
+                    break;
+                }
+                let context = block.translation_context();
+                let estimate = estimate_batch_block(&block.source, &context);
+                if !packer.accepts(&estimate) {
+                    // 这一批装不下：留给下一批。这一块还没有打开窗口，游标里没有它 ——
+                    // 停下来绝不会留下「处理中但没有请求」的块。
+                    carried = Some(block);
+                    break;
+                }
+                // The window is part of the durable cursor: the task window
+                // reads it as 「处理中」, so it is published before the request
+                // goes out.
+                let _transition = inner.transitions.lock().await;
+                run.cursor.open_inflight(ordinal);
+                run.persist(inner, job).await?;
+                packer.push(&estimate);
+                pending.push(TranslationBatchBlock {
+                    ordinal,
+                    unit_id: &block.unit_id,
+                    source: &block.source,
+                    context,
+                    scope: run.scope(ordinal),
+                });
+                frontier += 1;
+                if pending.len() >= batch_blocks {
+                    break;
                 }
             }
-            frontier += 1;
+            if retry_stopped {
+                // 收窄的重试在范围之外撞上一个还没译文的块：不再打开新请求。已经攒下但
+                // 还没发出去的这一批随之作废（那些块的游标窗口由收尾统一清空），它们没有
+                // 发过请求，也没有花掉任何输出预算。
+                break 'window;
+            }
+            if pending.is_empty() {
+                break 'window;
+            }
+            if pending.len() > 1 {
+                stats.batched_requests += 1;
+                stats.batched_blocks += pending.len();
+            }
+            spawn_translation_request(
+                &mut in_flight,
+                inner,
+                job,
+                &request_services,
+                target_language,
+                source_language.as_deref(),
+                pending,
+            );
         }
         // 3) Nothing is open and nothing is left to commit: every ordinal of the
         //    window was applied in order. The check has to cover `resolved` too —
@@ -310,28 +373,58 @@ pub(crate) async fn walk_translation_blocks(
         if in_flight.is_empty() {
             continue;
         }
-        let Some((ordinal, walk)) = in_flight.next().await else {
+        let Some((ordinals, walk)) = in_flight.next().await else {
             continue;
         };
-        let slot = match walk {
+        match walk {
             // A stop aborts the walk where it arrives, even while earlier blocks
             // are still waiting: nothing in flight is committed by this run.
-            Ok(BlockWalk::Stopped(stop)) => {
+            Ok(BlockStep::Stopped(stop)) => {
                 if stop != StopRequest::Abandoned {
                     let _transition = inner.transitions.lock().await;
                     run.settle(inner, job).await?;
                 }
                 return Ok(run.stopped(stop));
             }
-            Ok(BlockWalk::Stored(stored, block)) => BlockSlot::Translated(stored, block),
-            // 个别的失败（协议不合，或这一发请求本身失败）只跳过这一块，后面的块照常
-            // 翻；数据库、IO、取消类错误不是某一块的毛病，照旧让整次运行失败。
+            // 一发请求的逐块结果：按块号归位，提交仍是按块序号的。
+            Ok(BlockStep::Value(walks)) => {
+                for (ordinal, walk) in walks {
+                    let slot = match walk {
+                        Ok(BlockWalk::Stored(stored, block)) => {
+                            BlockSlot::Translated(stored, block)
+                        }
+                        // 单块回退里的停止已经作为这一发的停止返回，这里只做兜底。
+                        Ok(BlockWalk::Stopped(stop)) => {
+                            if stop != StopRequest::Abandoned {
+                                let _transition = inner.transitions.lock().await;
+                                run.settle(inner, job).await?;
+                            }
+                            return Ok(run.stopped(stop));
+                        }
+                        // 个别的失败（协议不合，或这一块的请求本身失败）只跳过这一块，
+                        // 同批其它块照常落库；数据库、IO、取消类错误不是某一块的毛病，
+                        // 照旧让整次运行失败。
+                        Err(error) => match block_skip_cause(&error) {
+                            Some((cause, kind)) => BlockSlot::Untranslated(cause, kind),
+                            None => return Err(error),
+                        },
+                    };
+                    resolved.insert(ordinal, slot);
+                }
+            }
+            // 这一发请求本身失败（传输、超时、流协议、超出上下文或响应上限）：它带走的
+            // 每一块都没有译文 —— 与单块路径同一条规则，逐块跳过（或让整次运行失败）。
+            // 连续失败照旧由下面的冷却兜住：批的失败一次记一批的块，冷却来得更快，
+            // 这也正是端点真出问题时应有的反应。
             Err(error) => match block_skip_cause(&error) {
-                Some((cause, kind)) => BlockSlot::Untranslated(cause, kind),
+                Some((cause, kind)) => {
+                    for ordinal in ordinals {
+                        resolved.insert(ordinal, BlockSlot::Untranslated(cause, kind));
+                    }
+                }
                 None => return Err(error),
             },
-        };
-        resolved.insert(ordinal, slot);
+        }
     }
     if retry_stopped {
         // 收窄的重试在范围之外撞上一个还没翻译的块：这一块既不在本次重试里（不许替它
@@ -368,6 +461,55 @@ pub(crate) async fn walk_translation_blocks(
     Ok(RunOutcome::Succeeded(run.cursor.clone()))
 }
 
+/// 一轮里打开的一个请求：它覆盖的块号，以及每一块的逐块结果（与块号一一对应）。
+///
+/// 一个请求现在可能带走多个块（端点级的「每请求文本块数」），所以结果不再是一块对一发：
+/// 块号单独带出来，walk 据此把每一块放回 `resolved`，提交仍是按块序号的。
+type TranslationRequestFuture<'a> = BoxFuture<
+    'a,
+    (
+        Vec<usize>,
+        Result<BlockStep<Vec<(usize, Result<BlockWalk>)>>>,
+    ),
+>;
+
+/// 把攒好的一批发出去。
+///
+/// 「每请求文本块数」为 1 时这里就是老的「一块一请求」路径：`translate_block_batch`
+/// 把手上的那**一**块交给单块路径，严格尝试、一次协议纠正、
+/// `TRANSLATION_BLOCK_RETRIES` 轮重发与逐片段回退都在那边，行为与加批之前一致。
+fn spawn_translation_request<'a>(
+    in_flight: &mut FuturesUnordered<TranslationRequestFuture<'a>>,
+    inner: &Arc<IndexingInner>,
+    job: &'a db::index_jobs::IndexJob,
+    services: &TranslationServices,
+    target_language: &'a str,
+    source_language: Option<&'a str>,
+    blocks: Vec<TranslationBatchBlock<'a>>,
+) {
+    let ordinals = blocks.iter().map(|block| block.ordinal).collect::<Vec<_>>();
+    let inner = Arc::clone(inner);
+    let services = services.clone();
+    in_flight.push(
+        async move {
+            let walk = translate_block_batch(
+                &inner,
+                job,
+                &services,
+                target_language,
+                source_language,
+                &blocks,
+            )
+            .await;
+            // 这一发收尾后才轮到本槽位休息，所以休眠永远发生在请求之后，不会挤占
+            // 模型的响应时间。批里的块共用这一次休息：间隔按请求计，不按块计。
+            pause_after_translation_request(&inner, &walk).await;
+            (ordinals, walk)
+        }
+        .boxed(),
+    );
+}
+
 /// 一发模型请求收尾后的块级节流，也就是「任务间隔」真正生效的地方。
 ///
 /// 间隔原本只作用于两个任务之间（`worker_loop`），而一整本书就是一个任务：书内几十上百
@@ -378,8 +520,11 @@ pub(crate) async fn walk_translation_blocks(
 ///
 /// 停止请求（暂停、取消、换版本）不休眠：这类结果要求马上把控制权交回 `walk`，
 /// 让它清空窗口并按终态发布，多睡一个间隔只会拖慢用户的暂停操作。
-async fn pause_after_translation_request(inner: &Arc<IndexingInner>, walk: &Result<BlockWalk>) {
-    if matches!(walk, Ok(BlockWalk::Stopped(_))) {
+async fn pause_after_translation_request<T>(
+    inner: &Arc<IndexingInner>,
+    walk: &Result<BlockStep<T>>,
+) {
+    if matches!(walk, Ok(BlockStep::Stopped(_))) {
         return;
     }
     let interval = inner.scheduling().interval;
@@ -522,13 +667,13 @@ pub(crate) fn block_skip_cause(error: &anyhow::Error) -> Option<(SkipCause, JobL
 /// window are both sent — the second one just writes the same text over its own
 /// row.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn plan_translation_block<'a>(
+pub(crate) async fn plan_translation_block(
     inner: &Arc<IndexingInner>,
     job: &db::index_jobs::IndexJob,
     book_id: &str,
     translation: &TranslationServices,
     target_language: &str,
-    blocks: &'a [TranslationBlock],
+    blocks: &[TranslationBlock],
     ordinal: usize,
     revision: u64,
     retry_targets: &HashSet<usize>,
@@ -536,7 +681,7 @@ pub(crate) async fn plan_translation_block<'a>(
     force_retry: bool,
     unit_cache: &mut HashMap<String, HashMap<String, StoredTranslation>>,
     stats: &mut TranslationRunStats,
-) -> Result<BlockPlan<'a>> {
+) -> Result<BlockPlan> {
     // 出了本次重试范围（最后一个目标之后）的块不能再被「跳过」：跳过它等于把它记成
     // 已处理，而它可能从来没有译文。那里只允许走缓存命中，没有译文就由调用方停下运行。
     let beyond_retry = retry_last.is_some_and(|last| ordinal > last);
@@ -667,8 +812,5 @@ pub(crate) async fn plan_translation_block<'a>(
         );
         return Ok(BlockPlan::Untouched);
     }
-    Ok(BlockPlan::Request {
-        source: &block.source,
-        context: block.translation_context(),
-    })
+    Ok(BlockPlan::Request)
 }

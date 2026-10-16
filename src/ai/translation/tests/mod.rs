@@ -1,5 +1,6 @@
 //! Tests for response decoding, wrapping and repair.
 
+mod batch_test;
 mod repair_test;
 mod segment_test;
 

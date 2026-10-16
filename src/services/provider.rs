@@ -404,6 +404,7 @@ impl AppServices {
                             next.settings.translation_model.clone(),
                             translation_identity,
                             next.settings.translation_generation.clone(),
+                            next.settings.resolved_translation_blocks_per_request()?,
                             next.settings.default_language.clone(),
                             next.settings.auto_run_background_jobs,
                         )

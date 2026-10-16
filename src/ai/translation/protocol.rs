@@ -47,12 +47,6 @@ impl TranslationSource {
     /// 用户消息体。`context` 里的书名与章节标题只作为语境字段附在同一个 JSON 里：
     /// 它们和正文走同一条不可信数据通道，模型不会把它们当成系统指令。
     pub fn request_input(&self, context: &TranslationContext<'_>) -> String {
-        let segments = self
-            .segments
-            .iter()
-            .enumerate()
-            .map(|(id, text)| serde_json::json!({"id": id, "text": text}))
-            .collect::<Vec<_>>();
         let mut payload = serde_json::Map::new();
         for (field, value) in [
             ("book", context.book_title),
@@ -63,11 +57,74 @@ impl TranslationSource {
                 payload.insert(field.to_string(), serde_json::Value::String(label));
             }
         }
-        payload.insert(
-            "source".to_string(),
-            serde_json::Value::String(self.text.clone()),
-        );
-        payload.insert("segments".to_string(), serde_json::Value::Array(segments));
+        let (source, segments) = self.payload_fields();
+        payload.insert("source".to_string(), source);
+        payload.insert("segments".to_string(), segments);
         serde_json::Value::Object(payload).to_string()
     }
+
+    /// 一个块自己的两个字段（`source` 与 `segments`）。
+    ///
+    /// 单块请求体与批请求里的每一项都从这里取，所以「同一个块单独发」与「放在批里发」
+    /// 拿到的块负载逐字节相同：批只是外面多了一层信封。
+    pub(crate) fn payload_fields(&self) -> (serde_json::Value, serde_json::Value) {
+        let segments = self
+            .segments
+            .iter()
+            .enumerate()
+            .map(|(id, text)| serde_json::json!({"id": id, "text": text}))
+            .collect::<Vec<_>>();
+        (
+            serde_json::Value::String(self.text.clone()),
+            serde_json::Value::Array(segments),
+        )
+    }
+}
+
+/// 批信封的补充说明，接在 [`FORMAT_INSTRUCTIONS`] 后面。
+///
+/// 逐片段作答、`keep`、JSON 结构与转义、标点这些规则只写一份：批只是多了一层信封，
+/// 所以这里只说明「这一次是多个块」与外层形状，两段拼起来就是批的全部协议文本 ——
+/// 规则不会在单块与批两条路径之间漂移。
+pub const FORMAT_INSTRUCTIONS_BATCH_ADDENDUM: &str = "这一次要翻译的不是一个文本块，而是用户输入里 blocks 数组中的多个文本块：\
+     每一项都有自己的 id、source 与 segments。上面关于 source、segments 与 translations 的规则\
+     逐块套用：每个块按它自己的 source 与 segments 作答，块与块之间不要合并、不要调换内容。\
+     只返回 JSON 对象 {\"blocks\":[{\"id\":0,\"translations\":[{\"id\":0,\"text\":\"译文\"}]}]}：\
+     外层的 id 是输入里那个块的 id，每个输入的块必须且只能出现一次；\
+     内层的 translations 就是上面说的那一个数组，规则完全相同。";
+
+/// 批请求的用户消息体：`blocks` 数组，每一项带自己的批内 `id`、`source` 与 `segments`。
+///
+/// 书名与章节标题取自第一项：调用方只把**同一个内容单元**（同一章）的块放进一批，
+/// 这些语境字段对批里每一块都成立；混进另一章的块会让 `chapter` 撒谎。
+///
+/// `id` 是批内编号（`0..N`），与任务游标里的 ordinal 无关 —— 请求体因此与块在书里的位置
+/// 无关，同一个块单独发与放进批里发，它自己那一份负载逐字节相同。
+pub fn batch_request_input(items: &[TranslationBatchItem<'_>]) -> String {
+    let mut payload = serde_json::Map::new();
+    if let Some(first) = items.first() {
+        for (field, value) in [
+            ("book", first.context.book_title),
+            ("chapter", first.context.chapter_title),
+        ] {
+            let label = context_label(value);
+            if !label.is_empty() {
+                payload.insert(field.to_string(), serde_json::Value::String(label));
+            }
+        }
+    }
+    let blocks = items
+        .iter()
+        .enumerate()
+        .map(|(id, item)| {
+            let mut block = serde_json::Map::new();
+            block.insert("id".to_string(), serde_json::json!(id));
+            let (source, segments) = item.source.payload_fields();
+            block.insert("source".to_string(), source);
+            block.insert("segments".to_string(), segments);
+            serde_json::Value::Object(block)
+        })
+        .collect::<Vec<_>>();
+    payload.insert("blocks".to_string(), serde_json::Value::Array(blocks));
+    serde_json::Value::Object(payload).to_string()
 }

@@ -2,6 +2,10 @@
 
 use super::*;
 
+/// 大多数用例关心的是「一块一次请求」的老行为：端点级打包由 `translation_batch_test`
+/// 专门覆盖，其余调用点显式关掉打包，让断言与加批之前逐字相同。
+pub(crate) const NO_BATCHING: usize = 1;
+
 /// 建好一个处于运行态的翻译任务，让测试可以直接调用 `translate_block`。
 pub(crate) fn translation_block_fixture(
     provider: &Arc<MockMergeProvider>,
@@ -39,6 +43,7 @@ pub(crate) fn translation_block_fixture_in(
             "chat-test".to_string(),
             identity.to_string(),
             TranslationGenerationSettings::default(),
+            NO_BATCHING,
             Some("zh-Hans".to_string()),
             false,
         ))
@@ -66,6 +71,7 @@ pub(crate) fn translation_block_fixture_in(
         model: "chat-test".to_string(),
         execution_identity: identity.to_string(),
         generation: TranslationGenerationSettings::default(),
+        batch_blocks: NO_BATCHING,
         target_language: Some("zh-Hans".to_string()),
         auto_run: false,
     };

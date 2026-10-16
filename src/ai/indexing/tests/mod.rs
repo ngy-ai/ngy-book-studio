@@ -24,6 +24,7 @@ mod endpoints_test;
 mod job_control_test;
 mod reconcile_test;
 mod scheduling_test;
+mod translation_batch_test;
 mod translation_retry_test;
 mod translation_test;
 mod translation_walk_test;

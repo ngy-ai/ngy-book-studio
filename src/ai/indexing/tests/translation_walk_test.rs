@@ -321,6 +321,7 @@ pub(crate) fn a_running_translation_switches_to_the_saved_endpoint_and_key() {
                     model,
                     execution_identity,
                     TranslationGenerationSettings::default(),
+                    NO_BATCHING,
                     Some("zh-Hans".to_string()),
                     false,
                 )
@@ -572,6 +573,7 @@ pub(crate) fn a_reconfigured_translation_job_runs_instead_of_abandoning_its_firs
             "chat-test".to_string(),
             "translation-v2:chat-test".to_string(),
             TranslationGenerationSettings::default(),
+            NO_BATCHING,
             Some("zh-Hans".to_string()),
             false,
         ))
@@ -711,6 +713,7 @@ pub(crate) fn a_narrowed_retry_stops_at_an_untranslated_block_outside_its_target
             "chat-test".to_string(),
             "translation-v2:chat-test".to_string(),
             TranslationGenerationSettings::default(),
+            NO_BATCHING,
             Some("zh-Hans".to_string()),
             false,
         ))
@@ -825,6 +828,7 @@ pub(crate) fn a_narrowed_retry_republishes_cached_blocks_beyond_its_targets() {
             "chat-test".to_string(),
             "translation-v2:chat-test".to_string(),
             TranslationGenerationSettings::default(),
+            NO_BATCHING,
             Some("zh-Hans".to_string()),
             false,
         ))

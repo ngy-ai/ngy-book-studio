@@ -2,6 +2,8 @@
 
 use super::*;
 
+mod batch;
+
 mod collect;
 
 mod diagnose;
@@ -9,6 +11,8 @@ mod diagnose;
 mod fragment;
 
 mod retry;
+
+pub(crate) use batch::*;
 
 pub(crate) use collect::*;
 

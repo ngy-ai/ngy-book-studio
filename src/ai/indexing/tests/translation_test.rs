@@ -173,6 +173,7 @@ pub(crate) fn retranslating_a_translation_job_resets_it_and_clears_its_rows() {
             "chat-test".to_string(),
             "translation-v1:chat-test".to_string(),
             TranslationGenerationSettings::default(),
+            NO_BATCHING,
             Some("zh-Hans".to_string()),
             false,
         ))
@@ -260,6 +261,7 @@ pub(crate) fn retranslating_a_translation_job_keeps_a_manual_edit_and_clears_the
             "chat-test".to_string(),
             "translation-v1:chat-test".to_string(),
             TranslationGenerationSettings::default(),
+            NO_BATCHING,
             Some("zh-Hans".to_string()),
             false,
         ))
@@ -345,6 +347,7 @@ pub(crate) fn changing_the_translation_model_resumes_at_the_same_block() {
             "chat-one".to_string(),
             "translation-v1:chat-one".to_string(),
             TranslationGenerationSettings::default(),
+            NO_BATCHING,
             Some("zh-Hans".to_string()),
             false,
         ))
@@ -360,6 +363,7 @@ pub(crate) fn changing_the_translation_model_resumes_at_the_same_block() {
             "chat-two".to_string(),
             "translation-v1:chat-two".to_string(),
             TranslationGenerationSettings::default(),
+            NO_BATCHING,
             Some("zh-Hans".to_string()),
             false,
         ))
@@ -402,6 +406,7 @@ pub(crate) fn translation_block_inspection_shows_the_configured_generation_param
                 presence_penalty: None,
                 frequency_penalty: None,
             },
+            NO_BATCHING,
             Some("zh-Hans".to_string()),
             false,
         ))
@@ -436,6 +441,7 @@ pub(crate) fn translation_block_inspection_is_revision_pinned_and_read_only() {
             "chat-test".to_string(),
             "translation-v1:chat-test".to_string(),
             TranslationGenerationSettings::default(),
+            NO_BATCHING,
             Some("zh-Hans".to_string()),
             false,
         ))
@@ -513,6 +519,7 @@ pub(crate) fn translation_block_detail_rebuilds_the_worker_request_and_stays_rea
             "chat-test".to_string(),
             "translation-v1:chat-test".to_string(),
             TranslationGenerationSettings::default(),
+            NO_BATCHING,
             Some("zh-Hans".to_string()),
             false,
         ))
@@ -631,6 +638,7 @@ pub(crate) fn replaying_a_failed_block_returns_the_raw_answer_and_changes_nothin
             "chat-test".to_string(),
             "translation-v1:chat-test".to_string(),
             TranslationGenerationSettings::default(),
+            NO_BATCHING,
             Some("zh-Hans".to_string()),
             false,
         ))

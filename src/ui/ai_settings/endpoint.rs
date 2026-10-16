@@ -125,6 +125,8 @@ impl EndpointSettingsWindow {
             request_timeout_secs: DEFAULT_AI_REQUEST_TIMEOUT_SECS,
             // 新端点从「自动」起步：地址填成远程时会自己带上默认的节流。
             requests_per_minute: 0,
+            // 打包同样从「自动」起步：本机端点一次一块，远程端点按批上限。
+            blocks_per_request: 0,
         };
         self.endpoints
             .push(new_endpoint_draft(endpoint, window, cx));
@@ -286,6 +288,13 @@ impl EndpointSettingsWindow {
                     "每分钟请求数上限（RPM）",
                     "留空或 0＝自动：本机地址不限，远程地址按 10 节流。服务商按 Endpoint 计量，所以同一个地址上的问答、翻译、向量、视觉与模型检测共用这一份额度：额度用满时请求在本地等待，问答与模型检测优先，不会硬撞服务商的限制。想固定上限就填数字（最多 10000），急着跑完可以调大；服务商返回 429 时整个 Endpoint 一起退避。",
                     &endpoint.requests_per_minute_input,
+                ),
+                render_input_field(
+                    theme,
+                    busy,
+                    "每请求文本块数",
+                    "留空或 0＝自动：本机地址一次一块（弱模型更容易把多个块合并成一条，打包会让一处坏形状牵连更多块），远程地址一次最多 8 块，省下往返与计费。填 1 表示关掉打包（一块一请求），2–64 是固定上限；整本翻译会按输出预算、块数与请求体 256 KB 三个上限自己决定一批装几块，装不下就少装。打包只改变一次请求带走几块：译文、缓存与进度仍按块，可以随时改，不会让已翻好的部分失效。",
+                    &endpoint.blocks_per_request_input,
                 ),
                 detection.unwrap_or_else(|| div().into_any_element()),
             ],

@@ -84,7 +84,15 @@ pub fn classify_error(error: &anyhow::Error) -> JobLogErrorKind {
         // 位置数组是「结构无效」的一个更具体的子类：模型按段答了，只是把
         // `{"id","text"}` 写成了 serde 的位置序列。任务日志沿用同一分类，
         // 逐片段回退的判定在读 `ResponseError::kind()` 时已经能把两者分开。
-        "invalid_schema" | "json_data" | "positional_segments" | "keep_with_text" => InvalidSchema,
+        // 批信封的形状问题（块数不符、块编号对不上）同样归到「结构不符合分段协议」：
+        // 它们都表示模型没有按协议作答，而具体分类在读 `ResponseError::kind()` 时已经
+        // 分开了（批路径还会据此拆半重发、退回单块）。
+        "invalid_schema"
+        | "json_data"
+        | "positional_segments"
+        | "keep_with_text"
+        | "batch_block_count_mismatch"
+        | "batch_block_ids" => InvalidSchema,
         "incomplete_reasoning" => IncompleteReasoning,
         "ambiguous_json" => AmbiguousJson,
         "missing_json" => MissingJson,

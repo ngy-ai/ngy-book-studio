@@ -12,12 +12,17 @@ impl IndexingCoordinator {
     /// `generation` 是翻译请求自己的生成参数（默认温度 0）。它随每次请求发送，但**不是
     /// 执行身份的一部分**：调整它不会重建任务、不会让已翻好的译文失效，也不会把游标
     /// 退回书首。
+    /// `batch_blocks` 是翻译端点「每请求文本块数」的**解析结果**（见
+    /// `EndpointSettings::resolved_blocks_per_request`）：`1` 表示一块一请求，`> 1`
+    /// 表示一次请求最多带走这么多块。与 `generation` 一样，它随每次请求生效但**不是**
+    /// 执行身份的一部分：改它不会重建任务、不会让已翻好的译文失效。
     pub async fn configure_translation(
         &self,
         provider: Arc<dyn OpenAiCompatibleProvider>,
         model: String,
         execution_identity: String,
         generation: TranslationGenerationSettings,
+        batch_blocks: usize,
         target_language: Option<String>,
         auto_run: bool,
     ) -> Result<()> {
@@ -37,6 +42,9 @@ impl IndexingCoordinator {
             model,
             execution_identity,
             generation,
+            // 端点策略给的最小是 1：装配点给 0 是 bug，而不是「关掉翻译」，所以直接
+            // 收敛成一块一请求，绝不让 0 变成「一次装 0 块」。
+            batch_blocks: batch_blocks.max(1),
             target_language,
             auto_run,
         };

@@ -46,6 +46,7 @@ pub(crate) fn retrying_named_blocks_rewinds_the_cursor_and_narrows_the_walk() {
             "chat-test".to_string(),
             "translation-v1:chat-test".to_string(),
             TranslationGenerationSettings::default(),
+            NO_BATCHING,
             Some("zh-Hans".to_string()),
             false,
         ))
@@ -120,6 +121,7 @@ pub(crate) fn retrying_queues_the_requested_blocks_and_leaves_the_decision_to_th
             "chat-test".to_string(),
             "translation-v1:chat-test".to_string(),
             TranslationGenerationSettings::default(),
+            NO_BATCHING,
             Some("zh-Hans".to_string()),
             false,
         ))
@@ -229,6 +231,7 @@ pub(crate) fn retrying_sends_a_request_for_a_block_whose_stored_row_is_not_displ
             "chat-test".to_string(),
             "translation-v1:chat-test".to_string(),
             TranslationGenerationSettings::default(),
+            NO_BATCHING,
             Some("zh-Hans".to_string()),
             false,
         ))
@@ -329,6 +332,7 @@ pub(crate) fn retrying_works_on_a_paused_task_and_refuses_a_running_one() {
             "chat-test".to_string(),
             "translation-v1:chat-test".to_string(),
             TranslationGenerationSettings::default(),
+            NO_BATCHING,
             Some("zh-Hans".to_string()),
             false,
         ))
@@ -576,6 +580,7 @@ pub(crate) fn retranslating_by_block_id_requeues_exactly_that_blocks_ordinal() {
             "chat-test".to_string(),
             "translation-v2:chat-test".to_string(),
             TranslationGenerationSettings::default(),
+            NO_BATCHING,
             Some("zh-Hans".to_string()),
             false,
         ))
@@ -653,6 +658,7 @@ pub(crate) fn retranslating_a_translated_block_by_id_re_sends_it_and_a_plain_ret
             "chat-test".to_string(),
             "translation-v1:chat-test".to_string(),
             TranslationGenerationSettings::default(),
+            NO_BATCHING,
             Some("zh-Hans".to_string()),
             // 自动运行打开：整本先真的翻一遍，目标块才会有一份阅读端会显示、缓存也会命中
             // 的译文 —— 手工种一行证明得了游标形状，证明不了「有译文还要重发」。
@@ -798,6 +804,7 @@ pub(crate) fn a_stored_translation_that_echoes_the_source_is_re_sent_instead_of_
             "chat-test".to_string(),
             "translation-v1:chat-test".to_string(),
             TranslationGenerationSettings::default(),
+            NO_BATCHING,
             Some("zh-Hans".to_string()),
             false,
         ))
@@ -1158,6 +1165,7 @@ pub(crate) fn translating_a_chapter_narrows_the_walk_to_that_chapter_and_borrows
             "chat-test".to_string(),
             "translation-v2:chat-test".to_string(),
             TranslationGenerationSettings::default(),
+            NO_BATCHING,
             Some("zh-Hans".to_string()),
             false,
         ))

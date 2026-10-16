@@ -198,6 +198,53 @@ startup_requeues_legacy_renderer_and_reclaims_its_visual_object` 等待视觉任
 「`services::tests::` 紧截止预算在默认并发下假失败」那一类。人工 GUI 验证（2026-10-15，用户
 实测）：整本翻译运行中点「重新翻译这一块」，先暂停再重排，不再报「这本书没有可重试的翻译任务」。
 
+2026-10-16 分段协议新增批信封层（`src/ai/translation/batch.rs`：块负载与单块逐字节一致的批请求体、
+三个上限的打包预算、端点「每请求文本块数」策略、按块还原并区分信封错误与块错误的解析，实现说明
+见 `code-map-ai.md`）之后复跑 Rust 门禁：`cargo fmt --all --check` 通过，
+`cargo clippy --all-targets --locked` 与改动前同量级、触及的文件无新增告警（只余既有
+`src/ai/translation/decode.rs` 两条 `needless_return`，该文件未改动），
+`cargo test --locked --all-targets --no-fail-fast` 全通过 —— lib 744 项（739 通过 / 5 忽略，
+比上一批多 7 项，全部是 `ai::translation::tests::batch_test` 的回归用例）、产品二进制 357 项
+（356 通过 / 1 忽略）、`openai_compatible_flow` 24、`translation_flow` 20 项（19 通过 / 1 忽略）、
+`epub_flow_test` 6、`multi_format_flow_test` 4、`multi_endpoint_flow_test` 1、`proxy_flow_test` 1、
+`format_corpus_gate_test` 1 忽略。**批这一层还没有调用方**：walk 仍然一块一请求，端点设置里也还没有
+「每请求文本块数」这一项，因此没有用户可见行为变化，README/ROADMAP 本次不更新；未做人工 GUI 验证。
+首轮 `cargo test --all-targets` 曾因用户正在运行 `target\debug\ngy-book-studio.exe` 而无法重建产品
+二进制（`os error 5`），关闭该实例后复跑即全通过 —— 以后跑全目标测试前先确认应用没有开着。
+
+2026-10-16 同日把批接进调用方（`walk.rs` 按端点「每请求文本块数」攒批，只装同一个内容单元、
+受打包预算约束；拆半重发、块级回退单块与整发失败逐块跳过都在 `response/batch.rs` 内部完成，
+实现说明见 `code-map-ai.md`）之后复跑 Rust 门禁：`cargo fmt --all --check` 通过，
+`cargo check --all-targets --locked` 无错误（只余 lib 目标里 `pub(crate)` 项既有的 dead_code
+告警），`cargo nextest run --locked` 两次全量各 1158 项运行 / 8 项 skip —— 第一次 1156 通过，
+失败 `services::tests::translation_test::translating_the_readers_chapter_narrows_its_task_and_prioritizes_it`
+与 `services::tests::visual::jobs_test::startup_requeues_legacy_renderer_and_reclaims_its_visual_object`；
+第二次 1157 通过，失败
+`services::tests::translation_test::retranslating_one_reader_block_waits_for_a_running_task_to_pause`。
+三条都单独复跑通过、`cargo nextest run --locked -E 'test(services::)'` 54 项全通过，属上面
+2026-09-17 记的「`services::tests::` 紧截止预算在默认并发下假失败」那一类。walk 层新增的回归用例
+是 `ai::indexing::tests::translation_batch_test` 7 项（协议形状仍由 `ai::translation::tests::batch_test`
+覆盖）。**上面那句「批这一层还没有调用方：walk 仍然一块一请求，端点设置里也还没有『每请求文本块数』」
+已不再成立**：Endpoint 窗口现在有「每请求文本块数」输入框（留空或 0＝自动：本机一次一块、
+远程最多 8；1＝关闭打包；2–64 为固定上限），walk 也按它攒批 —— 这是用户可见行为变化，README
+（AI 设置总述、Endpoint 段新增的「每请求文本块数」与「翻译生成参数」两段、阅读段的翻译说明）
+与 ROADMAP（同日条目）已按实现同步；人工验证步骤写进 `docs/agent/gui-verification.md`。人工 GUI
+验证（2026-10-16，真实窗口 + 远程端点 + 一本多章书，暂停任务取得收尾读数）：`translation_run_stats`
+（`run.rs:377`，debug）显示 `batched_requests=17`、`batched_blocks=136`（平均 8 块/发，满装）、
+`saved=128`、`cached=5`、`untranslated=0`、`fragment_fallback_*=0`、`cooldowns=0`、
+`next_ordinal=4442`、`elapsed_ms=594667` —— 省下 119 发请求；暂停时最后一发（8 块）在飞、未提交
+也不计跳过（136 − 128 = 8），恢复从 `next_ordinal` 重做，与「先清空窗口再发布」的规则一致。
+排障口径记两条：日志文件里字段的呈现是 `stage: "…"`（按 `stage="…"` 搜会搜不到），且这条统计
+**只在一次运行收尾时打** —— 运行中没有，进程重启或任务被替换接上的运行也不会有，**恢复任务也不算
+收尾**（恢复会开一次新运行，`translation_run_id` 变新），暂停一次或跑到书末才产生（先搜 info 级的
+`translation_run_finish` 定位那次收尾）。恢复后的第一条 `translation_batch_start` 的 `first_ordinal`
+等于暂停时 stats 里的 `next_ordinal`，即在飞的块被重做；恢复后那次运行再暂停的读数是 2 发 16 块
+全部落库（`saved=16`）、`next_ordinal` 4442→4458、无跳过与回退（这次暂停落在两批之间，在飞块没有
+被丢弃）。对照组（端点改回单块）在同一本书同一区段复跑：起点 4458 的 7 块全部走单块请求
+（`saved=7`、`next_ordinal=4465`、`batched_requests=0`、`batched_blocks=0`），而同一区段在批模式下
+一发装 8 块 —— 打包确实被关掉（单块这一段约 19 秒/块，批模式同区段约 4.5–7.6 秒/块，样本小、
+未控制端点节流差异，方向与预期一致）。**只剩「处理中」块数上界未核对**。
+
 ## AI 问答诊断日志
 
 AI 日志统一使用 `ngy_ai` target。未设置 `RUST_LOG` 时，默认

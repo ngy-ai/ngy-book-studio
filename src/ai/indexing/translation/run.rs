@@ -92,7 +92,7 @@ pub(crate) enum BlockStep<T> {
 }
 
 /// What one ordinal of the window needs before it can be committed.
-pub(crate) enum BlockPlan<'a> {
+pub(crate) enum BlockPlan {
     /// Nothing to send and nothing to publish: outside the retried set.
     Pass,
     /// 出了本次重试范围、又没有译文：本次运行既不许替它发请求，也不许把它记成
@@ -103,11 +103,11 @@ pub(crate) enum BlockPlan<'a> {
     /// Publish the translation already stored for this block text.
     Cached(Box<StoredTranslation>),
     /// Send this block to the provider.
-    Request {
-        source: &'a TranslationSource,
-        /// 书名与章节标题，随请求一起发给模型。
-        context: TranslationContext<'a>,
-    },
+    ///
+    /// 计划不携带块的输入：调用方按同一个块号从这次运行的冻结块列表里取它的
+    /// `source` 与语境（`TranslationBlock::translation_context`）。攒批要在「计划」与
+    /// 「真正发出」之间持有同一块块，一处取才不会有第二种说法。
+    Request,
 }
 
 /// The durable progress of one translation run: the cursor this execution owns
@@ -384,6 +384,8 @@ pub(crate) async fn run_translation_blocks(
         fragment_fallback_blocks = stats.fragment_fallback_blocks,
         fragment_fallback_requests = stats.fragment_fallback_requests,
         cooldowns = stats.cooldowns,
+        batched_requests = stats.batched_requests,
+        batched_blocks = stats.batched_blocks,
         next_ordinal = cursor.next_ordinal,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "Translation run statistics"

@@ -78,6 +78,8 @@ impl fmt::Display for ResponseError {
             "missing_json" => "翻译模型没有返回分段 JSON",
             "response_truncated" => "翻译模型响应在输出上限处被截断",
             "segment_count_mismatch" => "翻译模型返回的片段数量与原文不一致",
+            "batch_block_count_mismatch" => "翻译模型返回的文本块数量与这一批不一致",
+            "batch_block_ids" => "翻译模型返回的文本块编号对不上这一批",
             "unknown_segment_id" => "翻译模型返回了未知片段编号",
             "duplicate_segment_id" => "翻译模型返回了重复片段编号",
             "missing_segment_id" => "翻译模型遗漏了原文片段",

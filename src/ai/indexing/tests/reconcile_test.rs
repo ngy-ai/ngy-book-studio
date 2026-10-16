@@ -12,6 +12,7 @@ fn staged_translation_inner(fixture: &Fixture) -> Arc<IndexingInner> {
         model: "chat-test".to_string(),
         execution_identity: "translation-endpoint-a:chat-test".to_string(),
         generation: TranslationGenerationSettings::default(),
+        batch_blocks: NO_BATCHING,
         target_language: Some("en".to_string()),
         auto_run: true,
     });

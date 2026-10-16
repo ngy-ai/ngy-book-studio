@@ -12,16 +12,31 @@ pub fn parse_response(
     ensure!(!identity.trim().is_empty(), "翻译执行身份不能为空");
     ensure!(!source.segments.is_empty(), "原文没有可翻译片段");
     let response = decode_response(response)?;
-    if response.translations.len() != source.segments.len() {
+    restore_segments(source, response.translations, identity)
+}
+
+/// 把一个块已经解出来的片段数组恢复成落库形状。
+///
+/// 单块回复与批回复都走这里：批只是多了一层信封，块自己的校验规则（片段数量、编号、
+/// `keep`、空白归属、NUL）在两条路径上必须是同一份，否则同一个块单独发与放在批里发会
+/// 得到两种结果。`identity` 是这一批共用的执行身份，原样写进结果。
+pub(crate) fn restore_segments(
+    source: &TranslationSource,
+    translations: Vec<ResponseSegment>,
+    identity: &str,
+) -> Result<StoredTranslation> {
+    ensure!(!identity.trim().is_empty(), "翻译执行身份不能为空");
+    ensure!(!source.segments.is_empty(), "原文没有可翻译片段");
+    if translations.len() != source.segments.len() {
         return Err(ResponseError {
             expected_segments: Some(source.segments.len()),
-            actual_segments: Some(response.translations.len()),
+            actual_segments: Some(translations.len()),
             ..ResponseError::new("segment_count_mismatch")
         }
         .into());
     }
     let mut translated = vec![None; source.segments.len()];
-    for segment in response.translations {
+    for segment in translations {
         if segment.id >= translated.len() {
             return Err(ResponseError::new("unknown_segment_id").into());
         }

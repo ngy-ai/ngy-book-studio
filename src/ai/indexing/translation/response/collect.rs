@@ -12,7 +12,37 @@ use crate::{
     db,
 };
 
-/// Collects one streaming translation answer.
+/// 一次翻译流读取的策略：单块请求与批请求只在响应上界与诊断读数上不同。
+pub(crate) struct TranslationStreamRead<'a> {
+    /// 诊断里的块号。批请求用这一批第一块的块号：读流本身与批里有几块无关。
+    pub(crate) ordinal: usize,
+    /// 这一发请求装了多少个文本块（单块路径恒为 `1`）。只进日志，不改变读流规则。
+    pub(crate) blocks: usize,
+    pub(crate) request_attempt: usize,
+    /// 响应字节上界：单块与批各有一条（[`MAX_TRANSLATION_RESPONSE_BYTES`] /
+    /// [`MAX_TRANSLATION_BATCH_RESPONSE_BYTES`]）。
+    pub(crate) max_bytes: usize,
+    /// 这一发发给谁：只进日志行（转储行上的请求体由调用方自己留着）。
+    pub(crate) endpoint: Option<&'a str>,
+}
+
+/// 收完一条翻译流的结果。
+///
+/// 它只把事件读成文本，**不做任何协议判断**：`error` 描述流的结束方式（输出上限截断、
+/// 响应过大、静默、流错误），文本照旧带回来 —— 已经收到的字节可能是一个完整答案
+/// （模型答完继续啰嗦、服务端提前断开），由调用方按自己的协议抢救：单块
+/// `parse_response`、批 `parse_batch_response`。
+pub(crate) struct TranslationStreamText {
+    pub(crate) text: String,
+    pub(crate) stats: TranslationStreamStats,
+    /// 这一条流从发出到收尾的时长。批请求也按每一次读流自己算（批的耗时是整发共有的
+    /// 读数，与块数无关）。
+    pub(crate) elapsed_ms: u64,
+    pub(crate) error: Option<anyhow::Error>,
+}
+
+/// 读完一条翻译流，返回原文与它的结束方式。单块请求、批请求与逐片段回退共用这一份
+/// 循环：静默上限、进度行、控制轮询与响应字节上界因此只有一套规则。
 ///
 /// There is deliberately no total-duration deadline: a slow local model may need
 /// minutes for one block, and the observed failure (2026-09-11, block 1269) was a
@@ -21,23 +51,15 @@ use crate::{
 /// provider layer **and** by [`TRANSLATION_STREAM_SILENCE_LIMIT`] here, because a
 /// stream that stops producing events altogether (no TCP connection, no error) is
 /// exactly what the provider layer cannot see; the reply itself stays bounded by
-/// `MAX_TRANSLATION_RESPONSE_BYTES`. Progress lines and the end-of-stream shape
-/// keep such a run diagnosable.
-pub(crate) async fn collect_translation_response(
+/// `read.max_bytes`. Progress lines and the end-of-stream shape keep such a run
+/// diagnosable.
+pub(crate) async fn read_translation_stream(
     inner: &Arc<IndexingInner>,
     job: &db::index_jobs::IndexJob,
     scope: &TranslationBlockScope,
-    request_attempt: usize,
-    source: &TranslationSource,
-    // 收集阶段只用 `request_body` 与冻结的 `source`：上下文已经进了那一份 body，
-    // 这里不再解包它（调用方照旧传进来，因为它与 source 一起构成这次请求的身份）。
-    _context: &TranslationContext<'_>,
-    request_body: &str,
-    // 这一发的端点来源，只进转储行（见 `dump_raw_translation_response`）。
-    endpoint: Option<&str>,
-    identity: &str,
+    read: TranslationStreamRead<'_>,
     mut stream: crate::ai::ChatEventStream,
-) -> Result<BlockStep<String>> {
+) -> Result<BlockStep<TranslationStreamText>> {
     let started = Instant::now();
     let span = tracing::Span::current();
     let mut response = String::new();
@@ -47,6 +69,9 @@ pub(crate) async fn collect_translation_response(
         tokio::select! {
             event = stream.next() => {
                 let Some(event) = event else {
+                    // 服务端不保证发 `[DONE]`：健康的流也可能只是读到结尾
+                    // （现场 2026-09-11 的 120 秒流：7024 字节正文、没有终块）。收到的
+                    // 字节照旧交给调用方按协议判断，不在这里当成失败。
                     stats.end = "stream_eof";
                     break Ok(None);
                 };
@@ -78,9 +103,9 @@ pub(crate) async fn collect_translation_response(
                 {
                     stats.end = "unexpected_finish_reason";
                     // 输出上限截断：流是正常收尾的，只是模型没写完整答案。它不带运行级
-                    // 含义——「这个文本块这次没翻出来」——所以按 `ResponseError` 分类返回，
-                    // 由调用方按块跳过并继续翻译其余块（与 `docs/agent/code-map-ai.md`
-                    // 的「不重试输出上限错误」一致：跳过，不重复同一种请求）。当成不透明的
+                    // 含义——「这个文本块这次没翻出来」——所以按固定分类返回，由调用方
+                    // 决定按块跳过还是拆小这一批（见 `docs/agent/code-map-ai.md` 的
+                    // 「不重试输出上限错误」：跳过，不重复同一种请求）。当成不透明的
                     // anyhow 错误会让整本书永远停在同一个退化文本块上——现场 2026-09-15
                     // 的 block 1762
                     // （qwen3.5:0.8b，3 个片段）：两次运行都在 4096 个输出 token 处截断，
@@ -98,9 +123,7 @@ pub(crate) async fn collect_translation_response(
                         stats.empty_content_events = stats.empty_content_events.saturating_add(1);
                     } else {
                         stats.content_events = stats.content_events.saturating_add(1);
-                        if response.len().saturating_add(delta.len())
-                            > MAX_TRANSLATION_RESPONSE_BYTES
-                        {
+                        if response.len().saturating_add(delta.len()) > read.max_bytes {
                             stats.end = "response_too_large";
                             break Err(anyhow::anyhow!("翻译模型响应超过大小上限"));
                         }
@@ -138,9 +161,10 @@ pub(crate) async fn collect_translation_response(
                         target: "ngy_ai",
                         parent: &span,
                         stage = "translation_stream_silent",
-                        block_ordinal = scope.ordinal,
-                        request_attempt,
-                        endpoint = endpoint.unwrap_or("-"),
+                        block_ordinal = read.ordinal,
+                        batch_blocks = read.blocks,
+                        request_attempt = read.request_attempt,
+                        endpoint = read.endpoint.unwrap_or("-"),
                         since_last_event_ms = stats.since_last_event_ms(),
                         events = stats.events,
                         response_bytes = response.len(),
@@ -160,8 +184,9 @@ pub(crate) async fn collect_translation_response(
                         target: "ngy_ai",
                         parent: &span,
                         stage = "translation_stream_progress",
-                        block_ordinal = scope.ordinal,
-                        request_attempt,
+                        block_ordinal = read.ordinal,
+                        batch_blocks = read.blocks,
+                        request_attempt = read.request_attempt,
                         elapsed_ms = (Instant::now() - started).as_millis() as u64,
                         since_last_event_ms = stats.since_last_event_ms(),
                         events = stats.events,
@@ -181,14 +206,16 @@ pub(crate) async fn collect_translation_response(
         }
     };
     let elapsed_ms = started.elapsed().as_millis() as u64;
+    let shape = translation_response_shape(&response);
     match collected {
         Ok(None) => {
-            let shape = translation_response_shape(&response);
             tracing::debug!(
                 target: "ngy_ai",
                 parent: &span,
                 stage = "translation_stream",
                 outcome = "collected",
+                block_ordinal = read.ordinal,
+                batch_blocks = read.blocks,
                 end = stats.end,
                 events = stats.events,
                 content_events = stats.content_events,
@@ -209,7 +236,12 @@ pub(crate) async fn collect_translation_response(
                 elapsed_ms,
                 "Translation response stream collected"
             );
-            Ok(BlockStep::Value(response))
+            Ok(BlockStep::Value(TranslationStreamText {
+                text: response,
+                stats,
+                elapsed_ms,
+                error: None,
+            }))
         }
         Ok(Some(stop)) => {
             tracing::info!(
@@ -217,7 +249,9 @@ pub(crate) async fn collect_translation_response(
                 parent: &span,
                 stage = "translation_stream",
                 outcome = "interrupted",
-                endpoint = endpoint.unwrap_or("-"),
+                block_ordinal = read.ordinal,
+                batch_blocks = read.blocks,
+                endpoint = read.endpoint.unwrap_or("-"),
                 end = stats.end,
                 events = stats.events,
                 content_events = stats.content_events,
@@ -236,13 +270,14 @@ pub(crate) async fn collect_translation_response(
             Ok(BlockStep::Stopped(stop))
         }
         Err(error) => {
-            let shape = translation_response_shape(&response);
             tracing::warn!(
                 target: "ngy_ai",
                 parent: &span,
                 stage = "translation_stream",
                 outcome = "failed",
-                endpoint = endpoint.unwrap_or("-"),
+                block_ordinal = read.ordinal,
+                batch_blocks = read.blocks,
+                endpoint = read.endpoint.unwrap_or("-"),
                 error_kind = crate::ai::ai_diagnostics::error_kind(&error),
                 end = stats.end,
                 events = stats.events,
@@ -265,74 +300,113 @@ pub(crate) async fn collect_translation_response(
                 elapsed_ms,
                 "Translation response stream failed"
             );
-            dump_raw_translation_response(
-                &span,
-                scope.ordinal,
-                request_attempt,
-                endpoint,
-                request_body,
-                Some(&response),
-                stats.end,
-            );
-            // 流中断时已收到的字节往往就是失败原因的全部证据（半截 JSON、
-            // 提前结束的回答），这条 debug 预览让失败当场不必先去开转储开关。
-            log_raw_model_output(
-                &span,
-                scope.ordinal,
-                request_attempt,
-                endpoint,
-                "stream",
-                &response,
-            );
-            // 流没有正常结束，但已经收到的字节可能包含一个完整、能通过全部片段校验的
-            // 答案（模型答完继续啰嗦、或服务端在收尾前断开）。整段文本仍走原来的严格
-            // 解码：只有一个完整容器、id 不多不少时才会被采用，不会猜模型意图。
-            if crate::ai::translation::parse_response(source, &response, identity).is_ok() {
-                tracing::warn!(
-                    target: "ngy_ai",
-                    parent: &span,
-                    stage = "translation_response_salvaged",
-                    block_ordinal = scope.ordinal,
-                    request_attempt,
-                    endpoint = endpoint.unwrap_or("-"),
-                    end = stats.end,
-                    response_bytes = response.len(),
-                    containers = shape.containers,
-                    "Translation response salvaged from an unfinished stream"
-                );
-                return Ok(BlockStep::Value(response));
-            }
-            record_index_event(
-                inner,
-                job,
-                JobLogEvent::StepFailed,
-                JobLogMetrics {
-                    ordinal: Some(scope.ordinal as u64),
-                    request_attempt: Some(request_attempt as u64),
-                    response_bytes: Some(stats.content_bytes as u64),
-                    actual_count: Some(stats.events as u64),
-                    duration_ms: Some(elapsed_ms),
-                    // 截断已经是一条按 `ResponseError` 分好类的失败，直接用它的类别；
-                    // 其余按流的结束方式归类（`unexpected_finish_reason` 里除截断外都是
-                    // 流协议问题）。
-                    error_kind: Some(if error.is::<crate::ai::translation::ResponseError>() {
-                        classify_error(&error)
-                    } else {
-                        match stats.end {
-                            "response_too_large" => JobLogErrorKind::InvalidData,
-                            "tool_call" | "unexpected_finish_reason" => {
-                                JobLogErrorKind::StreamProtocol
-                            }
-                            "control_error" => JobLogErrorKind::Database,
-                            _ => classify_error(&error),
-                        }
-                    }),
-                    ..JobLogMetrics::for_error(&error)
-                },
-            );
-            Err(error)
+            Ok(BlockStep::Value(TranslationStreamText {
+                text: response,
+                stats,
+                elapsed_ms,
+                error: Some(error),
+            }))
         }
     }
+}
+
+/// Collects one streaming translation answer of a **single block**.
+///
+/// 读流本身见 [`read_translation_stream`]；这里只做单块路径自己的收尾：转储与 debug
+/// 预览、从异常结束的流里抢救一个完整答案、以及把那一次失败记成这一块的 `StepFailed`。
+pub(crate) async fn collect_translation_response(
+    inner: &Arc<IndexingInner>,
+    job: &db::index_jobs::IndexJob,
+    scope: &TranslationBlockScope,
+    request_attempt: usize,
+    source: &TranslationSource,
+    // 收集阶段只用 `request_body` 与冻结的 `source`：上下文已经进了那一份 body，
+    // 这里不再解包它（调用方照旧传进来，因为它与 source 一起构成这次请求的身份）。
+    _context: &TranslationContext<'_>,
+    request_body: &str,
+    // 这一发的端点来源，只进转储行（见 `dump_raw_translation_response`）。
+    endpoint: Option<&str>,
+    identity: &str,
+    stream: crate::ai::ChatEventStream,
+) -> Result<BlockStep<String>> {
+    let span = tracing::Span::current();
+    let read = TranslationStreamRead {
+        ordinal: scope.ordinal,
+        blocks: 1,
+        request_attempt,
+        max_bytes: MAX_TRANSLATION_RESPONSE_BYTES,
+        endpoint,
+    };
+    let read = match read_translation_stream(inner, job, scope, read, stream).await? {
+        BlockStep::Value(read) => read,
+        BlockStep::Stopped(stop) => return Ok(BlockStep::Stopped(stop)),
+    };
+    let Some(error) = read.error else {
+        return Ok(BlockStep::Value(read.text));
+    };
+    dump_raw_translation_response(
+        &span,
+        scope.ordinal,
+        request_attempt,
+        endpoint,
+        request_body,
+        Some(&read.text),
+        read.stats.end,
+    );
+    // 流中断时已收到的字节往往就是失败原因的全部证据（半截 JSON、
+    // 提前结束的回答），这条 debug 预览让失败当场不必先去开转储开关。
+    log_raw_model_output(
+        &span,
+        scope.ordinal,
+        request_attempt,
+        endpoint,
+        "stream",
+        &read.text,
+    );
+    // 流没有正常结束，但已经收到的字节可能包含一个完整、能通过全部片段校验的
+    // 答案（模型答完继续啰嗦、或服务端在收尾前断开）。整段文本仍走原来的严格
+    // 解码：只有一个完整容器、id 不多不少时才会被采用，不会猜模型意图。
+    if crate::ai::translation::parse_response(source, &read.text, identity).is_ok() {
+        tracing::warn!(
+            target: "ngy_ai",
+            parent: &span,
+            stage = "translation_response_salvaged",
+            block_ordinal = scope.ordinal,
+            request_attempt,
+            endpoint = endpoint.unwrap_or("-"),
+            end = read.stats.end,
+            response_bytes = read.text.len(),
+            "Translation response salvaged from an unfinished stream"
+        );
+        return Ok(BlockStep::Value(read.text));
+    }
+    record_index_event(
+        inner,
+        job,
+        JobLogEvent::StepFailed,
+        JobLogMetrics {
+            ordinal: Some(scope.ordinal as u64),
+            request_attempt: Some(request_attempt as u64),
+            response_bytes: Some(read.stats.content_bytes as u64),
+            actual_count: Some(read.stats.events as u64),
+            duration_ms: Some(read.elapsed_ms),
+            // 截断已经是一条按 `ResponseError` 分好类的失败，直接用它的类别；
+            // 其余按流的结束方式归类（`unexpected_finish_reason` 里除截断外都是
+            // 流协议问题）。
+            error_kind: Some(if error.is::<crate::ai::translation::ResponseError>() {
+                classify_error(&error)
+            } else {
+                match read.stats.end {
+                    "response_too_large" => JobLogErrorKind::InvalidData,
+                    "tool_call" | "unexpected_finish_reason" => JobLogErrorKind::StreamProtocol,
+                    "control_error" => JobLogErrorKind::Database,
+                    _ => classify_error(&error),
+                }
+            }),
+            ..JobLogMetrics::for_error(&error)
+        },
+    );
+    Err(error)
 }
 
 /// One awaited provider step of a translation block, under its own control check.

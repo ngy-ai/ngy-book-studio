@@ -6,6 +6,8 @@ use std::{borrow::Cow, fmt};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
+mod batch;
+
 mod decode;
 
 mod error;
@@ -19,6 +21,8 @@ mod repair;
 mod segment;
 
 mod source;
+
+pub use batch::*;
 
 pub use error::*;
 
