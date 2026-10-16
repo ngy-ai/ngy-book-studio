@@ -77,6 +77,24 @@ pub(crate) fn batch_limit_defaults_to_one_inside_the_machine_and_packs_remote_en
     );
 }
 
+/// 用户在设置里显式填的块数上限原样进预算：「自动」档的 8 只是默认值，不是天花板，
+/// 预算的钳制只兜住「至少一块」与设置验证之外的上界。
+#[test]
+pub(crate) fn an_explicit_block_limit_above_the_automatic_one_is_kept() {
+    let explicit = TranslationBatchBudget::new(100_000, 16);
+    assert_eq!(explicit.max_blocks, 16, "9–64 的设置不得被压回自动档的 8");
+    assert_eq!(
+        TranslationBatchBudget::new(100_000, usize::MAX).max_blocks,
+        MAX_TRANSLATION_BATCH_BLOCKS_SETTING as usize,
+        "预算只兜住设置验证之外的天花板"
+    );
+    assert_eq!(
+        TranslationBatchBudget::new(100_000, 0).max_blocks,
+        1,
+        "至少一块"
+    );
+}
+
 /// 打包的三个上限：输出预算、块数、请求体字节。空批永远收得下第一块。
 #[test]
 pub(crate) fn packer_fills_a_batch_by_output_budget_block_count_and_bytes() {

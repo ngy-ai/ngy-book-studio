@@ -30,19 +30,20 @@ pub struct TranslationBatchItem<'a> {
     pub context: TranslationContext<'a>,
 }
 
-/// 批内块数的硬上限。「自动」档在远程端点上用它，用户也可以把端点的「每请求文本块数」
-/// 调到这个值。再往上收益很小（输出预算先撑不住），而一旦模型答错，一次要退回的块更多。
+/// 「自动」档在远程端点上用的批内块数。用户可以把端点的「每请求文本块数」调得更高
+/// （最多 [`MAX_TRANSLATION_BATCH_BLOCKS_SETTING`]）：再往上收益很小（输出预算先撑不住），
+/// 而一旦模型答错，一次要退回的块更多，所以自动档不发这个险。
 pub const MAX_TRANSLATION_BATCH_BLOCKS: usize = 8;
 
-/// 端点设置里「每请求文本块数」能填的最大值。
+/// 端点设置里「每请求文本块数」能填的最大值，也是打包预算里块数上限的天花板。
 pub const MAX_TRANSLATION_BATCH_BLOCKS_SETTING: u32 = 64;
 
 /// 一次请求的输出预算里留给译文的百分比。剩下的留给 JSON 外壳、纠正重试与估算误差 ——
 /// 顶到输出上限的代价是整批被截断，等于白花一次请求。
 pub const TRANSLATION_BATCH_OUTPUT_SHARE_PERCENT: u32 = 60;
 
-/// 批请求体的字节上限。单块的 64 KiB 上限不变，批按份数放宽，但仍要有天花板：8 个块
-/// 各自接近上限时请求体能到几百 KiB。
+/// 批请求体的字节上限。单块的 64 KiB 上限不变，批按份数放宽，但仍要有天花板：块数上限
+/// 放到 64 之后，各自接近上限时请求体能到 MB 级。
 pub const MAX_TRANSLATION_BATCH_REQUEST_BYTES: usize = 256 * 1024;
 
 /// 批里每一项除块负载之外的外壳开销（`{"id":0,` 与分隔逗号）。
@@ -61,12 +62,16 @@ pub struct TranslationBatchBudget {
 
 impl TranslationBatchBudget {
     /// 按一次请求的生成参数与端点策略算出预算。
+    ///
+    /// `max_blocks` 是端点「每请求文本块数」的解析结果，用户显式填的上限直到
+    /// [`MAX_TRANSLATION_BATCH_BLOCKS_SETTING`] 都原样保留 —— 这里的钳制只兜住
+    /// 「至少一块」与设置验证之外的天花板，不再把 9–64 静默压回自动档的 8。
     pub fn new(max_output_tokens: u32, max_blocks: usize) -> Self {
         Self {
             output_tokens: max_output_tokens as usize
                 * TRANSLATION_BATCH_OUTPUT_SHARE_PERCENT as usize
                 / 100,
-            max_blocks: max_blocks.clamp(1, MAX_TRANSLATION_BATCH_BLOCKS),
+            max_blocks: max_blocks.clamp(1, MAX_TRANSLATION_BATCH_BLOCKS_SETTING as usize),
             max_bytes: MAX_TRANSLATION_BATCH_REQUEST_BYTES,
         }
     }
