@@ -84,6 +84,12 @@ pub(crate) fn exth_cover_offset(record0: &[u8]) -> Option<u32> {
             return None;
         }
         if tag == EXTH_COVER_OFFSET_TAG {
+            // The payload is a 4-byte offset: a record that declares less than
+            // 8 + 4 bytes cannot hold it. Without this check the read below
+            // would pick up the following record's bytes as the cover offset.
+            if length < 12 {
+                return None;
+            }
             let offset = read_u32(record0, cursor + 8)?;
             return (offset != u32::MAX).then_some(offset);
         }

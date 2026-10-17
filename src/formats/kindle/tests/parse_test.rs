@@ -107,6 +107,18 @@ pub(crate) fn record0_with_exth(tags: &[(u32, &[u8])]) -> Vec<u8> {
 }
 
 #[test]
+pub(crate) fn a_short_exth_cover_record_is_rejected_instead_of_reading_the_next_record() {
+    // Tag 201 with an empty payload (length 8) followed by another record: the
+    // following record's bytes must not be read as the cover offset.
+    let record0 = record0_with_exth(&[(EXTH_COVER_OFFSET_TAG, &[]), (3, &1_u32.to_be_bytes())]);
+    assert_eq!(
+        exth_cover_offset(&record0),
+        None,
+        "a 4-byte payload cannot live in a record shorter than 12 bytes"
+    );
+}
+
+#[test]
 pub(crate) fn resources_are_numbered_from_the_first_resource_record() {
     let record0 = record0_with_exth(&[(EXTH_COVER_OFFSET_TAG, &2_u32.to_be_bytes())]);
     let container = build_palmdb(&[
