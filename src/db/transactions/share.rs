@@ -302,6 +302,10 @@ fn ensure_shared_thread(
 /// Appends the turns this thread does not have yet, so re-sharing an updated
 /// conversation adds what is new instead of duplicating the whole thing.
 ///
+/// A package may list the same ordinal twice (a damaged or hand-edited file).
+/// Only the first turn of that ordinal is imported: the second one would hit
+/// the unique `(thread_id, ordinal)` index and roll back the whole transaction.
+///
 /// Returns how many messages were actually written.
 fn append_shared_messages(
     conn: &Connection,
@@ -311,21 +315,19 @@ fn append_shared_messages(
 ) -> Result<usize> {
     let stored = super::super::chat_messages::list_for_thread(conn, thread_id)?
         .into_iter()
-        .map(|message| message.ordinal)
-        .collect::<HashSet<_>>();
-    let message_ids = thread
-        .messages
-        .iter()
-        .map(|message| {
-            (
-                message.ordinal,
-                deterministic_id(
-                    "chat-message",
-                    format!("{thread_id}\0{}\0{}", message.ordinal, message.created_at),
-                ),
-            )
-        })
+        .map(|message| (message.ordinal, message.id))
         .collect::<HashMap<_, _>>();
+    // First occurrence wins, so the id used below belongs to the turn that is
+    // actually written — a duplicate's own id names no row in the end.
+    let mut message_ids: HashMap<usize, String> = HashMap::new();
+    for message in &thread.messages {
+        message_ids.entry(message.ordinal).or_insert_with(|| {
+            deterministic_id(
+                "chat-message",
+                format!("{thread_id}\0{}\0{}", message.ordinal, message.created_at),
+            )
+        });
+    }
     // A message body from a package is capped like a citation quote; anything
     // larger is not a conversation turn this build accepts. The turn is skipped
     // whole (its citations ride with it), and its ID is not a valid parent.
@@ -335,6 +337,7 @@ fn append_shared_messages(
         .filter(|message| message.content.len() > MAX_SHARE_QUOTE_BYTES)
         .map(|message| message.ordinal)
         .collect::<HashSet<_>>();
+    let mut imported = HashSet::new();
     let mut written = 0;
     for message in &thread.messages {
         let Some(id) = message_ids.get(&message.ordinal) else {
@@ -342,7 +345,19 @@ fn append_shared_messages(
         };
         // Either already imported, or this ordinal holds a different turn of a
         // thread that merely shares a name; neither may be displaced.
-        if stored.contains(&message.ordinal) {
+        if stored.contains_key(&message.ordinal) {
+            continue;
+        }
+        // A second turn with the same ordinal can only come from a defective
+        // package: keep the first turn, because this insert would violate the
+        // unique (thread_id, ordinal) index and fail the whole transaction.
+        if !imported.insert(message.ordinal) {
+            tracing::debug!(
+                target: "ngy_share",
+                thread_id,
+                ordinal = message.ordinal,
+                "分享包：同一序号在包内重复出现，只导入第一次"
+            );
             continue;
         }
         if oversized.contains(&message.ordinal) {
@@ -354,12 +369,20 @@ fn append_shared_messages(
             );
             continue;
         }
-        let parent_id = message
-            .parent_ordinal
+        let parent_id = message.parent_ordinal.and_then(|ordinal| {
+            // A parent already stored here keeps its own row id: the package's
+            // id for this ordinal may name a different turn of a same-named
+            // thread and would leave the child dangling.
+            if let Some(id) = stored.get(&ordinal) {
+                return Some(id.clone());
+            }
             // A skipped turn was never inserted here, so a child may not point
             // at it: the deferred FK would fail the whole transaction.
-            .filter(|ordinal| !oversized.contains(ordinal))
-            .and_then(|ordinal| message_ids.get(&ordinal).cloned());
+            if oversized.contains(&ordinal) {
+                return None;
+            }
+            message_ids.get(&ordinal).cloned()
+        });
         super::super::chat_messages::insert(
             conn,
             &super::super::chat_messages::ChatMessage {

@@ -603,3 +603,195 @@ fn an_oversized_package_file_is_rejected_by_metadata_before_full_allocation() {
         "unexpected error: {error}"
     );
 }
+
+/// A package that lists the same ordinal twice may only import the first turn.
+/// The second insert would hit the unique (thread_id, ordinal) index and roll
+/// the whole section transaction back, taking the notes and译文 with it.
+#[test]
+fn a_duplicated_ordinal_in_a_package_imports_only_the_first_turn() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut sender = LibraryStore::load_from(temp.path().join("sender")).unwrap();
+    let book = sender.create_book("重复轮次之书", "作者").unwrap();
+    let conn = crate::db::open_conn(&sender.database_path()).unwrap();
+    crate::db::chat_threads::insert(
+        &conn,
+        &ChatThread {
+            id: "thread-1".into(),
+            book_id: Some(book.id.clone()),
+            title: "重复的讨论".into(),
+            scope_json: serde_json::to_string(&serde_json::json!({ "book_ids": [book.id] }))
+                .unwrap(),
+            window_kind: "reader".into(),
+            created_at: 20,
+            updated_at: 20,
+        },
+    )
+    .unwrap();
+    let turns: [(usize, &str, &str, Option<usize>); 3] = [
+        (0, "user", "最初的问题", None),
+        (1, "assistant", "第一份回答", Some(0)),
+        (2, "user", "被留下的追问", Some(1)),
+    ];
+    for (ordinal, role, content, parent_ordinal) in turns {
+        crate::db::chat_messages::insert(
+            &conn,
+            &ChatMessage {
+                id: format!("message-{ordinal}"),
+                thread_id: "thread-1".into(),
+                parent_id: parent_ordinal.map(|ordinal| format!("message-{ordinal}")),
+                ordinal,
+                role: role.into(),
+                content: content.to_string(),
+                model: None,
+                created_at: 20 + ordinal as u64,
+            },
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let target = temp.path().join("shared.ngyshare");
+    sender.export_share_package(&book.id, &target).unwrap();
+
+    // 在包内给 1 号补一条同序号的重复轮次（内容与时间都不同），模拟被改动过的包。
+    let mut package = crate::share::read_share_package(&fs::read(&target).unwrap()).unwrap();
+    let thread = &mut package.chats[0];
+    let mut duplicate = thread.messages[1].clone();
+    duplicate.content = "重复出现的另一份回答".to_string();
+    duplicate.created_at += 1;
+    thread.messages.push(duplicate);
+
+    let mut receiver = LibraryStore::load_from(temp.path().join("receiver")).unwrap();
+    let outcome = receiver
+        .import_share_package_contents(package, None, None)
+        .unwrap();
+    assert_eq!(outcome.chat_threads, 1);
+    assert_eq!(
+        outcome.chat_messages, 3,
+        "重复的那一轮不落库，其余三轮照常导入"
+    );
+
+    let conn = crate::db::open_conn(&receiver.database_path()).unwrap();
+    let threads = crate::db::chat_threads::list_for_book(&conn, Some(&outcome.record.id)).unwrap();
+    assert_eq!(threads.len(), 1);
+    let messages = crate::db::chat_messages::list_for_thread(&conn, &threads[0].id).unwrap();
+    assert_eq!(
+        messages.iter().map(|m| m.ordinal).collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    let second = messages.iter().find(|m| m.ordinal == 1).unwrap();
+    assert_eq!(second.content, "第一份回答", "保留的是第一次出现的轮次");
+    assert_eq!(
+        second.id,
+        crate::document::deterministic_id(
+            "chat-message",
+            format!("{}\0{}\0{}", threads[0].id, 1, 21)
+        ),
+        "重复序号用第一次出现的确定性 ID 落库"
+    );
+    let third = messages.iter().find(|m| m.ordinal == 2).unwrap();
+    assert_eq!(
+        third.parent_id.as_deref(),
+        Some(second.id.as_str()),
+        "子轮挂到真正落库的那一行上"
+    );
+}
+
+/// A re-share may carry a turn whose ordinal the receiver already holds as a
+/// *different* turn (a same-named thread, an edited package). A child of that
+/// ordinal must link to the stored row: the package-derived id names no row and
+/// the deferred FK would fail the whole import.
+#[test]
+fn a_child_of_a_displaced_turn_links_to_the_stored_row() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut sender = LibraryStore::load_from(temp.path().join("sender")).unwrap();
+    let book = sender.create_book("改轮次之书", "作者").unwrap();
+    let conn = crate::db::open_conn(&sender.database_path()).unwrap();
+    crate::db::chat_threads::insert(
+        &conn,
+        &ChatThread {
+            id: "thread-1".into(),
+            book_id: Some(book.id.clone()),
+            title: "会被改动的讨论".into(),
+            scope_json: serde_json::to_string(&serde_json::json!({ "book_ids": [book.id] }))
+                .unwrap(),
+            window_kind: "reader".into(),
+            created_at: 20,
+            updated_at: 20,
+        },
+    )
+    .unwrap();
+    let turns: [(usize, &str, &str, Option<usize>); 3] = [
+        (0, "user", "最初的问题", None),
+        (1, "assistant", "第一份回答", Some(0)),
+        (2, "user", "被留下的追问", Some(1)),
+    ];
+    for (ordinal, role, content, parent_ordinal) in turns {
+        crate::db::chat_messages::insert(
+            &conn,
+            &ChatMessage {
+                id: format!("message-{ordinal}"),
+                thread_id: "thread-1".into(),
+                parent_id: parent_ordinal.map(|ordinal| format!("message-{ordinal}")),
+                ordinal,
+                role: role.into(),
+                content: content.to_string(),
+                model: None,
+                created_at: 20 + ordinal as u64,
+            },
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    // 第一次分享：接收方存下这整段对话。
+    let first = temp.path().join("first.ngyshare");
+    sender.export_share_package(&book.id, &first).unwrap();
+    let mut receiver = LibraryStore::load_from(temp.path().join("receiver")).unwrap();
+    let first_outcome = receiver.import_share_package(&first, None, None).unwrap();
+    assert_eq!(first_outcome.chat_messages, 3);
+
+    let conn = crate::db::open_conn(&receiver.database_path()).unwrap();
+    let threads =
+        crate::db::chat_threads::list_for_book(&conn, Some(&first_outcome.record.id)).unwrap();
+    let stored = crate::db::chat_messages::list_for_thread(&conn, &threads[0].id).unwrap();
+    let stored_second = stored.iter().find(|m| m.ordinal == 1).unwrap().clone();
+    drop(conn);
+
+    // 第二次分享：1 号换成了另一轮（内容与时间都不同），后面追加一轮它的追问。
+    let mut package = crate::share::read_share_package(&fs::read(&first).unwrap()).unwrap();
+    let thread = &mut package.chats[0];
+    thread.messages[1].content = "改写后的回答".to_string();
+    thread.messages[1].created_at += 1;
+    let mut follow_up = thread.messages[2].clone();
+    follow_up.ordinal = 3;
+    follow_up.parent_ordinal = Some(1);
+    follow_up.content = "针对新回答的追问".to_string();
+    follow_up.created_at = 24;
+    follow_up.citations.clear();
+    thread.messages.push(follow_up);
+
+    let outcome = receiver
+        .import_share_package_contents(package, None, None)
+        .unwrap();
+    assert_eq!(outcome.chat_threads, 0, "同一段对话不会建出第二个会话");
+    assert_eq!(outcome.chat_messages, 1, "只有追加的那一轮是新的");
+
+    let conn = crate::db::open_conn(&receiver.database_path()).unwrap();
+    let messages = crate::db::chat_messages::list_for_thread(&conn, &threads[0].id).unwrap();
+    assert_eq!(
+        messages.iter().map(|m| m.ordinal).collect::<Vec<_>>(),
+        vec![0, 1, 2, 3]
+    );
+    let second = messages.iter().find(|m| m.ordinal == 1).unwrap();
+    assert_eq!(
+        second.content, stored_second.content,
+        "已存的轮次不会被包里的另一轮顶掉"
+    );
+    let appended = messages.iter().find(|m| m.ordinal == 3).unwrap();
+    assert_eq!(
+        appended.parent_id.as_deref(),
+        Some(stored_second.id.as_str()),
+        "子轮指向接收方真正存下的那一行，而不是包派生 ID"
+    );
+}
