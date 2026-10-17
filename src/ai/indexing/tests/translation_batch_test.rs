@@ -19,8 +19,8 @@ use futures_util::{future::BoxFuture, stream};
 use crate::{
     ai::translation::TranslationSource,
     ai::{
-        ChatEventStream, ChatRequest, ChatStreamEvent, EmbeddingBatch, EmbeddingRequest,
-        MessageContent, ModelInfo,
+        ChatEventStream, ChatRequest, ChatStreamEvent, ContextWindowExceeded, EmbeddingBatch,
+        EmbeddingRequest, MessageContent, ModelInfo,
     },
     db,
 };
@@ -42,6 +42,9 @@ pub(crate) struct MockBatchProvider {
     pub(crate) truncate_requests: AtomicUsize,
     /// 前 N 发请求传输层直接失败：这一批的块按请求级失败处理，不拆半。
     pub(crate) fail_requests: AtomicUsize,
+    /// 前 N 发**批形状**请求被端点以「超出上下文长度」直接拒绝（收流之前的 HTTP 400
+    /// 封套）：这是容量问题，整批必须拆半重发，而不是按请求级失败整批跳过。
+    pub(crate) reject_context: AtomicUsize,
     /// 这些来源文字**在批里**给出的答案不合格（整段合并成一条）：只有那一块要退回单块。
     pub(crate) merged_in_batches: Mutex<Vec<String>>,
     /// 设置后，每个请求开始时读一次持久游标并记下窗口。
@@ -149,6 +152,21 @@ impl OpenAiCompatibleProvider for MockBatchProvider {
             {
                 // 传输层失败：重发同一个请求解决不了，整批按请求级失败处理。
                 anyhow::bail!("mock batch provider is temporarily unavailable");
+            }
+            if value["blocks"].is_array()
+                && self
+                    .reject_context
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                        left.checked_sub(1)
+                    })
+                    .is_ok()
+            {
+                // 收流前被拒：与 `ai::http` 解析 HTTP 400 的 context-length 封套同一种
+                // 错误类型。批太大，不是端点坏了 —— 更小的批才装得下。
+                return Err(anyhow::Error::new(ContextWindowExceeded {
+                    prompt_tokens: Some(4096),
+                    context_tokens: Some(4096),
+                }));
             }
             if self
                 .truncate_requests
@@ -481,8 +499,12 @@ pub(crate) fn a_batch_publishes_every_block_of_its_window_as_inflight() {
 /// 两个并发槽位、每发最多两块：谁都不许多带一块，也不许多开一发 —— 于是「处理中」的
 /// 上界就是「任务并发 × 每请求文本块数」。
 ///
-/// 这里只看请求形状、不读持久游标：并发下在请求线程里同步读库的探针会与 walk 的持久化
-/// 互相等待（用例会挂住）。游标侧的窗口语义由上面那条单发用例读游标固定。
+/// 请求形状与持久窗口各查一半：`batch_sizes` 说明两发各带满两块；探针在请求**开始时**读
+/// 持久游标，所以读数就是那一发发出时「处理中」的实际块集合 —— 第一发可能在第二发还没攒
+/// 完时就被轮询（攒批要拿门闩，等锁期间窗口照常被驱动，见 `walk.rs` 的
+/// `lock_transitions`），因此读数只承诺两件事：永远是块列表的一段前缀（发布与提交都按
+/// 序号），而且填到过 4 块 ——「任务并发 × 每请求文本块数」的上界既没有被越过，也不是靠
+/// 少发请求凑出来的。
 #[test]
 pub(crate) fn a_batch_window_never_exceeds_concurrency_times_the_block_limit() {
     let provider = Arc::new(MockBatchProvider::default());
@@ -491,13 +513,37 @@ pub(crate) fn a_batch_window_never_exceeds_concurrency_times_the_block_limit() {
     let (fixture, inner, job, mut cursor, translation) = batch_case_in(fixture, &provider, 2);
     let blocks = blocks_of(&fixture, &inner);
     assert_eq!(blocks.len(), 4, "章标题 + 三个段落");
+    provider.attach_probe(fixture.db_path.clone(), job.id.clone());
+    let ordinals = blocks.iter().map(|block| block.ordinal).collect::<Vec<_>>();
 
     let (_outcome, stats) = run_batch_walk(&fixture, &inner, &job, &mut cursor, &translation, 2);
+
     assert_eq!(stats.saved, 4);
     assert_eq!(
         provider.batch_sizes(),
         vec![2, 2],
         "两发各带满「每请求文本块数」= 2 块：没有哪一发越界，也没有多发一发"
+    );
+    let windows = provider.windows();
+    assert_eq!(windows.len(), 2, "两个并发槽位：两发请求各读一次窗口");
+    for (next_ordinal, inflight) in &windows {
+        assert_eq!(
+            *next_ordinal, ordinals[0],
+            "两个请求都在第一个块提交之前发出：窗口从头开始"
+        );
+        assert!(
+            inflight.len() <= 4,
+            "「处理中」最多是「任务并发 × 每请求文本块数」= 4 块，读到 {inflight:?}"
+        );
+        assert!(
+            ordinals.starts_with(inflight),
+            "窗口是块列表的一段前缀：发布与提交都按块序号，读到 {inflight:?}"
+        );
+    }
+    assert_eq!(
+        windows.iter().map(|(_, inflight)| inflight.len()).max(),
+        Some(4),
+        "第二发在四块全部进窗口之后才被轮询：窗口确实填到了上界"
     );
 }
 
@@ -661,6 +707,42 @@ pub(crate) fn a_failed_batch_request_skips_its_blocks_without_splitting() {
         .filter(|entry| entry.event == JobLogEvent::ProviderSkipped)
         .count();
     assert_eq!(skipped, 4);
+}
+
+/// 端点收流之前就以「超出上下文长度」拒掉整批：这是容量问题，拆半重发 ——
+/// 一直拆到单块路径，而不是像传输层失败那样整批逐块跳过。
+#[test]
+pub(crate) fn a_context_rejected_batch_is_split_until_every_block_goes_out_on_its_own() {
+    let provider = Arc::new(MockBatchProvider::default());
+    let mut fixture = Fixture::new();
+    three_paragraphs(&mut fixture);
+    let (fixture, inner, job, mut cursor, translation) = batch_case_in(fixture, &provider, 2);
+    let blocks = blocks_of(&fixture, &inner);
+    assert_eq!(blocks.len(), 4, "章标题 + 三个段落");
+    provider.reject_context.store(1, Ordering::SeqCst);
+
+    let (_outcome, stats) = run_batch_walk(&fixture, &inner, &job, &mut cursor, &translation, 1);
+
+    assert_eq!(
+        provider.batch_sizes(),
+        vec![2, 1, 1, 2],
+        "被拒的两块批拆成两个单块请求，下一窗的两块批照常发出"
+    );
+    assert_eq!(
+        provider
+            .batches
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .map(|(_, _, batch)| *batch)
+            .collect::<Vec<_>>(),
+        vec![true, false, false, true],
+        "拆半之后的两发走单块路径：一条请求只装一块时批信封没有意义"
+    );
+    for block in &blocks {
+        assert_block_stored(&fixture, block.ordinal, &block.source);
+    }
+    assert_eq!(stats.saved, 4, "每一块都翻出来了，没有哪一块被整批跳过");
 }
 
 /// 一批只装同一个内容单元（同一章）的块：跨过章边界就必须另起一发。
