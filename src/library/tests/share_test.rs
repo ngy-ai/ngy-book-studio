@@ -586,3 +586,20 @@ fn an_oversized_shared_message_is_skipped_and_its_children_reattach_safely() {
         "children of turns that did land keep their parent link"
     );
 }
+
+#[test]
+fn an_oversized_package_file_is_rejected_by_metadata_before_full_allocation() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("oversized.ngyshare");
+    let file = fs::File::create(&path).unwrap();
+    file.set_len(crate::share::MAX_SHARE_PACKAGE_BYTES + 1)
+        .unwrap();
+    drop(file);
+
+    let mut library = LibraryStore::load_from(temp.path().join("receiver")).unwrap();
+    let error = library.import_share_package(&path, None, None).unwrap_err();
+    assert!(
+        error.to_string().contains("2 GiB 安全上限"),
+        "unexpected error: {error}"
+    );
+}

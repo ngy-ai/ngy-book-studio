@@ -154,8 +154,27 @@ impl LibraryStore {
         group_id: Option<&str>,
         stamp: Option<&ShareTranslationStamp>,
     ) -> Result<ShareImportOutcome> {
-        let bytes =
-            fs::read(path).with_context(|| format!("无法读取分享包：{}", path.display()))?;
+        // A package is parsed from memory whole, so the file is measured and
+        // read with a bound instead of being slurped first and rejected after.
+        let metadata = path
+            .metadata()
+            .with_context(|| format!("无法读取分享包信息：{}", path.display()))?;
+        ensure!(metadata.is_file(), "分享包不存在：{}", path.display());
+        ensure!(
+            metadata.len() <= share::MAX_SHARE_PACKAGE_BYTES,
+            "分享包超过 2 GiB 安全上限"
+        );
+        let file =
+            fs::File::open(path).with_context(|| format!("无法打开分享包：{}", path.display()))?;
+        let initial_capacity = usize::try_from(metadata.len().min(8 * 1024 * 1024)).unwrap_or(0);
+        let mut bytes = Vec::with_capacity(initial_capacity);
+        file.take(share::MAX_SHARE_PACKAGE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("无法读取分享包：{}", path.display()))?;
+        ensure!(
+            bytes.len() as u64 <= share::MAX_SHARE_PACKAGE_BYTES,
+            "分享包超过 2 GiB 安全上限"
+        );
         let package = share::read_share_package(&bytes)?;
         self.import_share_package_contents(package, group_id, stamp)
     }
