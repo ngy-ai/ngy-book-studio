@@ -52,7 +52,9 @@ impl IndexingCoordinator {
     }
 
     /// Rebuilds one text block of a whole-book translation task together with
-    /// the request the worker would send for it. Same read-only inspection
+    /// the single-block request the worker sends when this block goes out on
+    /// its own（「每请求文本块数」为 1、坏批拆半退回单块、或单块重发；多块一批的
+    /// 批信封取决于运行时打包，无法从钉住的修订重建）. Same read-only inspection
     /// contract as [`Self::translation_blocks`]: nothing is claimed, advanced or
     /// published, and the returned body is debug data derived from the pinned
     /// revision that is never persisted.
@@ -84,9 +86,10 @@ impl IndexingCoordinator {
 
         // The configured model is only a fallback: a task that already ran
         // records the model it was pinned to, and the body must describe that
-        // execution rather than today's settings. 生成参数没有这种记录 —— 它不是执行
-        // 身份的一部分，所以展示当天配置的那一份，与旁边「重试」「重新请求」实际会
-        // 发出的请求一致。
+        // execution rather than today's settings. 这里重建的一律是**单块**请求
+        // （批路径的线上形状见 `translation_batch_request`，不可重建）。生成参数没有
+        // 执行记录 —— 它不是执行身份的一部分，所以展示当天配置的那一份，与旁边
+        // 「重试」「重新请求」实际会发出的请求一致。
         let (configured_model, generation) = self
             .inner
             .models
@@ -152,8 +155,9 @@ impl IndexingCoordinator {
     /// answer is returned to the caller rather than persisted, exactly like the
     /// request body of [`Self::translation_block_detail`].
     ///
-    /// The request is the one a retry would send: same frozen source, same
-    /// `translation_request` builder, same configured model. The stream is
+    /// The request is the single-block one — the shape this block gets when it
+    /// goes out on its own: same frozen source, same `translation_request`
+    /// builder, same configured model（多块的批重试走批信封，形状不同）。The stream is
     /// collected leniently (see `collect_probe_response`), so a truncated or
     /// malformed answer still reaches the window instead of failing the call.
     pub async fn probe_translation_block_response(

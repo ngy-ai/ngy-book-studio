@@ -109,8 +109,9 @@ impl AppServices {
     }
 
     /// Reads one text block of a whole-book translation task together with the
-    /// request body the worker would send for it, for the task window's debug
-    /// view. Same access rule as [`Self::background_job_translation_blocks`]:
+    /// single-block request body the worker sends when the block goes out on
+    /// its own, for the task window's debug view. Same access rule as
+    /// [`Self::background_job_translation_blocks`]:
     /// the task must belong to the current book scope. Rebuilding the body
     /// re-parses the pinned revision and reads `book_sources`, so it runs on the
     /// application I/O runtime rather than in the GPUI callback.

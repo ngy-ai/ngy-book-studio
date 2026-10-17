@@ -353,8 +353,9 @@ impl BackgroundJobsWindow {
     }
 
     /// Debug view of one text block: the identifiers, the full source, and the
-    /// exact request body the worker would send. Rendered as an in-window
-    /// overlay so it stays attached to the task it describes.
+    /// exact single-block request body the worker sends when the block goes out
+    /// on its own. Rendered as an in-window overlay so it stays attached to the
+    /// task it describes.
     pub(super) fn render_block_detail_modal(
         &self,
         window: &mut Window,
@@ -465,7 +466,10 @@ impl BackgroundJobsWindow {
             BlockDetailTab::Response => {
                 "模型响应为一次现场重放的原始回答，只显示在这里，不落库、不写译文。"
             }
-            _ => "请求 Body 为工作进程构造的完整 chat-completions 请求，仅用于调试，不落库。",
+            _ => {
+                "请求 Body 为这一块单独发送时的完整 chat-completions 请求\
+                 （端点把多个文本块打包成一个请求时形状不同），仅用于调试，不落库。"
+            }
         });
         let footer = div()
             .h_flex()

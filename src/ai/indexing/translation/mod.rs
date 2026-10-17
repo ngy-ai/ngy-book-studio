@@ -96,8 +96,9 @@ pub struct TranslationBlockList {
 }
 
 /// One text block of a whole-book translation task, with the full revision
-/// pinned source and the request the worker would build for it. Debugging
-/// payload of the task window: it is rebuilt on demand from the pinned
+/// pinned source and the single-block request the worker builds when this block
+/// goes out on its own（多块一批的批信封取决于运行时打包，无法从钉住的修订重建）.
+/// Debugging payload of the task window: it is rebuilt on demand from the pinned
 /// revision and never persisted, so a book or provider body cannot leak into
 /// the durable log or database.
 #[derive(Clone, Debug, PartialEq)]
@@ -154,8 +155,10 @@ pub struct TranslationBlockProbe {
 }
 
 /// The translation request one block produces, in the exact shape the worker
-/// sends: the system prompt and the user message are reported separately so the
-/// window can show either, and `body` is the serialized `ChatRequest`.
+/// sends when this block goes out on its own（「每请求文本块数」为 1 或批回退到
+/// 单块；多块一批的请求另走批信封，形状不同）: the system prompt and the user
+/// message are reported separately so the window can show either, and `body` is
+/// the serialized `ChatRequest`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TranslationBlockRequest {
     pub model: String,

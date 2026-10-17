@@ -284,7 +284,8 @@ pub(crate) enum BlockDetailTab {
     /// Identifiers, sizes and request shape, with nothing that can be truncated.
     Overview,
     Source,
-    /// The serialized chat-completions body — the payload actually sent.
+    /// The serialized chat-completions body — the payload a single-block send
+    /// puts on the wire（端点打包的批请求形状不同）.
     Body,
     Prompt,
     Message,
