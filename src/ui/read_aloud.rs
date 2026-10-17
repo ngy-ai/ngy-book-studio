@@ -7,7 +7,8 @@
 //!
 //! 朗读是**进程级**资源（系统语音与音频输出各只有一份）：同一时刻只允许
 //! 一个朗读会话。新的会话开始前，[`claim_read_aloud_ownership`] 会先停掉
-//! 登记表里的旧窗口；系统配置窗口的「试听」同样占用音频输出。
+//! 登记表里的旧窗口；系统配置窗口的「试听」同样占用音频输出，开始前经
+//! [`stop_any_read_aloud`] 停掉登记表里的会话。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -261,6 +262,20 @@ pub(crate) fn release_read_aloud_ownership(cx: &mut App, owner: EntityId) {
     }
 }
 
+/// 停掉登记表里正在朗读的窗口（若有）。试听等其它应用级播放资源在开始前调用：
+/// 音频输出只有一份，不能让两边同时出声。登记项先取出再执行停止闭包，闭包内部
+/// 走到窗口自己的停止路径时登记表已经空着，按 `release_read_aloud_ownership`
+/// 的语义只能清自家，不会误伤别的窗口。
+pub(crate) fn stop_any_read_aloud(cx: &mut App) {
+    if !cx.has_global::<ReadAloudRegistry>() {
+        return;
+    }
+    let Some((_, stop)) = cx.global_mut::<ReadAloudRegistry>().owner.take() else {
+        return;
+    };
+    stop(cx);
+}
+
 /// 一个能朗读的阅读窗口。默认实现覆盖「读设置 → 起会话 → 轮询 → 呈现 →
 /// 停止」整条链路；窗口只需要说明：状态放哪、设置从哪读、高亮怎么呈现。
 pub(crate) trait ReadAloudWindow: Sized + 'static {
@@ -388,11 +403,24 @@ mod tests {
     use super::*;
     use crate::ui::init_ui_test;
     use gpui_kit::{AppContext, TestAppContext};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// 一个最小朗读窗口：登记表只经手窗口身份，用不到会话或呈现。
+    /// 一个最小朗读窗口：登记表只经手窗口身份，用不到会话或呈现；停止路径记
+    /// 一次数，供「登记项被执行」的断言使用。
     struct TestReadAloudWindow {
         services: Arc<AppServices>,
         host: ReadAloudHost,
+        stops: Arc<AtomicUsize>,
+    }
+
+    impl TestReadAloudWindow {
+        fn new(services: &Arc<AppServices>, stops: Arc<AtomicUsize>) -> Self {
+            Self {
+                services: Arc::clone(services),
+                host: ReadAloudHost::default(),
+                stops,
+            }
+        }
     }
 
     impl ReadAloudWindow for TestReadAloudWindow {
@@ -406,6 +434,26 @@ mod tests {
 
         fn apply_read_aloud_highlight(&mut self, _block_id: Option<&str>, _cx: &mut Context<Self>) {
         }
+
+        fn stop_read_aloud(&mut self, cx: &mut Context<Self>) {
+            self.stops.fetch_add(1, Ordering::SeqCst);
+            let was_active = self.read_aloud().stop();
+            let owner = cx.entity().entity_id();
+            release_read_aloud_ownership(cx, owner);
+            if was_active {
+                self.apply_read_aloud_highlight(None, cx);
+                cx.notify();
+            }
+        }
+    }
+
+    fn registered_owner(cx: &TestAppContext) -> Option<EntityId> {
+        cx.read(|app| {
+            app.global::<ReadAloudRegistry>()
+                .owner
+                .as_ref()
+                .map(|(id, _)| *id)
+        })
     }
 
     /// 朗读是进程级资源：登记表只属于最后一个 claim 的窗口。被接管停掉的旧窗口还
@@ -417,48 +465,73 @@ mod tests {
         init_ui_test(cx);
         let temp = tempfile::tempdir().unwrap();
         let services = Arc::new(AppServices::open(temp.path()).unwrap());
-        let window = || TestReadAloudWindow {
-            services: Arc::clone(&services),
-            host: ReadAloudHost::default(),
-        };
+        let stops = Arc::new(AtomicUsize::new(0));
+        let window = || TestReadAloudWindow::new(&services, Arc::clone(&stops));
         let first = cx.new(|_| window());
         let second = cx.new(|_| window());
         let third = cx.new(|_| window());
-        let registered = |cx: &TestAppContext| {
-            cx.read(|app| {
-                app.global::<ReadAloudRegistry>()
-                    .owner
-                    .as_ref()
-                    .map(|(id, _)| *id)
-            })
-        };
 
         cx.update(|cx| claim_read_aloud_ownership(cx, first.downgrade()));
-        assert_eq!(registered(cx), Some(first.entity_id()));
+        assert_eq!(registered_owner(cx), Some(first.entity_id()));
 
         // 「开始朗读」先停自家旧会话再 claim：这一步属于还没有任何会话的 second，
         // 不得清掉 first 的登记。
         cx.update_entity(&second, |this, cx| this.stop_read_aloud(cx));
         assert_eq!(
-            registered(cx),
+            registered_owner(cx),
             Some(first.entity_id()),
             "a window without a session must not release another window's claim"
         );
 
         cx.update(|cx| claim_read_aloud_ownership(cx, second.downgrade()));
-        assert_eq!(registered(cx), Some(second.entity_id()));
+        assert_eq!(registered_owner(cx), Some(second.entity_id()));
 
         // first 被接管停掉后仍会走自己的停止路径（可能来自迟到的 Finished 轮询）；
         // 它只能清自家登记。
         cx.update_entity(&first, |this, cx| this.stop_read_aloud(cx));
         assert_eq!(
-            registered(cx),
+            registered_owner(cx),
             Some(second.entity_id()),
             "the displaced window's own stop must not release the new owner"
         );
 
         cx.update(|cx| claim_read_aloud_ownership(cx, third.downgrade()));
-        assert_eq!(registered(cx), Some(third.entity_id()));
+        assert_eq!(registered_owner(cx), Some(third.entity_id()));
+    }
+
+    /// 试听是应用级播放资源：开始前必须停掉登记表里的朗读会话，否则两者同时占用
+    /// 音频输出。停止闭包要真的被执行，不只是把登记项丢掉。
+    #[gpui_kit::test]
+    fn starting_a_preview_stops_the_registered_read_aloud(cx: &mut TestAppContext) {
+        init_ui_test(cx);
+        let temp = tempfile::tempdir().unwrap();
+        let services = Arc::new(AppServices::open(temp.path()).unwrap());
+        let stops = Arc::new(AtomicUsize::new(0));
+        let window = || TestReadAloudWindow::new(&services, Arc::clone(&stops));
+        let first = cx.new(|_| window());
+        cx.update(|cx| claim_read_aloud_ownership(cx, first.downgrade()));
+        assert_eq!(registered_owner(cx), Some(first.entity_id()));
+
+        cx.update(|cx| stop_any_read_aloud(cx));
+        assert_eq!(
+            registered_owner(cx),
+            None,
+            "the preview must take the ownership away"
+        );
+        assert_eq!(
+            stops.load(Ordering::SeqCst),
+            1,
+            "the registered window's own stop must actually run"
+        );
+
+        // 空登记表上再停一次是无害的。
+        cx.update(|cx| stop_any_read_aloud(cx));
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+
+        // 表已释放，新会话照常登记。
+        let second = cx.new(|_| window());
+        cx.update(|cx| claim_read_aloud_ownership(cx, second.downgrade()));
+        assert_eq!(registered_owner(cx), Some(second.entity_id()));
     }
 
     #[test]

@@ -24,7 +24,8 @@ pub use session::*;
 
 /// 试听一句话：用系统语音合成后同步播放到底。供设置窗口的「试听」按钮使用。
 ///
-/// 会占用应用唯一的音频输出：试听与朗读不能同时出声，调用方要在界面上说明这一点。
+/// 会占用应用唯一的音频输出：试听与朗读不能同时出声。调用方必须在开始前停掉
+/// 正在进行的朗读（界面层经 `ui::stop_any_read_aloud`），而不是只提示用户。
 pub fn preview(voice_id: &str, rate: f32) -> anyhow::Result<()> {
     const PREVIEW_TEXT: &str = "这是朗读的试听效果。";
     let engine = platform_engine();

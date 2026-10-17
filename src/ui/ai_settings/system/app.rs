@@ -74,8 +74,10 @@ impl SystemSettingsWindow {
     /// 试听当前选择：合成一句话并播放到底。
     ///
     /// 合成与播放都在后台线程（会占用音频输出），界面只等一个结果提示；试听会
-    /// 打断正在进行的朗读——它是应用级播放资源，两者不能同时出声。
+    /// 打断正在进行的朗读——它是应用级播放资源，两者不能同时出声。因此在交给
+    /// 后台线程之前先停掉登记表里的朗读会话，而不是只提示用户。
     pub(crate) fn preview_speech(&mut self, cx: &mut Context<Self>) {
+        crate::ui::stop_any_read_aloud(cx);
         let voice_id = self.speech_voice_id.clone();
         let rate = self.speech_rate;
         let preview = cx

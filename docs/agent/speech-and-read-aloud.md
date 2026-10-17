@@ -161,7 +161,9 @@ macOS 的 `AVSpeechUtterance.rate` 是 0.0–1.0 的绝对值语义（默认 0.5
 - **DjVu 只对隐藏文字层开放**：Office 逐页预览是图片页，没有文字层，工具栏不显示朗读按钮；
   Office 图书的结构化阅读在阅读窗口里，那里已经支持朗读。
 - **单会话**：开始新的朗读前，`ReadAloudRegistry` 里登记的旧窗口先停；系统配置窗口的
-  「试听」同样占用音频输出，会打断正在进行的朗读。登记表只属于最后一个 claim 的窗口：
+  「试听」同样占用音频输出，会打断正在进行的朗读——`preview_speech` 在交给后台线程
+  合成之前经 `stop_any_read_aloud` 停掉登记表里的会话（闭包真的执行，不只是丢登记项）。
+  登记表只属于最后一个 claim 的窗口：
   被接管停掉的旧窗口还会走自己的停止路径（`stop_read_aloud` 或迟到的 `Finished` 轮询），
   它只能清自家登记（`release_read_aloud_ownership` 按 owner 条件清除），否则会把刚接管
   的新窗口挤掉，下一个窗口 claim 时无人可停。
