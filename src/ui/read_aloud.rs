@@ -247,10 +247,17 @@ pub(crate) fn claim_read_aloud_ownership<T: ReadAloudWindow>(cx: &mut App, owner
     }
 }
 
-/// 清掉登记表（会话结束或窗口关闭时调用，幂等）。
-pub(crate) fn release_read_aloud_ownership(cx: &mut App) {
+/// 清掉登记表中属于 `owner` 的项（会话结束或窗口关闭时调用，幂等）。
+///
+/// 只清自家的登记。一个窗口被新窗口的 claim 停掉之后，还会走到自己的停止路径
+/// （`stop_read_aloud`，或已排队事件里那次迟到的 `Finished` 轮询）；若无条件清空，
+/// 就会把刚登记的新窗口挤掉，下一个窗口 claim 时旧会话不再被停止，单会话约束失效。
+pub(crate) fn release_read_aloud_ownership(cx: &mut App, owner: EntityId) {
     if cx.has_global::<ReadAloudRegistry>() {
-        cx.global_mut::<ReadAloudRegistry>().owner = None;
+        let registry = cx.global_mut::<ReadAloudRegistry>();
+        if registry.owner.as_ref().is_some_and(|(id, _)| *id == owner) {
+            registry.owner = None;
+        }
     }
 }
 
@@ -306,7 +313,8 @@ pub(crate) trait ReadAloudWindow: Sized + 'static {
         claim_read_aloud_ownership(cx, owner);
 
         if let Err(error) = self.read_aloud().begin(blocks, start_index, voice_id, rate) {
-            release_read_aloud_ownership(cx);
+            let owner = cx.entity().entity_id();
+            release_read_aloud_ownership(cx, owner);
             self.report_read_aloud_error(format!("无法开始朗读：{error:#}"), cx);
             return;
         }
@@ -324,10 +332,11 @@ pub(crate) trait ReadAloudWindow: Sized + 'static {
         cx.notify();
     }
 
-    /// 停止朗读并清除呈现。幂等：没有会话时只清登记。
+    /// 停止朗读并清除呈现。幂等：只清自己名下的登记，不会挤掉已接管的最新媒体窗口。
     fn stop_read_aloud(&mut self, cx: &mut Context<Self>) {
         let was_active = self.read_aloud().stop();
-        release_read_aloud_ownership(cx);
+        let owner = cx.entity().entity_id();
+        release_read_aloud_ownership(cx, owner);
         if was_active {
             self.apply_read_aloud_highlight(None, cx);
             cx.notify();
@@ -345,7 +354,8 @@ pub(crate) trait ReadAloudWindow: Sized + 'static {
                 true
             }
             ReadAloudPoll::Finished { error } => {
-                release_read_aloud_ownership(cx);
+                let owner = cx.entity().entity_id();
+                release_read_aloud_ownership(cx, owner);
                 self.apply_read_aloud_highlight(None, cx);
                 if let Some(error) = error {
                     self.report_read_aloud_error(format!("朗读已停止：{error}"), cx);
@@ -376,6 +386,80 @@ pub(crate) trait ReadAloudWindow: Sized + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::init_ui_test;
+    use gpui_kit::{AppContext, TestAppContext};
+
+    /// 一个最小朗读窗口：登记表只经手窗口身份，用不到会话或呈现。
+    struct TestReadAloudWindow {
+        services: Arc<AppServices>,
+        host: ReadAloudHost,
+    }
+
+    impl ReadAloudWindow for TestReadAloudWindow {
+        fn read_aloud(&mut self) -> &mut ReadAloudHost {
+            &mut self.host
+        }
+
+        fn read_aloud_services(&self) -> &Arc<AppServices> {
+            &self.services
+        }
+
+        fn apply_read_aloud_highlight(&mut self, _block_id: Option<&str>, _cx: &mut Context<Self>) {
+        }
+    }
+
+    /// 朗读是进程级资源：登记表只属于最后一个 claim 的窗口。被接管停掉的旧窗口还
+    /// 会走自己的停止路径（`stop_read_aloud`，或已排队事件里那次迟到的 `Finished`
+    /// 轮询），那条路径只能清自家登记。无条件清空会把刚接管的新窗口挤掉：下一个
+    /// 窗口 claim 时无人可停，两个会话同时占用音频输出。
+    #[gpui_kit::test]
+    fn a_late_stop_from_a_displaced_window_keeps_the_new_owners_claim(cx: &mut TestAppContext) {
+        init_ui_test(cx);
+        let temp = tempfile::tempdir().unwrap();
+        let services = Arc::new(AppServices::open(temp.path()).unwrap());
+        let window = || TestReadAloudWindow {
+            services: Arc::clone(&services),
+            host: ReadAloudHost::default(),
+        };
+        let first = cx.new(|_| window());
+        let second = cx.new(|_| window());
+        let third = cx.new(|_| window());
+        let registered = |cx: &TestAppContext| {
+            cx.read(|app| {
+                app.global::<ReadAloudRegistry>()
+                    .owner
+                    .as_ref()
+                    .map(|(id, _)| *id)
+            })
+        };
+
+        cx.update(|cx| claim_read_aloud_ownership(cx, first.downgrade()));
+        assert_eq!(registered(cx), Some(first.entity_id()));
+
+        // 「开始朗读」先停自家旧会话再 claim：这一步属于还没有任何会话的 second，
+        // 不得清掉 first 的登记。
+        cx.update_entity(&second, |this, cx| this.stop_read_aloud(cx));
+        assert_eq!(
+            registered(cx),
+            Some(first.entity_id()),
+            "a window without a session must not release another window's claim"
+        );
+
+        cx.update(|cx| claim_read_aloud_ownership(cx, second.downgrade()));
+        assert_eq!(registered(cx), Some(second.entity_id()));
+
+        // first 被接管停掉后仍会走自己的停止路径（可能来自迟到的 Finished 轮询）；
+        // 它只能清自家登记。
+        cx.update_entity(&first, |this, cx| this.stop_read_aloud(cx));
+        assert_eq!(
+            registered(cx),
+            Some(second.entity_id()),
+            "the displaced window's own stop must not release the new owner"
+        );
+
+        cx.update(|cx| claim_read_aloud_ownership(cx, third.downgrade()));
+        assert_eq!(registered(cx), Some(third.entity_id()));
+    }
 
     #[test]
     fn a_read_aloud_request_is_bounded_by_blocks_and_bytes() {
