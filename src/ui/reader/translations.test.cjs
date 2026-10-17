@@ -175,8 +175,8 @@ for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; c
           layers: document.querySelectorAll("[data-ngy-translation]").length,
           mergedHidden: document.getElementById("merged").style.display,
           mergedIcon: !!layer.querySelector("[data-ngy-translation-reveal]"),
-          mergedButtons: [...layer.querySelector("[data-ngy-translation-controls]").shadowRoot
-            .querySelectorAll("button")].map((element) => element.textContent),
+          mergedButtons: [...layer.querySelectorAll("[data-ngy-translation-actions] button")]
+            .map((element) => element.getAttribute("aria-label")),
           staleLayer: document.getElementById("stale").previousElementSibling
             ?.hasAttribute("data-ngy-translation") ?? false,
           staleText: document.getElementById("stale").textContent,
@@ -217,12 +217,20 @@ test("the trailing icon is the only toggle between translation-only and bilingua
     });
     const initial = await page.evaluate(() => {
       const layer = document.getElementById("a").previousElementSibling;
+      const text = layer.querySelector(".ngy-translation-text");
       return {
         display: document.getElementById("a").style.display,
         icons: document.querySelectorAll("[data-ngy-translation-reveal]").length,
         label: layer.querySelector("[data-ngy-translation-reveal]").getAttribute("aria-label"),
-        text: layer.querySelector(".ngy-translation-text").textContent,
+        text: text.textContent,
         layerText: layer.textContent,
+        // 两个动作排在眼睛与朗读小喇叭之后，与它们同一行：读者看到的顺序是
+        // 「译文 · 眼睛 · 小喇叭 · 铅笔 · 重译」，不会为按钮多出一行。
+        tail: [...text.children].map((element) => element.hasAttribute("data-ngy-translation-reveal")
+          ? "reveal"
+          : element.classList.contains("ngy-read-aloud-button")
+            ? "speaker"
+            : element.hasAttribute("data-ngy-translation-actions") ? "actions" : "other"),
         // The read-aloud speaker sits inside every candidate block: the collapse
         // decision must look past that chrome or nothing hides at all.
         chrome: document.querySelectorAll(".ngy-read-aloud-button").length,
@@ -233,7 +241,9 @@ test("the trailing icon is the only toggle between translation-only and bilingua
     assert.equal(initial.icons, 7, "every collapsible translated block carries one reveal icon, the table cell included");
     assert.equal(initial.label, "显示原文", "the icon names the action it offers");
     assert.equal(initial.text, "甲一");
-    assert.equal(initial.layerText, "甲一", "the icon adds no text to the layer it trails");
+    assert.equal(initial.layerText, "甲一", "the icons add no text to the layer they trail");
+    assert.deepEqual(initial.tail, ["reveal", "speaker", "actions"],
+      "the two actions trail the reveal icon and the read-aloud speaker on the same line");
 
     // A table cell is collapsible as well: 「译文」 mode hides the wrapped
     // original inside the cell and keeps the cell box itself visible.
@@ -904,8 +914,9 @@ for (const contentType of ["text/html; charset=utf-8", "application/xhtml+xml; c
 const manualMessages = (page) => page.evaluate(() =>
   window.__messages.filter((item) => item.type === "manual_translation"));
 
-// The control row is chrome inside the layer's shadow root: its labels must not
-// join the block's text, so every lookup goes through that boundary.
+// 编辑与重新翻译是译文末尾的两个图标（`data-ngy-translation-actions`，标签只在
+// `aria-label` 里），保存 / 取消 / 恢复机器译文与状态文字仍在控制行的 shadow root。
+// 两个地方的标签都不能进入译文层的文字。
 const noticeText = (page, id) => page.evaluate((id) => {
   const layer = document.getElementById(id).previousElementSibling;
   return layer.querySelector("[data-ngy-translation-controls]").shadowRoot
@@ -914,8 +925,13 @@ const noticeText = (page, id) => page.evaluate((id) => {
 
 const clickControl = (page, id, label) => page.evaluate(({ id, label }) => {
   const layer = document.getElementById(id).previousElementSibling;
-  const button = [...layer.querySelector("[data-ngy-translation-controls]").shadowRoot
-    .querySelectorAll("button")].find((element) => element.textContent === label);
+  const candidates = [
+    ...layer.querySelectorAll("[data-ngy-translation-actions] button"),
+    ...layer.querySelector("[data-ngy-translation-controls]").shadowRoot
+      .querySelectorAll("button"),
+  ];
+  const button = candidates.find((element) =>
+    element.getAttribute("aria-label") === label || element.textContent === label);
   if (!button) throw new Error(`missing control: ${label}`);
   button.click();
 }, { id, label });
@@ -925,6 +941,9 @@ const manualState = (page, id) => page.evaluate((id) => {
   const layer = book.previousElementSibling;
   const row = layer.querySelector("[data-ngy-translation-controls]").shadowRoot;
   const editable = layer.querySelector("[contenteditable='true']");
+  const actions = layer.querySelector("[data-ngy-translation-actions]");
+  // 隐藏中的段末图标（编辑、提交期间 `display:none`）不算读者能按的按钮。
+  const actionsShown = !!actions && getComputedStyle(actions).display !== "none";
   return {
     translated: layer.querySelector(".ngy-translation-text").textContent,
     editing: !!editable,
@@ -932,7 +951,13 @@ const manualState = (page, id) => page.evaluate((id) => {
     focused: editable ? document.activeElement === editable : false,
     manual: !!row.querySelector(".ngy-translation-manual"),
     error: row.querySelector(".ngy-translation-error")?.textContent ?? null,
-    buttons: [...row.querySelectorAll("button")].map((element) => element.textContent),
+    buttons: [
+      ...(actionsShown
+        ? [...actions.querySelectorAll("button")]
+          .map((element) => element.getAttribute("aria-label"))
+        : []),
+      ...[...row.querySelectorAll("button")].map((element) => element.textContent),
+    ],
     bookText: book.textContent,
     bookHidden: book.style.display,
   };
@@ -944,38 +969,44 @@ test("a manual edit is posted for the displayed block and survives the host's an
     await configure(page);
     assert.deepEqual(await page.evaluate(() => {
       const layer = document.getElementById("c").previousElementSibling;
-      const controls = layer.querySelector("[data-ngy-translation-controls]");
-      const style = getComputedStyle(controls);
+      const actions = layer.querySelector("[data-ngy-translation-actions]");
+      const row = layer.querySelector("[data-ngy-translation-controls]");
+      const style = getComputedStyle(actions);
       return {
-        buttons: [...controls.shadowRoot.querySelectorAll("button")]
-          .map((element) => element.textContent),
+        buttons: [...actions.querySelectorAll("button")]
+          .map((element) => element.getAttribute("aria-label")),
         faded: style.opacity,
         clickable: style.pointerEvents,
-        tabbable: [...document.querySelectorAll("[data-ngy-translation-controls]")]
-          .flatMap((element) => [...element.shadowRoot.querySelectorAll("button")]).length,
+        tabbable: document.querySelectorAll("[data-ngy-translation-actions] button").length,
+        // 空闲的机器译文块没有文字按钮：控制行是空的，它的下边距也必须归零，否则
+        // 每条译文下面仍会多出一段看不见的间距。
+        rowButtons: row.shadowRoot.querySelectorAll("button").length,
+        rowMargin: getComputedStyle(row).marginBottom,
         // Chrome must never join the block's text: a copied translation would
         // carry the button labels.
         layerText: layer.textContent,
       };
-      // 七个可寻址的文本块各有一行控制条，每行两个按钮：都能用键盘到达。
-    }), { buttons: ["编辑译文", "重新翻译"], faded: "0", clickable: "none", tabbable: 14, layerText: "乙" },
-    "every applied block offers an edit affordance that stays out of the way until it is used");
+      // 七个可寻址的文本块各有两个段末图标：都能用键盘到达。
+    }), {
+      buttons: ["编辑译文", "重新翻译"], faded: "0", clickable: "none", tabbable: 14,
+      rowButtons: 0, rowMargin: "0px", layerText: "乙",
+    },
+    "every applied block offers two trailing icons that stay out of the way until used");
 
-    // Revealing happens on hover or on keyboard focus, and settling the row back
-    // happens without rebuilding the layer. The row fades in, so the revealed
-    // state is waited for instead of read in the same frame as the focus.
+    // Revealing happens on hover or on keyboard focus, and settling back happens
+    // without rebuilding the layer. The icons fade in, so the revealed state is
+    // waited for instead of read in the same frame as the focus.
     await page.evaluate(() => {
-      const layer = document.getElementById("c").previousElementSibling;
-      layer.querySelector("[data-ngy-translation-controls]").shadowRoot
-        .querySelector("button").focus();
+      document.getElementById("c").previousElementSibling
+        .querySelector("[data-ngy-translation-actions] button").focus();
     });
     await page.waitForFunction(() => getComputedStyle(
       document.getElementById("c").previousElementSibling
-        .querySelector("[data-ngy-translation-controls]")).opacity === "1");
+        .querySelector("[data-ngy-translation-actions]")).opacity === "0.5");
     assert.equal(await page.evaluate(() => getComputedStyle(
       document.getElementById("c").previousElementSibling
-        .querySelector("[data-ngy-translation-controls]")).opacity), "1",
-    "tabbing into the row reveals it");
+        .querySelector("[data-ngy-translation-actions]")).opacity), "0.5",
+    "tabbing into a trailing icon reveals it");
 
     await clickControl(page, "c", "编辑译文");
     assert.deepEqual(await manualState(page, "c"), {

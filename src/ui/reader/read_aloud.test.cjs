@@ -103,6 +103,11 @@ test("段落末尾的小喇叭落在读者看得见的那份文字上", async ()
           inBlock: !!block.querySelector(":scope > .ngy-read-aloud-button"),
           inLayer: !!text?.querySelector(":scope > .ngy-read-aloud-button"),
           layerText: text ? text.textContent : null,
+          // 小喇叭排在眼睛之后、译文层的两个动作图标之前。
+          tail: text ? [...text.children].map((element) =>
+            element.classList.contains("ngy-read-aloud-button") ? "speaker"
+              : element.hasAttribute("data-ngy-translation-actions") ? "actions"
+                : element.hasAttribute("data-ngy-translation-reveal") ? "reveal" : "other") : [],
         };
       };
       return {
@@ -121,6 +126,8 @@ test("段落末尾的小喇叭落在读者看得见的那份文字上", async ()
     assert.equal(state.paragraph.inBlock, false, "「译文」模式下原文块被隐藏，按钮不能留在它里面");
     assert.equal(state.paragraph.inLayer, true, "按钮要落在读者看得见的译文末尾");
     assert.equal(state.paragraph.layerText, "甲段落。", "小喇叭不含文字，译文层仍只报译文");
+    assert.deepEqual(state.paragraph.tail, ["reveal", "speaker", "actions"],
+      "眼睛、小喇叭、编辑与重译排在同一行末尾，小喇叭在两个动作图标之前");
     assert.equal(state.listItem.inBlock, false, "列表项的原文本也被隐藏，按钮同样要跟着走");
     assert.equal(state.listItem.inLayer, true);
     assert.equal(state.listItem.layerText, "列表项一");

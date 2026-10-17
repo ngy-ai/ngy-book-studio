@@ -25,6 +25,9 @@
   const COLLAPSED = "data-ngy-collapsed";
   // 列表项与表格单元格里承载原文的 `display:contents` 包装（译文层写的标记）。
   const ORIGINAL = "data-ngy-translation-original";
+  // 译文末尾「编辑译文 / 重新翻译」两个图标的包装（译文层写的标记）。小喇叭要排在
+  // 它们前面，读者看到的顺序才是「译文 · 眼睛 · 小喇叭 · 铅笔 · 重译」。
+  const ACTIONS = "[data-ngy-translation-actions]";
   const ACTIVE_CLASS = "ngy-read-aloud-active";
   const BUTTON_CLASS = "ngy-read-aloud-button";
   const BUTTON_STYLE = "display:inline-block!important;width:1em!important;height:1em!important;" +
@@ -168,8 +171,11 @@
         buttons.set(block, button);
       }
       // 位置没变就不动它（按钮因此留在译文最后一个字之后）；承载元素换了就搬过去，
-      // 旧译文层已被摘掉时（按钮脱离文档）也同样挂回来。
-      if (button.parentElement !== host) host.append(button);
+      // 旧译文层已被摘掉时（按钮脱离文档）也同样挂回来。译文末尾还有译文层的两个
+      // 动作图标：插在它们前面，`insertBefore(button, null)` 就是普通的 append。
+      if (button.parentElement !== host) {
+        host.insertBefore(button, host.querySelector(`:scope > ${ACTIONS}`));
+      }
       // 悬停由块与承载元素一起接：承载元素是 `display:contents` 包装时它自己不生成
       // 盒子、收不到 `mouseenter`，指针事件落在块上；原文被隐藏时块又没有盒子，只能靠
       // 译文层的悬停。

@@ -129,13 +129,19 @@
   `data-ngy-translation-original` 标记（朗读脚本按它把段落末尾的小喇叭挂回原文末尾，
   而不是落到包装外面）。含媒体段落保持
   双语，不能隐藏图片。HTML/XHTML 均须支持。
-  手工修改单块译文（`TranslatedBlock::manual` + 每块 `key`）：页面在每个译文叶子旁提供
-  「编辑译文 / 重新翻译 / 保存 / 取消 / 恢复机器译文」（`data-ngy-translation-controls`，默认 `opacity:0`
-  且 `pointer-events:none`，悬停或 `focusin` 时显现——用 `visibility:hidden` 会把按钮移出 Tab
-  序列，键盘用户将无法进入编辑）。控制行自身放在该 host 的 shadow root
-  （`attachShadow({mode:"open"})`）里：按钮文字是 chrome，留在译文层的 light DOM 里会跟着
-  选区被复制，也会让译文层报出比它显示的译文更多的文字（`focusin` 会穿过边界，悬停由
-  layer 的 `mouseenter` 决定）。编辑器只在译文叶子位置替换成单行 `contenteditable` 纯文本
+  手工修改单块译文（`TranslatedBlock::manual` + 每块 `key`）：段末的铅笔与环形箭头两个图标
+  （`data-ngy-translation-actions`，`aria-label`/`title` 分别是「编辑译文」「重新翻译」）排在
+  「显示原文」眼睛和朗读小喇叭之后，同为 1em 内联 `<button>`，默认 `opacity:0` 且
+  `pointer-events:none`，悬停或 `focusin` 时与眼睛一起淡入（0.5）——用 `visibility:hidden`
+  会把按钮移出 Tab 序列，键盘用户将无法进入编辑。图标没有文本节点，所以留在译文层的
+  light DOM 里也不进入 `textContent`、不会被复制；朗读脚本把段落末尾的小喇叭插进这组图标
+  之前，读者看到的顺序是「译文 · 眼睛 · 小喇叭 · 铅笔 · 重译」，不再为按钮单占一行。
+  需要文字的状态（保存 / 取消、恢复机器译文、忙碌、提示与错误）仍在
+  `data-ngy-translation-controls` 那一行：默认 `opacity:0` 且不吃指针事件，悬停或 `focusin`
+  时显现；行内没有内容时下边距归零，空闲的机器译文块因此不会多出段间距。这一行的文字放在
+  host 的 shadow root（`attachShadow({mode:"open"})`）里：按钮文字是 chrome，留在译文层的
+  light DOM 里会跟着选区被复制，也会让译文层报出比它显示的译文更多的文字（`focusin` 会穿过
+  边界，悬停由 layer 的 `mouseenter` 决定）。编辑器只在译文叶子位置替换成单行 `contenteditable` 纯文本
   节点（`Enter` 禁止、`Escape` 取消、粘贴只取 `text/plain`、空译文在页面先拒绝），原文节点、
   笔记 UTF-16 锚点与 `originalRange()` 叶子映射都不受影响（`pair.copy` 在编辑期间就是该
   可编辑节点）。保存把 `source`（取自**原文**叶子，不是页面显示的文字）与当前文本经
@@ -148,7 +154,8 @@
   空片段列表。宿主按「请求与机器行整段铺满」对齐：等长时一一对应，请求更粗（每个请求片段覆盖
   ≥1 个完整机器片段）时按顺序拼接，落库的手工行保持请求的形状、原文一律取自机器行；切开
   机器片段、改写原文或留下没覆盖的片段都按「原文结构已改变」拒绝。
-  **逐块「重新翻译」**（2026-09-22 起）是控制行上的第三个按钮，走另一条 IPC
+  **逐块「重新翻译」**（2026-09-22 起；2026-10-17 起由控制行上的文字按钮改成段末的第二个
+  图标）走另一条 IPC
   （`retranslate_block`，载荷只有 `revision / request_id / key`；`RetranslateBlockRequest::valid()`
   只拒绝空标识、越界标识与请求序号 0）。页面只说得出**块标识**：序号由宿主在任务自己的文本块
   列表里查出来（`IndexingCoordinator::retranslate_translation_block`），页面多送一个 `ordinal`
@@ -162,10 +169,11 @@
   任务 —— 超时文案里才会出现「先到『后台任务』窗口暂停这本书的翻译」这句。
   `src/ui/reader/translations.test.cjs` 是可选 DOM 门禁（Node + 已安装 Playwright），
   覆盖双语顺序、重复文本消歧、嵌套块、单元格插入、译文末尾图标的展开/收起（含“单击译文
-  不再切换”）、图标的悬停显现与聚焦显现（默认透明且不吃指针事件、重推重建后仍显示）与
+  不再切换”）、图标的悬停显现与聚焦显现（默认透明且不吃指针事件、重推重建后仍显示）、
+  段末顺序（眼睛 → 小喇叭 → 铅笔 → 重译）与空闲控制行不占下边距，以及
   笔记/选区排除，
   以及手工译文用例：编辑→保存的请求形状、失败后保留输入、重推延后到取消之后、空译文不发请求、
-  编辑时选区仍解析回原文（HTML/XHTML）；逐块重新翻译用例：按钮只提交块标识与修订、提交期间
+  编辑时选区仍解析回原文（HTML/XHTML）；逐块重新翻译用例：段末图标只提交块标识与修订、提交期间
   行内忙碌、成功后留下提示且不改手工标记、失败后显示原因并可再点；更细分段拼回当前叶子的用例
   （HTML/XHTML）：拼接后的译文、图标与控制行、拼不回时保留原文、拼接块的手工请求形状。
   2026-09-23 分段拼接：来源被重新导入后，阅读投影会并掉译文行拆分时的内联包装（现场

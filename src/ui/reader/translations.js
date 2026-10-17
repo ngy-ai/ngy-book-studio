@@ -45,13 +45,16 @@
     ...["top", "right", "bottom", "left"].flatMap((side) =>
       ["width", "style", "color"].map((part) => `border-${side}-${part}`)),
   ];
-  // The manual editor is presentation only. It never becomes book text, a note
-  // anchor or a translation payload: those still read the original leaves.
-  // Faded instead of `visibility:hidden`: opacity keeps the row in the tab order
-  // so a keyboard-only reader can still reach 「编辑译文」, while
-  // `pointer-events:none` keeps the invisible row unclickable. Its labels live in
-  // a shadow root below `CONTROLS_STYLE`: chrome inside the layer would join the
-  // block's text, so a copied translation would carry 「编辑译文」.
+  // 「编辑译文」「重新翻译」是段末的两个图标（`ACTIONS_STYLE`）：和眼睛、朗读小喇叭
+  // 一样默认透明且不吃指针事件，只在指针停在这一段、或键盘焦点进入时淡入。图标只有
+  // `<svg>` 与属性、没有文本节点，所以留在译文层的 light DOM 里也不进入 `textContent`，
+  // 复制译文不会带上按钮文字；文字按钮会为每一段多占一行，图标不会改变行距。
+  //
+  // `CONTROLS_STYLE` 那一行只留给需要文字的状态：保存 / 取消、恢复机器译文、忙碌与
+  // 提示、错误。它是 chrome，留在 light DOM 会被选区复制、也会让译文层报出比译文更多
+  // 的文字，所以整行放在 host 的 shadow root 里。淡出而不是 `visibility:hidden`：
+  // opacity 让这一行仍留在 Tab 序列里，键盘读者才够得着「保存」；`pointer-events:none`
+  // 保证看不见的行按不动。空闲时行内没有任何内容，`showControls` 把它的下边距归零。
   const CONTROLS_STYLE = "display:block!important;margin:0 0 0.3em!important;padding:0!important;" +
     "font:0.78em/1.7 system-ui,\"Microsoft YaHei\",sans-serif!important;color:#8a8a8a!important;" +
     "letter-spacing:normal!important;text-align:right!important;" +
@@ -61,6 +64,14 @@
   const CONTROL_BUTTON_STYLE = "margin:0 0 0 0.5em!important;padding:0.1em 0.5em!important;" +
     "border:1px solid currentColor!important;border-radius:0.25em!important;background:transparent!important;" +
     "color:inherit!important;font:inherit!important;cursor:pointer!important;";
+  // 段末的两个动作与眼睛同高：1em 见方的图标按钮排在同一行末尾，不另起一行。
+  // 透明度与指针事件落在包装上，两个图标的淡入淡出因此共用一次过渡。
+  const ACTIONS_STYLE = "display:inline!important;margin:0!important;padding:0!important;" +
+    "opacity:0!important;pointer-events:none!important;transition:opacity 0.12s ease-out;";
+  const ACTION_BUTTON_STYLE = "display:inline-block!important;width:1em!important;height:1em!important;" +
+    "margin:0 0 0 0.35em!important;padding:0!important;border:0!important;background:transparent!important;" +
+    "color:inherit!important;cursor:pointer!important;vertical-align:-0.12em!important;" +
+    "font:inherit!important;line-height:1!important;";
   const EDITABLE_STYLE = "outline:1px dashed rgba(90,130,200,0.75)!important;border-radius:2px!important;";
   // The reveal control trails the last translated character of a block. In
   // 「译文」mode the original is hidden, and this icon is the only way back to
@@ -71,9 +82,9 @@
   // `textContent` must stay exactly the translation it displays.
   //
   // Like the read-aloud speaker it stays out of the reader's way: it is faded
-  // in only while the pointer rests on the block (or the icon itself holds
-  // keyboard focus) and is click-through otherwise — see
-  // `bindRevealVisibility`.
+  // in only while the pointer rests on the block (or one of the trailing
+  // controls holds keyboard focus) and is click-through otherwise — see
+  // `bindTrailingVisibility`.
   const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
   const REVEAL_STYLE = "display:inline-block!important;width:1em!important;height:1em!important;" +
     "margin:0 0 0 0.25em!important;padding:0!important;border:0!important;background:transparent!important;" +
@@ -85,6 +96,9 @@
   const REVEAL_SHOW = [REVEAL_STROKE, "M12 9.4a2.6 2.6 0 1 0 0 5.2 2.6 2.6 0 0 0 0-5.2z"];
   // Shown once the original is back: the same eye struck through reads as 「收起原文」.
   const REVEAL_HIDE = [...REVEAL_SHOW, "M3.5 3.5l17 17"];
+  // 段末动作：铅笔＝就地改写这一块译文，环形箭头＝把这一块再交给模型翻一次。
+  const EDIT_STROKE = ["M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z", "m15 5 4 4"];
+  const RETRANSLATE_STROKE = ["M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8", "M21 3v5h-5"];
 
   let session = "";
   let revision = 0;
@@ -324,18 +338,22 @@
     reveal.element.setAttribute("title", label);
   };
 
-  /// The icon is chrome the reader does not have to read past: it stays
-  /// transparent and click-through until it is worth showing. Same value as
-  /// the read-aloud speaker, so the two trailing controls fade in together.
-  const setRevealShown = (state, shown) => {
-    const reveal = state.reveal;
-    if (!reveal) return;
-    reveal.element.style.setProperty("opacity", shown ? "0.5" : "0", "important");
-    reveal.element.style.setProperty("pointer-events", shown ? "auto" : "none", "important");
+  /// The trailing chrome — the reveal icon and the two actions — is chrome the
+  /// reader does not have to read past: it stays transparent and click-through
+  /// until it is worth showing. Same value as the read-aloud speaker, so the
+  /// controls trailing a block fade in together.
+  const setTrailingShown = (state, shown) => {
+    const opacity = shown ? "0.5" : "0";
+    const events = shown ? "auto" : "none";
+    for (const element of [state.reveal?.element, state.actions]) {
+      if (!element) continue;
+      element.style.setProperty("opacity", opacity, "important");
+      element.style.setProperty("pointer-events", events, "important");
+    }
   };
 
   const syncReveal = (state) =>
-    setRevealShown(state, state.revealHover || state.revealBlockHover || state.revealFocus);
+    setTrailingShown(state, state.revealHover || state.revealBlockHover || state.revealFocus);
 
   /// Hover is driven by the two halves of one block, exactly like the
   /// read-aloud speaker: in 「译文」 mode the original block has no box, so the
@@ -343,14 +361,16 @@
   /// halves are on screen and either one counts as 「the pointer is on this
   /// paragraph」. The two hosts keep separate flags on purpose — moving from
   /// the translation onto the original fires `mouseleave` and `mouseenter` of
-  /// different hosts, and a single flag would blink. The icon lives inside the
-  /// layer, so moving onto the icon itself never fires `mouseleave`.
+  /// different hosts, and a single flag would blink. The icons live inside the
+  /// layer, so moving onto one of them never fires `mouseleave`.
   ///
-  /// Keyboard focus is tracked separately: the icon keeps its place in the tab
-  /// order while faded out, and a reader who tabs to it must be able to see
-  /// where they are (the manual-edit row follows the same rule, see
-  /// `CONTROLS_STYLE`).
-  const bindRevealVisibility = (state) => {
+  /// Keyboard focus is tracked separately: the trailing icons keep their place
+  /// in the tab order while faded out, and a reader who tabs to one of them must
+  /// be able to see where they are (the manual-edit row follows the same rule,
+  /// see `CONTROLS_STYLE`). Focus is tracked on the layer instead of per icon:
+  /// moving from the eye to the pencil would otherwise hide the row between the
+  /// two events.
+  const bindTrailingVisibility = (state) => {
     const track = (host, key) => {
       host.addEventListener("mouseenter", () => {
         state[key] = true;
@@ -363,12 +383,12 @@
     };
     track(state.layer, "revealHover");
     if (state.block !== state.layer) track(state.block, "revealBlockHover");
-    const element = state.reveal.element;
-    element.addEventListener("focus", () => {
+    state.layer.addEventListener("focusin", () => {
       state.revealFocus = true;
       syncReveal(state);
     });
-    element.addEventListener("blur", () => {
+    state.layer.addEventListener("focusout", (event) => {
+      if (event.relatedTarget && state.layer.contains(event.relatedTarget)) return;
       state.revealFocus = false;
       syncReveal(state);
     });
@@ -407,13 +427,18 @@
     return element;
   };
 
-  /// What the editor offers for one applied block: nothing while a request is in
-  /// flight, save/cancel while editing, and the idle row otherwise — edit, ask the
-  /// model to translate this block again, and (for a manual block) restore.
+  /// What the worded row offers for one applied block: nothing while a request is
+  /// in flight, save/cancel while editing, restore for a manual block, plus the
+  /// status the reader must read. Editing and retranslating are the two icons at
+  /// the end of the translated text (`appendActions`), so this row stays empty —
+  /// and out of the paragraph's height — while the block is at rest.
   const renderControls = (state) => {
     const controls = state.controls;
     if (!controls) return;
     controls.textContent = "";
+    // 编辑或提交期间段末的两个图标先退场：读者不该对着一个按不动的铅笔。
+    state.actions?.style.setProperty(
+      "display", state.editing || state.request > 0 ? "none" : "inline", "important");
     if (state.error) {
       const error = create("span");
       error.className = "ngy-translation-error";
@@ -439,10 +464,8 @@
         button("取消", () => endEdit(state, true)),
       );
     } else {
-      controls.append(button("编辑译文", () => beginEdit(state)));
-      // 重新翻译：把这一块再交给模型翻一次。按钮只负责提交，新译文要等后台任务跑完
-      // 那一块才会入库，届时宿主会重新推送本章（提示语就是这么写的）。
-      controls.append(button("重新翻译", () => submitRetranslate(state)));
+      // 手工译文才需要这一行：「恢复机器译文」仍是一个文字按钮，读者读得懂它比认得
+      // 一个图标更重要；机器译文块空闲时这一行没有任何内容。
       if (state.manual) {
         controls.append(button("恢复机器译文", () => {
           state.error = "";
@@ -667,10 +690,28 @@
     return svg;
   };
 
+  /// One trailing icon: an SVG-only `<button>` whose label lives in `aria-label`
+  /// and `title`. It is chrome in the layer's light DOM, so it must contribute no
+  /// text; `insert` binds its visibility together with the reveal icon.
+  const iconButton = (label, paths, handler) => {
+    const element = create("button");
+    element.type = "button";
+    element.setAttribute("aria-label", label);
+    element.setAttribute("title", label);
+    element.style.cssText = ACTION_BUTTON_STYLE;
+    element.append(svgIcon(paths));
+    element.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      handler();
+    });
+    return element;
+  };
+
   /// Appends the reveal icon to the end of one block's translated text. The
   /// block is addressed through the state it was built with, so the icon only
   /// ever collapses the paragraph it belongs to. It starts faded out and is
-  /// driven by `bindRevealVisibility` from then on.
+  /// driven by `bindTrailingVisibility` from then on.
   const appendReveal = (state, text) => {
     const element = create("button");
     element.type = "button";
@@ -690,7 +731,28 @@
     state.reveal = { element, show, hide };
     text.append(element);
     renderReveal(state);
-    bindRevealVisibility(state);
+  };
+
+  /// Appends the two actions to the end of one block's translated text. A
+  /// reader who tabs to them lands after the reveal icon; the read-aloud
+  /// speaker joins the same tail (it inserts itself in front of this wrapper,
+  /// see `read_aloud.js`), so the line ends with 眼睛 · 小喇叭 · 铅笔 · 重译.
+  /// Chrome text would join a copied translation and would make the layer report
+  /// more text than it displays, hence icons with attribute labels only.
+  const appendActions = (state, text) => {
+    if (!state.key) return;
+    const wrapper = create("span");
+    wrapper.className = "ngy-translation-actions";
+    wrapper.setAttribute("data-ngy-translation-actions", "1");
+    wrapper.style.cssText = ACTIONS_STYLE;
+    wrapper.append(
+      iconButton("编辑译文", EDIT_STROKE, () => beginEdit(state)),
+      // 重新翻译：把这一块再交给模型翻一次。按钮只负责提交，新译文要等后台任务跑完
+      // 那一块才会入库，届时宿主会重新推送本章（提示语就是这么写的）。
+      iconButton("重新翻译", RETRANSLATE_STROKE, () => submitRetranslate(state)),
+    );
+    state.actions = wrapper;
+    text.append(wrapper);
   };
 
   const insert = (element, entry, validated, translateOnly) => {
@@ -747,7 +809,7 @@
       key: typeof entry.key === "string" ? entry.key : "",
       manual: entry.manual === true,
       editing: false, request: 0, requestKind: null, error: "", notice: "", hovering: false,
-      controls: null, showControls: null, reveal: null,
+      controls: null, showControls: null, reveal: null, actions: null,
       revealHover: false, revealBlockHover: false, revealFocus: false,
       display: original.style.getPropertyValue("display"),
       priority: original.style.getPropertyPriority("display"),
@@ -763,14 +825,20 @@
     if (inPlace) element.insertBefore(layer, element.firstChild);
     else element.parentNode.insertBefore(layer, element);
     if (revealable) appendReveal(state, text);
+    appendActions(state, text);
     appendControls(state);
     setCollapsed(state, revealable);
+    // 眼睛与两个动作共用一次悬停 / 聚焦绑定：它们在同一个层里，一起淡入。
+    bindTrailingVisibility(state);
     applied.push(state);
   };
 
-  /// Adds the manual-edit row to one applied block. It sits between the
-  /// translation and the divider, appears on hover, and is inert for a block the
-  /// page cannot address (no key means the host cannot find the stored row).
+  /// Adds the worded row to one applied block: 保存 / 取消, 恢复机器译文, busy and
+  /// status text. It sits between the translation and the divider, appears on
+  /// hover, and is inert for a block the page cannot address (no key means the
+  /// host cannot find the stored row). An idle machine-translated block leaves
+  /// the row empty — the two actions are icons at the end of the text — so an
+  /// empty row must not add a line or a margin to the paragraph.
   ///
   /// The row's contents live in a shadow root: labels are chrome, and light DOM
   /// text inside the layer would be copied with a selection and would make the
@@ -790,6 +858,10 @@
     state.showControls = (visible) => {
       const pinned = state.editing || state.request > 0 || !!state.error;
       const shown = visible || pinned;
+      // 空闲的机器译文块这一行一个字也没有：不归零它自己的下边距，段间距仍会被
+      // 一条看不见的空行撑开。手工译文、编辑与状态提示出现时再还给整行间距。
+      host.style.setProperty(
+        "margin-bottom", state.controls.childElementCount ? "0.3em" : "0", "important");
       host.style.setProperty("opacity", shown ? "1" : "0", "important");
       host.style.setProperty("pointer-events", shown ? "auto" : "none", "important");
     };
