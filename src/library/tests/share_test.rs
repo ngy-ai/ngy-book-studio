@@ -499,3 +499,90 @@ fn a_shared_translation_never_lands_on_a_block_with_different_text() {
     assert_eq!(after[0].source_text, before[0].source_text);
     assert_eq!(after[0].translated_text, before[0].translated_text);
 }
+
+#[test]
+fn an_oversized_shared_message_is_skipped_and_its_children_reattach_safely() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut sender = LibraryStore::load_from(temp.path().join("sender")).unwrap();
+    let book = sender.create_book("长消息之书", "作者").unwrap();
+    let conn = crate::db::open_conn(&sender.database_path()).unwrap();
+    crate::db::chat_threads::insert(
+        &conn,
+        &ChatThread {
+            id: "thread-1".into(),
+            book_id: Some(book.id.clone()),
+            title: "长回答的讨论".into(),
+            scope_json: serde_json::to_string(&serde_json::json!({ "book_ids": [book.id] }))
+                .unwrap(),
+            window_kind: "reader".into(),
+            created_at: 20,
+            updated_at: 20,
+        },
+    )
+    .unwrap();
+    let giant = "冗长的回答。".repeat(crate::share::MAX_SHARE_QUOTE_BYTES / 4 + 1);
+    let turns: [(usize, &str, String, Option<usize>); 4] = [
+        (0, "user", "最初的问题".to_string(), None),
+        (1, "assistant", giant.clone(), Some(0)),
+        (2, "user", "被留下的追问".to_string(), Some(1)),
+        (3, "assistant", "收尾的回答".to_string(), Some(2)),
+    ];
+    for (ordinal, role, content, parent_ordinal) in turns {
+        crate::db::chat_messages::insert(
+            &conn,
+            &ChatMessage {
+                id: format!("message-{ordinal}"),
+                thread_id: "thread-1".into(),
+                parent_id: parent_ordinal.map(|ordinal| format!("message-{ordinal}")),
+                ordinal,
+                role: role.into(),
+                content,
+                model: None,
+                created_at: 20 + ordinal as u64,
+            },
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let target = temp.path().join("shared.ngyshare");
+    let summary = sender.export_share_package(&book.id, &target).unwrap();
+    assert_eq!(
+        summary.chat_messages, 4,
+        "the export writes what the sender stored; the ceiling applies on import"
+    );
+
+    let mut receiver = LibraryStore::load_from(temp.path().join("receiver")).unwrap();
+    let outcome = receiver.import_share_package(&target, None, None).unwrap();
+    assert_eq!(outcome.sections_note, None);
+    assert_eq!(outcome.chat_threads, 1);
+    assert_eq!(
+        outcome.chat_messages, 3,
+        "the oversized turn must be dropped, the rest must land"
+    );
+
+    let conn = crate::db::open_conn(&receiver.database_path()).unwrap();
+    let threads = crate::db::chat_threads::list_for_book(&conn, Some(&outcome.record.id)).unwrap();
+    assert_eq!(threads.len(), 1);
+    let messages = crate::db::chat_messages::list_for_thread(&conn, &threads[0].id).unwrap();
+    let ordinals = messages.iter().map(|m| m.ordinal).collect::<Vec<_>>();
+    assert_eq!(ordinals, vec![0, 2, 3], "ordinal 1 was dropped");
+    assert!(
+        messages.iter().all(
+            |message| message.content.len() <= crate::share::MAX_SHARE_QUOTE_BYTES
+                && message.content != giant
+        ),
+        "no oversized body may reach the receiving database"
+    );
+    let second = messages.iter().find(|m| m.ordinal == 2).unwrap();
+    assert_eq!(
+        second.parent_id, None,
+        "a child of a skipped turn reattaches at the root instead of dangling"
+    );
+    let third = messages.iter().find(|m| m.ordinal == 3).unwrap();
+    assert_eq!(
+        third.parent_id.as_deref(),
+        Some(second.id.as_str()),
+        "children of turns that did land keep their parent link"
+    );
+}

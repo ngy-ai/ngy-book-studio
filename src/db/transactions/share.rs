@@ -326,6 +326,15 @@ fn append_shared_messages(
             )
         })
         .collect::<HashMap<_, _>>();
+    // A message body from a package is capped like a citation quote; anything
+    // larger is not a conversation turn this build accepts. The turn is skipped
+    // whole (its citations ride with it), and its ID is not a valid parent.
+    let oversized = thread
+        .messages
+        .iter()
+        .filter(|message| message.content.len() > MAX_SHARE_QUOTE_BYTES)
+        .map(|message| message.ordinal)
+        .collect::<HashSet<_>>();
     let mut written = 0;
     for message in &thread.messages {
         let Some(id) = message_ids.get(&message.ordinal) else {
@@ -336,8 +345,20 @@ fn append_shared_messages(
         if stored.contains(&message.ordinal) {
             continue;
         }
+        if oversized.contains(&message.ordinal) {
+            tracing::debug!(
+                target: "ngy_share",
+                thread_id,
+                ordinal = message.ordinal,
+                "分享包：消息正文超过大小上限，已跳过"
+            );
+            continue;
+        }
         let parent_id = message
             .parent_ordinal
+            // A skipped turn was never inserted here, so a child may not point
+            // at it: the deferred FK would fail the whole transaction.
+            .filter(|ordinal| !oversized.contains(ordinal))
             .and_then(|ordinal| message_ids.get(&ordinal).cloned());
         super::super::chat_messages::insert(
             conn,
