@@ -184,6 +184,65 @@ fn startup_gc_collects_an_object_left_before_database_commit() {
 }
 
 #[test]
+fn startup_gc_skips_a_malformed_key_instead_of_refusing_to_open() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("library");
+    let library = LibraryStore::load_from(data_dir.clone()).unwrap();
+    // A registered-but-unreferenced object the sweep should normally collect.
+    let key = library
+        .io
+        .block_on(library.blob_store.put(b"stale-object"))
+        .unwrap();
+    let conn = db::open_conn(library.database_path()).unwrap();
+    db::blobs::insert(
+        &conn,
+        &db::blobs::BlobRecord {
+            object_key: key.as_str().to_string(),
+            media_type: "application/octet-stream".into(),
+            byte_len: 12,
+            hash: "unused".into(),
+            created_at: 1,
+        },
+    )
+    .unwrap();
+    // A row whose key cannot be parsed maps to no object file at all; it can
+    // only come from external corruption.
+    db::blobs::insert(
+        &conn,
+        &db::blobs::BlobRecord {
+            object_key: "not-a-blob-key".into(),
+            media_type: "application/octet-stream".into(),
+            byte_len: 1,
+            hash: "broken".into(),
+            created_at: 1,
+        },
+    )
+    .unwrap();
+    drop(conn);
+    drop(library);
+
+    // The bad row must not refuse the library; the healthy row is collected.
+    let reopened = LibraryStore::load_from(data_dir.clone()).unwrap();
+    assert!(
+        !reopened
+            .io
+            .block_on(reopened.blob_store.exists(&key))
+            .unwrap()
+    );
+    let conn = db::open_conn(reopened.database_path()).unwrap();
+    assert!(db::blobs::get(&conn, key.as_str()).unwrap().is_none());
+    assert!(
+        db::blobs::get(&conn, "not-a-blob-key").unwrap().is_some(),
+        "the unparseable row is kept for diagnosis; only its use is skipped"
+    );
+    drop(conn);
+    drop(reopened);
+
+    // And it is not a one-shot escape: every later startup skips it too.
+    LibraryStore::load_from(data_dir).unwrap();
+}
+
+#[test]
 fn removing_a_book_unlinks_first_and_reclaims_objects_in_background() {
     let temp = tempfile::tempdir().unwrap();
     let data_dir = temp.path().join("library");

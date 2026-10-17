@@ -103,7 +103,20 @@ pub(crate) fn run_startup_blob_gc(
     io: &IoRuntime,
 ) -> Result<()> {
     for blob in db::blobs::list_unreferenced(conn)? {
-        let key = BlobKey::parse(&blob.object_key)?;
+        // A malformed key is a row we cannot act on, not a reason to refuse to
+        // open the library: warn and let the next startup retry, same policy as
+        // the language backfill below.
+        let key = match BlobKey::parse(&blob.object_key) {
+            Ok(key) => key,
+            Err(error) => {
+                tracing::warn!(
+                    object_key = %blob.object_key,
+                    %error,
+                    "启动 GC 忽略无法解析的未引用对象键，将保留后重试"
+                );
+                continue;
+            }
+        };
         match io.block_on(store.delete(&key)) {
             Ok(()) => {
                 db::blobs::delete(conn, &blob.object_key)?;
@@ -116,8 +129,18 @@ pub(crate) fn run_startup_blob_gc(
 
     let registered = db::blobs::list(conn)?
         .into_iter()
-        .map(|blob| BlobKey::parse(&blob.object_key))
-        .collect::<Result<Vec<_>>>()?;
+        .filter_map(|blob| match BlobKey::parse(&blob.object_key) {
+            Ok(key) => Some(key),
+            Err(error) => {
+                tracing::warn!(
+                    object_key = %blob.object_key,
+                    %error,
+                    "启动 GC 忽略无法解析的对象键，其对象不参与孤儿扫描"
+                );
+                None
+            }
+        })
+        .collect::<Vec<_>>();
     if let Err(error) = io.block_on(store.delete_orphans(&registered)) {
         tracing::warn!(%error, "启动 GC 无法完成孤儿对象扫描，将在下次启动重试");
     }
