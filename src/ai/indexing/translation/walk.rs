@@ -362,12 +362,6 @@ pub(crate) async fn walk_translation_blocks(
                     break;
                 }
             }
-            if retry_stopped {
-                // 收窄的重试在范围之外撞上一个还没译文的块：不再打开新请求。已经攒下但
-                // 还没发出去的这一批随之作废（那些块的游标窗口由收尾统一清空），它们没有
-                // 发过请求，也没有花掉任何输出预算。
-                break 'window;
-            }
             if pending.is_empty() {
                 break 'window;
             }
@@ -384,6 +378,15 @@ pub(crate) async fn walk_translation_blocks(
                 source_language.as_deref(),
                 pending,
             );
+            if retry_stopped {
+                // 收窄的重试已经在范围之外撞线：不再开新批，但**已经攒下的这一批照发** ——
+                // 它的块全在重试范围内，请求本来就该发。以前这里把整批作废，于是「每请求
+                // 文本块数」大于重试块数时整次重试一个请求都发不出去（现场 2026-10-17：
+                // 立即翻译本章的重试范围有 22 块要发，端点上限 32，批永远攒不满就撞线，
+                // 任务窗口里「处理中 22」却没有任何请求）。
+                // 收尾等窗口清空之后再进行：在飞的块不会被提交，下一次运行重做。
+                break 'window;
+            }
         }
         // 3) Nothing is open and nothing is left to commit: every ordinal of the
         //    window was applied in order. The check has to cover `resolved` too —
@@ -402,6 +405,14 @@ pub(crate) async fn walk_translation_blocks(
         //    blocks has nothing to wait for; the next iteration commits those
         //    slots in ordinal order and fills the window again.
         if in_flight.is_empty() {
+            if retry_stopped {
+                // 撞线时一批都没发出去（`pending` 为空）：没有在飞请求可等，必须直接走
+                // 下面的收尾发布。在这里 `continue` 会跳过那段发布 —— 此后每一轮既不能
+                // 提交（游标不许越过窗口里还在等的块）也不能再开窗口（窗口已满），main
+                // loop 于是变成一个没有任何 await 点的 100% 空转：任务永远停在「运行中」
+                // 并带着一批幽灵「处理中」块，重启也只会在同一处复现（现场 2026-10-17）。
+                break;
+            }
             continue;
         }
         let Some((ordinals, walk)) = in_flight.next().await else {
