@@ -22,7 +22,7 @@ pub enum BackgroundJobAction {
     Retry,
     Cancel,
     /// Re-runs a whole-book translation from the first block, discarding the
-    /// persisted译文 of that book and language.
+    /// persisted translations of that book and language.
     Retranslate,
     /// Removes one finished (`failed` / `cancelled`) task row. Derived data —
     /// translations, index rows, visual pages — is deliberately untouched.

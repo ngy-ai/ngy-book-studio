@@ -816,7 +816,8 @@ LangGraph 依赖。CLI 课程验证与桌面接入的验证分别列出。
   Office 增强页面的全部门闩与 BLAKE3/BlobKey/图片格式校验，`load_office_enhanced_pages`
   改为委托；新增 `ensure_visual_render_job` 在打开 DjVu 时恢复/重试本地渲染任务，
   Office 仍保留显式信任对话框与 300 秒等待上限
-- [x] 页面图片阅读窗口 `src/ui/page_image.rs`（由 `office_slides.rs` 泛化并删除原文件）：
+- [x] 页面图片阅读窗口 `src/ui/page_image/`（由 `office_slides.rs` 泛化并删除原文件；后续按窗口拆分惯例
+  拆成 `app`/`launch`/`layout`/`model`/`render`/`view` 等文件）：
   来源类别决定副标题、AI 引用资格与文字面板；新增缩放（适应窗口 / 25%–400%）、
   按页阅读进度（复用 `ReadingProgressWriter` 有序写入与投影刷新）、
   DjVu“本页文字”面板（可选中复制，复用外层滚动 + 自然高度 `TextView` 的既有约定）。
@@ -1147,7 +1148,26 @@ LangGraph 依赖。CLI 课程验证与桌面接入的验证分别列出。
   全部通过（译文 27、朗读 7，含「眼睛 → 小喇叭 → 铅笔 → 重译」顺序、空闲控制行零下边距与
   段末图标聚焦显现）；另用 Chromium 渲染一段译文并截图核对图标形状与行距。未做真实
   Windows GUI 手工验证。
-  - [x] 2026-10-18 已取消或失败的后台任务可以删除（TODO：取消后任务行永远留在列表里，只能
+  - [x] 2026-10-18 暂停排队中的任务当场结清，启动恢复消费无人观察的暂停标志（现场 2026-10-17：
+  整本翻译点了暂停一直显示「正在暂停」，重启仍旧）。根因是 `pause_requested` 只有拥有游标的
+  执行者能消费成 `paused`，而它被留在两类无人认领的行上：任务还在排队时点暂停（claim 要求
+  `pause_requested = 0`，这行永远领不走，界面还把恢复/取消全藏了），以及运行中点暂停随即退出
+  （`recover_interrupted` 把 `running` 改回 `queued` 却留着标志，每次重启重造死局）。
+  `request_pause` 对排队行当场写 `paused` 并清标志、对运行行照旧只置标志；`recover_interrupted`
+  /`recover_interrupted_kind` 结清没有执行者能观察的标志，旧构建留下的「排队中 + 标志」行一并修好；
+  `MemoryVisualJobStore` 与 SQLite 同一契约。回归：`restart_recovery_settles_a_pause_request_no_
+  executor_can_observe`、`queued_pause_settles_immediately_and_survives_restart`（实现见
+  `docs/agent/code-map-ai.md`）。
+- [x] 2026-10-18 收窄重试撞线时照发已攒的批，不再跳过收尾发布（现场 2026-10-17：「立即翻译本章」
+  的任务永远停在「运行中 · 已处理 226 · 处理中 22」，一个请求都没发过，重启仍旧；任务日志第 65–68
+  次领取一字不差 —— 53 条 item_started、0 条 model_requested，线程 100% 空转）。端点的「每请求
+  文本块数」32 大于重试范围内要发的 22 块，批永远攒不满就撞线。`walk` 撞线时先把攒下的批照常
+  发出去再 `break 'window`；`in_flight` 为空且撞线时直接走收尾发布，不再 `continue` 跳过发布把主
+  循环退化成没有 await 点的空转。回归：`a_narrowed_retry_sends_its_batch_before_stopping_and_
+  publishes_paused`（撤掉修复即失败）、`a_narrowed_retry_with_nothing_to_send_still_publishes_
+  paused`（实现见 `docs/agent/code-map-ai.md`）。两条门禁读数见
+  `docs/agent/environment-and-commands.md` 2026-10-18 段。
+- [x] 2026-10-18 已取消或失败的后台任务可以删除（TODO：取消后任务行永远留在列表里，只能
   看着）：后台任务窗口对 `failed` / `cancelled` 的任务在「重试」旁给出「删除」，
   `BackgroundJobAction::Delete` 是新动作而不是状态转换，因此 UI 把它分流到新的
   `AppServices::delete_background_job`（不在 `control_background_job` 里；路由过去会大声
