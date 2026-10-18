@@ -1162,3 +1162,48 @@ LangGraph 依赖。CLI 课程验证与桌面接入的验证分别列出。
   `cargo check --lib/--bins --locked` 与 `cargo check --lib --locked --tests` 无错误、
   `services::tests::` 54 项全过。未做人工 GUI 验证（删除按钮的窗口内交互路径），
   bin 测试目标当时因产品 exe 被运行中的实例占用无法重建。
+- [x] 2026-10-18 暂停排队中的任务当场结清，启动恢复消费无人观察的暂停标志（现场
+  2026-10-17：整本翻译点了暂停一直显示「正在暂停」，重启仍旧）：`pause_requested` 只有
+  持有游标的执行者能把它消费成 `paused`，它却会被留在两类没人认领的行上 —— ① 任务还在
+  排队时点暂停，而 `claim` 要求 `pause_requested = 0`，这行永远领不走，界面还因此把恢复
+  与取消都藏起来；② 运行中点了暂停随后进程退出，`recover_interrupted` 把 `running` 改回
+  `queued` 却把标志原样留着，每次重启都重新制造同一个死局。`request_pause` 对排队中的行
+  当场写成 `paused` 并清掉标志（没有执行者需要中断），运行中的行照旧只置标志，由执行者按
+  它最后持久化的游标发布 `paused`；`recover_interrupted` / `recover_interrupted_kind`
+  把没有执行者能观察的暂停标志一并结清：被恢复的 `running` 行带着标志就按 `paused` 落，
+  旧构建留下的「排队中 + 标志」行同样修好，其它状态上的残留标志只清标志、不动状态，让
+  真实状态和它的操作重新可见。`MemoryVisualJobStore` 同步同一契约：SQLite 与内存两个存储
+  不能有两种口径。回归：`restart_recovery_settles_a_pause_request_no_executor_can_observe`、
+  `queued_pause_settles_immediately_and_survives_restart`；`document_test` 中「排队中暂停后
+  取消直接落 `cancelled`」的断言按新契约更新。
+- [x] 2026-10-18 收窄重试撞线时照发已攒的批，不再跳过收尾发布（现场 2026-10-17：
+  「立即翻译本章」的任务永远停在「运行中 · 已处理 226 · 处理中 22」，一个请求都没发过，
+  重启仍旧 —— 任务日志第 65–68 次领取一字不差：53 条 `item_started`、0 条
+  `model_requested`，之后只剩看门狗，一个线程 100% 空转、数据库零写入。端点的「每请求
+  文本块数」32 大于重试范围里要发的 22 块，批永远攒不满就撞线）：
+  1）撞线（`retry_stopped`）时先把攒下的这批发出去再 `break 'window` —— 它的块全在重试
+  范围内，请求本来就该发；那些块的窗口早已 `open_inflight` 落盘，以前整批作废导致整次
+  重试一个请求都发不出去。
+  2）`in_flight` 为空时先看 `retry_stopped`：撞线且一批都没发出去就直接走收尾发布。以前
+  这里 `continue` 会跳过那段发布，此后既不能提交（`next_ordinal` 不许越过窗口里还在等的
+  块）也不能再开窗口（窗口已满），main loop 退化成没有任何 await 点的 100% 空转，任务
+  永远「运行中」并带着一批幽灵「处理中」块。回归：`translation_retry_test` 的
+  `a_narrowed_retry_sends_its_batch_before_stopping_and_publishes_paused`（撤掉修复即
+  失败）与 `a_narrowed_retry_with_nothing_to_send_still_publishes_paused`。
+  验证（2026-10-18，应用已关闭后补跑，两处修复同批）：`cargo fmt --all --check` 通过、
+  `cargo check --all-targets --locked` 无错误、
+  `cargo test --locked --all-targets --no-fail-fast` 复跑全通过 —— lib 758 项（753 通过 /
+  5 忽略）、产品二进制 361 项（360 通过 / 1 忽略）、`translation_flow` 20 项（19 通过 /
+  1 忽略）、`openai_compatible_flow` 24、`epub_flow` 6、`multi_format_flow` 4、
+  `multi_endpoint_flow` 1、`proxy_flow` 1、`format_corpus_gate` 1 忽略。首轮全目标运行有
+  两项失败，均属 `docs/agent/environment-and-commands.md` 记的「紧截止夹具在默认并发下
+  假失败」：`ai::indexing::tests::translation_walk_test::
+  a_translation_run_keeps_the_configured_number_of_blocks_in_flight`（断言在飞窗口 2、
+  实测 1）与 `translation_flow` 的
+  `malformed_or_plain_first_response_gets_one_immutable_structured_correction`（30 秒内
+  一次都没看到翻译任务行），各自单独复跑通过，随后第二次全量复跑无失败。
+  `cargo clippy --all-targets --locked` 的告警都落在既有文件（`src/ui/`、
+  `src/windows_pdf_renderer.rs` 等），本次触及的 `translation/walk.rs`、`worker.rs`、
+  `db/index_jobs.rs`、`preview/job.rs` 无告警。人工 GUI 验证未复现原现场：本地
+  `library.db` 里已没有 `running`/`queued` 的翻译任务（最新两条翻译行都是 2026-10-17
+  23:53 的 `succeeded`），只能以回归用例作为行为证据。

@@ -245,6 +245,24 @@ startup_requeues_legacy_renderer_and_reclaims_its_visual_object` 等待视觉任
 一发装 8 块 —— 打包确实被关掉（单块这一段约 19 秒/块，批模式同区段约 4.5–7.6 秒/块，样本小、
 未控制端点节流差异，方向与预期一致）。**只剩「处理中」块数上界未核对**。
 
+2026-10-18 修「暂停排队中的任务当场结清、恢复消费无人观察的暂停标志」与「收窄重试撞线时照发
+已攒的批、不再跳过收尾发布」（实现见 `code-map-ai.md`，现场与回归见 `ROADMAP.md` 同日两条）之后
+补跑 Rust 门禁（应用先关闭，否则 `target/debug` 下的产品 exe 被占用，链接器会以 `os error 5`
+拒绝替换）：`cargo fmt --all --check` 通过、`cargo check --all-targets --locked` 无错误、
+`cargo test --locked --all-targets --no-fail-fast` 复跑全通过 —— lib 758 项（753 通过 / 5 忽略）、
+产品二进制 361 项（360 通过 / 1 忽略）、`translation_flow` 20 项（19 通过 / 1 忽略）、
+`openai_compatible_flow` 24、`epub_flow` 6、`multi_format_flow` 4、`multi_endpoint_flow` 1、
+`proxy_flow` 1、`format_corpus_gate` 1 忽略。`cargo clippy --all-targets --locked` 告警全部落在
+既有文件，本次触及的 `src/ai/indexing/translation/walk.rs`、`src/ai/indexing/worker.rs`、
+`src/db/index_jobs.rs`、`src/preview/job.rs` 无告警。首轮全目标运行的两项失败都是上面 2026-09-17
+记的那一类并发假失败，各自单独复跑通过：`translation_walk_test::
+a_translation_run_keeps_the_configured_number_of_blocks_in_flight`（实测在飞窗口 1、断言 2 ——
+它的 200ms 延迟就是留给 `plan_translation_block` 的规划窗口，全量并发时 blocking 池被抢空就会
+叠不上第二个请求）与 `translation_flow` 的
+`malformed_or_plain_first_response_gets_one_immutable_structured_correction`（30 秒停滞预算内
+一次都没轮询到翻译任务行）。人工 GUI 验证未做：本地 `library.db` 里已没有卡住的翻译任务
+（最新翻译行是 2026-10-17 23:53 的 `succeeded`），原现场无法复现。
+
 ## AI 问答诊断日志
 
 AI 日志统一使用 `ngy_ai` target。未设置 `RUST_LOG` 时，默认
