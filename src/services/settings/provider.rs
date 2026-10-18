@@ -67,6 +67,10 @@ pub struct ProviderSettings {
     /// 该范围钳制，手改坏的行不会让阅读窗口打不开。
     #[serde(skip, default = "default_speech_rate")]
     pub speech_rate: f32,
+    /// 选中文本点「AI 解释」时自动填入的问题。存进自己的 settings key
+    /// （`ai.question.preferences.v1`），与上面的偏好同理：应用级设置，所有窗口共用。
+    #[serde(skip, default = "default_selection_explanation_question")]
+    pub selection_explanation_question: String,
     pub embedding_model: String,
     /// Dimension override sent to the embedding provider. Changing this value
     /// invalidates all existing vector indices because stored vectors with the
@@ -169,6 +173,7 @@ impl Default for ProviderSettings {
             // 空 ID 表示系统默认语音；默认语速 1.0 倍。
             speech_voice_id: String::new(),
             speech_rate: default_speech_rate(),
+            selection_explanation_question: default_selection_explanation_question(),
         }
     }
 }
@@ -203,6 +208,20 @@ impl ProviderSettings {
         ensure!(
             self.background_job_interval_ms <= MAX_BACKGROUND_JOB_INTERVAL_MS,
             "后台任务间隔必须是 0 到 {MAX_BACKGROUND_JOB_INTERVAL_MS} 之间的整数毫秒"
+        );
+        // 解释问题随每次解释请求发送：空问题会让模型无从回答，超长会挤占侧栏的
+        // 问题预算，控制字符则会把请求体弄脏。读取时不做截断，只在保存时拒绝。
+        let question = self.selection_explanation_question.trim();
+        ensure!(!question.is_empty(), "AI 解释提示词不能为空");
+        ensure!(
+            question.len() <= MAX_SELECTION_EXPLANATION_QUESTION_BYTES,
+            "AI 解释提示词不能超过 {MAX_SELECTION_EXPLANATION_QUESTION_BYTES} 字节"
+        );
+        ensure!(
+            !question
+                .chars()
+                .any(|character| character.is_control() && !matches!(character, '\n' | '\t')),
+            "AI 解释提示词不能包含控制字符"
         );
         let mut ids = BTreeSet::new();
         let mut urls = BTreeSet::new();

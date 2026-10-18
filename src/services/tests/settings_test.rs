@@ -748,3 +748,57 @@ fn translation_language_defaults_to_simplified_chinese_and_round_trips_through_i
         "the translation language must not leak into the provider JSON contract",
     );
 }
+
+/// AI 解释提示词：默认值、往返保存与保存时校验。
+///
+/// 它存在自己的 settings key（`ai.question.preferences.v1`），与其它偏好一样不能
+/// 漏进 provider JSON；没有这一行的老库落到默认问题，而不是让侧栏无法解释。
+#[test]
+fn the_selection_explanation_question_round_trips_and_is_validated() {
+    let temp = tempfile::tempdir().unwrap();
+    let services =
+        AppServices::open_with_credentials(temp.path(), Arc::new(MemoryCredentialStore::default()))
+            .unwrap();
+    assert_eq!(
+        services.selection_explanation_question(),
+        DEFAULT_SELECTION_EXPLANATION_QUESTION,
+        "没有这一行的库必须落到默认问题"
+    );
+
+    let mut settings = services.provider_settings().unwrap();
+    settings.selection_explanation_question = "请用英语解释，并给出出处。".to_string();
+    block_on_without_tokio(services.configure_provider(settings, ApiKeyUpdate::Keep)).unwrap();
+    assert_eq!(
+        services.selection_explanation_question(),
+        "请用英语解释，并给出出处。"
+    );
+
+    let conn = db::open_conn(services.database_path()).unwrap();
+    let row = db::settings::get(&conn, AI_QUESTION_SETTINGS_KEY)
+        .unwrap()
+        .expect("the question preference must be persisted under its own key");
+    assert!(row.value_json.contains("请用英语解释"));
+    let provider = db::settings::get(&conn, PROVIDER_SETTINGS_KEY)
+        .unwrap()
+        .expect("provider settings must stay persisted");
+    assert!(
+        !provider
+            .value_json
+            .contains("selection_explanation_question"),
+        "the question must not leak into the provider JSON contract",
+    );
+
+    // 空问题、控制字符与超长提示词都在保存时被拒绝。
+    let mut invalid = services.provider_settings().unwrap();
+    for question in [
+        "   ".to_string(),
+        "bad\u{0}character".to_string(),
+        "长".repeat(MAX_SELECTION_EXPLANATION_QUESTION_BYTES),
+    ] {
+        invalid.selection_explanation_question = question;
+        assert!(
+            invalid.validate().is_err(),
+            "invalid explanation questions must be rejected on save"
+        );
+    }
+}

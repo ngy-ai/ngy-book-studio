@@ -10,12 +10,12 @@ pub(crate) const AI_SIDEBAR_NARROW_THRESHOLD: f32 = 1080.;
 pub(crate) const AI_REFERENCE_VISIBLE_ROWS: usize = 3;
 pub(crate) const AI_REFERENCE_ROW_HEIGHT: f32 = 28.;
 pub(crate) const MAX_QUESTION_BYTES: usize = 32 * 1024;
-pub(crate) const SELECTION_EXPLANATION_QUESTION: &str = "用汉语详细解释一下";
-/// Used when the reader selected text of a reading-time translation: the model
-/// must explain what the reader actually read, while the frozen quote it also
-/// receives stays the immutable original behind every citation and note.
-pub(crate) const SELECTION_TRANSLATION_QUESTION: &str =
-    "用汉语详细解释一下下面这段译文（原文见所选引用，请按译文解释）：\n\n";
+/// Appended to the user-configured explanation prompt when the reader selected
+/// text of a reading-time translation: the model must explain what the reader
+/// actually read, while the frozen quote it also receives stays the immutable
+/// original behind every citation and note.
+pub(crate) const SELECTION_TRANSLATION_QUESTION_SUFFIX: &str =
+    "\n\n下面这段是译文（原文见所选引用，请按译文解释）：\n\n";
 pub(crate) const SELECTION_TRANSLATION_QUESTION_TRUNCATED: &str = "…";
 pub(crate) const NO_KNOWLEDGE_BASE_SOURCE_WARNING_TITLE: &str = "没有可验证的知识库来源";
 pub(crate) const NO_KNOWLEDGE_BASE_SOURCE_WARNING_BODY: &str =

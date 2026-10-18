@@ -1148,7 +1148,18 @@ LangGraph 依赖。CLI 课程验证与桌面接入的验证分别列出。
   全部通过（译文 27、朗读 7，含「眼睛 → 小喇叭 → 铅笔 → 重译」顺序、空闲控制行零下边距与
   段末图标聚焦显现）；另用 Chromium 渲染一段译文并截图核对图标形状与行距。未做真实
   Windows GUI 手工验证。
-  - [x] 2026-10-18 暂停排队中的任务当场结清，启动恢复消费无人观察的暂停标志（现场 2026-10-17：
+  - [x] 2026-10-18 「AI 解释」的提示词可以配置，默认值改为「用汉语详细解释一下已锁定文本」
+  （TODO：提示词写死在代码里）。设置存进自己的 settings key
+  （`ai.question.preferences.v1`），与其它偏好一样以已保存设置为底、只覆盖本窗口字段；
+  AI 设置 → 系统新增「AI 问答」卡片（多行输入）。侧栏在提交解释的那一刻读取设置，保存后
+  下一次解释立即生效；选中阅读译文时，提示词后自动补「下面这段是译文（原文见所选引用，
+  请按译文解释）」与译文，而不是被一句固定文案替换。保存时校验：非空、≤2048 字节、
+  除换行/制表外无控制字符；读取时遇到手改坏的空值落回默认问题，不让整份设置快照读不出来。
+  provider JSON 不变（字段 `#[serde(skip)]` 并单独成行），设置备份快照的 key 列表同步。
+  回归：`services::tests::settings_test::the_selection_explanation_question_round_trips_and_is_
+  validated`、`ui::ai_sidebar::tests::explanation_test::explanation_question_names_the_displayed_
+  translation_within_its_budget`（含自定义提示词前缀断言）、`request_test` 的解释请求断言。
+- [x] 2026-10-18 暂停排队中的任务当场结清，启动恢复消费无人观察的暂停标志（现场 2026-10-17：
   整本翻译点了暂停一直显示「正在暂停」，重启仍旧）。根因是 `pause_requested` 只有拥有游标的
   执行者能消费成 `paused`，而它被留在两类无人认领的行上：任务还在排队时点暂停（claim 要求
   `pause_requested = 0`，这行永远领不走，界面还把恢复/取消全藏了），以及运行中点暂停随即退出

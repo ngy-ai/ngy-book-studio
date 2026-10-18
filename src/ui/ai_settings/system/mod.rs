@@ -36,6 +36,8 @@ pub(crate) struct SystemSettingsWindow {
     pub(crate) translation_display_mode: TranslationDisplayMode,
     /// Whether AI and web-search requests go through the system proxy.
     pub(crate) use_proxy: bool,
+    /// 选中文本点「AI 解释」时自动填入的问题。多行输入，随「保存设置」一起落盘。
+    pub(crate) prompt_input: Entity<TextareaState>,
     /// 朗读用的系统语音 ID；空串表示系统默认语音。
     pub(crate) speech_voice_id: String,
     /// 朗读语速倍率（1.0 为正常）。

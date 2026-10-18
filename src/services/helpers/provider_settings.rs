@@ -118,6 +118,19 @@ pub(crate) fn load_provider_settings(db_path: &Path) -> Result<ProviderSettings>
     settings.speech_rate = speech
         .rate
         .clamp(SpeechRequest::RATE_MIN, SpeechRequest::RATE_MAX);
+    let question = match db::settings::get(&tx, AI_QUESTION_SETTINGS_KEY)? {
+        Some(row) => serde_json::from_str::<PersistedQuestionSettings>(&row.value_json)
+            .context("保存的 AI 问答设置无效")?,
+        None => PersistedQuestionSettings::default(),
+    };
+    // 手改坏的空问题不该让整个设置快照读不出来：落回默认问题，保存时 `validate`
+    // 仍会拦住下一次空值写入。
+    settings.selection_explanation_question =
+        if question.selection_explanation_question.trim().is_empty() {
+            default_selection_explanation_question()
+        } else {
+            question.selection_explanation_question
+        };
     settings.validate()?;
     tx.commit().context("无法完成 AI 设置快照读取")?;
     Ok(settings)
@@ -213,6 +226,14 @@ pub(crate) fn save_provider_settings(db_path: &Path, settings: &ProviderSettings
         .context("无法序列化朗读设置")?,
         updated_at,
     };
+    let question = db::settings::Setting {
+        key: AI_QUESTION_SETTINGS_KEY.to_string(),
+        value_json: serde_json::to_string(&PersistedQuestionSettings {
+            selection_explanation_question: settings.selection_explanation_question.clone(),
+        })
+        .context("无法序列化 AI 问答设置")?,
+        updated_at,
+    };
     let mut conn = db::open_conn(db_path)?;
     let tx = conn.transaction().context("无法开始保存 AI 设置")?;
     ensure!(
@@ -252,6 +273,10 @@ pub(crate) fn save_provider_settings(db_path: &Path, settings: &ProviderSettings
         "网络设置未能保存"
     );
     ensure!(db::settings::upsert(&tx, &speech)? == 1, "朗读设置未能保存");
+    ensure!(
+        db::settings::upsert(&tx, &question)? == 1,
+        "AI 问答设置未能保存"
+    );
     tx.commit().context("无法提交 AI 设置")?;
     Ok(())
 }

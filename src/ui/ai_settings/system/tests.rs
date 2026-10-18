@@ -24,9 +24,9 @@ fn preferences_are_drafts_until_saved(cx: &mut TestAppContext) {
         .expect("compact reading checkbox must be rendered");
     visual.simulate_click(compact.center(), Modifiers::none());
     redraw(visual);
-    settings.read_with(visual, |view, _| {
+    settings.read_with(visual, |view, cx| {
         assert!(view.pdf_compact_reading);
-        assert!(view.entered_settings().unwrap().pdf_compact_reading);
+        assert!(view.entered_settings(cx).unwrap().pdf_compact_reading);
         assert!(
             !view
                 .services
@@ -48,9 +48,9 @@ fn preferences_are_drafts_until_saved(cx: &mut TestAppContext) {
     });
     visual.simulate_click(proxy.center(), Modifiers::none());
     redraw(visual);
-    settings.read_with(visual, |view, _| {
+    settings.read_with(visual, |view, cx| {
         assert!(!view.use_proxy);
-        assert!(!view.entered_settings().unwrap().use_proxy);
+        assert!(!view.entered_settings(cx).unwrap().use_proxy);
         assert!(
             view.services.provider_settings().unwrap().use_proxy,
             "changing the checkbox must not save the network preference",
@@ -85,10 +85,13 @@ fn language_dropdown_updates_the_translation_draft(cx: &mut TestAppContext) {
         });
     });
     redraw(visual);
-    settings.read_with(visual, |view, _| {
+    settings.read_with(visual, |view, cx| {
         assert_eq!(view.default_language.as_deref(), Some("ja"));
         assert_eq!(
-            view.entered_settings().unwrap().default_language.as_deref(),
+            view.entered_settings(cx)
+                .unwrap()
+                .default_language
+                .as_deref(),
             Some("ja")
         );
         assert_eq!(
@@ -110,8 +113,8 @@ fn storage_paths_are_shown_without_touching_other_settings(cx: &mut TestAppConte
         .debug_bounds("ai-data-directory-change")
         .expect("data-directory button must be rendered");
     assert!(change.size.width > px(0.));
-    settings.read_with(visual, |view, _| {
-        let entered = view.entered_settings().unwrap();
+    settings.read_with(visual, |view, cx| {
+        let entered = view.entered_settings(cx).unwrap();
         assert_eq!(
             entered.chat_model,
             view.services.provider_settings().unwrap().chat_model

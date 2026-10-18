@@ -59,6 +59,25 @@ impl Default for PersistedSpeechSettings {
     }
 }
 
+/// AI 问答的行为偏好：选中文本点「AI 解释」时自动填入的问题。
+///
+/// 与其它偏好一样存进自己的 settings key。`#[serde(default)]` 让没有这一行的老库
+/// 直接落到默认问题，不需要迁移。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PersistedQuestionSettings {
+    #[serde(default = "default_selection_explanation_question")]
+    pub(crate) selection_explanation_question: String,
+}
+
+impl Default for PersistedQuestionSettings {
+    fn default() -> Self {
+        Self {
+            selection_explanation_question: default_selection_explanation_question(),
+        }
+    }
+}
+
 /// 界面皮肤偏好。与上面的阅读偏好一样存进自己的 settings key，provider JSON 的
 /// 既有契约不变。
 ///

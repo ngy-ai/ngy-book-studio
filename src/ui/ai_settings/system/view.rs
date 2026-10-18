@@ -27,7 +27,7 @@ impl SettingsWindowView for SystemSettingsWindow {
         if self.state.busy() {
             return;
         }
-        let settings = match self.entered_settings() {
+        let settings = match self.entered_settings(cx) {
             Ok(settings) => settings,
             Err(error) => {
                 self.state.report(format!("系统配置无效：{error:#}"), true);

@@ -172,7 +172,13 @@ impl AiSidebar {
             );
             return;
         }
-        let Some(request) = self.conversation.begin_selection_explanation(reference) else {
+        // 提示词在提交这一刻从设置快照读取：设置窗口里刚保存的新值立刻生效，不必
+        // 等侧栏重启。
+        let prompt = self.services.selection_explanation_question();
+        let Some(request) = self
+            .conversation
+            .begin_selection_explanation(reference, &prompt)
+        else {
             self.reject_selection_explanation(
                 "所选文本已不在当前 AI 范围内，请重新选择后再试。",
                 cx,

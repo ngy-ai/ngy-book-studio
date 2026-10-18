@@ -246,6 +246,22 @@ impl SystemSettingsWindow {
             .child(panel(
                 theme,
                 vec![
+                    card_title(theme, "AI 问答"),
+                    Textarea::new(&self.prompt_input)
+                        .disabled(busy)
+                        .into_any_element(),
+                    card_note(
+                        theme,
+                        "选中文本后点「AI 解释」时，这段文字会自动填入提问框；\
+                         回答仍然只基于宿主冻结的那段选区，改这里不会改变引用与笔记的锚点。\
+                         默认是「用汉语详细解释一下已锁定文本」；选中阅读译文时，这段提示词\
+                         后面会自动补上译文与「按译文解释」的说明。保存后下一次解释立即生效。",
+                    ),
+                ],
+            ))
+            .child(panel(
+                theme,
+                vec![
                     card_title(theme, "网络"),
                     Checkbox::new("ai-use-system-proxy")
                         .checked(self.use_proxy)

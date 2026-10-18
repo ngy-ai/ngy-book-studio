@@ -42,20 +42,26 @@ impl AiReferenceHint {
     }
 }
 
-/// The fixed explanation question, or the same request naming the译文 the reader
-/// displayed. The question must stay inside the sidebar's own byte budget even
-/// when the reader's selection cap allows more, so an oversized translation is
-/// truncated at a character boundary instead of rejecting the whole request.
-pub(crate) fn selection_explanation_question(reference: &AiReferenceHint) -> String {
+/// The configured explanation question, or the same request naming the译文 the
+/// reader displayed.
+///
+/// `prompt` 是设置里的「AI 解释提示词」；把译文附在它后面，而不是替换成一句固定
+/// 文案：用户改提示词（换语言、加要求）时，译文解释请求也应当跟着改。
+///
+/// The question must stay inside the sidebar's own byte budget even when the
+/// reader's selection cap allows more, so an oversized translation is truncated
+/// at a character boundary instead of rejecting the whole request.
+pub(crate) fn selection_explanation_question(reference: &AiReferenceHint, prompt: &str) -> String {
     let displayed = reference
         .displayed_text
         .as_deref()
         .map(str::trim)
         .filter(|text| !text.is_empty());
     let Some(displayed) = displayed else {
-        return SELECTION_EXPLANATION_QUESTION.to_string();
+        return prompt.to_string();
     };
-    let mut question = String::from(SELECTION_TRANSLATION_QUESTION);
+    let mut question = String::from(prompt);
+    question.push_str(SELECTION_TRANSLATION_QUESTION_SUFFIX);
     let budget = MAX_QUESTION_BYTES
         .saturating_sub(question.len() + SELECTION_TRANSLATION_QUESTION_TRUNCATED.len());
     if displayed.len() <= budget {

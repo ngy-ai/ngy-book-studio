@@ -421,6 +421,7 @@ impl ConversationState {
     pub(super) fn begin_selection_explanation(
         &mut self,
         reference: AiReferenceHint,
+        prompt: &str,
     ) -> Option<AiQuestionRequest> {
         if self.is_sending()
             || !self.scope.book_ids().contains(&reference.book_id)
@@ -432,7 +433,7 @@ impl ConversationState {
         {
             return None;
         }
-        let question = selection_explanation_question(&reference);
+        let question = selection_explanation_question(&reference, prompt);
         self.messages.clear();
         // The explanation replaces the transcript entirely; an anchor left
         // over from an abandoned edit belongs to the discarded conversation.

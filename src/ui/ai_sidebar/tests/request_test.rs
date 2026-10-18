@@ -68,13 +68,16 @@ fn selection_explanation_replaces_previous_history_and_reference_choices() {
         AgentAnswerSourceStatus::NoVerifiedSources,
     ));
 
-    let request = state.begin_selection_explanation(selected.clone()).unwrap();
+    let prompt = ngy_book_studio::services::DEFAULT_SELECTION_EXPLANATION_QUESTION;
+    let request = state
+        .begin_selection_explanation(selected.clone(), prompt)
+        .unwrap();
 
-    assert_eq!(request.question, "用汉语详细解释一下");
+    assert_eq!(request.question, "用汉语详细解释一下已锁定文本");
     assert_eq!(request.reference_hints, vec![selected.clone()]);
     assert_eq!(request.reference, Some(selected.clone()));
     assert_eq!(state.messages.len(), 1);
-    assert_eq!(state.messages[0].content, "用汉语详细解释一下");
+    assert_eq!(state.messages[0].content, "用汉语详细解释一下已锁定文本");
     assert!(request.request_id > previous.request_id);
     assert!(state.included_references.is_empty());
     assert!(state.reference_is_included(&selected));
@@ -98,7 +101,10 @@ fn selection_explanation_rejects_busy_or_removed_scope_without_mutating_conversa
     let messages = state.messages.clone();
     assert!(
         state
-            .begin_selection_explanation(selected.clone())
+            .begin_selection_explanation(
+                selected.clone(),
+                ngy_book_studio::services::DEFAULT_SELECTION_EXPLANATION_QUESTION,
+            )
             .is_none()
     );
     assert!(state.is_current(request.request_id));
@@ -112,7 +118,14 @@ fn selection_explanation_rejects_busy_or_removed_scope_without_mutating_conversa
     ));
     let completed = state.messages.clone();
     selected.book_id = "removed-book".to_string();
-    assert!(state.begin_selection_explanation(selected).is_none());
+    assert!(
+        state
+            .begin_selection_explanation(
+                selected,
+                ngy_book_studio::services::DEFAULT_SELECTION_EXPLANATION_QUESTION,
+            )
+            .is_none()
+    );
     assert_eq!(state.messages, completed);
 }
 

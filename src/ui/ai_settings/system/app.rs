@@ -7,10 +7,17 @@ impl SystemSettingsWindow {
         services: Arc<AppServices>,
         settings: ProviderSettings,
         window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> Self {
+        let prompt_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .rows(3)
+                .default_value(settings.selection_explanation_question.clone())
+                .placeholder("选中文本后点「AI 解释」时自动填入的问题")
+        });
         Self {
             services,
+            prompt_input,
             pdf_compact_reading: settings.pdf_compact_reading,
             appearance: settings.appearance,
             default_language: settings.default_language.clone(),
@@ -30,8 +37,9 @@ impl SystemSettingsWindow {
     }
 
     /// 以已保存设置为底，只覆盖本窗口负责的偏好。
-    pub(crate) fn entered_settings(&self) -> Result<ProviderSettings> {
+    pub(crate) fn entered_settings(&self, cx: &App) -> Result<ProviderSettings> {
         let mut settings = self.services.provider_settings()?;
+        settings.selection_explanation_question = self.prompt_input.read(cx).value().to_string();
         settings.pdf_compact_reading = self.pdf_compact_reading;
         settings.appearance = self.appearance;
         settings.default_language = self.default_language.clone();

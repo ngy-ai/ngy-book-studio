@@ -200,4 +200,14 @@ impl AppServices {
             .settings
             .clone())
     }
+
+    /// 选中文本点「AI 解释」时自动填入的问题；读不到设置时用默认值。
+    ///
+    /// 一次读快照失败不该把解释功能整个关掉：解释请求本来就要继续发出去，问题用
+    /// 默认值比弹出「AI 设置读不出来」更接近用户意图。
+    pub fn selection_explanation_question(&self) -> String {
+        self.provider_settings()
+            .map(|settings| settings.selection_explanation_question)
+            .unwrap_or_else(|_| default_selection_explanation_question())
+    }
 }

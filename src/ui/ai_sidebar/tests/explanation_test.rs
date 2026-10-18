@@ -4,21 +4,33 @@ use super::*;
 
 #[test]
 fn explanation_question_names_the_displayed_translation_within_its_budget() {
+    // 设置里的提示词原样成为问题；没有译文时不做任何拼接。
+    let prompt = ngy_book_studio::services::DEFAULT_SELECTION_EXPLANATION_QUESTION;
+    assert_eq!(prompt, "用汉语详细解释一下已锁定文本");
     assert_eq!(
-        selection_explanation_question(&explanation_reference(None)),
-        SELECTION_EXPLANATION_QUESTION
+        selection_explanation_question(&explanation_reference(None), prompt),
+        prompt
     );
     assert_eq!(
-        selection_explanation_question(&explanation_reference(Some(" \n\t "))),
-        SELECTION_EXPLANATION_QUESTION
+        selection_explanation_question(&explanation_reference(Some(" \n\t ")), prompt),
+        prompt
     );
-    let translated = selection_explanation_question(&explanation_reference(Some("  译文段落  ")));
-    assert!(translated.starts_with(SELECTION_TRANSLATION_QUESTION));
+    let translated =
+        selection_explanation_question(&explanation_reference(Some("  译文段落  ")), prompt);
+    assert!(translated.starts_with(prompt));
+    assert!(translated.contains(SELECTION_TRANSLATION_QUESTION_SUFFIX));
     assert!(translated.ends_with("译文段落"));
+    // 用户改过的提示词也要出现在译文解释里，而不是被一句固定文案替换。
+    let custom = "请用英语解释这段文字，并给出一个例子。";
+    let custom_translated =
+        selection_explanation_question(&explanation_reference(Some("译文")), custom);
+    assert!(custom_translated.starts_with(custom));
+    assert!(custom_translated.ends_with("译文"));
     // The sidebar's own question budget wins over the reader's larger
     // selection limit: an oversized译文 is truncated, never rejected.
     let oversized = "译".repeat(MAX_QUESTION_BYTES);
-    let truncated = selection_explanation_question(&explanation_reference(Some(&oversized)));
+    let truncated =
+        selection_explanation_question(&explanation_reference(Some(&oversized)), prompt);
     assert!(truncated.ends_with(SELECTION_TRANSLATION_QUESTION_TRUNCATED));
     assert!(truncated.len() <= MAX_QUESTION_BYTES);
     assert!(truncated.is_char_boundary(truncated.len()));

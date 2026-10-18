@@ -29,8 +29,8 @@ pub(crate) use endpoint::{resolve_blocks_per_request, resolve_requests_per_minut
 
 pub(crate) use preferences::{
     PersistedAppearanceSettings, PersistedBackgroundJobSettings, PersistedBookTranslationDisplay,
-    PersistedNetworkSettings, PersistedPdfReaderSettings, PersistedReaderZoom,
-    PersistedSpeechSettings, PersistedTranslationSettings,
+    PersistedNetworkSettings, PersistedPdfReaderSettings, PersistedQuestionSettings,
+    PersistedReaderZoom, PersistedSpeechSettings, PersistedTranslationSettings,
 };
 
 pub(crate) const OBJECT_DIRECTORY: &str = "objects";
@@ -50,6 +50,9 @@ pub(crate) const NETWORK_SETTINGS_KEY: &str = "ai.network.preferences.v1";
 /// settings key；它是**应用级**设置（所有阅读窗口共用一份），因此不按书记忆，
 /// 也就不需要任何删书清理。
 pub(crate) const SPEECH_SETTINGS_KEY: &str = "speech.preferences.v1";
+/// AI 问答的行为偏好：选中文本点「AI 解释」时自动填入的问题。与上面的偏好一样
+/// 存进自己的 settings key，provider JSON 的既有契约不变。
+pub(crate) const AI_QUESTION_SETTINGS_KEY: &str = "ai.question.preferences.v1";
 pub(crate) const WEB_SEARCH_CREDENTIAL_TARGET: &str = "ai.openai_compatible.web_search.v1";
 pub(crate) const MAX_MODEL_NAME_CHARS: usize = 256;
 /// 等待 `ai_configuration` 门闩的上限。
@@ -168,6 +171,18 @@ pub(crate) fn default_pdf_compact_reading() -> bool {
 pub(crate) fn default_speech_rate() -> f32 {
     1.0
 }
+
+/// 选中文本点「AI 解释」时自动填入的问题。用户可以在 AI 设置 → 系统里改；
+/// 默认值明确点出「已锁定文本」，模型因此知道解释对象是宿主冻结的那段选区。
+pub const DEFAULT_SELECTION_EXPLANATION_QUESTION: &str = "用汉语详细解释一下已锁定文本";
+
+pub(crate) fn default_selection_explanation_question() -> String {
+    DEFAULT_SELECTION_EXPLANATION_QUESTION.to_string()
+}
+
+/// 解释问题的字节上限。它随每次解释请求体发送，并且要留在侧栏的
+/// `MAX_QUESTION_BYTES` 预算之内，所以这里给一个远小于 32 KB 的上限。
+pub(crate) const MAX_SELECTION_EXPLANATION_QUESTION_BYTES: usize = 2 * 1024;
 
 /// Whether AI and web-search requests use the system proxy. Kept in its own
 /// settings key, exactly like the preferences above.
