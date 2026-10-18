@@ -1,168 +1,9 @@
-use anyhow::{Context as _, Result, ensure};
-use rusqlite::{Connection, OptionalExtension, params};
+//! Writes of the `index_jobs` table: enqueueing, reconfiguration, recovery,
+//! guarded claims, control requests, resets, and terminal publication.
 
-pub(crate) const VISION_WAITING_FOR_PAGES_ERROR: &str =
-    "视觉页面尚未生成；页面渲染完成后可自动或手动重试";
+use super::*;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum IndexJobStatus {
-    Queued,
-    Running,
-    Paused,
-    Succeeded,
-    Failed,
-    Cancelled,
-}
-
-impl IndexJobStatus {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Queued => "queued",
-            Self::Running => "running",
-            Self::Paused => "paused",
-            Self::Succeeded => "succeeded",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-        }
-    }
-
-    fn parse(value: &str) -> rusqlite::Result<Self> {
-        match value {
-            "queued" => Ok(Self::Queued),
-            "running" => Ok(Self::Running),
-            "paused" => Ok(Self::Paused),
-            "succeeded" => Ok(Self::Succeeded),
-            "failed" => Ok(Self::Failed),
-            "cancelled" => Ok(Self::Cancelled),
-            _ => Err(rusqlite::Error::InvalidColumnType(
-                4,
-                "status".to_string(),
-                rusqlite::types::Type::Text,
-            )),
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct IndexJob {
-    pub(crate) id: String,
-    pub(crate) book_id: String,
-    pub(crate) source_id: Option<String>,
-    pub(crate) kind: String,
-    pub(crate) status: IndexJobStatus,
-    pub(crate) pause_requested: bool,
-    pub(crate) cancel_requested: bool,
-    pub(crate) attempts: u32,
-    pub(crate) cursor_json: String,
-    pub(crate) error: Option<String>,
-    pub(crate) created_at: u64,
-    pub(crate) updated_at: u64,
-    pub(crate) started_at: Option<u64>,
-    pub(crate) finished_at: Option<u64>,
-}
-
-const SELECT: &str = "SELECT id, book_id, source_id, kind, status, pause_requested,
-    cancel_requested, attempts, cursor_json, error, created_at, updated_at, started_at,
-    finished_at FROM index_jobs";
-
-pub(crate) fn get(conn: &Connection, job_id: &str) -> Result<Option<IndexJob>> {
-    conn.query_row(&format!("{SELECT} WHERE id = ?1"), [job_id], job_from_row)
-        .optional()
-        .context("无法读取索引任务")
-}
-
-pub(crate) fn list_for_book(conn: &Connection, book_id: &str) -> Result<Vec<IndexJob>> {
-    let mut stmt = conn
-        .prepare(&format!(
-            "{SELECT} WHERE book_id = ?1 ORDER BY created_at, id"
-        ))
-        .context("无法准备索引任务查询")?;
-    let rows = stmt
-        .query_map([book_id], job_from_row)
-        .context("无法读取索引任务")?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .context("无法读取索引任务记录")
-}
-
-pub(crate) fn list_for_source_kind(
-    conn: &Connection,
-    source_id: &str,
-    kind: &str,
-) -> Result<Vec<IndexJob>> {
-    let mut stmt = conn
-        .prepare(&format!(
-            "{SELECT} WHERE source_id = ?1 AND kind = ?2 ORDER BY created_at, id"
-        ))
-        .context("无法准备来源索引任务查询")?;
-    let rows = stmt
-        .query_map(params![source_id, kind], job_from_row)
-        .context("无法读取来源索引任务")?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .context("无法读取来源索引任务记录")
-}
-
-/// Returns queued work in a deterministic order. Control flags remain visible
-/// so the coordinator can publish a terminal/paused state without claiming
-/// the job first.
-pub(crate) fn list_queued(conn: &Connection, limit: usize) -> Result<Vec<IndexJob>> {
-    let mut stmt = conn
-        .prepare(&format!(
-            "{SELECT} WHERE status = 'queued' AND kind IN ('embedding', 'vision', 'translation')
-               AND (kind <> 'vision' OR id = 'vision:' || source_id)
-             ORDER BY COALESCE(
-                          json_extract(
-                              CASE WHEN json_valid(cursor_json) THEN cursor_json END,
-                              '$.priority'
-                          ),
-                          0
-                      ) DESC,
-                      created_at,
-                      CASE kind
-                          WHEN 'embedding' THEN 0
-                          WHEN 'vision' THEN 1
-                          WHEN 'translation' THEN 2
-                          ELSE 3
-                      END,
-                      id
-             LIMIT ?1"
-        ))
-        .context("无法准备待执行索引任务查询")?;
-    let rows = stmt
-        .query_map([limit as i64], job_from_row)
-        .context("无法读取待执行索引任务")?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .context("无法读取待执行索引任务记录")
-}
-
-pub(crate) fn list_queued_ids_for_kind(
-    conn: &Connection,
-    kind: &str,
-    limit: usize,
-) -> Result<Vec<String>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id FROM index_jobs
-             WHERE kind = ?1 AND status = 'queued'
-             ORDER BY created_at, id LIMIT ?2",
-        )
-        .context("无法准备分类待执行任务查询")?;
-    let rows = stmt
-        .query_map(params![kind, limit as i64], |row| row.get(0))
-        .context("无法读取分类待执行任务")?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .context("无法读取分类待执行任务记录")
-}
-
-pub(crate) fn list_by_kind(conn: &Connection, kind: &str) -> Result<Vec<IndexJob>> {
-    let mut stmt = conn
-        .prepare(&format!("{SELECT} WHERE kind = ?1 ORDER BY created_at, id"))
-        .context("无法准备同类索引任务查询")?;
-    let rows = stmt
-        .query_map([kind], job_from_row)
-        .context("无法读取同类索引任务")?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .context("无法读取同类索引任务记录")
-}
+use super::model::VISION_WAITING_FOR_PAGES_ERROR;
 
 /// Rewrites one derived job to a caller-supplied execution generation,
 /// regardless of its previous state. Used by translation reconfiguration to
@@ -365,7 +206,7 @@ pub(crate) fn bind_queued_canonical_execution(
 ///
 /// Translation cursors come from two writers: the executor, which serializes
 /// the whole block-level cursor, and the reconfiguration path, which persists
-/// the smaller [`PersistedIndexCursor`] shape. Every executor comparison is
+/// the smaller [`PersistedIndexCursor`](crate::db::transactions::PersistedIndexCursor) shape. Every executor comparison is
 /// JSON string equality, so a job configured by the latter has to be re-encoded
 /// before its first claim — otherwise that execution abandons itself and the
 /// row stays `running` with no worker. The exact old cursor keeps a stale queue
@@ -710,24 +551,4 @@ pub(crate) fn delete(conn: &Connection, job_id: &str) -> Result<usize> {
 pub(crate) fn delete_for_source(conn: &Connection, source_id: &str) -> Result<usize> {
     conn.execute("DELETE FROM index_jobs WHERE source_id = ?1", [source_id])
         .context("无法删除来源对应的索引任务")
-}
-
-fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexJob> {
-    let status = row.get::<_, String>(4)?;
-    Ok(IndexJob {
-        id: row.get(0)?,
-        book_id: row.get(1)?,
-        source_id: row.get(2)?,
-        kind: row.get(3)?,
-        status: IndexJobStatus::parse(&status)?,
-        pause_requested: row.get(5)?,
-        cancel_requested: row.get(6)?,
-        attempts: row.get(7)?,
-        cursor_json: row.get(8)?,
-        error: row.get(9)?,
-        created_at: row.get::<_, i64>(10)? as u64,
-        updated_at: row.get::<_, i64>(11)? as u64,
-        started_at: row.get::<_, Option<i64>>(12)?.map(|value| value as u64),
-        finished_at: row.get::<_, Option<i64>>(13)?.map(|value| value as u64),
-    })
 }
