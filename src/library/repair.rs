@@ -14,7 +14,7 @@ use anyhow::{Result, bail};
 
 use crate::annotations::{compact_text, reader_body_text};
 use crate::db::{self};
-use crate::document::{Block, BlockDocument, ContentUnit, DocumentLocator, SourceLocator};
+use crate::document::{Block, BlockDocument, ContentUnit, SourceLocator};
 use crate::markup::{parse_source_for_unit, serialize_source};
 use crate::storage::BlobKey;
 use rbook::Epub;

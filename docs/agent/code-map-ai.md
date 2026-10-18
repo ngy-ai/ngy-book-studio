@@ -84,8 +84,9 @@
   只有②能约束一本书内部的请求频率：一整本书是一个任务，①对它等于不存在（现场 2026-09-20：
   本机模型连续请求把 GPU 吃到满载、桌面黑屏，用户把间隔调到 5000 毫秒也不起作用）。
   同一个「任务并发」既是任务上限，也是**单个整本翻译的请求窗口上限**：一轮里最多同时开
-  `concurrency` 发请求，每发带走几块由翻译端点的「每请求文本块数」决定（攒批在 `walk.rs`、
-  打包预算在 `batch.rs`），所以在飞的文本块最多是「任务并发 × 每请求块数」
+  `concurrency` 发请求，每发带走几块由翻译端点的「每请求文本块数」决定（攒批在
+  `walk/drive.rs` 的窗口循环、打包预算在 `batch.rs`），所以在飞的文本块最多是
+  「任务并发 × 每请求块数」
   （`walk_translation_blocks` 的窗口，每轮重读设置，所以运行中调大只让 walk 走得更前、不打断
   任何在飞请求），因此一本翻译自己也会出现多个「处理中」。
   `ai/indexing/translation/` 另实现整本图书翻译任务
@@ -202,7 +203,7 @@
   错误（`segment_count_mismatch`、`keep_with_text` 等）只拒绝那一块、同批其它块照常落库；
   批这一层不重试、不纠正，宽容解码只做单块路径上那几件必要的事。**调用方是 walk**
   （2026-10-16 起）：`TranslationServices::batch_blocks`（端点「每请求文本块数」的解析结果，
-  见 `EndpointSettings::resolved_blocks_per_request`）大于 1 时 `walk.rs` 按同一个内容单元
+  见 `EndpointSettings::resolved_blocks_per_request`）大于 1 时 `walk/drive.rs` 按同一个内容单元
   攒批、受上面三个上限约束，窗口仍按**请求**计（同时在飞的块最多「任务并发 × 每请求块数」）；
   批里每一块照旧落回它自己的块号，拆半重发、块级回退单块与整发失败逐块跳过都由
   `response/batch.rs` 内部完成，`TranslationRunStats::batched_requests`/`batched_blocks` 只记
