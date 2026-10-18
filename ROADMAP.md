@@ -1159,25 +1159,6 @@ LangGraph 依赖。CLI 课程验证与桌面接入的验证分别列出。
   回归：`services::tests::settings_test::the_selection_explanation_question_round_trips_and_is_
   validated`、`ui::ai_sidebar::tests::explanation_test::explanation_question_names_the_displayed_
   translation_within_its_budget`（含自定义提示词前缀断言）、`request_test` 的解释请求断言。
-- [x] 2026-10-18 暂停排队中的任务当场结清，启动恢复消费无人观察的暂停标志（现场 2026-10-17：
-  整本翻译点了暂停一直显示「正在暂停」，重启仍旧）。根因是 `pause_requested` 只有拥有游标的
-  执行者能消费成 `paused`，而它被留在两类无人认领的行上：任务还在排队时点暂停（claim 要求
-  `pause_requested = 0`，这行永远领不走，界面还把恢复/取消全藏了），以及运行中点暂停随即退出
-  （`recover_interrupted` 把 `running` 改回 `queued` 却留着标志，每次重启重造死局）。
-  `request_pause` 对排队行当场写 `paused` 并清标志、对运行行照旧只置标志；`recover_interrupted`
-  /`recover_interrupted_kind` 结清没有执行者能观察的标志，旧构建留下的「排队中 + 标志」行一并修好；
-  `MemoryVisualJobStore` 与 SQLite 同一契约。回归：`restart_recovery_settles_a_pause_request_no_
-  executor_can_observe`、`queued_pause_settles_immediately_and_survives_restart`（实现见
-  `docs/agent/code-map-ai.md`）。
-- [x] 2026-10-18 收窄重试撞线时照发已攒的批，不再跳过收尾发布（现场 2026-10-17：「立即翻译本章」
-  的任务永远停在「运行中 · 已处理 226 · 处理中 22」，一个请求都没发过，重启仍旧；任务日志第 65–68
-  次领取一字不差 —— 53 条 item_started、0 条 model_requested，线程 100% 空转）。端点的「每请求
-  文本块数」32 大于重试范围内要发的 22 块，批永远攒不满就撞线。`walk` 撞线时先把攒下的批照常
-  发出去再 `break 'window`；`in_flight` 为空且撞线时直接走收尾发布，不再 `continue` 跳过发布把主
-  循环退化成没有 await 点的空转。回归：`a_narrowed_retry_sends_its_batch_before_stopping_and_
-  publishes_paused`（撤掉修复即失败）、`a_narrowed_retry_with_nothing_to_send_still_publishes_
-  paused`（实现见 `docs/agent/code-map-ai.md`）。两条门禁读数见
-  `docs/agent/environment-and-commands.md` 2026-10-18 段。
 - [x] 2026-10-18 已取消或失败的后台任务可以删除（TODO：取消后任务行永远留在列表里，只能
   看着）：后台任务窗口对 `failed` / `cancelled` 的任务在「重试」旁给出「删除」，
   `BackgroundJobAction::Delete` 是新动作而不是状态转换，因此 UI 把它分流到新的
@@ -1238,3 +1219,30 @@ LangGraph 依赖。CLI 课程验证与桌面接入的验证分别列出。
   `db/index_jobs.rs`、`preview/job.rs` 无告警。人工 GUI 验证未复现原现场：本地
   `library.db` 里已没有 `running`/`queued` 的翻译任务（最新两条翻译行都是 2026-10-17
   23:53 的 `succeeded`），只能以回归用例作为行为证据。
+- [x] 2026-10-18 「立即翻译本章」之后任务窗口的「待处理」不再按整本计（现场 2026-10-18：
+  整本早已翻完的书点这个按钮，任务窗口显示「已处理 168 · 处理中 43 · 待处理 7763」，
+  实际只翻了这一章就结束。任务诊断里能逐条对上：`chapter_requested` 之前那次运行
+  `paused` 在 `ordinal=7974`（= 块总数），紧接着新一次运行 `source_loaded` 的
+  `ordinal=168` 就是借出的推进点，收窄范围是 168 起这一章）：`BackgroundJobProgress`
+  新增 `scope`（游标里的
+  `retry_ordinals`）与 `resume`（`resume_ordinal`）两份投影，`TranslationProgress` 的
+  「已处理」边界改用它们 —— 收窄范围内的块看游标，范围之外看借出点（`done_limit`）；
+  向前跳时也不再因为游标直接跳到这一章，就把借出点与它之间没翻过的块记成已处理。
+  表头与复制出的诊断多一行 `scope_note`，写清这次只跑哪一段、跑完回到哪一块；任务列表行里
+  的进度（`progress_label`）也按借出点报。回归：
+  `ui::background_jobs::layout_tests::blocks_test::
+  a_chapter_jump_counts_the_blocks_outside_its_range_by_the_borrowed_position`、
+  `services::tests::jobs_test::a_running_translation_snapshot_projects_its_in_flight_window`
+  （新增 `scope` / `resume` 断言）、
+  `ui::background_jobs::tests::a_borrowed_cursor_reports_the_progress_of_the_whole_book`。
+  验证：`cargo fmt --all --check` 通过、`cargo check --all-targets --locked` 无错误、
+  `cargo test --locked --lib`（754 通过 / 5 忽略）、受影响路径的
+  `cargo test --locked --bin ngy-book-studio background_jobs`（25 项）与
+  `cargo test --locked --lib jobs_test`（7 项）全通过。产品二进制全量
+  （361 通过 / 1 忽略）有 1 项失败：
+  `ui::ai_controller::tests::explanation_test::
+  reader_selection_explanation_emits_once_after_fresh_session_callback` 期望
+  「用汉语详细解释一下」、实际「用汉语详细解释一下已锁定文本」—— 是 `cb6ca76` 改默认提示词
+  后没跟上的旧断言，与本次改动无关。全目标测试（含集成测试）没能复跑：应用实例（PID 15768）
+  占用 `target/debug/ngy-book-studio.exe`，链接器拒绝重建。未做人工 GUI 验证：需要在真实
+  窗口里让一本整本翻译已完成的书点「立即翻译本章」，核对表头的四个计数与说明行。

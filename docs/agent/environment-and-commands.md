@@ -263,6 +263,26 @@ a_translation_run_keeps_the_configured_number_of_blocks_in_flight`（实测在�
 一次都没轮询到翻译任务行）。人工 GUI 验证未做：本地 `library.db` 里已没有卡住的翻译任务
 （最新翻译行是 2026-10-17 23:53 的 `succeeded`），原现场无法复现。
 
+2026-10-18 全项目扫描（缺陷清单与逐项修复）后的门禁与基线更正：`cargo fmt --all --check` 通过；
+`cargo clippy --all-targets --locked` 0 错误，`--message-format short` 各目标告警 lib 51、lib-test 64、
+bin 43（40 条与 lib 重复）、bin-test 49（39 条与 bin 重复），按源码位置去重 64 处。此前文档里的
+「110 条既有告警」（2026-09-25 至 10-15 几次记录）与本次口径不同、不可直接比较，**之后记 clippy 请
+写明命令与口径**，并以「错误数为 0、本次触及文件无新增告警」为准。`cargo nextest run --locked --lib`
+754 项：753 通过 / 1 失败 / 5 忽略 —— 失败的是
+`services::tests::visual::jobs_test::startup_requeues_legacy_renderer_and_reclaims_its_visual_object`
+（等待视觉任务进入 `Succeeded` 超时），单独复跑通过，属上面 2026-09-17 记的「紧截止夹具在默认并发下
+假失败」那一类；另在修复过程中曾观察到
+`services::tests::translation_test::retranslating_one_reader_block_waits_for_a_running_task_to_pause`
+单独复跑 6 次挂 3 次，已改为「关闭该测试实例的 worker 池」后修掉，修后单独复跑 5/5 通过、
+`services::tests::` 整模块 55 项复跑全过。bin 测试目标
+与集成测试本次无法执行：用户的 `target/debug/ngy-book-studio.exe` 正在运行（PID 55832），链接器以
+`os error 5` 拒绝替换（期间用户重启过应用，占用 exe 的 PID 从 55832 变为 15768）—— 与 2026-10-16
+记录同类，应用关闭后需补跑
+`cargo test --locked --all-targets --no-fail-fast`。同日拆分的文件（`translation/walk/`、
+`db/translations/`、`db/index_jobs/`、`services/settings/`、`ui/ai_settings/endpoint/`、
+`markup/tests/`）各自跑过对应模块用例：markup 31 项、services 54 项以上、db 与 ai::indexing
+模块用例全过；纯移动不改行为，未见断言变化。
+
 ## AI 问答诊断日志
 
 AI 日志统一使用 `ngy_ai` target。未设置 `RUST_LOG` 时，默认
