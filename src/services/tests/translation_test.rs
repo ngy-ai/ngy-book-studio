@@ -930,6 +930,18 @@ fn retranslating_one_reader_block_waits_for_a_running_task_to_pause() {
         AppServices::open_with_credentials(temp.path(), Arc::new(MemoryCredentialStore::default()))
             .unwrap();
     let runtime = services.runtime();
+    // 这条用例用一根线程模拟「正在运行的执行器」，不需要真实 worker 参与。
+    // 重置会把任务放回队列，空闲 worker 会（正确地）立刻领取它，于是「断言队列状态」
+    // 变成竞态 —— 2026-10-18 复现：6 次里 3 次读到 `running`（worker 已领取并开始翻）。
+    // 中止本测试实例的 worker 池，断言因此只钉住「先暂停、后规划」这一步的落盘结果。
+    services
+        .indexing
+        .inner
+        .shutdown
+        .store(true, std::sync::atomic::Ordering::Release);
+    for worker in services.indexing.workers.lock().unwrap().drain(..) {
+        worker.abort();
+    }
 
     // 与另外两条用例同一套准备：先关掉翻译把书建出来，再打开。
     let mut settings = services.provider_settings().unwrap();
