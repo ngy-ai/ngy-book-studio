@@ -197,6 +197,16 @@ impl VisualJobStore for MemoryVisualJobStore {
                 record.finished_at = None;
                 record.error = Some("应用退出时视觉任务仍在执行，已恢复".to_string());
                 changed += 1;
+            } else if record.pause_requested {
+                // 与 SQLite 存储同一条规则：没有执行者能观察这个 flag。排队中的行按
+                // paused 修复，其它状态只把 flag 清掉，让真实状态重新可见。
+                if record.state == VisualJobState::Queued {
+                    record.state = VisualJobState::Paused;
+                    record.error = None;
+                }
+                record.pause_requested = false;
+                record.updated_at = now;
+                changed += 1;
             }
         }
         Ok(changed)
@@ -204,16 +214,25 @@ impl VisualJobStore for MemoryVisualJobStore {
 
     fn request_pause(&self, job_id: &str, now: u64) -> Result<bool> {
         self.update(job_id, |record| {
-            if matches!(
-                record.state,
-                VisualJobState::Queued | VisualJobState::Running
-            ) && !record.cancel_requested
-            {
-                record.pause_requested = true;
-                record.updated_at = now;
-                true
-            } else {
-                false
+            if record.cancel_requested {
+                return false;
+            }
+            match record.state {
+                // 排队中的任务没有执行者：暂停当场结清。flag 单独留着的话这行既不会被
+                // 领取、也没有人消费它，界面会永远显示「正在暂停」。
+                VisualJobState::Queued => {
+                    record.state = VisualJobState::Paused;
+                    record.pause_requested = false;
+                    record.error = None;
+                    record.updated_at = now;
+                    true
+                }
+                VisualJobState::Running => {
+                    record.pause_requested = true;
+                    record.updated_at = now;
+                    true
+                }
+                _ => false,
             }
         })
     }

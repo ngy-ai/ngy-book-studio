@@ -64,6 +64,15 @@
   没有任何任务日志事件时，写一条 `ClaimedNoProgress`（带无进展时长与当前游标）。
   它只报告、不取消不重排；事件本身走 `record_index_event`，因此会刷新观察时间戳，
   同一段无进展每个阈值周期最多报一条。
+  **暂停的结清点（2026-10-17）**：`pause_requested` 只是一个「待观察」标志，只有拥有游标的
+  执行者能把它消费成 `paused`。因此 `db::index_jobs::request_pause` 对**排队中**的行当场
+  结清（直接写成 `paused` 并清掉标志）—— 排队中的任务没有执行者，只留标志的话这行既领不走
+  （`claim` 要求 `pause_requested = 0`）也没有人消费，任务窗口会永远显示「正在暂停」且
+  `available_actions` 一个操作都不给（现场：整本翻译点暂停后一直暂停中，重启仍旧）。
+  `recover_interrupted` / `recover_interrupted_kind`（启动恢复）把同一个标志一并结清：
+  被恢复的 `running` 行带着标志就按 `paused` 落，旧构建留下的「排队中 + 标志」行同样修好，
+  其它状态上的残留标志只清不掉状态。运行中的行照旧只置标志，由执行者按它最后持久化的
+  游标发布 `paused`（发布 JSON 必须与库里那份逐字相同，见下文游标规则）。
   执行器固定启动
   `MAX_BACKGROUND_JOB_CONCURRENCY` 个 worker，只有序号小于当前并发的 worker 扫描队列；
   并发上限与间隔由 AI 设置的「后台任务」窗口经

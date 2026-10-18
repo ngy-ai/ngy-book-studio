@@ -55,6 +55,13 @@ pub(crate) fn queued_controls_pause_resume_and_cancel_without_losing_cursor() {
     let vision_job = format!("vision:{}", fixture.source_id);
     let conn = db::open_conn(&fixture.db_path).unwrap();
     db::index_jobs::request_pause(&conn, &embedding_job, unix_timestamp().unwrap()).unwrap();
+    // 这条任务还在排队、没有任何执行者领过它：暂停必须当场结清。只留下 flag 的话
+    // 这行谁也领不走（claim 要求 pause_requested = 0），界面会永远显示「正在暂停」。
+    {
+        let settled = db::index_jobs::get(&conn, &embedding_job).unwrap().unwrap();
+        assert_eq!(settled.status, db::index_jobs::IndexJobStatus::Paused);
+        assert!(!settled.pause_requested);
+    }
     db::index_jobs::request_cancel(&conn, &vision_job, unix_timestamp().unwrap()).unwrap();
     drop(conn);
     let coordinator = fixture.coordinator(Arc::new(MockProvider::default()));
@@ -204,51 +211,36 @@ pub(crate) fn queued_cancel_binds_both_canonical_jobs_and_survives_restart() {
 }
 
 #[test]
-pub(crate) fn queued_pause_binds_both_canonical_jobs_and_survives_restart() {
+pub(crate) fn queued_pause_settles_immediately_and_survives_restart() {
     let fixture = Fixture::new();
     let embedding_id = format!("embedding:{}", fixture.source_id);
     let vision_id = format!("vision:{}", fixture.source_id);
     let conn = db::open_conn(&fixture.db_path).unwrap();
     let embedding_scheduled = db::index_jobs::get(&conn, &embedding_id).unwrap().unwrap();
     let unbound_embedding_cursor = embedding_scheduled.cursor_json.clone();
-    let vision_scheduled = db::index_jobs::get(&conn, &vision_id).unwrap().unwrap();
-    db::index_jobs::request_pause(&conn, &embedding_id, 10).unwrap();
-    db::index_jobs::request_pause(&conn, &vision_id, 10).unwrap();
-    drop(conn);
+    // 排队中的任务没有执行者：暂停当场结清，worker 根本不该被叫醒。
+    assert_eq!(
+        db::index_jobs::request_pause(&conn, &embedding_id, 10).unwrap(),
+        1
+    );
+    assert_eq!(
+        db::index_jobs::request_pause(&conn, &vision_id, 10).unwrap(),
+        1
+    );
+    for id in [&embedding_id, &vision_id] {
+        let job = db::index_jobs::get(&conn, id).unwrap().unwrap();
+        assert_eq!(job.status, db::index_jobs::IndexJobStatus::Paused);
+        assert!(!job.pause_requested && !job.cancel_requested);
+    }
 
+    // 暂停的行不再是待执行工作：这一轮什么都不该发生。
     let inner = fixture.indexing_inner();
     fixture
         .runtime
         .block_on(run_queued_job(&inner, embedding_scheduled))
         .unwrap();
-    fixture
-        .runtime
-        .block_on(run_queued_job(&inner, vision_scheduled))
-        .unwrap();
-    let conn = db::open_conn(&fixture.db_path).unwrap();
-    let paused_embedding = db::index_jobs::get(&conn, &embedding_id).unwrap().unwrap();
-    let paused_vision = db::index_jobs::get(&conn, &vision_id).unwrap().unwrap();
-    assert_eq!(
-        paused_embedding.status,
-        db::index_jobs::IndexJobStatus::Paused
-    );
-    assert_eq!(paused_vision.status, db::index_jobs::IndexJobStatus::Paused);
-    for (job, model, identity) in [
-        (
-            &paused_embedding,
-            "embed-test",
-            "embedding-endpoint-a:embed-test",
-        ),
-        (
-            &paused_vision,
-            "vision-test",
-            "vision-endpoint-a:vision-test",
-        ),
-    ] {
-        let cursor: JobCursor = serde_json::from_str(&job.cursor_json).unwrap();
-        assert_eq!(cursor.model.as_deref(), Some(model));
-        assert_eq!(cursor.execution_identity.as_deref(), Some(identity));
-    }
+    let still_paused = db::index_jobs::get(&conn, &embedding_id).unwrap().unwrap();
+    assert_eq!(still_paused.status, db::index_jobs::IndexJobStatus::Paused);
 
     // Exercise recovery of an older unbound paused canonical row as well.
     db::index_jobs::update_state(

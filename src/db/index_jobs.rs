@@ -255,12 +255,32 @@ pub(crate) fn insert_if_absent(conn: &Connection, job: &IndexJob) -> Result<usiz
 
 /// Returns interrupted work to the durable queue after a process restart.
 /// Its cursor is preserved, so already committed batches are not lost.
+///
+/// A pause request is consumed here as well: the executor that was supposed
+/// to observe it died with the process, and the flag alone would leave the
+/// row unclaimable (`claim` requires `pause_requested = 0`) with no worker
+/// owning it — the task window would show "正在暂停" forever, restart after
+/// restart. Rows an older build left in that state (`queued` carrying the
+/// flag) are repaired the same way; a flag on any other status is simply
+/// dropped so the real status and its actions become visible again.
 pub(crate) fn recover_interrupted(conn: &Connection, updated_at: u64) -> Result<usize> {
     conn.execute(
         "UPDATE index_jobs
-         SET status = 'queued', updated_at = ?1, finished_at = NULL,
-             error = '应用退出时任务仍在执行，已从持久游标恢复'
-         WHERE status = 'running' AND kind IN ('embedding', 'vision', 'translation')",
+         SET status = CASE
+                 WHEN pause_requested = 1 AND status IN ('queued', 'running') THEN 'paused'
+                 WHEN status = 'running' THEN 'queued'
+                 ELSE status
+             END,
+             pause_requested = 0,
+             error = CASE
+                 WHEN pause_requested = 1 AND status IN ('queued', 'running') THEN NULL
+                 WHEN status = 'running' THEN '应用退出时任务仍在执行，已从持久游标恢复'
+                 ELSE error
+             END,
+             updated_at = ?1,
+             finished_at = CASE WHEN status = 'running' THEN NULL ELSE finished_at END
+         WHERE kind IN ('embedding', 'vision', 'translation')
+           AND (status = 'running' OR pause_requested = 1)",
         [updated_at as i64],
     )
     .context("无法恢复中断的索引任务")
@@ -273,9 +293,20 @@ pub(crate) fn recover_interrupted_kind(
 ) -> Result<usize> {
     conn.execute(
         "UPDATE index_jobs
-         SET status = 'queued', updated_at = ?2, finished_at = NULL,
-             error = '应用退出时任务仍在执行，已重新进入持久队列'
-         WHERE kind = ?1 AND status = 'running'",
+         SET status = CASE
+                 WHEN pause_requested = 1 AND status IN ('queued', 'running') THEN 'paused'
+                 WHEN status = 'running' THEN 'queued'
+                 ELSE status
+             END,
+             pause_requested = 0,
+             error = CASE
+                 WHEN pause_requested = 1 AND status IN ('queued', 'running') THEN NULL
+                 WHEN status = 'running' THEN '应用退出时任务仍在执行，已重新进入持久队列'
+                 ELSE error
+             END,
+             updated_at = ?2,
+             finished_at = CASE WHEN status = 'running' THEN NULL ELSE finished_at END
+         WHERE kind = ?1 AND (status = 'running' OR pause_requested = 1)",
         params![kind, updated_at as i64],
     )
     .context("无法恢复分类中断任务")
@@ -304,8 +335,11 @@ pub(crate) fn claim(
 }
 
 /// Binds an unclaimed canonical embedding/vision row to the active provider
-/// contract. Control flags and status are intentionally preserved so a pause
-/// or cancellation requested before the first claim publishes a bound cursor.
+/// contract. Status and control flags are intentionally preserved so a
+/// cancellation requested before the first claim still publishes from the
+/// bound cursor. A pause never reaches this path any more: it settles a
+/// queued row to `paused` outright (see [`request_pause`]), and this
+/// statement's `status = 'queued'` guard then refuses to touch that row.
 /// The exact old cursor prevents a stale queue scan from rewriting a newer
 /// configuration generation.
 pub(crate) fn bind_queued_canonical_execution(
@@ -336,7 +370,9 @@ pub(crate) fn bind_queued_canonical_execution(
 /// before its first claim — otherwise that execution abandons itself and the
 /// row stays `running` with no worker. The exact old cursor keeps a stale queue
 /// scan from rewriting a newer generation; status and control flags are
-/// preserved so a pause/cancel requested before the claim still wins.
+/// preserved so a cancellation requested before the claim still wins (a pause
+/// settles a queued row to `paused` inside [`request_pause`] and never leaves
+/// a flag here for a claim to trip over).
 pub(crate) fn bind_queued_translation_cursor(
     conn: &Connection,
     job_id: &str,
@@ -392,9 +428,21 @@ pub(crate) fn advance_running_cursor_from(
     .map(|changed| changed == 1)
 }
 
+/// Requests a pause. A queued job has no executor that could ever observe the
+/// flag, so it is settled to `paused` right here: the flag alone would make
+/// the row unclaimable (`claim` requires `pause_requested = 0`) while nobody
+/// owns it, and the task window would then show "正在暂停" forever with every
+/// action hidden (现场 2026-10-17：排队中的整本翻译点了暂停一直显示暂停中，
+/// 重启之后仍旧 —— `recover_interrupted` 那时还会把 flag 原样留在行上).
+/// A running job keeps the flag so the executor that owns the cursor
+/// publishes `paused` from the position it last persisted.
 pub(crate) fn request_pause(conn: &Connection, job_id: &str, updated_at: u64) -> Result<usize> {
     conn.execute(
-        "UPDATE index_jobs SET pause_requested = 1, updated_at = ?2
+        "UPDATE index_jobs
+         SET status = CASE WHEN status = 'queued' THEN 'paused' ELSE status END,
+             pause_requested = CASE WHEN status = 'queued' THEN 0 ELSE 1 END,
+             error = CASE WHEN status = 'queued' THEN NULL ELSE error END,
+             updated_at = ?2
          WHERE id = ?1 AND status IN ('queued', 'running') AND cancel_requested = 0",
         params![job_id, updated_at as i64],
     )

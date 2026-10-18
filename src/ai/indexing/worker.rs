@@ -336,6 +336,9 @@ pub(crate) async fn run_queued_job(
         )
         .await;
     }
+    // 安全网：`request_pause` 现在会把排队中的行当场结清成 `paused`，正常不会再有
+    // 「排队中 + 暂停请求」的行到这里；留着这一条是兜住旧构建写下的行（它们在
+    // `recover_interrupted` 的启动修复之前也可能被这一轮撞见）。
     if job.pause_requested {
         return publish_outcome(
             inner,

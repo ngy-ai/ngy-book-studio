@@ -11,6 +11,10 @@
   必须在 `db::transactions::{renderer_for_source, visual_job_spec}` 里按 `format == "djvu"`
   选中；新增 renderer 时这三处（注册、恢复选择、任务构造）必须同时更新，否则导入时
   创建的 `visual-render:{source_id}` 任务会退回结构化 SVG 渲染。
+  暂停的结清与索引任务同一套规则（2026-10-17，见 `code-map-ai.md`）：
+  `VisualJobStore::request_pause` 对排队中的记录当场写成 `Paused`（SQLite 与内存两个存储
+  都必须如此），`recover_interrupted` 把没有执行者能观察的 `pause_requested` 一并结清；
+  只留标志会让这行永远「正在暂停」且界面不给任何操作。
   渲染器选择失败/未注册会在恢复期报「找不到当前来源所需的 renderer」，不要用
   `ngy-structural-png` 兜底掩盖 DjVu 页面缺失。
 - `src/office_com.rs`、`src/office_preview/`、`src/office_visual.rs`：可选 Office STA

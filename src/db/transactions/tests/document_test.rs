@@ -97,17 +97,18 @@ fn document_and_supporting_crud_round_trip() {
         finished_at: None,
     };
     index_jobs::insert(&conn, &job).unwrap();
+    // 排队中的任务没有执行者：暂停必须当场结清。只留下 flag 会让这行谁也领不走
+    // （claim 要求 pause_requested = 0），界面于是永远显示「正在暂停」。
     index_jobs::request_pause(&conn, "job-1", 3).unwrap();
-    assert!(
-        index_jobs::get(&conn, "job-1")
-            .unwrap()
-            .unwrap()
-            .pause_requested
-    );
+    let paused = index_jobs::get(&conn, "job-1").unwrap().unwrap();
+    assert_eq!(paused.status, IndexJobStatus::Paused);
+    assert!(!paused.pause_requested);
     index_jobs::request_cancel(&conn, "job-1", 4).unwrap();
     let cancelled = index_jobs::get(&conn, "job-1").unwrap().unwrap();
+    // 取消一条已暂停的任务直接落终态：留着 cancel_requested 只会重演「谁都不消费」。
+    assert_eq!(cancelled.status, IndexJobStatus::Cancelled);
     assert!(!cancelled.pause_requested);
-    assert!(cancelled.cancel_requested);
+    assert!(!cancelled.cancel_requested);
 
     let thread = ChatThread {
         id: "thread-1".to_string(),
@@ -292,4 +293,89 @@ fn disabled_auto_run_pauses_import_and_replacement_derivative_jobs() {
             .all(|job_id| index_jobs::get(&conn, job_id).unwrap().is_none()),
         "the superseded source must not retain paused derivative jobs"
     );
+}
+
+/// 重启恢复要把暂停请求一并结清（现场 2026-10-17）：进程退出时正在暂停的任务若带着
+/// flag 回到队列，这行既领不走（claim 要求 pause_requested = 0）也没有执行者消费它，
+/// 界面于是永远显示「正在暂停」，重启多少次都一样。旧构建写下的「排队中 + flag」行
+/// 按同一条规则修复；没有暂停请求的运行中任务照旧回到队列。
+#[test]
+fn restart_recovery_settles_a_pause_request_no_executor_can_observe() {
+    let (_temp, mut conn) = open_database();
+    let fixture = Fixture::new();
+    insert_document(&mut conn, &fixture.graph(), true).unwrap();
+    let embedding_id = "embedding:source-1";
+
+    // 进程退出时正在暂停：行还在 running，flag 已经写下。
+    let running = index_jobs::get(&conn, embedding_id).unwrap().unwrap();
+    index_jobs::update_state(
+        &conn,
+        embedding_id,
+        IndexJobStatus::Running,
+        &running.cursor_json,
+        None,
+        10,
+        Some(10),
+        None,
+    )
+    .unwrap();
+    index_jobs::request_pause(&conn, embedding_id, 11).unwrap();
+    assert!(
+        index_jobs::get(&conn, embedding_id)
+            .unwrap()
+            .unwrap()
+            .pause_requested
+    );
+
+    index_jobs::recover_interrupted(&conn, 12).unwrap();
+    let paused = index_jobs::get(&conn, embedding_id).unwrap().unwrap();
+    assert_eq!(paused.status, IndexJobStatus::Paused);
+    assert!(!paused.pause_requested);
+    assert!(paused.error.is_none());
+
+    // 旧构建留下的卡死形态：排队中的行带着暂停请求。
+    index_jobs::insert(
+        &conn,
+        &IndexJob {
+            id: "embedding:legacy-stuck".to_string(),
+            book_id: "book-1".to_string(),
+            source_id: Some("source-1".to_string()),
+            kind: "embedding".to_string(),
+            status: IndexJobStatus::Queued,
+            pause_requested: true,
+            cancel_requested: false,
+            attempts: 1,
+            cursor_json: "{}".to_string(),
+            error: None,
+            created_at: 1,
+            updated_at: 1,
+            started_at: None,
+            finished_at: None,
+        },
+    )
+    .unwrap();
+    index_jobs::recover_interrupted(&conn, 13).unwrap();
+    let repaired = index_jobs::get(&conn, "embedding:legacy-stuck")
+        .unwrap()
+        .unwrap();
+    assert_eq!(repaired.status, IndexJobStatus::Paused);
+    assert!(!repaired.pause_requested);
+
+    // 没有暂停请求的运行中任务照旧回到持久队列。
+    index_jobs::update_state(
+        &conn,
+        embedding_id,
+        IndexJobStatus::Running,
+        &paused.cursor_json,
+        None,
+        14,
+        Some(14),
+        None,
+    )
+    .unwrap();
+    index_jobs::recover_interrupted(&conn, 15).unwrap();
+    let queued = index_jobs::get(&conn, embedding_id).unwrap().unwrap();
+    assert_eq!(queued.status, IndexJobStatus::Queued);
+    assert!(!queued.pause_requested);
+    assert!(queued.error.is_some());
 }
