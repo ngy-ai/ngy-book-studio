@@ -5,21 +5,19 @@
 
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::search::build_search_chunks;
 use super::*;
 use anyhow::{Result, bail};
-use rusqlite::{TransactionBehavior, params};
 
 use crate::annotations::{compact_text, reader_body_text};
 use crate::db::{self};
-use crate::document::{Block, BlockDocument, ContentUnit, SourceLocator};
+use crate::document::{Block, BlockDocument, ContentUnit, DocumentLocator, SourceLocator};
 use crate::markup::{parse_source_for_unit, serialize_source};
 use crate::storage::BlobKey;
 use rbook::Epub;
-use rusqlite::OptionalExtension;
 
 /// 单本书修复的结果摘要，供调用方记录与核对。
 #[derive(Clone, Copy, Debug, Default)]
@@ -44,7 +42,6 @@ impl LibraryStore {
     pub fn repair_leaked_head_titles(&mut self, book_id: &str) -> Result<RepairReport> {
         let mut document = self.document(book_id)?;
         let book_title = document.title.clone();
-        let mut units = document.units;
 
         // 精确识别泄漏块：读取原书 EPUB 中每个单元的 <head><title>，与单元首块文本比对。
         let original_titles = self.original_unit_titles(book_id)?;
@@ -54,7 +51,7 @@ impl LibraryStore {
             HashMap::new();
         let mut report = RepairReport::default();
 
-        for unit in units.iter_mut() {
+        for unit in document.units.iter_mut() {
             if !leaked_first_block(unit, &book_title, &original_titles) {
                 continue;
             }
@@ -99,44 +96,51 @@ impl LibraryStore {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs() as i64;
+            .as_secs();
+
+        // 读取当前发布来源与被改单元的行：事务只接收数据，SQL 全部在 `src/db/`。
         let mut conn = db::open_conn(&self.db_path)?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for (unit_id, (block_json, source, id_map, removed_len)) in &changed {
-            tx.execute(
-                "UPDATE content_units SET block_json = ?1, source_text = ?2, updated_at = ?3
-                 WHERE id = ?4 AND book_id = ?5",
-                params![block_json, source, now, unit_id, book_id],
-            )
-            .context("无法写回清理后的内容单元")?;
-            for (old_id, (new_id, ordinal)) in id_map {
-                tx.execute(
-                    "UPDATE translations SET block_id = ?1, ordinal = ?2
-                     WHERE book_id = ?3 AND content_unit_id = ?4 AND block_id = ?5",
-                    params![new_id, *ordinal as i64, book_id, unit_id, old_id],
-                )
-                .context("无法重映射译文块标识")?;
-            }
-            if *removed_len > 0 {
-                tx.execute(
-                    "UPDATE annotations
-                     SET start_offset = MAX(0, start_offset - ?1),
-                         end_offset = MAX(0, end_offset - ?1)
-                     WHERE book_id = ?2 AND content_unit_id = ?3 AND start_offset >= ?1",
-                    params![*removed_len as i64, book_id, unit_id],
-                )
-                .context("无法前移批注偏移")?;
-                let deleted = tx
-                    .execute(
-                        "DELETE FROM annotations
-                         WHERE book_id = ?1 AND content_unit_id = ?2 AND start_offset < ?3",
-                        params![book_id, unit_id, *removed_len as i64],
-                    )
-                    .context("无法清理落在被删文本内的批注")?;
-                report.annotations_deleted += deleted as u64;
-            }
+        let record = self.book_record(book_id)?;
+        let source = db::book_sources::get_revision(&conn, book_id, record.revision)?
+            .context("当前图书来源不存在")?;
+        let mut repaired = Vec::with_capacity(changed.len());
+        for (unit_id, (block_json, source_text, id_map, removed_len)) in &changed {
+            let mut unit = db::content_units::get(&conn, unit_id)?.context("内容单元不存在")?;
+            unit.block_json = block_json.clone();
+            unit.source_text = Some(source_text.clone());
+            let block_remap = id_map
+                .iter()
+                .map(|(old_id, (new_id, ordinal))| (old_id.clone(), new_id.clone(), *ordinal))
+                .collect();
+            repaired.push(db::transactions::RepairedUnit {
+                unit,
+                block_remap,
+                removed_utf16_len: *removed_len,
+            });
         }
-        tx.commit()?;
+        // 搜索分块按清理后的文档重建，与正文在同一个事务里替换：FTS 走触发器，
+        // embedding 随旧块级联删除（都是可按内容重建的派生数据）。
+        //
+        // 渲染页单元的检索存在来自视觉分块，不在文档分块里：整份重建必须把它们
+        // 排除，否则空正文的兜底分块会和视觉分块撞 (content_unit_id, ordinal)
+        // 唯一索引（office 增强预览的书修复时报 UNIQUE 约束）。
+        let mut chunk_source = document.clone();
+        chunk_source.units.retain(|unit| {
+            !matches!(
+                unit.source_locator,
+                Some(SourceLocator::OfficeRenderedPage { .. })
+            )
+        });
+        let search_chunks = build_search_chunks(&chunk_source, &source.id, now)?;
+
+        report.annotations_deleted = db::transactions::repair_leaked_head_titles(
+            &mut conn,
+            book_id,
+            &source.id,
+            &repaired,
+            &search_chunks,
+            now,
+        )?;
 
         if let Some(position) = self.books.iter().position(|book| book.id == book_id) {
             self.books[position] = self.book_record(book_id)?;
@@ -231,15 +235,10 @@ impl LibraryStore {
     /// 取原书来源的 blob key，并读出各单元的 `<head><title>`。
     fn original_unit_titles(&self, book_id: &str) -> Result<HashMap<String, String>> {
         let conn = db::open_conn(&self.db_path)?;
-        let key: Option<String> = conn
-            .query_row(
-                "SELECT object_key FROM book_sources
-                 WHERE book_id = ?1 AND source_kind = 'original'
-                 ORDER BY revision LIMIT 1",
-                params![book_id],
-                |row| row.get(0),
-            )
-            .optional()?;
+        let key = db::book_sources::list_for_book(&conn, book_id)?
+            .into_iter()
+            .find(|source| source.source_kind == "original")
+            .map(|source| source.object_key);
         let Some(key) = key else {
             return Ok(HashMap::new());
         };
@@ -256,6 +255,8 @@ impl LibraryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
     use crate::ai::translation::{StoredTranslation, TranslationSegment};
     use crate::annotations::{Annotation, AnnotationKind, TextAnchor};
     use crate::db;
@@ -394,6 +395,82 @@ mod tests {
 
         // 回归守卫：修复后数据库不变量必须成立，否则重启会被判定重建。
         assert!(db::schema::is_current(&conn).unwrap());
+    }
+
+    /// 修复必须连同搜索分块一起重建（否则 FTS 留着被删标题、定位错乱），但属于渲染页
+    /// 的视觉分块要保留。回归 2026-10-18：修复路径曾完全不碰 search_chunks。
+    #[test]
+    fn repair_rebuilds_search_chunks_and_keeps_visual_ones() {
+        let temp = tempdir().unwrap();
+        let mut store = LibraryStore::load_from(temp.path().to_path_buf()).unwrap();
+        let book = store.create_book("Demo", "作者").unwrap();
+        let unit = store.document(&book.id).unwrap().units[0].clone();
+        let revision = unit.revision.get();
+        insert_unit_with_leak(&store, &book.id, &unit.id, revision);
+
+        let conn = db::open_conn(&store.db_path).unwrap();
+        let source = db::book_sources::get_revision(&conn, &book.id, book.revision)
+            .unwrap()
+            .unwrap();
+        // 一枚视觉分块：生产中它属于独立的渲染页单元（真实 content_units 行，
+        // 与正文单元不共用 (content_unit_id, ordinal) 唯一索引），修复不得碰它。
+        let rendered_unit_id = format!("{}-rendered", unit.id);
+        db::content_units::insert(
+            &conn,
+            &db::content_units::ContentUnit {
+                id: rendered_unit_id.clone(),
+                book_id: book.id.clone(),
+                source_id: source.id.clone(),
+                parent_id: None,
+                ordinal: 99,
+                kind: "page".into(),
+                href: None,
+                source_locator_json: serde_json::to_string(&SourceLocator::office_rendered_page(1))
+                    .unwrap(),
+                title: None,
+                media_type: None,
+                source_text: None,
+                block_json: serde_json::to_string(&BlockDocument::new(Vec::new())).unwrap(),
+                revision,
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .unwrap();
+        let visual = db::search_chunks::SearchChunk {
+            id: "vision-chunk-page-1".into(),
+            book_id: book.id.clone(),
+            source_id: source.id.clone(),
+            content_unit_id: rendered_unit_id.clone(),
+            ordinal: 0,
+            heading: String::new(),
+            body: "渲染页文字".into(),
+            token_count: 5,
+            content_hash: "visual".into(),
+            locator_json: serde_json::to_string(&DocumentLocator::unit(
+                &book.id,
+                &rendered_unit_id.clone(),
+            ))
+            .unwrap(),
+            created_at: 1,
+        };
+        db::search_chunks::upsert_derived(&conn, &visual).unwrap();
+
+        store.repair_leaked_head_titles(&book.id).unwrap();
+
+        // 被删标题不再可被搜到，保留下来的文字可以。
+        assert!(store.search_book(&book.id, "第一章", 10).unwrap().len() >= 1);
+        assert!(
+            store.search_book(&book.id, "Demo", 10).unwrap().is_empty(),
+            "泄漏标题已删，不得仍能被搜到"
+        );
+        // 文档分块确实重建过，视觉分块原样保留。
+        assert!(db::search_chunks::count_for_source(&conn, &source.id).unwrap() >= 2);
+        assert!(
+            db::search_chunks::get(&conn, "vision-chunk-page-1")
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// 仅在设置 `MOYE_REPAIR_DIR` 时运行，对真实数据目录就地修复并校验不变量。

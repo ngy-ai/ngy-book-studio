@@ -53,6 +53,8 @@ mod embedding_job;
 
 mod group;
 
+mod repair;
+
 mod share;
 
 mod translation_job;
@@ -76,6 +78,8 @@ pub(crate) use document_graph::*;
 pub(crate) use embedding_job::*;
 
 pub(crate) use group::*;
+
+pub(crate) use repair::*;
 
 pub(crate) use share::*;
 

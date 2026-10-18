@@ -171,6 +171,18 @@ pub(crate) fn delete_for_source(conn: &Connection, source_id: &str) -> Result<us
     .context("无法删除来源搜索分块")
 }
 
+/// Deletes only the canonical (document-derived) chunks of one source. Visual
+/// derived chunks (`vision-chunk-…`) belong to rendered pages: they are rebuilt
+/// from their own durable pages, so an in-place text repair must preserve them.
+pub(crate) fn delete_canonical_for_source(conn: &Connection, source_id: &str) -> Result<usize> {
+    conn.execute(
+        "DELETE FROM search_chunks
+         WHERE source_id = ?1 AND id NOT LIKE 'vision-chunk-%' ESCAPE '\\'",
+        [source_id],
+    )
+    .context("无法删除来源文档搜索分块")
+}
+
 pub(crate) fn delete_stale_visual_derived(
     conn: &Connection,
     source_id: &str,

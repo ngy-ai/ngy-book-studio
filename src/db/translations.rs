@@ -418,6 +418,33 @@ pub(crate) fn delete_for_retranslation(
     .context("无法删除指定语言的译文")
 }
 
+/// Repoints one译文 row at a re-indexed block. An in-place repair that removed
+/// a leaked first block re-indexes the surviving blocks, so their stable block
+/// ids — and with them the row key — change; `block_id` and `ordinal` move
+/// together. The text itself is untouched, which is the whole point of the
+/// repair: paid-for译文 survives without being re-requested.
+pub(crate) fn repoint_block(
+    conn: &Connection,
+    book_id: &str,
+    content_unit_id: &str,
+    old_block_id: &str,
+    new_block_id: &str,
+    ordinal: u64,
+) -> Result<usize> {
+    conn.execute(
+        "UPDATE translations SET block_id = ?1, ordinal = ?2
+         WHERE book_id = ?3 AND content_unit_id = ?4 AND block_id = ?5",
+        params![
+            new_block_id,
+            ordinal as i64,
+            book_id,
+            content_unit_id,
+            old_block_id
+        ],
+    )
+    .context("无法重映射译文块标识")
+}
+
 fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Translation> {
     Ok(Translation {
         block_id: row.get(0)?,

@@ -168,6 +168,42 @@ pub(crate) fn delete(conn: &Connection, book_id: &str, id: &str) -> Result<usize
     .context("无法删除笔记")
 }
 
+/// Moves every note whose anchor starts at or after `removed` back by `removed`
+/// UTF-16 units. Used by the in-place repair that dropped text from the front of
+/// a unit: notes further into the chapter keep highlighting the same words.
+pub(crate) fn shift_offsets_after_removal(
+    conn: &Connection,
+    book_id: &str,
+    content_unit_id: &str,
+    removed: i64,
+) -> Result<usize> {
+    conn.execute(
+        "UPDATE annotations
+         SET start_offset = MAX(0, start_offset - ?1),
+             end_offset = MAX(0, end_offset - ?1)
+         WHERE book_id = ?2 AND content_unit_id = ?3 AND start_offset >= ?1",
+        params![removed, book_id, content_unit_id],
+    )
+    .context("无法前移批注偏移")
+}
+
+/// Drops every note whose anchor started inside the removed text: its quote is
+/// gone, so keeping the row would leave a highlight over the wrong words. Used
+/// together with [`shift_offsets_after_removal`] by the in-place repair.
+pub(crate) fn delete_inside_removed_range(
+    conn: &Connection,
+    book_id: &str,
+    content_unit_id: &str,
+    removed: i64,
+) -> Result<usize> {
+    conn.execute(
+        "DELETE FROM annotations
+         WHERE book_id = ?1 AND content_unit_id = ?2 AND start_offset < ?3",
+        params![book_id, content_unit_id, removed],
+    )
+    .context("无法清理落在被删文本内的批注")
+}
+
 fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Annotation> {
     let kind = match row.get::<_, String>(8)?.as_str() {
         "highlight" => AnnotationKind::Highlight,
