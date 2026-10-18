@@ -3,7 +3,7 @@
 
 use super::*;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 #[derive(Clone)]
 pub(crate) struct ModelServices {
@@ -112,10 +112,40 @@ impl TranslationReconcileProgress {
 }
 
 /// 后台任务最近一次进展。看门狗据此把「领取后长期没有动静」的任务写进任务日志。
+///
+/// **每个被观察的任务各占一格**（`job_id -> 最近事件时间`）。曾经这里只有一个槽，
+/// 任意任务的事件都会覆写它，于是 `progress_idle()` 只反映「最近写日志的那个任务」：
+/// 并发大于 1 时，别的任务就算彻底静默也永远不会被报告——看门狗形同虚设
+/// （现场 2026-10-18：并发 8 时只有最后写事件的那一个任务可被观察）。
 #[derive(Debug, Default)]
 pub(crate) struct ProgressWatch {
-    job_id: Option<String>,
-    last_event_at: Option<Instant>,
+    entries: HashMap<String, Instant>,
+}
+
+impl ProgressWatch {
+    /// 记一次进展；同一任务重复出现只保留最新时间戳。
+    fn note(&mut self, job_id: &str, at: Instant) {
+        self.entries.insert(job_id.to_string(), at);
+    }
+
+    /// 忘记一个任务：它的行已经不在运行态（收尾、被替换、被删）之后不再观察，
+    /// 条目随之清理，观察表只随「还在跑的任务」增长。
+    fn forget(&mut self, job_id: &str) {
+        self.entries.remove(job_id);
+    }
+
+    /// 当前所有「已领取但没有新事件」且超过 `threshold` 的任务与无进展时长。
+    ///
+    /// 并发下每个静默的任务都要报，所以返回列表而不是单个。
+    fn stalled(&self, now: Instant, threshold: Duration) -> Vec<(String, Duration)> {
+        self.entries
+            .iter()
+            .filter_map(|(job_id, at)| {
+                let elapsed = now.saturating_duration_since(*at);
+                (elapsed >= threshold).then(|| (job_id.clone(), elapsed))
+            })
+            .collect()
+    }
 }
 
 impl IndexingInner {
@@ -147,19 +177,27 @@ impl IndexingInner {
             .progress_watch
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        watch.job_id = Some(job_id.to_string());
-        watch.last_event_at = Some(at);
+        watch.note(job_id, at);
     }
 
-    /// 当前「已领取但没有新事件」的任务与时长；还没有任何进展记录时为 `None`。
-    pub(crate) fn progress_idle(&self) -> Option<(String, Duration)> {
+    /// 停止观察一个任务（它的行已经不在运行态）。看门狗每周期对不在运行态的格子
+    /// 调用它，观察表因此不会随历史任务无限增长。
+    pub(crate) fn forget_progress(&self, job_id: &str) {
+        let mut watch = self
+            .progress_watch
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        watch.forget(job_id);
+    }
+
+    /// 当前所有超过 `threshold` 没有任何新事件（进展）的任务与时长；还没有任何
+    /// 进展记录时为空。
+    pub(crate) fn stalled_jobs(&self, threshold: Duration) -> Vec<(String, Duration)> {
         let watch = self
             .progress_watch
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let job_id = watch.job_id.clone()?;
-        let elapsed = Instant::now().saturating_duration_since(watch.last_event_at?);
-        Some((job_id, elapsed))
+        watch.stalled(Instant::now(), threshold)
     }
 
     pub(crate) fn clear_translation_reconcile(&self) {

@@ -155,41 +155,45 @@ pub(crate) async fn advance_translation_reconcile(
     Ok(TranslationReconcileStep::Advanced)
 }
 
-/// 静默看门狗的一个周期：任务被领取后超过 [`NO_PROGRESS_WATCHDOG_THRESHOLD`]
-/// 没有任何新事件（进展）时，往任务日志写一条「已领取但无进展」。
+/// 静默看门狗的一个周期：**每一个**被领取后超过
+/// [`NO_PROGRESS_WATCHDOG_THRESHOLD`] 没有任何新事件（进展）的任务，都往任务日志写一条
+/// 「已领取但无进展」。
 ///
 /// 看门狗只报告、不干预：它不取消、不重排任务，只是让「任务显示运行中但处理中恒为 0」
 /// 这类现场（2026-10-15 用户反馈）在任务窗口里有据可查，而不是一片沉默。写入的事件
-/// 走 [`record_index_event`]，因此它同时刷新观察时间戳：同一段无进展每个阈值周期最多
-/// 报一条，不会刷屏。
+/// 走 [`record_index_event`]，因此它同时刷新该任务的观察时间戳：同一段无进展每个阈值
+/// 周期最多报一条，不会刷屏。
+///
+/// 并发大于 1 时多个任务同时跑：曾经观察槽只有一个，任意任务的事件都会覆写它，彻底
+/// 静默的那个任务因此永远漏报（2026-10-18 修：`ProgressWatch` 按任务分槽，这里逐个
+/// 处理）。行已经不在运行态（收尾、被替换）的格子只清理、不记录。
 pub(crate) async fn watchdog_tick(inner: &Arc<IndexingInner>) -> Result<()> {
-    let Some((job_id, idle)) = inner.progress_idle() else {
-        return Ok(());
-    };
-    if !no_progress_exceeded(idle) {
-        return Ok(());
+    for (job_id, idle) in inner.stalled_jobs(NO_PROGRESS_WATCHDOG_THRESHOLD) {
+        let db_path = inner.db_path.clone();
+        let lookup = job_id.clone();
+        let Some(job) = run_db(db_path, move |conn| db::index_jobs::get(&conn, &lookup)).await?
+        else {
+            inner.forget_progress(&job_id);
+            continue;
+        };
+        if job.status != db::index_jobs::IndexJobStatus::Running {
+            inner.forget_progress(&job_id);
+            continue;
+        }
+        let ordinal = serde_json::from_str::<JobCursor>(&job.cursor_json)
+            .ok()
+            .map(|cursor| cursor.next_ordinal as u64);
+        record_index_event(
+            inner,
+            &job,
+            JobLogEvent::ClaimedNoProgress,
+            JobLogMetrics {
+                ordinal,
+                duration_ms: Some(idle.as_millis() as u64),
+                ..JobLogMetrics::default()
+            },
+        );
     }
-    let db_path = inner.db_path.clone();
-    let lookup = job_id.clone();
-    let Some(job) = run_db(db_path, move |conn| db::index_jobs::get(&conn, &lookup)).await? else {
-        return Ok(());
-    };
-    if job.status != db::index_jobs::IndexJobStatus::Running {
-        return Ok(());
-    }
-    let ordinal = serde_json::from_str::<JobCursor>(&job.cursor_json)
-        .ok()
-        .map(|cursor| cursor.next_ordinal as u64);
-    record_index_event(
-        inner,
-        &job,
-        JobLogEvent::ClaimedNoProgress,
-        JobLogMetrics {
-            ordinal,
-            duration_ms: Some(idle.as_millis() as u64),
-            ..JobLogMetrics::default()
-        },
-    );
     Ok(())
 }
 
@@ -206,7 +210,9 @@ pub(crate) async fn watchdog_loop(inner: Arc<IndexingInner>) {
 }
 
 /// 静默看门狗的判定线。单独成函数是为了把边界钉在测试里 —— 差一毫秒就该继续等，
-/// 到达就该报告。
+/// 到达就该报告。产品路径的判定在 [`ProgressWatch::stalled`]（阈值由调用方传入），
+/// 这里只服务测试，因此只在测试构建里存在。
+#[cfg(test)]
 pub(crate) fn no_progress_exceeded(idle: Duration) -> bool {
     idle >= NO_PROGRESS_WATCHDOG_THRESHOLD
 }

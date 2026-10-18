@@ -269,3 +269,32 @@ pub(crate) fn watchdog_reports_a_claimed_job_without_progress() {
         "任务已经不在运行态，看门狗只观察不记录"
     );
 }
+
+/// 并发大于 1 时每个静默任务都要报：一个任务刚有过事件，另一个超过阈值，
+/// 只有后者留下「已领取但无进展」。回归的是 2026-10-18 的观察槽只有一个、
+/// 被任意任务的事件覆写导致漏报的问题。
+#[test]
+pub(crate) fn watchdog_reports_every_stalled_job_under_concurrency() {
+    let fixture = Fixture::new();
+    let inner = fixture.indexing_inner();
+    let fresh = insert_running_job(&fixture, "translation:fresh");
+    let stalled = insert_running_job(&fixture, "translation:stalled-concurrent");
+
+    inner.note_progress(&fresh, Instant::now());
+    inner.note_progress(
+        &stalled,
+        Instant::now() - NO_PROGRESS_WATCHDOG_THRESHOLD - Duration::from_secs(1),
+    );
+    fixture.runtime.block_on(watchdog_tick(&inner)).unwrap();
+
+    assert!(
+        recorded_events(&fixture, &fresh).is_empty(),
+        "刚有过事件的任务不得被报告"
+    );
+    assert!(
+        recorded_events(&fixture, &stalled)
+            .iter()
+            .any(|entry| entry.event == JobLogEvent::ClaimedNoProgress),
+        "彻底静默的那个任务必须留下「已领取但无进展」，不能被别的任务的事件掩盖"
+    );
+}
