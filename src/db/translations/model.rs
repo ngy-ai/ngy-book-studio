@@ -1,7 +1,5 @@
 //! Row shapes of the `translations` table and the mapping between them.
 
-use super::*;
-
 /// One persisted, revision-scoped translation of a single block. Rows are keyed
 /// by `(book_id, content_unit_id, block_id, target_language)` so the reader can
 /// look up a whole chapter in one query, and the background job can replace a

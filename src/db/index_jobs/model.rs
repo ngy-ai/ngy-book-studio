@@ -1,8 +1,6 @@
 //! Row shapes of the `index_jobs` table: the status enum, the job row, and the
 //! mapping between them.
 
-use super::*;
-
 pub(crate) const VISION_WAITING_FOR_PAGES_ERROR: &str =
     "视觉页面尚未生成；页面渲染完成后可自动或手动重试";
 
