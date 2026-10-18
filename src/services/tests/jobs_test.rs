@@ -70,3 +70,87 @@ fn a_running_translation_snapshot_projects_its_in_flight_window() {
         .expect("向量任务的快照必须能建出来");
     assert!(snapshot.progress.processing.is_empty());
 }
+
+/// 已取消与失败的任务可以删除（TODO 2026-10-18：取消后只能看着）；排队、运行、暂停与
+/// 已成功的行不能删，删除也不经过 `control_background_job`。
+#[test]
+fn deleting_a_background_job_only_removes_terminal_unsuccessful_rows() {
+    let temp = tempfile::tempdir().unwrap();
+    let services =
+        AppServices::open_with_credentials(temp.path(), Arc::new(MemoryCredentialStore::default()))
+            .unwrap();
+    let runtime = services.runtime();
+    let book_id = runtime
+        .block_on(async {
+            services
+                .spawn_library(|library| Ok(library.create_book("Delete book", "Author")?.id))
+                .await
+                .context("library test worker stopped")?
+        })
+        .unwrap();
+    let source_id = {
+        let conn = db::open_conn(services.database_path()).unwrap();
+        db::book_sources::list_for_book(&conn, &book_id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .context("the created book has no source")
+            .unwrap()
+            .id
+    };
+    let insert = |id: &str, status: db::index_jobs::IndexJobStatus| {
+        let conn = db::open_conn(services.database_path()).unwrap();
+        db::index_jobs::insert(
+            &conn,
+            &db::index_jobs::IndexJob {
+                id: id.to_string(),
+                book_id: book_id.clone(),
+                source_id: Some(source_id.clone()),
+                kind: "embedding".to_string(),
+                status,
+                pause_requested: false,
+                cancel_requested: false,
+                attempts: 1,
+                cursor_json: "{}".to_string(),
+                error: None,
+                created_at: 1,
+                updated_at: 2,
+                started_at: Some(1),
+                finished_at: Some(2),
+            },
+        )
+        .unwrap();
+    };
+    let cancelled = "embedding:delete-cancelled";
+    let failed = "embedding:delete-failed";
+    let running = "embedding:delete-running";
+    let succeeded = "embedding:delete-succeeded";
+    insert(cancelled, db::index_jobs::IndexJobStatus::Cancelled);
+    insert(failed, db::index_jobs::IndexJobStatus::Failed);
+    insert(running, db::index_jobs::IndexJobStatus::Running);
+    insert(succeeded, db::index_jobs::IndexJobStatus::Succeeded);
+
+    assert!(block_on_without_tokio(services.delete_background_job(cancelled.into())).unwrap());
+    assert!(block_on_without_tokio(services.delete_background_job(failed.into())).unwrap());
+    // 不该删的一个不动，谎报也不行。
+    for kept in [running, succeeded] {
+        assert!(
+            !block_on_without_tokio(services.delete_background_job(kept.into())).unwrap(),
+            "{kept} 不是可删除的终态"
+        );
+    }
+    let conn = db::open_conn(services.database_path()).unwrap();
+    assert!(db::index_jobs::get(&conn, cancelled).unwrap().is_none());
+    assert!(db::index_jobs::get(&conn, failed).unwrap().is_none());
+    assert!(db::index_jobs::get(&conn, running).unwrap().is_some());
+    assert!(db::index_jobs::get(&conn, succeeded).unwrap().is_some());
+
+    // 删除不是状态转换：路由到 control_background_job 必须报错，而不是静默无事。
+    assert!(
+        block_on_without_tokio(
+            services.control_background_job(running.into(), BackgroundJobAction::Delete)
+        )
+        .is_err(),
+        "Delete 路由到控制入口是 bug，必须大声失败"
+    );
+}

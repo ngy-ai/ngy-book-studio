@@ -1147,3 +1147,18 @@ LangGraph 依赖。CLI 课程验证与桌面接入的验证分别列出。
   全部通过（译文 27、朗读 7，含「眼睛 → 小喇叭 → 铅笔 → 重译」顺序、空闲控制行零下边距与
   段末图标聚焦显现）；另用 Chromium 渲染一段译文并截图核对图标形状与行距。未做真实
   Windows GUI 手工验证。
+  - [x] 2026-10-18 已取消或失败的后台任务可以删除（TODO：取消后任务行永远留在列表里，只能
+  看着）：后台任务窗口对 `failed` / `cancelled` 的任务在「重试」旁给出「删除」，
+  `BackgroundJobAction::Delete` 是新动作而不是状态转换，因此 UI 把它分流到新的
+  `AppServices::delete_background_job`（不在 `control_background_job` 里；路由过去会大声
+  报错，避免静默无事）。删除只移除 `index_jobs` 行：排队中、运行中、已暂停与已成功的行
+  一律拒绝（`Ok(false)`，界面提示「只能删除已取消或失败的任务」），已生成的译文、索引行、
+  视觉页面与暂存对象全部不动，之后配置再要求时任务行会照常重建。`visual_page_staging`
+  经外键级联清理，不留下孤儿。回归：`services::tests::jobs_test` 新增
+  `deleting_a_background_job_only_removes_terminal_unsuccessful_rows`（取消/失败被删、
+  运行中/已成功被拒且行仍在、`control_background_job(Delete)` 报错）；
+  `ui::background_jobs::tests::actions_follow_the_durable_job_state_machine` 同步改为
+  「失败/已取消 = 重试 + 删除」。验证：`cargo fmt --all --check` 通过、
+  `cargo check --lib/--bins --locked` 与 `cargo check --lib --locked --tests` 无错误、
+  `services::tests::` 54 项全过。未做人工 GUI 验证（删除按钮的窗口内交互路径），
+  bin 测试目标当时因产品 exe 被运行中的实例占用无法重建。

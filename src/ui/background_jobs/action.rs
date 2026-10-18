@@ -27,18 +27,31 @@ impl BackgroundJobsWindow {
         });
         let services = Arc::clone(&self.services);
         cx.spawn_in(window, async move |view, cx| {
-            let result = services.control_background_job(job_id, action).await;
+            // 删除不是状态转换：它直接移除终态行，因此不走 control_background_job。
+            let result = if action == BackgroundJobAction::Delete {
+                services.delete_background_job(job_id).await
+            } else {
+                services.control_background_job(job_id, action).await
+            };
             let _ = cx.update(|window, cx| {
                 view.update(cx, |this, cx| {
                     this.pending_job_id = None;
                     if scope == this.scope_generation {
                         this.notice = Some(match result {
                             Ok(true) => JobsNotice {
-                                text: format!("已请求{}任务。", action_verb(action)),
+                                text: if action == BackgroundJobAction::Delete {
+                                    "已删除任务。".into()
+                                } else {
+                                    format!("已请求{}任务。", action_verb(action))
+                                },
                                 error: false,
                             },
                             Ok(false) => JobsNotice {
-                                text: "任务状态已发生变化，未重复执行操作。".into(),
+                                text: if action == BackgroundJobAction::Delete {
+                                    "只能删除已取消或失败的任务。".into()
+                                } else {
+                                    "任务状态已发生变化，未重复执行操作。".into()
+                                },
                                 error: false,
                             },
                             Err(error) => JobsNotice {

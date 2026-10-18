@@ -43,11 +43,11 @@ fn actions_follow_the_durable_job_state_machine() {
     );
     assert_eq!(
         available_actions(&job(BackgroundJobStatus::Failed)),
-        vec![BackgroundJobAction::Retry]
+        vec![BackgroundJobAction::Retry, BackgroundJobAction::Delete]
     );
     assert_eq!(
         available_actions(&job(BackgroundJobStatus::Cancelled)),
-        vec![BackgroundJobAction::Retry]
+        vec![BackgroundJobAction::Retry, BackgroundJobAction::Delete]
     );
     assert!(available_actions(&job(BackgroundJobStatus::Succeeded)).is_empty());
 }

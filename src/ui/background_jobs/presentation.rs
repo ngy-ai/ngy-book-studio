@@ -46,7 +46,7 @@ pub(crate) fn available_actions(job: &BackgroundJobSnapshot) -> Vec<BackgroundJo
             vec![BackgroundJobAction::Resume, BackgroundJobAction::Cancel]
         }
         BackgroundJobStatus::Failed | BackgroundJobStatus::Cancelled => {
-            vec![BackgroundJobAction::Retry]
+            vec![BackgroundJobAction::Retry, BackgroundJobAction::Delete]
         }
         BackgroundJobStatus::Succeeded => Vec::new(),
     };
@@ -65,6 +65,7 @@ pub(crate) fn action_label(action: BackgroundJobAction) -> &'static str {
         BackgroundJobAction::Retry => "重试",
         BackgroundJobAction::Cancel => "取消",
         BackgroundJobAction::Retranslate => "重新翻译",
+        BackgroundJobAction::Delete => "删除",
     }
 }
 
@@ -75,6 +76,7 @@ pub(crate) fn action_verb(action: BackgroundJobAction) -> &'static str {
         BackgroundJobAction::Retry => "重试",
         BackgroundJobAction::Cancel => "取消",
         BackgroundJobAction::Retranslate => "重新翻译",
+        BackgroundJobAction::Delete => "删除",
     }
 }
 
@@ -85,6 +87,7 @@ pub(crate) fn action_id(action: BackgroundJobAction) -> &'static str {
         BackgroundJobAction::Retry => "retry",
         BackgroundJobAction::Cancel => "cancel",
         BackgroundJobAction::Retranslate => "retranslate",
+        BackgroundJobAction::Delete => "delete",
     }
 }
 

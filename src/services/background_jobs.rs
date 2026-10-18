@@ -221,15 +221,60 @@ impl AppServices {
             .context("后台任务重试线程异常退出")?
     }
 
+    /// Deletes one finished background task row.
+    ///
+    /// Only terminal unsuccessful work (`failed` / `cancelled`) can be deleted:
+    /// a queued, running or paused row still has an executor or a resume path,
+    /// and a `succeeded` row is the durable record of published derived data —
+    /// removing it would erase the only trace of what ran. The derived data
+    /// itself (translations, index rows, visual pages) is deliberately left
+    /// untouched: only the task row goes away, so a later run simply recreates
+    /// the row when the configuration asks for it again.
+    ///
+    /// Returns `false` — without deleting — when the row is missing or not in a
+    /// deletable state, so the caller can report "nothing happened" instead of
+    /// pretending the task is gone.
+    pub async fn delete_background_job(&self, job_id: String) -> Result<bool> {
+        ensure!(!job_id.trim().is_empty(), "后台任务 ID 不能为空");
+        let db_path = self.db_path.clone();
+        let delete_job_id = job_id.clone();
+        self.runtime
+            .handle()
+            .spawn_blocking(move || {
+                let conn = db::open_conn(&db_path)?;
+                let Some(job) = db::index_jobs::get(&conn, &delete_job_id)? else {
+                    return Ok(false);
+                };
+                if !matches!(
+                    job.status,
+                    db::index_jobs::IndexJobStatus::Failed
+                        | db::index_jobs::IndexJobStatus::Cancelled
+                ) {
+                    return Ok(false);
+                }
+                Ok(db::index_jobs::delete(&conn, &delete_job_id)? == 1)
+            })
+            .await
+            .context("后台任务删除线程异常退出")?
+    }
+
     /// Applies one state transition using the coordinator that owns the job
     /// kind. In particular, a running visual renderer must receive its in-memory
     /// control signal in addition to the durable SQLite flag.
+    ///
+    /// [`BackgroundJobAction::Delete`] is deliberately not a transition: it
+    /// removes the row outright and lives in [`Self::delete_background_job`].
+    /// Routing it here is a bug, so it fails loudly instead of silently doing
+    /// nothing.
     pub async fn control_background_job(
         &self,
         job_id: String,
         action: BackgroundJobAction,
     ) -> Result<bool> {
         ensure!(!job_id.trim().is_empty(), "后台任务 ID 不能为空");
+        if action == BackgroundJobAction::Delete {
+            anyhow::bail!("删除后台任务不是状态转换，请使用删除入口");
+        }
         let indexing = Arc::clone(&self.indexing);
         let visual_jobs = self.visual_jobs();
         self.runtime
@@ -249,6 +294,7 @@ impl AppServices {
                             // Only translation has a re-run; a page render is
                             // rebuilt by re-importing a revision.
                             BackgroundJobAction::Retranslate => Ok(false),
+                            BackgroundJobAction::Delete => Ok(false),
                         }
                     }
                     "translation" => match action {
@@ -257,6 +303,7 @@ impl AppServices {
                         BackgroundJobAction::Retry => indexing.retry(&job_id).await,
                         BackgroundJobAction::Cancel => indexing.cancel(&job_id).await,
                         BackgroundJobAction::Retranslate => indexing.retranslate(&job_id).await,
+                        BackgroundJobAction::Delete => Ok(false),
                     },
                     "embedding" | "vision" => match action {
                         BackgroundJobAction::Pause => indexing.pause(&job_id).await,
@@ -264,6 +311,7 @@ impl AppServices {
                         BackgroundJobAction::Retry => indexing.retry(&job_id).await,
                         BackgroundJobAction::Cancel => indexing.cancel(&job_id).await,
                         BackgroundJobAction::Retranslate => Ok(false),
+                        BackgroundJobAction::Delete => Ok(false),
                     },
                     other => anyhow::bail!("不支持控制后台任务类型：{other}"),
                 }
