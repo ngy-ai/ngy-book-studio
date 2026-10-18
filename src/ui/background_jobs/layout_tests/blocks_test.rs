@@ -84,6 +84,82 @@ pub(crate) fn translation_block_inspector_pages_filters_and_marks_the_in_flight_
     );
 }
 
+/// 「立即翻译本章」把推进点借给一章：计数必须按借出点算「已处理」，不能拿停在
+/// 那一章第一块的游标当边界。
+///
+/// 现场 2026-10-18：整本 7974 个文本块早已翻完，点「立即翻译本章」后任务窗口显示
+/// 「已处理 168 · 处理中 43 · 待处理 7763」—— 游标被借到了这一章的第一块，于是整本
+/// 剩下的块都被当成没翻过；实际只翻译了这一章，任务随即结束。
+#[test]
+pub(crate) fn a_chapter_jump_counts_the_blocks_outside_its_range_by_the_borrowed_position() {
+    let blocks = block_list(78);
+    let mut job = snapshots().remove(0);
+    job.status = BackgroundJobStatus::Running;
+    job.cursor_json = None;
+    // 整本翻完之后跳到 #40 这一章：借出点是 78，收窄到 40..=42，41 正在发请求。
+    job.progress.completed = 40;
+    job.progress.scope = vec![40, 41, 42];
+    job.progress.resume = Some(78);
+    job.progress.processing = vec![41];
+
+    let inspector = BlockInspector::new(&job, blocks.total, None);
+    let progress = &inspector.progress;
+    assert_eq!(
+        (
+            progress.done,
+            progress.processing.clone(),
+            progress.failed,
+            progress.pending
+        ),
+        (75, vec![41], 0, 2),
+        "范围之外的块按借出点算已处理，只有这一章没翻完的两块在等"
+    );
+    assert_eq!(
+        progress.done + progress.processing.len() + progress.failed + progress.pending,
+        progress.total
+    );
+    assert_eq!(inspector.state(39), BlockState::Done);
+    assert_eq!(inspector.state(40), BlockState::Pending);
+    assert_eq!(inspector.state(41), BlockState::Processing);
+    assert_eq!(inspector.state(43), BlockState::Done);
+    // 说明行与复制出来的诊断都要讲清楚这次只有一章在跑，以及跑完回到哪一块。
+    let note = scope_note(&job, progress).expect("收窄的运行必须给出说明");
+    assert!(
+        note.contains("3 个文本块") && note.contains("#78"),
+        "{note}"
+    );
+    assert!(
+        translation_blocks_copy(&job, &blocks, &inspector).contains("#78"),
+        "复制文本必须带上收窄说明"
+    );
+    assert!(
+        block_page_indices(&blocks, &inspector, Some(BlockState::Pending), 0) == vec![40, 42],
+        "待处理筛选只应列出这一章没翻完的块"
+    );
+
+    // 向前跳（借出点 17、跳到 #60）：游标直接跳到这一章，借出点与那一章之间的块
+    // 并没有被处理过，不能因为游标越过了它们就记成已处理。
+    job.progress.completed = 60;
+    job.progress.scope = vec![60, 61, 62];
+    job.progress.resume = Some(17);
+    job.progress.processing = Vec::new();
+    let forward = BlockInspector::new(&job, blocks.total, None);
+    assert_eq!((forward.progress.done, forward.progress.pending), (17, 61));
+    assert_eq!(forward.state(16), BlockState::Done);
+    assert_eq!(forward.state(30), BlockState::Pending);
+    assert_eq!(forward.state(59), BlockState::Pending);
+    assert_eq!(forward.state(60), BlockState::Pending);
+
+    // 收窄结束、推进点还回来之后又回到普通口径。
+    job.progress.completed = 78;
+    job.progress.scope = Vec::new();
+    job.progress.resume = None;
+    let returned = BlockInspector::new(&job, blocks.total, None);
+    assert_eq!(returned.progress.done, 78);
+    assert_eq!(returned.progress.pending, 0);
+    assert!(scope_note(&job, &returned.progress).is_none());
+}
+
 /// The durable cursor alone can only say how far a failed task got: the blocks
 /// it skipped are named by the per-block diagnostics, and those are what the
 /// window has to show.

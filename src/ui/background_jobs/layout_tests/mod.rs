@@ -48,6 +48,8 @@ pub(crate) fn snapshots() -> Vec<BackgroundJobSnapshot> {
                 completed: 17,
                 total: Some(78),
                 processing: Vec::new(),
+                scope: Vec::new(),
+                resume: None,
             },
             error: Some("当前模型请求失败。请检查模型服务后重试。".repeat(20)),
             created_at: 1_700_000_000,

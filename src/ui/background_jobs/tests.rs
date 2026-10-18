@@ -17,6 +17,8 @@ fn job(status: BackgroundJobStatus) -> BackgroundJobSnapshot {
             completed: 3,
             total: Some(10),
             processing: Vec::new(),
+            scope: Vec::new(),
+            resume: None,
         },
         error: None,
         created_at: 1_700_000_000,
@@ -124,6 +126,24 @@ fn progress_is_bounded_by_the_latest_total() {
     assert_eq!(progress_label(&snapshot), "进度 10 / 10 分块");
     snapshot.progress.total = None;
     assert_eq!(progress_label(&snapshot), "已处理 12 分块");
+}
+
+/// 「立即翻译本章」借出推进点期间，行里的进度按借出点报：游标停在那一章的第一块，
+/// 拿它当进度会把整本显示成「刚开头」，与明细页按同一份边界算出的「已处理」矛盾。
+#[test]
+fn a_borrowed_cursor_reports_the_progress_of_the_whole_book() {
+    let mut snapshot = job(BackgroundJobStatus::Running);
+    snapshot.kind = "translation".to_string();
+    snapshot.progress.completed = 2;
+    snapshot.progress.scope = vec![2, 3];
+    snapshot.progress.resume = Some(9);
+    assert_eq!(progress_label(&snapshot), "进度 9 / 10 文本块");
+
+    // 收窄结束、推进点还回来之后，游标重新就是进度。
+    snapshot.progress.scope = Vec::new();
+    snapshot.progress.resume = None;
+    snapshot.progress.completed = 10;
+    assert_eq!(progress_label(&snapshot), "进度 10 / 10 文本块");
 }
 
 #[test]

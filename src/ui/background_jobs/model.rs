@@ -123,29 +123,15 @@ impl BlockFailures {
             .and_then(|kind| *kind)
             .map(JobLogErrorKind::label)
     }
-
-    pub(super) fn failed(&self, total: usize) -> usize {
-        self.reasons
-            .keys()
-            .filter(|ordinal| **ordinal < total)
-            .count()
-    }
-
-    /// Blocks already accounted for by the cursor lose that state to `Failed`,
-    /// so the counters keep adding up to the block count.
-    pub(super) fn before_cursor(&self, cursor: usize) -> usize {
-        self.reasons
-            .keys()
-            .filter(|ordinal| **ordinal < cursor)
-            .count()
-    }
 }
 
 /// Live translation counters for one job. `cursor` mirrors the durable cursor:
 /// the first block the task has not finished, and the first one a failed task
 /// still has to translate. `processing` mirrors the worker's open window — whole
 /// book translation keeps up to `任务并发` blocks in flight at once, so the cursor
-/// alone can no longer say which block is being translated.
+/// alone can no longer say which block is being translated. `done_limit` carries
+/// the boundary a narrowed run borrows its cursor from; 已处理 comes from it
+/// instead of the cursor.
 ///
 /// A block the newest execution recorded as failed leaves the state the cursor
 /// would give it, so `done + processing + failed + pending` always equals
@@ -155,6 +141,17 @@ pub(crate) struct TranslationProgress {
     pub(crate) total: usize,
     /// Raw durable cursor, kept for the anchor page.
     pub(crate) cursor: usize,
+    /// 本次运行被收窄到的块（升序块号）。空表示整本：收窄的章节跳转与按块重试只
+    /// 处理这些块，界面据此说明表头为什么不是整本书的进度。
+    pub(crate) scope: Vec<usize>,
+    /// 收窄范围之外的块的「已处理」边界：小于它的块在本次收窄开始前就已经处理过。
+    ///
+    /// 范围之内的块仍看游标（游标才代表这次运行走到哪），所以这个边界只回答收窄
+    /// 之外那一部分。「立即翻译本章」借出推进点，它就是借出点；按块重试没有借出点，
+    /// 它就是游标；整本运行范围为空，同样退回游标。少了这一份，借出期间游标停在
+    /// 那一章的第一块，整本剩下的块会被显示成待处理（现场 2026-10-18：整本早已翻
+    /// 完，点「立即翻译本章」后表头显示待处理 7763）。
+    pub(crate) done_limit: usize,
     pub(crate) done: usize,
     /// Ordinals the worker has sent and not committed yet, ascending. Empty for
     /// a task that is not walking a whole book, and for every terminal state.
@@ -166,23 +163,75 @@ pub(crate) struct TranslationProgress {
 impl TranslationProgress {
     pub(super) fn new(job: &BackgroundJobSnapshot, total: usize, failures: &BlockFailures) -> Self {
         let cursor = job.progress.completed.min(total);
-        let failed = failures.failed(total);
-        let failed_before_cursor = failures.before_cursor(cursor);
+        let scope = job.progress.scope.clone();
+        // 收窄之外的块不归这次运行处理，但它们的真实状态由借出点决定：借出点之前的
+        // 块是早先的运行处理过的，之后的块要等这次收窄结束、回到借出点才轮到它们。
+        // 没有收窄（或按块重试没有借出点）时游标本身就是边界。
+        let done_limit = if scope.is_empty() {
+            cursor
+        } else {
+            job.progress
+                .resume
+                .map_or(cursor, |resume| resume.min(total))
+        };
         // 窗口里的块不会再被算成失败：它对 `state()` 是 `Failed`（最新一次执行记过失败），
         // 对计数也是失败，否则表头加起来会超过块总数。
         let processing = in_flight_blocks(job, cursor, total)
             .into_iter()
             .filter(|ordinal| !failures.contains(*ordinal))
             .collect::<Vec<_>>();
-        let failed_after_cursor = failed - failed_before_cursor;
-        let pending = total - cursor - processing.len() - failed_after_cursor;
-        Self {
+        let mut progress = Self {
             total,
             cursor,
-            done: cursor - failed_before_cursor,
+            scope,
+            done_limit,
+            done: 0,
             processing,
-            failed,
-            pending,
+            failed: 0,
+            pending: 0,
+        };
+        // 计数与 `state()` 共用同一份判定：四个数相加恒等于块总数，表头、筛选按钮与
+        // 下面的列表不会各说各话。
+        let mut done = 0;
+        let mut failed = 0;
+        let mut pending = 0;
+        for index in 0..total {
+            match progress.classify(index, failures) {
+                BlockState::Done => done += 1,
+                BlockState::Processing => {}
+                BlockState::Failed => failed += 1,
+                BlockState::Pending => pending += 1,
+            }
+        }
+        progress.done = done;
+        progress.failed = failed;
+        progress.pending = pending;
+        progress
+    }
+
+    /// State of one ordinal. 失败来自最新一次执行的逐块诊断，其余三种来自游标、
+    /// 收窄边界与服务层投影的窗口；计数用的是同一份判定。
+    fn classify(&self, index: usize, failures: &BlockFailures) -> BlockState {
+        if failures.contains(index) {
+            BlockState::Failed
+        } else if self.is_processing(index) {
+            BlockState::Processing
+        } else if self.is_done(index) {
+            BlockState::Done
+        } else {
+            BlockState::Pending
+        }
+    }
+
+    /// Whether this run has already processed one ordinal.
+    ///
+    /// 收窄范围内的块只看游标：游标越过它才算这次运行翻过（范围里的块本来就该在
+    /// 这一轮里重新过一遍）。范围之外的块不归这次运行，它们的答案来自借出点。
+    fn is_done(&self, index: usize) -> bool {
+        if self.scope.binary_search(&index).is_ok() {
+            index < self.cursor
+        } else {
+            index < self.done_limit
         }
     }
 
@@ -262,15 +311,7 @@ impl BlockInspector {
     }
 
     pub(super) fn state(&self, index: usize) -> BlockState {
-        if self.failures.contains(index) {
-            BlockState::Failed
-        } else if index < self.progress.cursor {
-            BlockState::Done
-        } else if self.progress.is_processing(index) {
-            BlockState::Processing
-        } else {
-            BlockState::Pending
-        }
+        self.progress.classify(index, &self.failures)
     }
 
     pub(super) fn reason(&self, index: usize) -> Option<&str> {

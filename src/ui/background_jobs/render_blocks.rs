@@ -77,6 +77,16 @@ impl BackgroundJobsWindow {
                 ))
                 .into_any_element(),
         );
+        // 收窄运行（「立即翻译本章」/ 重试一组块）的计数只覆盖那一段，说明行让用户
+        // 知道待处理为什么不是整本剩下的块。
+        if let Some(note) = scope_note(job, progress) {
+            rows.push(
+                div()
+                    .text_color(rgb(palette(cx).muted))
+                    .child(note)
+                    .into_any_element(),
+            );
+        }
         rows.push(
             div()
                 .text_color(rgb(palette(cx).muted))

@@ -37,6 +37,15 @@ pub struct BackgroundJobProgress {
     /// 读数：原始游标对运行中的任务是不下发的（见 `cursor_json`），所以窗口必须由
     /// 服务层解析后交出去，界面不自己读内部 JSON。其它任务逐项走、窗口恒空。
     pub processing: Vec<usize>,
+    /// 本任务这次被收窄到的文本块（升序块号；空表示整本）。「立即翻译本章」与
+    /// 「重试失败块」只处理这些块，游标在收窄期间停在范围的第一块 —— 界面不能把
+    /// 收窄之外的块一律算成「待处理」，那会给出一份整本书都没翻过的假读数
+    /// （现场 2026-10-18：整本早已翻完，点「立即翻译本章」后表头显示待处理 7763）。
+    pub scope: Vec<usize>,
+    /// 「立即翻译本章」借出推进点之前的位置：小于它的块在本次运行开始前已经处理完。
+    /// 借出期间 `completed` 停在那一章的第一块，所以「已处理」的边界要用这一份，
+    /// 不能用游标。没有借出（整本运行、按块重试）时为 `None`。
+    pub resume: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -175,6 +184,20 @@ pub(crate) fn background_job_snapshot(
         "translation" => in_flight_ordinals(cursor.as_ref()),
         _ => Vec::new(),
     };
+    // 收窄的读数同样只有整本翻译有：章节跳转把推进点借给这一章，按块重试把范围
+    // 收窄成一组块。两者都让游标不再是「已处理前缀」的边界，界面必须拿到这一份
+    // 才能把范围之外的块算对（见 `BackgroundJobProgress::scope` / `resume`）。
+    let (scope, resume) = match job.kind.as_str() {
+        "translation" => (
+            cursor_ordinals(cursor.as_ref(), "retry_ordinals"),
+            json_usize(
+                cursor
+                    .as_ref()
+                    .and_then(|value| value.get("resume_ordinal")),
+            ),
+        ),
+        _ => (Vec::new(), None),
+    };
     let kept_cursor = snapshot_cursor_json(&job.kind, job.status, &job.cursor_json);
     Ok(BackgroundJobSnapshot {
         id: job.id,
@@ -196,6 +219,8 @@ pub(crate) fn background_job_snapshot(
             completed,
             total,
             processing,
+            scope,
+            resume,
         },
         error: job.error,
         created_at: job.created_at,
@@ -230,8 +255,15 @@ pub(crate) fn snapshot_cursor_json(
 /// 有几块在跑」的唯一权威读数。缺字段、写坏的 JSON 或非数字项一律按「没有在飞的块」
 /// 处理，绝不猜一个出来：旧格式游标不该凭空显示成处理中。
 pub(crate) fn in_flight_ordinals(cursor: Option<&serde_json::Value>) -> Vec<usize> {
+    cursor_ordinals(cursor, "inflight")
+}
+
+/// 游标里一组块号字段，升序、去重；缺字段、写坏的 JSON 或非法项一律按「没有这一组」
+/// 处理。收窄范围与在飞窗口共用它：两者都是「哪些块归这次运行管」的读数，解析规则
+/// 不该有第二份。
+fn cursor_ordinals(cursor: Option<&serde_json::Value>, field: &str) -> Vec<usize> {
     let mut blocks = cursor
-        .and_then(|value| value.get("inflight"))
+        .and_then(|value| value.get(field))
         .and_then(serde_json::Value::as_array)
         .map(|ordinals| {
             ordinals

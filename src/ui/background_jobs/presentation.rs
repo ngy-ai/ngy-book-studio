@@ -98,13 +98,17 @@ pub(crate) fn progress_label(job: &BackgroundJobSnapshot) -> String {
         "translation" => "文本块",
         _ => "项",
     };
+    // 「立即翻译本章」借出推进点期间，游标停在那一章的第一块；整本的进度要按借出点
+    // 报，否则列表里这本书会显示成「刚开头」，与明细页按同一份边界算出的「已处理」
+    // 对不上（见 `TranslationProgress::done_limit`）。
+    let completed = if job.progress.scope.is_empty() {
+        job.progress.completed
+    } else {
+        job.progress.resume.unwrap_or(job.progress.completed)
+    };
     match job.progress.total {
-        Some(total) => format!(
-            "进度 {} / {} {unit}",
-            job.progress.completed.min(total),
-            total
-        ),
-        None => format!("已处理 {} {unit}", job.progress.completed),
+        Some(total) => format!("进度 {} / {} {unit}", completed.min(total), total),
+        None => format!("已处理 {completed} {unit}"),
     }
 }
 

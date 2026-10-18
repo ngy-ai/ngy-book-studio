@@ -55,6 +55,30 @@ pub(crate) fn block_chapter_label(block: &TranslationBlockInfo) -> String {
     }
 }
 
+/// 收窄运行的说明：表头为什么不是整本书的进度。
+///
+/// 「立即翻译本章」把推进点借给这一章，按块重试把范围收窄成一组块；两种情况下
+/// 游标都不再是「已处理前缀」的边界，计数必须说明自己只覆盖哪一段。
+pub(crate) fn scope_note(
+    job: &BackgroundJobSnapshot,
+    progress: &TranslationProgress,
+) -> Option<String> {
+    if progress.scope.is_empty() {
+        return None;
+    }
+    let blocks = progress.scope.len();
+    Some(match job.progress.resume {
+        Some(resume) => format!(
+            "本次运行只处理「立即翻译本章」收窄的 {blocks} 个文本块，跑完回到 #{resume} 继续整本；\
+             「已处理」按借出推进点之前的进度计算。"
+        ),
+        None => format!(
+            "本次运行只处理收窄的 {blocks} 个文本块（重试失败块或阅读端重翻），\
+             范围之外的块不归这次运行。"
+        ),
+    })
+}
+
 pub(crate) fn translation_blocks_copy(
     job: &BackgroundJobSnapshot,
     blocks: &TranslationBlockList,
@@ -79,6 +103,9 @@ pub(crate) fn translation_blocks_copy(
         ),
         "序号与任务游标一致，从 0 开始。".to_string(),
     ];
+    if let Some(note) = scope_note(job, progress) {
+        lines.push(note);
+    }
     if progress.failed > 0 {
         let ordinals = inspector
             .failures

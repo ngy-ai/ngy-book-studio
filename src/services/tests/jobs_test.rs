@@ -64,11 +64,37 @@ fn a_running_translation_snapshot_projects_its_in_flight_window() {
         .expect("旧游标仍然要能读出进度");
     assert_eq!(snapshot.progress.completed, 5);
     assert!(snapshot.progress.processing.is_empty());
+    assert!(snapshot.progress.scope.is_empty());
+    assert_eq!(snapshot.progress.resume, None);
+
+    // 收窄的章节跳转同时交出范围与借出点：游标停在那一章的第一块，界面要靠这两份
+    // 读数才能把范围之外的块算成已处理（现场 2026-10-18：整本早已翻完，点「立即翻译
+    // 本章」后表头显示待处理 7763）。
+    let narrowed = serde_json::json!({
+        "next_ordinal": 40,
+        "retry_ordinals": [43, 40, 41, 43],
+        "resume_ordinal": 78,
+        "inflight": [],
+    })
+    .to_string();
+    let snapshot = background_job_snapshot(&conn, job("translation", running, narrowed))
+        .expect("收窄的翻译任务也要能读出快照");
+    assert_eq!(snapshot.progress.completed, 40);
+    assert_eq!(
+        snapshot.progress.scope,
+        vec![40, 41, 43],
+        "范围必须升序去重"
+    );
+    assert_eq!(snapshot.progress.resume, Some(78));
+    // 收窄一样不下发原始游标：这份读数就是界面需要的全部。
+    assert!(snapshot.cursor_json.is_none());
 
     // 其它任务逐项走、窗口恒空：这个集合只属于整本翻译。
     let snapshot = background_job_snapshot(&conn, job("embedding", running, cursor))
         .expect("向量任务的快照必须能建出来");
     assert!(snapshot.progress.processing.is_empty());
+    assert!(snapshot.progress.scope.is_empty());
+    assert_eq!(snapshot.progress.resume, None);
 }
 
 /// 已取消与失败的任务可以删除（TODO 2026-10-18：取消后只能看着）；排队、运行、暂停与
