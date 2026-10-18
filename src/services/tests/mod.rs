@@ -10,7 +10,7 @@ mod settings_test;
 
 mod settings_validation_test;
 
-mod translation_test;
+mod translation;
 
 mod visual;
 
