@@ -90,7 +90,7 @@ pub(crate) async fn build_editor_webview(
                         &protocol_state,
                         &request,
                     ));
-                    let open = protocol_state.protocol_open.lock().unwrap();
+                    let open = lock_shared(&protocol_state.protocol_open);
                     if *open {
                         responder.respond(response);
                     }
@@ -122,7 +122,7 @@ pub(crate) async fn build_editor_webview(
                             editor_error_response(404, "编辑器媒体不存在")
                         }
                     };
-                    let open = response_state.protocol_open.lock().unwrap();
+                    let open = lock_shared(&response_state.protocol_open);
                     if *open {
                         responder.respond(editor_owned_response(response));
                     }

@@ -121,6 +121,18 @@ pub(crate) use status_bar::*;
 
 pub(crate) use window_registry::*;
 
+/// Locks a mutex shared between the GPUI thread and a WebView protocol thread,
+/// recovering from poisoning instead of unwrapping.
+///
+/// A panic on either side poisons the lock, and every later `lock().unwrap()`
+/// would then abort the process — and a GPUI callback cannot unwind, so a single
+/// poisoned lock would take the whole application down over state that is still
+/// perfectly readable. The guard carries the last consistent value, which is
+/// what every caller here wants anyway.
+pub(crate) fn lock_shared<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|error| error.into_inner())
+}
+
 #[cfg(test)]
 mod book_window_tests {
     use super::*;

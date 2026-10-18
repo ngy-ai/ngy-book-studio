@@ -164,7 +164,7 @@ impl EditorWebState {
                 .with_context(|| format!("编辑器媒体元数据不存在：{asset_id}"))?;
             assets.insert(asset_id, EditorMediaAsset::authorized(metadata)?);
         }
-        *self.media.lock().unwrap() = Arc::new(assets);
+        *lock_shared(&self.media) = Arc::new(assets);
         Ok(())
     }
 
@@ -215,7 +215,7 @@ impl EditorWebState {
             };
             retained.insert(asset_id, asset);
         }
-        *self.media.lock().unwrap() = Arc::new(retained);
+        *lock_shared(&self.media) = Arc::new(retained);
         Ok(())
     }
 
@@ -230,20 +230,20 @@ impl EditorWebState {
     pub(crate) fn media_snapshot(&self) -> EditorMediaSnapshot {
         EditorMediaSnapshot {
             book_id: Arc::clone(&self.book_id),
-            assets: Arc::clone(&self.media.lock().unwrap()),
+            assets: Arc::clone(&lock_shared(&self.media)),
         }
     }
 
     pub(crate) fn protocol_is_open(&self) -> bool {
-        *self.protocol_open.lock().unwrap()
+        *lock_shared(&self.protocol_open)
     }
 
     pub(crate) fn close_protocol(&self) {
-        *self.protocol_open.lock().unwrap() = false;
+        *lock_shared(&self.protocol_open) = false;
     }
 
     pub(crate) fn set(&self, revision: u64, chapter_id: String, href: String, html: String) {
-        let mut state = self.pages.lock().unwrap();
+        let mut state = lock_shared(&self.pages);
         state.pages.insert(
             revision,
             EditorWebPage {
@@ -261,7 +261,7 @@ impl EditorWebState {
     }
 
     pub(crate) fn page(&self, revision: u64) -> Option<EditorWebPage> {
-        self.pages.lock().unwrap().pages.get(&revision).cloned()
+        lock_shared(&self.pages).pages.get(&revision).cloned()
     }
 
     pub(crate) fn apply_message(&self, message: EditorIpcMessage) -> Option<EditorIpcUpdate> {
@@ -272,7 +272,7 @@ impl EditorWebState {
         }
         let selected_text = normalize_editor_selection(&message.selected_text)?;
         let media = self.media_snapshot();
-        let mut state = self.pages.lock().unwrap();
+        let mut state = lock_shared(&self.pages);
         let page = state.pages.get_mut(&message.revision)?;
         if page.chapter_id != message.chapter_id || !editor_hrefs_match(&page.href, &message.href) {
             return None;

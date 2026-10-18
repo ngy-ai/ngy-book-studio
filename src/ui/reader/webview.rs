@@ -50,7 +50,7 @@ pub(crate) async fn build_reader_webview(
                     return;
                 }
                 if !is_reader_document_uri(request.uri()) {
-                    let open = protocol_callback_gate.open.lock().unwrap();
+                    let open = lock_shared(&protocol_callback_gate.open);
                     if *open {
                         responder.respond(reader_owned_response(reader_error_response(
                             403,
@@ -93,7 +93,7 @@ pub(crate) async fn build_reader_webview(
                             reader_error_response(404, "阅读器资源不存在")
                         }
                     };
-                    let open = response_gate.open.lock().unwrap();
+                    let open = lock_shared(&response_gate.open);
                     if *open {
                         responder.respond(reader_owned_response(response));
                     }
