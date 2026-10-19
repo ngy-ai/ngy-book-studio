@@ -36,10 +36,11 @@ impl BackgroundJobsWindow {
                     }),
             );
         }
-        for job in jobs
+        for (row_index, job) in jobs
             .into_iter()
             .skip(self.page * JOBS_PER_PAGE)
             .take(JOBS_PER_PAGE)
+            .enumerate()
         {
             let id = job.id.clone();
             let selected = self.selected_job_id.as_deref() == Some(&job.id);
@@ -74,6 +75,12 @@ impl BackgroundJobsWindow {
                     .cursor_pointer()
                     .child(
                         div()
+                            // 第一行只有书名：状态胶囊和进度都在第二行，标题列
+                            // 一直用到行右边缘，只让展开箭头占位（布局回归见
+                            // layout_tests）。
+                            .when(row_index == 0, |this| {
+                                this.debug_selector(|| "jobs-row-title".into())
+                            })
                             .v_flex()
                             .flex_1()
                             .min_w(px(0.))
@@ -86,33 +93,50 @@ impl BackgroundJobsWindow {
                                     .child(title.to_string()),
                             )
                             .child(
+                                // 元信息、进度、状态共处第二行：只要其中一项单独
+                                // 占一列，标题行就会被那一列挤窄；放进同一行后
+                                // 只有元信息会收缩（现场 2026-10-19）。
                                 div()
-                                    .text_xs()
-                                    .text_color(rgb(palette(cx).muted))
-                                    .truncate()
-                                    .child(format!("{} · {}", job_kind_label(&job.kind), job.id)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .v_flex()
-                            .gap_1()
-                            .items_end()
-                            .flex_none()
-                            .child(
-                                div()
-                                    .px_2()
-                                    .rounded_full()
-                                    .bg(background)
-                                    .text_xs()
-                                    .text_color(color)
-                                    .child(label),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(palette(cx).muted))
-                                    .child(progress_label(job)),
+                                    .h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .min_w(px(0.))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .text_xs()
+                                            .text_color(rgb(palette(cx).muted))
+                                            .truncate()
+                                            .child(format!(
+                                                "{} · {}",
+                                                job_kind_label(&job.kind),
+                                                job.id
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .text_xs()
+                                            .text_color(rgb(palette(cx).muted))
+                                            .child(progress_label(job)),
+                                    )
+                                    .child(
+                                        div()
+                                            .when(row_index == 0, |this| {
+                                                this.debug_selector(|| "jobs-row-status".into())
+                                            })
+                                            .flex_none()
+                                            .child(
+                                                div()
+                                                    .px_2()
+                                                    .rounded_full()
+                                                    .bg(background)
+                                                    .text_xs()
+                                                    .text_color(color)
+                                                    .child(label),
+                                            ),
+                                    ),
                             ),
                     )
                     .child(Icon::new(IconName::ChevronRight).small())
