@@ -19,18 +19,18 @@ use crate::{
     storage::LocalBlobStore,
 };
 
-mod embedding_test;
+mod batch;
+mod embedding;
 mod endpoints_test;
 mod job_control_test;
 mod reconcile_test;
 mod retry;
 mod scheduling_test;
-mod translation_batch_test;
-mod translation_test;
-mod translation_walk_test;
-mod unit_test;
+mod translation;
+mod unit;
+mod vision;
 mod vision_publication_test;
-mod vision_test;
+mod walk;
 
 /// How long one test waits for the coordinator to reach a state or to make a
 /// provider call. Every test in this module runs in parallel while other
