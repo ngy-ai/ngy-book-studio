@@ -69,6 +69,12 @@
     目标加的 `/STACK:16777216` 是必需的：删掉它，图书库窗口会在后台任务触发重绘时以
     `STATUS_STACK_OVERFLOW`（0xc00000fd）崩在 `render_library` 的布局递归里。需要看
     崩溃栈时用 `cdb -o -g -G -c "g; kb 60; q" target\debug\ngy-book-studio.exe`。
+16. 阅读窗口不要在实体更新（尤其 WebView IPC 回调）里直接调用 `EvaluateScript`：
+    WebView2 会同步泵窗口消息，把 GPUI 的帧处理泵回 `App` 借用期间，日志里留下
+    `RefCell already borrowed`（该帧被跳过，下一帧重试，窗口不会因此关闭）。统一用
+    `ReaderApp::run_reader_script`：先在更新闭包里取 `WebViewHandle`，脚本在
+    `cx.spawn` 的前台任务里执行，不持 `App` 借用。译文、笔记、字号/皮肤、阅读位置、
+    引用定位、朗读高亮与「从视口朗读」都已走这条路径。
 
 ## 不可破坏的内容安全约束
 

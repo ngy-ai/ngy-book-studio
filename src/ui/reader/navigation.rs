@@ -19,15 +19,15 @@ impl ReaderApp {
             );
             return;
         }
-        if let Some(webview) = self.webview.as_ref() {
-            let script = format!(
-                "window.ngyAnnotations?.explainSelection({});",
-                serde_json::json!(selected_text)
-            );
-            if let Err(error) = webview.read(cx).raw().evaluate_script(&script) {
-                self.set_error(format!("无法读取笔记选区：{error}"), cx);
-            }
-        }
+        let script = format!(
+            "window.ngyAnnotations?.explainSelection({});",
+            serde_json::json!(selected_text)
+        );
+        self.run_reader_script(
+            script,
+            |this, error, cx| this.set_error(format!("无法读取笔记选区：{error}"), cx),
+            cx,
+        );
     }
 
     pub(crate) fn go_to_toc(&mut self, toc_index: usize, cx: &mut Context<Self>) {

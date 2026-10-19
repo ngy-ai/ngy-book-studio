@@ -31,6 +31,8 @@ fn job_row(fixture: &Fixture, job_id: &str) -> db::index_jobs::IndexJob {
 /// translation, because that end state is exactly what makes the retry the
 mod chapter_narrowing_test;
 
+mod incremental_skip_test;
+
 mod per_block_rerun_test;
 
 mod protocol_retry_test;

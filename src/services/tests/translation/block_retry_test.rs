@@ -11,6 +11,15 @@ fn retranslating_one_reader_block_requeues_that_block_of_the_display_language_ta
             .unwrap();
     let runtime = services.runtime();
 
+    // 这条用例看的是规划后的游标：阅读端的重译现在会插到队列最前，执行器会立刻
+    // 领取它，所以先把这一组 worker 停掉，免得断言跑到执行完的任务上。
+    {
+        let mut workers = services.indexing.workers.lock().unwrap();
+        for worker in workers.drain(..) {
+            worker.abort();
+        }
+    }
+
     // 先关掉翻译，把图书建出来，再打开：这条路径与
     // `configuring_a_default_language_enqueues_translation_for_existing_books` 相同，
     // 因此这里测的是「任务真的存在」之后的重跑，而不是任务怎么来的。
@@ -68,6 +77,10 @@ fn retranslating_one_reader_block_requeues_that_block_of_the_display_language_ta
     let cursor: serde_json::Value = serde_json::from_str(&job.cursor_json).unwrap();
     assert_eq!(cursor["retry_ordinals"], serde_json::json!([1]));
     assert_eq!(cursor["next_ordinal"], serde_json::json!(1));
+    assert!(
+        cursor["priority"].as_u64().is_some(),
+        "阅读端的「重新翻译」要像「立即翻译本章」一样插到待执行队列最前"
+    );
 
     // 不属于这本书的块标识：报错，而不是挑一块重跑。
     let error = block_on_without_tokio(services.retranslate_reader_translation_block(
@@ -235,4 +248,8 @@ fn retranslating_one_reader_block_waits_for_a_running_task_to_pause() {
     let cursor: serde_json::Value = serde_json::from_str(&job.cursor_json).unwrap();
     assert_eq!(cursor["retry_ordinals"], serde_json::json!([1]));
     assert_eq!(cursor["next_ordinal"], serde_json::json!(1));
+    assert!(
+        cursor["priority"].as_u64().is_some(),
+        "等运行中的任务落盘之后，这一块也要插到待执行队列最前"
+    );
 }

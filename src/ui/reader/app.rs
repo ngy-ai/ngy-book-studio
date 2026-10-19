@@ -168,6 +168,34 @@ impl ReaderApp {
         reader
     }
 
+    /// Sends a script to the reader webview after the caller's borrow is released.
+    ///
+    /// WebView2's `EvaluateScript` synchronously pumps window messages. Calling it
+    /// from an entity update (especially a WebView IPC callback) re-enters GPUI's
+    /// frame handler while `App` is still borrowed — that is the
+    /// `RefCell already borrowed` in the log. The native handle is cheap to clone
+    /// and the foreground task runs after the borrow is released.
+    pub(crate) fn run_reader_script(
+        &self,
+        script: String,
+        on_error: impl FnOnce(&mut Self, String, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(handle) = self
+            .webview
+            .as_ref()
+            .map(|webview| webview.read(cx).handle())
+        else {
+            return;
+        };
+        cx.spawn(async move |view, cx| {
+            if let Err(error) = handle.raw().evaluate_script(&script) {
+                let _ = view.update(cx, |this, cx| on_error(this, error.to_string(), cx));
+            }
+        })
+        .detach();
+    }
+
     pub(crate) fn toggle_navigation_collapsed(&mut self, cx: &mut Context<Self>) {
         if self.pane_layout.toggle_navigation_collapsed() {
             cx.notify();

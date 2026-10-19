@@ -187,13 +187,21 @@ impl IndexingCoordinator {
         let diagnostic_id = job_id.to_string();
         let job_id = job_id.to_string();
         let db_path = self.inner.db_path.clone();
-        let config = {
+        let (config, translation) = {
             let models = self
                 .inner
                 .models
                 .read()
                 .map_err(|_| anyhow::anyhow!("indexing model lock is poisoned"))?;
-            models.config.clone()
+            (
+                models.config.clone(),
+                models.translation.as_ref().map(|translation| {
+                    (
+                        translation.model.clone(),
+                        translation.execution_identity.clone(),
+                    )
+                }),
+            )
         };
         let now = unix_timestamp()?;
         let changed = run_db_on(self.inner.runtime.clone(), db_path, move |conn| {
@@ -220,6 +228,26 @@ impl IndexingCoordinator {
                 )?
             {
                 return Ok(0);
+            }
+            if job.kind == TRANSLATION_JOB_KIND {
+                // 取消/失败可能把一次没跑完的收窄留在游标里：重试必须从当前推进点继续
+                // 整本，不能再沿用那份范围与「命中缓存也重发」。清掉之后游标之前（已处理）
+                // 的块根本不进入 walk，范围内已译的块按缓存命中推进，都不会再花请求。
+                let mut cursor: JobCursor =
+                    serde_json::from_str(&job.cursor_json).context("索引任务游标无效")?;
+                let stored = cursor.encode()?;
+                cursor.retry_ordinals.clear();
+                cursor.force_retry = false;
+                cursor.resume_ordinal = None;
+                cursor.stops_after_targets = false;
+                if let Some((model, execution_identity)) = &translation {
+                    cursor.model = Some(model.clone());
+                    cursor.execution_identity = Some(execution_identity.clone());
+                }
+                let cursor_json = cursor.encode()?;
+                if cursor_json != stored {
+                    return db::index_jobs::retry_translation(&conn, &job_id, &cursor_json, now);
+                }
             }
             db::index_jobs::retry(&conn, &job_id, now)
         })

@@ -97,6 +97,15 @@
   `(document_revision, unit_revision, target_language, 翻译模型)` 判定失效并重译。目标语言
   或翻译模型变化由 `AppServices::configure_translations` 经
   `transactions::reconfigure_translation_jobs` 重排；每本当前来源只保留一个目标语言任务。
+  对账时已存译文由 `adopt_execution_identity` 改签到新身份；即使对账还没跑到，`JobCursor::from_job`
+  也不再为翻译任务把 `next_ordinal` 退回书首（块列表与模型无关）。`IndexingCoordinator::retry`
+  在重新排队前清掉取消/失败时残留的 `retry_ordinals` / `force_retry` / `resume_ordinal`，
+  因此「重试」永远从断点继续整本、只对缺译文的块发请求；「立即翻译本章」与逐块「重新翻译」
+  同样只让缺译文的块发请求（后者只强制重发目标块）。逐块「重新翻译」还写
+  `stops_after_targets`：walk 的窗口停在最后一个目标块之后，后续块不重挂、也不进入这一轮；
+  跑完 `next_ordinal` 回到 `resume_ordinal`（原来的推进点）。这两条阅读端入口还共用同一套优先级：
+  `TranslationRange::prioritizes` 让它们往游标写 `priority`（`index_jobs` 没有优先级列，
+  `list_queued` 先读它），插到所有待执行任务之前；任务窗口的「重试失败块」不写这个键。
   源语言（`books.language` 主语言子标签）等于目标语言时跳过；翻译任务未配置翻译模型时
   失败而不猜测。模型调用不得逐 token 打日志，也不得记录正文或译文内容。
   **问答模型与翻译模型是两个独立设置**（`ProviderSettings.chat_model` /

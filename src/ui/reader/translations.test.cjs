@@ -1083,6 +1083,28 @@ test("retranslating one block posts its key and waits for the host's answer", as
   } finally { await page.close(); }
 });
 
+// 宿主漏回结果时，这一行不能永远停在「正在提交重新翻译…」：超时后要把提交态撤掉，
+// 并把原因写给读者（否则连「再点一次」都没有入口）。时钟由用例直接推进。
+test("a retranslate request the host never answers leaves the submitting state", async () => {
+  const page = await pageWithFixture();
+  try {
+    await configure(page);
+    await page.clock.install();
+    await clickControl(page, "c", "重新翻译");
+    const rowText = await page.evaluate(() => {
+      const layer = document.getElementById("c").previousElementSibling;
+      return layer.querySelector("[data-ngy-translation-controls]").shadowRoot.textContent;
+    });
+    assert.match(rowText, /正在提交重新翻译/);
+
+    await page.clock.fastForward(30000);
+    const state = await manualState(page, "c");
+    assert.equal(state.error, "阅读窗口没有响应，请稍后再试");
+    assert.deepEqual(state.buttons, ["编辑译文", "重新翻译"],
+      "超时后按钮必须回来，读者可以再点一次");
+  } finally { await page.close(); }
+});
+
 test("a failed manual edit keeps the typed text, a republish waits and cancel restores it", async () => {
   const page = await pageWithFixture();
   try {

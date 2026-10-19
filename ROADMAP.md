@@ -117,6 +117,34 @@
     注解）由宿主 `markup::looks_like_source_code` 与阅读器 `translations.js` 按同一套规则
     跳过，任务列表里不再出现这些块；收紧判定会改变块数，游标因此记 `blocks_version`，版本
     不符时把翻译任务退回书首重扫（已存译文仍按缓存键命中）
+  - [x] 2026-10-19 增量续译：取消/失败后的「重试」从落盘断点继续整本，并清掉取消时没收尾的
+    收窄与 `force_retry` —— 不再重发已有译文的块，也不再被锁在那一章里；换翻译模型/端点时
+    `JobCursor::from_job` 对翻译任务保留推进点（块列表与模型无关，已存译文由
+    `adopt_execution_identity` 改签），任务窗口的「已处理」不会归零。已译块在「立即翻译本章」
+    与逐块「重新翻译」里都只按缓存复用、不发请求；后者只强制重发目标块。回归：
+    `ai::indexing::tests::retry::incremental_skip_test` 3 项、
+    `translation::rerun_test::rebinding_a_translation_cursor_to_another_model_keeps_its_position`
+  - [x] 2026-10-19 阅读端「重新翻译」不再静默卡住：页面载荷陈旧不再拒绝（块标识由服务层在当前
+    修订里重新查找），不属于当前章节或缺少定位信息会回一条失败结果并显示原因；页面另有 30 秒
+    兜底，宿主漏回时撤掉「正在提交重新翻译…」并提示「阅读窗口没有响应」。手工译文保存同样
+    必回结果。回归：`reader/translations` DOM 门禁新增「宿主不回结果」1 项（28 项全过）、
+    `cargo test --bin ngy-book-studio translations` 8 项通过。
+  - [x] 2026-10-19 阅读端两条即时入口共用同一套优先级：逐块「重新翻译」与「立即翻译本章」都会
+    把任务游标的 `priority` 写成当前时间（`index_jobs` 没有优先级列，`list_queued` 先读它），
+    排到所有待执行任务之前；同一本书正在跑的整本翻译由 `pause_running_translation` 做到手上
+    这一批落盘后让位，没有在跑的任务时执行器立即领取。任务窗口的「重试失败块」不写优先级。
+    回归：`services::tests::translation::block_retry_test` 断言规划后的 `priority`，
+    `retry_planning_test` 断言 `force=false` 的重试不插队。
+  - [x] 2026-10-19 逐块「重新翻译」只做这一块：游标新增 `stops_after_targets`，walk 的窗口
+    停在最后一个目标块之后，不再把后续块重挂、也不把它们算进这一轮；跑完 `next_ordinal`
+    回到原来的推进点（`resume_ordinal`）。整本没翻完时，目标块之后的未译块也不会把这次
+    重译拖成暂停。回归：`retry::incremental_skip_test` 4 项（新增「目标块之后的未译块
+    不进入这一轮」1 项）。
+  - [x] 2026-10-19 阅读器脚本不再在实体更新里直接调用 WebView2：`ReaderApp::run_reader_script`
+    先取 `WebViewHandle`，在 `cx.spawn` 的前台任务里执行 `EvaluateScript`。WebView2 的
+    脚本执行会同步泵窗口消息，在 `App` 借用期间调用会把 GPUI 的帧处理泵进来
+    （`RefCell already borrowed`，该帧被跳过）。译文、笔记、字号/皮肤、阅读位置、引用定位、
+    朗读高亮与「从视口朗读」都改走它；`cargo test --bin ngy-book-studio ui::reader` 46 项通过。
   - [x] 阅读器翻译显示：打开章节时按当前单元读取与当前版本、对话模型一致的译文并经
     session/generation 门控注入；默认“译文”只显示译文、隐藏原文，“译文/双语”的段内
     切换由每段译文末尾的图标完成（悬停在该段译文上时淡入，键盘焦点落在图标上时同样

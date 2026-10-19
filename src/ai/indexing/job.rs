@@ -93,6 +93,11 @@ pub(crate) struct JobCursor {
     /// 连续点两章时保留更早的那个位置，否则第二章会把「原地到第一章之间」那一段丢掉。
     #[serde(default)]
     pub(crate) resume_ordinal: Option<usize>,
+    /// 逐块「重新翻译」只跑 `retry_ordinals` 这一组就收尾：walk 的窗口不越过最后一个
+    /// 目标块，后面的文本块既不重挂、也不进入这一轮。`false`（默认）让收窄按旧的
+    /// 跨度规则一路重挂到书末；「立即翻译本章」用它保证整本仍然能继续推进。
+    #[serde(default)]
+    pub(crate) stops_after_targets: bool,
     /// Ordinals this execution has already sent to the provider and not committed
     /// yet, sorted. `任务并发` is how many of them one task keeps open at a time,
     /// and the task window reads the set as 「处理中」.
@@ -160,7 +165,13 @@ impl JobCursor {
             cursor.model = Some(model.to_string());
             cursor.execution_identity = execution_identity.map(str::to_string);
             cursor.input_execution_identity = None;
-            cursor.next_ordinal = 0;
+            // 翻译任务的序号只由正文的块列表决定，与模型/执行身份无关：已存译文在重配置
+            // 时已改签到当前身份（`adopt_execution_identity`），缓存仍按内容命中。换模型
+            // 时把推进点退回书首，只会让任务窗口的「已处理」归零、把整本重扫一遍，并把
+            // 还没改签到的行当成「没译文」重新发请求。其它种类保持原有的重置语义。
+            if cursor.kind != TRANSLATION_JOB_KIND {
+                cursor.next_ordinal = 0;
+            }
         }
         // 提取文本块的规则变了（例如「这一块是源代码」的判定变严），块数随之改变，
         // 于是受影响之后的每个序号都指向了另一段文字。旧版本的游标因此退回书首重扫：

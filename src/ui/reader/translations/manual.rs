@@ -15,6 +15,9 @@ impl ReaderApp {
         request: ManualTranslationRequest,
         cx: &mut Context<Self>,
     ) {
+        if self.closing || self.webview_build_gate.close_requested {
+            return;
+        }
         // The page can only answer with the revision it was pushed with.
         let pushed_revision = self
             .annotations
@@ -22,18 +25,28 @@ impl ReaderApp {
             .1
             .get(self.current_spine)
             .copied();
-        if self.closing
-            || self.webview_build_gate.close_requested
-            || !manual_edit_belongs_to_current_chapter(
-                self.book.spine_index_for_url(url),
-                self.current_spine,
-                pushed_revision,
-                request.revision,
-            )
-        {
+        if !manual_edit_belongs_to_current_chapter(
+            self.book.spine_index_for_url(url),
+            self.current_spine,
+            pushed_revision,
+            request.revision,
+        ) {
+            // 页面在收到结果之前会一直显示「保存中…」/提交态；静默丢弃会把它卡死。
+            self.reject_manual_translation(
+                request.request_id,
+                "该文本块不属于当前章节，或本章内容已更新，请重新打开本章后再试",
+                "stale_page",
+                cx,
+            );
             return;
         }
         let Some(locator) = self.progress_locators.get(self.current_spine) else {
+            self.reject_manual_translation(
+                request.request_id,
+                "本章缺少定位信息，请重新打开本书后再试",
+                "missing_locator",
+                cx,
+            );
             return;
         };
         let unit_id = locator.unit_id.clone();
@@ -55,6 +68,32 @@ impl ReaderApp {
         .detach();
     }
 
+    /// Answers a save/clear request the window refused, so the page can leave
+    /// its submitting state with the reason instead of waiting forever.
+    fn reject_manual_translation(
+        &mut self,
+        request_id: u64,
+        reason: &str,
+        stage: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        tracing::info!(
+            target: "ngy_reader",
+            stage = "reader_manual_translation_rejected",
+            reason = stage,
+            "Reader manual translation request rejected"
+        );
+        self.translation_script(
+            "result",
+            serde_json::json!({
+                "request_id": request_id,
+                "ok": false,
+                "error": format!("无法保存手工译文：{reason}"),
+            }),
+            cx,
+        );
+    }
+
     pub(crate) fn finish_manual_translation(
         &mut self,
         url: &str,
@@ -62,14 +101,19 @@ impl ReaderApp {
         result: anyhow::Result<()>,
         cx: &mut Context<Self>,
     ) {
-        if self.closing || self.current_reader_url.as_deref() != Some(url) {
+        if self.closing {
             return;
         }
+        // The page may have moved on; replying is harmless there (its pending
+        // map is gone), but the error belongs to the chapter that was shown.
+        let stale_page = self.current_reader_url.as_deref() != Some(url);
         let payload = match &result {
             Ok(()) => serde_json::json!({ "request_id": request_id, "ok": true }),
             Err(error) => {
                 let message = format!("{error:#}");
-                self.set_error(format!("无法保存手工译文：{message}"), cx);
+                if !stale_page {
+                    self.set_error(format!("无法保存手工译文：{message}"), cx);
+                }
                 serde_json::json!({ "request_id": request_id, "ok": false, "error": message })
             }
         };

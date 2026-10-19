@@ -348,6 +348,10 @@ pub(crate) fn retrying_works_on_a_paused_task_and_refuses_a_running_one() {
     assert_eq!(replanned.status, db::index_jobs::IndexJobStatus::Queued);
     let cursor: JobCursor = serde_json::from_str(&replanned.cursor_json).unwrap();
     assert_eq!(cursor.retry_ordinals, vec![0]);
+    assert_eq!(
+        cursor.priority, None,
+        "任务窗口的「重试失败块」只是补失败块，不该抢正在跑的整本翻译"
+    );
 
     // A running job is left alone: its cursor belongs to the executor.
     {

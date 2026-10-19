@@ -13,14 +13,13 @@ impl ReaderApp {
         if self.closing {
             return;
         }
-        let Some(webview) = self.webview.as_ref() else {
-            return;
-        };
         let script = reader_appearance_script(self.text_size, current_appearance(cx));
-        if let Err(error) = webview.read(cx).raw().evaluate_script(&script) {
+        self.run_reader_script(
+            script,
             // Presentation only: a missed update must not become a reader error.
-            tracing::warn!(%error, "cannot apply the reading appearance");
-        }
+            |_, error, _| tracing::warn!(%error, "cannot apply the reading appearance"),
+            cx,
+        );
     }
 
     /// Reads this book's remembered text size once per window. Until it arrives

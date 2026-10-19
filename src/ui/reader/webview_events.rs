@@ -267,11 +267,11 @@ impl ReaderApp {
         if self.book.spine_index_for_url(url) != Some(pending.spine_index) {
             return;
         }
-        let Some(webview) = self.webview.as_ref() else {
+        if self.webview.is_none() {
             self.pending_citation_navigation = None;
             self.set_error("正文视图尚未就绪，无法定位引用".to_owned(), cx);
             return;
-        };
+        }
         let script = match citation_dom_navigation_script(
             &pending.focus,
             serde_json::json!({
@@ -286,10 +286,14 @@ impl ReaderApp {
                 return;
             }
         };
-        if let Err(error) = webview.read(cx).raw().evaluate_script(&script) {
-            self.pending_citation_navigation = None;
-            self.set_error(format!("无法执行引用定位：{error}"), cx);
-        }
+        self.run_reader_script(
+            script,
+            |this, error, cx| {
+                this.pending_citation_navigation = None;
+                this.set_error(format!("无法执行引用定位：{error}"), cx);
+            },
+            cx,
+        );
     }
 
     pub(crate) fn finish_citation_navigation(

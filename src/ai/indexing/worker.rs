@@ -472,6 +472,7 @@ pub(crate) async fn run_queued_job(
                         next_ordinal: 0,
                         retry_ordinals: Vec::new(),
                         resume_ordinal: None,
+                        stops_after_targets: false,
                         inflight: Vec::new(),
                         blocks_version: TRANSLATION_BLOCKS_VERSION,
                         priority: None,

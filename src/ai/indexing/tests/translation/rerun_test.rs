@@ -223,3 +223,43 @@ pub(crate) fn changing_the_translation_model_resumes_at_the_same_block() {
     let bound = JobCursor::from_job(&job, "chat-two", Some("translation-v1:chat-two")).unwrap();
     assert_eq!(bound.next_ordinal, 7, "换模型必须从原来的位置继续");
 }
+
+/// 对账还没来得及改签游标时（任务先被领取，或旧构建写下的行），`from_job` 自己也不能
+/// 把翻译的推进点退回书首：块列表与模型无关，已存译文下一轮对账会改签到新身份，
+/// 重扫只会让任务窗口的「已处理」归零、把断点之前的块再走一遍。
+#[test]
+pub(crate) fn rebinding_a_translation_cursor_to_another_model_keeps_its_position() {
+    let fixture = Fixture::new();
+    let coordinator = IndexingCoordinator {
+        inner: fixture.indexing_inner(),
+        workers: Mutex::new(Vec::new()),
+    };
+    let provider: Arc<dyn OpenAiCompatibleProvider> = Arc::new(MockProvider::default());
+    let job_id = format!("translation:{}:zh-Hans", fixture.source_id);
+    fixture
+        .runtime
+        .block_on(coordinator.configure_translation(
+            provider,
+            "chat-one".to_string(),
+            "translation-v1:chat-one".to_string(),
+            TranslationGenerationSettings::default(),
+            NO_BATCHING,
+            Some("zh-Hans".to_string()),
+            false,
+        ))
+        .unwrap();
+    finish_job_at(&fixture, &job_id, 7);
+    let conn = db::open_conn(&fixture.db_path).unwrap();
+    let job = db::index_jobs::get(&conn, &job_id).unwrap().unwrap();
+    assert_eq!(
+        serde_json::from_str::<JobCursor>(&job.cursor_json)
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("chat-one")
+    );
+
+    let bound = JobCursor::from_job(&job, "chat-two", Some("translation-v1:chat-two")).unwrap();
+    assert_eq!(bound.model.as_deref(), Some("chat-two"));
+    assert_eq!(bound.next_ordinal, 7, "换模型不能把翻译的推进点退回书首");
+}

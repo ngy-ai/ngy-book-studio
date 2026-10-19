@@ -580,6 +580,28 @@
     submit(state, "update", segments);
   };
 
+  // 宿主会为每次提交回一条 result；漏回时不能让这一行永远停在提交态。
+  // 30 秒比服务层等执行器落盘的上限（15 秒）宽，正常请求绝不会被它截断。
+  const REQUEST_TIMEOUT_MS = 30000;
+  const clearRequestTimer = (state) => {
+    if (state.timer) {
+      clearTimeout(state.timer);
+      state.timer = 0;
+    }
+  };
+  const waitForResult = (state, request) => {
+    clearRequestTimer(state);
+    state.timer = setTimeout(() => {
+      state.timer = 0;
+      if (state.request !== request) return;
+      pending.delete(request);
+      state.request = 0;
+      state.requestKind = null;
+      state.error = "阅读窗口没有响应，请稍后再试";
+      renderControls(state);
+    }, REQUEST_TIMEOUT_MS);
+  };
+
   const submit = (state, action, segments) => {
     if (state.request || !state.key) return;
     if (!window.ipc?.postMessage) {
@@ -592,6 +614,7 @@
     // 请求类别决定宿主回答之后怎么办：手工译文要落在编辑态上，重新翻译只留一句提示。
     state.requestKind = action;
     pending.set(requestId, state);
+    waitForResult(state, state.request);
     try {
       window.ipc.postMessage(JSON.stringify({
         type: "manual_translation",
@@ -603,6 +626,7 @@
       }));
     } catch {
       pending.delete(state.request);
+      clearRequestTimer(state);
       state.request = 0;
       state.error = "无法发送译文修改请求";
     }
@@ -624,6 +648,7 @@
     state.request = requestId;
     state.requestKind = "retranslate";
     pending.set(requestId, state);
+    waitForResult(state, state.request);
     try {
       window.ipc.postMessage(JSON.stringify({
         type: "retranslate_block",
@@ -633,6 +658,7 @@
       }));
     } catch {
       pending.delete(state.request);
+      clearRequestTimer(state);
       state.request = 0;
       state.requestKind = null;
       state.error = "无法发送重新翻译请求";
@@ -647,6 +673,7 @@
     const state = pending.get(payload.request_id);
     if (!state || state.request !== payload.request_id) return;
     pending.delete(payload.request_id);
+    clearRequestTimer(state);
     state.request = 0;
     const kind = state.requestKind;
     state.requestKind = null;
@@ -808,7 +835,8 @@
       sources: validated.sources,
       key: typeof entry.key === "string" ? entry.key : "",
       manual: entry.manual === true,
-      editing: false, request: 0, requestKind: null, error: "", notice: "", hovering: false,
+      editing: false, request: 0, requestKind: null, timer: 0,
+      error: "", notice: "", hovering: false,
       controls: null, showControls: null, reveal: null, actions: null,
       revealHover: false, revealBlockHover: false, revealFocus: false,
       display: original.style.getPropertyValue("display"),

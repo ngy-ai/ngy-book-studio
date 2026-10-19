@@ -347,6 +347,28 @@ pub(crate) fn retry(conn: &Connection, job_id: &str, updated_at: u64) -> Result<
     .context("无法重试索引任务")
 }
 
+/// Retries one translation job from the caller-supplied cursor.
+///
+/// 「重试」是从断点继续整本，不是重做上一次的收窄：取消或失败可能把一次没跑完的
+/// 「立即翻译本章」或逐块「重新翻译」留在游标里（连同 `force_retry`）。沿用它会让已经
+/// 有译文的目标块被强制重发，或被锁在那一章里不再碰别的章节。调用方在写回之前清掉
+/// 收窄，只保留推进点，并用当前模型/执行身份覆盖游标里的旧值。
+pub(crate) fn retry_translation(
+    conn: &Connection,
+    job_id: &str,
+    cursor_json: &str,
+    updated_at: u64,
+) -> Result<usize> {
+    conn.execute(
+        "UPDATE index_jobs SET status = 'queued', pause_requested = 0,
+         cancel_requested = 0, cursor_json = ?2, error = NULL, updated_at = ?3,
+         finished_at = NULL
+         WHERE id = ?1 AND kind = 'translation' AND status IN ('failed', 'cancelled')",
+        params![job_id, cursor_json, updated_at as i64],
+    )
+    .context("无法重试翻译任务")
+}
+
 pub(crate) fn retry_failed_for_source_kind(
     conn: &Connection,
     source_id: &str,

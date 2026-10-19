@@ -159,13 +159,12 @@ impl ReaderApp {
         value: serde_json::Value,
         cx: &mut Context<Self>,
     ) {
-        let Some(webview) = self.webview.as_ref() else {
-            return;
-        };
         let script = format!("window.ngyAnnotations?.{method}({value});");
-        if let Err(error) = webview.read(cx).raw().evaluate_script(&script) {
-            self.set_error(format!("无法更新阅读笔记界面：{error}"), cx);
-        }
+        self.run_reader_script(
+            script,
+            |this, error, cx| this.set_error(format!("无法更新阅读笔记界面：{error}"), cx),
+            cx,
+        );
     }
 
     pub(crate) fn configure_annotations(&mut self, cx: &mut Context<Self>) {

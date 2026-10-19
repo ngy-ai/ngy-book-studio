@@ -52,12 +52,11 @@ impl ReaderApp {
         if self.pending_citation_navigation.is_some() {
             return;
         }
-        let Some(webview) = self.webview.as_ref() else {
-            return;
-        };
         let script = position_restore_script(&anchor);
-        if let Err(error) = webview.read(cx).raw().evaluate_script(&script) {
-            tracing::warn!(%error, "cannot restore chapter reading position");
-        }
+        self.run_reader_script(
+            script,
+            |_, error, _| tracing::warn!(%error, "cannot restore chapter reading position"),
+            cx,
+        );
     }
 }

@@ -9,13 +9,12 @@ impl ReaderApp {
         value: serde_json::Value,
         cx: &mut Context<Self>,
     ) {
-        let Some(webview) = self.webview.as_ref() else {
-            return;
-        };
         let script = format!("window.ngyTranslations?.{method}({value});");
-        if let Err(error) = webview.read(cx).raw().evaluate_script(&script) {
-            self.set_error(format!("无法更新译文显示：{error}"), cx);
-        }
+        self.run_reader_script(
+            script,
+            |this, error, cx| this.set_error(format!("无法更新译文显示：{error}"), cx),
+            cx,
+        );
     }
 
     /// Starts the background poll that surfaces the translations of the chapter

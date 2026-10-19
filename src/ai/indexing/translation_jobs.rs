@@ -164,6 +164,7 @@ impl IndexingCoordinator {
                 next_ordinal: 0,
                 retry_ordinals: Vec::new(),
                 resume_ordinal: None,
+                stops_after_targets: false,
                 inflight: Vec::new(),
                 blocks_version: TRANSLATION_BLOCKS_VERSION,
                 priority: None,
@@ -372,25 +373,54 @@ impl IndexingCoordinator {
                 next_ordinal: first,
                 retry_ordinals: retry_ordinals.clone(),
                 resume_ordinal: None,
+                stops_after_targets: false,
                 inflight: Vec::new(),
                 blocks_version: TRANSLATION_BLOCKS_VERSION,
                 priority: None,
                 force_retry: range.force_retry(),
             };
             let now = unix_timestamp()?;
-            if range == TranslationRange::Chapter {
-                // 把推进点借给这一章之前先记下原地位置：最后一个目标块提交时 walk 回到这里
-                // 继续整本（`TranslationRun::commit`）。已经有一次收窄在等回来时保留更早的
-                // 那一个 —— 连着点两章不该把中间那一段丢掉。
-                let current = JobCursor::from_job(
-                    &job,
-                    &translation.model,
-                    Some(&translation.execution_identity),
-                )?;
-                cursor.resume_ordinal = current.resume_ordinal.or(Some(current.next_ordinal));
+            let last = cursor.retry_ordinals.last().copied().unwrap_or(first);
+            match range {
+                TranslationRange::Chapter => {
+                    // 把推进点借给这一章之前先记下原地位置：最后一个目标块提交时 walk 回到
+                    // 这里继续整本（`TranslationRun::commit`）。已经有一次收窄在等回来时保留
+                    // 更早的那一个 —— 连着点两章不该把中间那一段丢掉。
+                    let current = JobCursor::from_job(
+                        &job,
+                        &translation.model,
+                        Some(&translation.execution_identity),
+                    )?;
+                    cursor.resume_ordinal = current.resume_ordinal.or(Some(current.next_ordinal));
+                }
+                TranslationRange::Retry { force: true } => {
+                    // 逐块「重新翻译」只做用户点的那一块：walk 的窗口停在它之后，后来的
+                    // 文本块既不会重挂，也不会被算进这一轮（现场 2026-10-19：点一块重译，
+                    // 任务窗口里这一块之后的所有块都显示成了这一轮的范围）。
+                    cursor.stops_after_targets = true;
+                    // 目标块通常落在已处理区域（推进点之后）：跑完回到推进点，下一次运行
+                    // 不会重扫中间已翻好的块。目标块本身还没翻过时推进点停在它之前，回到
+                    // 那里才能把中间尚未翻译的块接着翻完；只有目标块正好是下一个未处理块
+                    // 时才让它前进一格，避免下一次运行又从头处理同一块。
+                    let current = JobCursor::from_job(
+                        &job,
+                        &translation.model,
+                        Some(&translation.execution_identity),
+                    )?;
+                    cursor.resume_ordinal = current
+                        .resume_ordinal
+                        .or_else(|| (current.next_ordinal != last).then_some(current.next_ordinal));
+                }
+                // 任务窗口的「重试失败块」保持旧语义：集合原样交给 walk，跑完停在该组之后。
+                TranslationRange::Retry { force: false } => {}
+            }
+            // 阅读端的两个入口（逐块「重新翻译」与「立即翻译本章」）对用户都是「现在就看我
+            // 这里」：写下比既有插队请求更新的优先级，`list_queued` 会把它排到所有待执行
+            // 任务之前。同一本书正在跑的任务由调用方先暂停，等它做完手上这一批让出执行器
+            // 就轮到它；没有在跑的任务时，worker 的下一次领取就是它。
+            if range.prioritizes() {
                 cursor.priority = Some(now);
             }
-            let last = cursor.retry_ordinals.last().copied().unwrap_or(first);
             match range {
                 TranslationRange::Retry { force } => tracing::info!(
                     target: "ngy_ai",
@@ -400,6 +430,8 @@ impl IndexingCoordinator {
                     next_ordinal = first,
                     last_ordinal = last,
                     force,
+                    stops_after_targets = cursor.stops_after_targets,
+                    resume_ordinal = ?cursor.resume_ordinal,
                     "Planned a per-block translation retry"
                 ),
                 TranslationRange::Chapter => tracing::info!(
@@ -453,6 +485,17 @@ impl TranslationRange {
         match self {
             Self::Retry { force } => force,
             Self::Chapter => false,
+        }
+    }
+
+    /// 这次收窄是不是阅读端「现在就要」的请求，要插到待执行队列最前。
+    ///
+    /// 逐块「重新翻译」与「立即翻译本章」的优先级规则相同；任务窗口的「重试失败块」
+    /// 只是修复失败块，不抢正在跑的整本翻译。
+    fn prioritizes(self) -> bool {
+        match self {
+            Self::Retry { force } => force,
+            Self::Chapter => true,
         }
     }
 

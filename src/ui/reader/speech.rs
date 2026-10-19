@@ -25,14 +25,13 @@ impl ReadAloudWindow for ReaderApp {
         if self.closing {
             return;
         }
-        let Some(webview) = self.webview.clone() else {
-            return;
-        };
         let script = read_aloud_highlight_script(block_id);
-        if let Err(error) = webview.read(cx).raw().evaluate_script(&script) {
+        self.run_reader_script(
+            script,
             // 高亮只是呈现：丢一次更新不该升级成阅读器错误。
-            tracing::warn!(%error, "cannot apply the read-aloud highlight");
-        }
+            |_, error, _| tracing::warn!(%error, "cannot apply the read-aloud highlight"),
+            cx,
+        );
     }
 
     fn report_read_aloud_error(&mut self, message: String, cx: &mut Context<Self>) {
@@ -62,16 +61,11 @@ impl ReaderApp {
         if self.closing {
             return;
         }
-        let Some(webview) = self.webview.clone() else {
-            return;
-        };
-        if let Err(error) = webview
-            .read(cx)
-            .raw()
-            .evaluate_script("window.ngyReadAloud && window.ngyReadAloud.startFromViewport();")
-        {
-            tracing::warn!(%error, "cannot start read-aloud from the viewport");
-        }
+        self.run_reader_script(
+            "window.ngyReadAloud && window.ngyReadAloud.startFromViewport();".to_string(),
+            |_, error, _| tracing::warn!(%error, "cannot start read-aloud from the viewport"),
+            cx,
+        );
     }
 
     /// 改朗读语速：工具栏的下拉与「系统配置」的档位是同一份应用级偏好

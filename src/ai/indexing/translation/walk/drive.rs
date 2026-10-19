@@ -90,6 +90,17 @@ pub(crate) async fn walk_translation_blocks(
     // has no译文 (see `BlockPlan::Untouched`).
     let retry_targets: HashSet<usize> = run.cursor.retry_ordinals.iter().copied().collect();
     let retry_last = run.cursor.retry_ordinals.last().copied();
+    // 逐块「重新翻译」只跑用户点的那一块：窗口不越过最后一个目标块。没有这一行，
+    // walk 会接着把后面的已译块逐个重挂（不发请求，但会写库，也会让任务窗口把它们
+    // 算进这一轮），后面的未译块还会把运行按下暂停。
+    let frontier_limit = if run.cursor.stops_after_targets {
+        retry_last
+            .map(|last| last.saturating_add(1))
+            .unwrap_or(total)
+            .min(total)
+    } else {
+        total
+    };
     // Ordinals in `[next_ordinal, frontier)` are exactly the window: each of them
     // is either finished (`resolved`) or waiting on a request (`in_flight`).
     let mut frontier = run.cursor.next_ordinal;
@@ -185,7 +196,7 @@ pub(crate) async fn walk_translation_blocks(
             streak_cooldown = false;
             // 书末已经没有新请求要发时不必再等：那只会让用户在任务最后一分钟里盯着一个
             // 不动的进度，等一个根本不会发出的请求。
-            if frontier < total {
+            if frontier < frontier_limit {
                 let cooldown = inner.failure_cooldown;
                 if let Some(outcome) = cool_down_after_request_failure_streak(
                     inner,
@@ -238,7 +249,7 @@ pub(crate) async fn walk_translation_blocks(
         // `translation_block_start` 日志）已经做过了，重做会重复记账，所以连它的冻结
         // 输入一起带过去，下一批直接用。
         let mut carried: Option<&TranslationBlock> = None;
-        'window: while in_flight.len() + resolved.len() < window && frontier < total {
+        'window: while in_flight.len() + resolved.len() < window && frontier < frontier_limit {
             // 攒一批：一个请求最多装「每请求文本块数」块，只装同一个内容单元的块，
             // 装到预算上限为止。缓存命中与「不必处理」的块不进批，也不打断这一批。
             let mut pending: Vec<TranslationBatchBlock<'_>> = Vec::new();
@@ -249,7 +260,7 @@ pub(crate) async fn walk_translation_blocks(
                 let block = match carried.take() {
                     Some(block) => block,
                     None => {
-                        if frontier >= total {
+                        if frontier >= frontier_limit {
                             break;
                         }
                         let ordinal = frontier;
