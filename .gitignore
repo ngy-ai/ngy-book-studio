@@ -24,3 +24,6 @@ target/
 .codebuddy/
 PRD.md
 .env
+
+# 本地待办草稿：只留在工作区，不入库，历史中也已清除。
+/TODO.md
